@@ -1,0 +1,15 @@
+[package]
+name = "tab5-hello-world"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,
+# this does not invoke ECO5-only ROM functions before Rust reaches `main`.
+riscv-rt = "0.16"
+
+[profile.release]
+debug = 2
+lto = "fat"
+codegen-units = 1

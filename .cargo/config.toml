@@ -1,0 +1,13 @@
+[build]
+target = "riscv32imafc-unknown-none-elf"
+
+[target.riscv32imafc-unknown-none-elf]
+# Tab5's reset/boot circuitry can stay in download mode when a serial monitor
+# toggles DTR/RTS. Flash first; start a no-reset monitor separately after a
+# short physical reset/power cycle.
+runner = "espflash flash --chip esp32p4 --after no-reset"
+rustflags = [
+  "-C", "link-arg=-Tmemory.x",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "force-frame-pointers",
+]
