@@ -17,6 +17,7 @@ pub const FRAMEBUFFER_COUNT: usize = 2;
 const PSRAM_VADDR: usize = 0x4800_0000;
 const MAPPED_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_BYTES: usize = 64 * 1024;
+const CACHE_LINE_BYTES: usize = 64;
 
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const MSPI2: usize = 0x5008_E000;
@@ -81,28 +82,43 @@ impl Psram {
 
     /// Writes dirty CPU cache lines to PSRAM before a DMA transfer.
     pub fn writeback(&self, index: usize) -> bool {
-        if let Some(framebuffer) = self.framebuffer(index) {
-            let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
-                unsafe { transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
-            unsafe {
-                // Push dirty L1 lines into L2 first, then push L2 into PSRAM.
-                // Invalidate both levels as part of the operation so the
-                // verification read below must fetch the external contents
-                // that DW-GDMA will observe.
-                let l1 = writeback_invalidate(
-                    CACHE_MAP_L1_DCACHE,
-                    framebuffer as u32,
-                    FRAMEBUFFER_BYTES as u32,
-                );
-                let l2 = writeback_invalidate(
-                    CACHE_MAP_L2_CACHE,
-                    framebuffer as u32,
-                    FRAMEBUFFER_BYTES as u32,
-                );
-                return l1 == 0 && l2 == 0;
-            }
+        self.writeback_range(index, 0, FRAMEBUFFER_BYTES)
+    }
+
+    /// Writes back a bounded byte range within one framebuffer.
+    pub fn writeback_range(&self, index: usize, offset: usize, bytes: usize) -> bool {
+        let Some(framebuffer) = self.framebuffer(index) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(bytes) else {
+            return false;
+        };
+        if bytes == 0 || end > FRAMEBUFFER_BYTES {
+            return false;
         }
-        false
+
+        // Both P4 cache levels use 64-byte lines. Expand the requested range
+        // so neither level can retain a dirty edge line after the operation.
+        let aligned_offset = offset & !(CACHE_LINE_BYTES - 1);
+        let aligned_end = end
+            .saturating_add(CACHE_LINE_BYTES - 1)
+            .min(FRAMEBUFFER_BYTES)
+            & !(CACHE_LINE_BYTES - 1);
+        let aligned_end = if aligned_end < end {
+            FRAMEBUFFER_BYTES
+        } else {
+            aligned_end
+        };
+        let address = framebuffer as usize + aligned_offset;
+        let length = aligned_end - aligned_offset;
+        let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
+            unsafe { transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
+        unsafe {
+            // Push dirty L1 lines into L2 first, then push L2 into PSRAM.
+            let l1 = writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
+            let l2 = writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
+            l1 == 0 && l2 == 0
+        }
     }
 }
 

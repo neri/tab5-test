@@ -9,16 +9,20 @@
  */
 MEMORY
 {
-    /* The P4 IDF bootloader expects two XIP segments: app-desc/rodata and
-     * executable text. Keep them as separate, contiguous flash regions. */
-    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x00000fe0
-    ROM_TEXT : ORIGIN = 0x40001000, LENGTH = 0x003ff000
+    /* The P4 IDF bootloader expects exactly two XIP segments. Keep an 8-byte
+     * virtual gap between the descriptor segment and compatibility segment:
+     * espflash then preserves two headers without adding a padding segment. */
+    /* The 0x1018-byte first segment makes the following image segment's
+     * physical payload start at +0x1040, matching ROM_TEXT's page offset. */
+    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x00001018
+    /* A four-byte compatibility segment is enough to satisfy the ECO2
+     * bootloader's exactly-two-XIP-segments invariant. Application code is
+     * loaded into HP SRAM instead of executing through the flash cache. */
+    ROM_TEXT : ORIGIN = 0x40001040, LENGTH = 0x00000004
     RAM : ORIGIN = 0x4ff40000, LENGTH = 0x0006e000
 }
 
-REGION_ALIAS("REGION_TEXT", ROM_TEXT);
-/* Generic riscv-rt emits a 16-byte empty .rodata section after .text. Put
- * that bookkeeping section in RAM so it cannot become a third XIP segment. */
+REGION_ALIAS("REGION_TEXT", RAM);
 REGION_ALIAS("REGION_RODATA", RAM);
 REGION_ALIAS("REGION_DATA", RAM);
 REGION_ALIAS("REGION_BSS", RAM);
@@ -36,8 +40,12 @@ SECTIONS
 
     .eco2.rodata : ALIGN(4)
     {
-        *(.srodata .srodata.*)
-        *(.rodata .rodata.*)
+        KEEP(*(.eco2.pad));
     } > ROM_RODATA
+
+    .eco2.xip_stub : ALIGN(4)
+    {
+        KEEP(*(.eco2.xip_stub));
+    } > ROM_TEXT
 }
 INSERT BEFORE .text;

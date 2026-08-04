@@ -23,12 +23,18 @@ RTC watchdogを停止します。
 ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では次の配置を
 定義しています。
 
-- `0x40000020`: アプリケーション記述子と読み取り専用データ
-- `0x40001000`: 実行コード
-- `0x4ff40000`: データ、BSS、スタック
+- `0x40000020`: アプリケーション記述子とXIP位置調整用パディング
+- `0x40001040`: 4 byteのXIP互換セグメント（実行しない）
+- `0x4ff40000`: 実行コード、読み取り専用データ、データ、BSS、スタック
 
-アプリケーション記述子は`src/main.rs`の`EspAppDesc`です。空のRAMロード
-セグメントにならないよう、`.data`に`BOOT_LAYOUT_MARKER`も配置しています。
+アプリケーション記述子は`src/main.rs`の`EspAppDesc`です。ESP-IDF v5.5.3の
+ESP32-P4ブートローダーは、XIP領域にあるセグメントがちょうど2本であることを
+要求します。そこでフラッシュ上には記述子セグメントと4 byteの互換セグメントだけを
+残し、Rust本体は2nd-stage bootloaderが内部HP SRAMへロードします。先頭セグメントの
+長さを調整し、次のイメージセグメントの物理アドレスと仮想アドレスの64 KiBページ内
+オフセットを一致させることで、`espflash`による余分なパディングセグメントを防ぎます。
+この構成ではイメージはXIP 2本とRAMロード1本になり、アプリ本体はフラッシュキャッシュ
+を経由せずに実行されます。`.data`先頭には`BOOT_LAYOUT_MARKER`も配置しています。
 
 ## 起動シーケンス
 
@@ -37,10 +43,10 @@ riscv-rt
   → RTC watchdog停止
   → USB Serial/JTAG初期化
   → PSRAM電源・クロック・DQS調整・MMU割り当て
-  → 2面のRGB565画像を描画してキャッシュを同期・検証
+  → 2面のRGB565コンソール画面を描画してキャッシュを同期
   → LCDリセット・D-PHY・パネル初期化
   → DSI BridgeとDW-GDMAを準備してvideo modeを開始
-  → GDMA完了割り込みで次フレームを再投入
+  → CardKB入力時に変更セルだけを両面へ描画・部分同期
 ```
 
 正常経路ではDSI HostのVideo Pattern Generatorを使用しません。ECO2では動作中の
@@ -138,7 +144,7 @@ source 24をCPU external line 1、CLIC interrupt 17へ接続しています。
 - `draw_text`
 
 `draw_text`は`src/framebuffer/font.rs`の5×7 ASCIIフォントを使用します。倍率と
-前景色、任意の背景色を指定できます。小文字は大文字として表示します。
+前景色、任意の背景色を指定できます。大文字・小文字を区別して表示します。
 
 描画APIの論理解像度は1280×720 Landscapeです。CW回転のため、論理座標を
 ネイティブフレームバッファへ次のように変換します。
@@ -151,9 +157,11 @@ native_y = 1279 - logical_x
 DSIの解像度やパネル初期化コマンドは変更せず、全描画プリミティブと画像転送に
 同じ座標変換を適用します。
 
-FB1は表示位置を確認する座標校正画面です。100 px間隔のグリッド、四隅と中央の
-論理座標、外端から赤・緑・青・白の1 px枠を描きます。外周色の欠落からクロップを、
-グリッド位置から表示オフセットを判別できます。
+`src/console.rs` は 69 列 × 28 行の固定サイズ端末としてCardKBのASCII入力を保持します。
+通常キーでは変更された1セルだけを非表示面、表示面の順に描画し、回転後のセルを含む
+約26 KiBのPSRAM範囲だけを書き戻します。毎キーの全画面再描画によるGDMA帯域不足を
+避けつつ、2面を同じ内容に保ちます。末尾スクロール時だけ全画面を再生成します。
+Carriage Return、Line Feed、Backspace、Tabと末尾スクロールを処理します。
 
 ## ファイル構成
 
@@ -163,6 +171,8 @@ FB1は表示位置を確認する座標校正画面です。100 px間隔のグ�
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期
 - `src/framebuffer.rs`: ダブルバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
+- `src/console.rs`: CardKB入力エコー用コンソール
+- `src/cardkb.rs`: PORT.AのソフトウェアI2C CardKBドライバ
 - `src/lcd.rs`: I/O expander、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR

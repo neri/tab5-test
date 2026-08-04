@@ -1,11 +1,13 @@
-//! M5Stack Tab5 (ESP32-P4 ECO2) no_std startup diagnostic.
-//! Linker layout revision: two XIP segments for the ESP-IDF bootloader.
+//! M5Stack Tab5 (ESP32-P4 ECO2) CardKB input echo console.
+//! Linker layout: two minimal XIP compatibility segments and an HP-SRAM body.
 
 #![no_std]
 #![no_main]
 
 use riscv_rt::entry;
 
+mod cardkb;
+mod console;
 mod framebuffer;
 mod interrupts;
 mod lcd;
@@ -51,8 +53,8 @@ static APP_DESC: EspAppDesc = EspAppDesc {
     magic_word: 0xABCD_5432,
     secure_version: 0,
     reserv1: [0; 2],
-    version: cstr("0.1.0"),
-    project_name: cstr("tab5-hello-world"),
+    version: cstr("0.2.0"),
+    project_name: cstr("tab5-cardkb-console"),
     time: cstr("00:00:00"),
     date: cstr("2026-08-03"),
     idf_ver: cstr("no_std-eco2"),
@@ -64,20 +66,31 @@ static APP_DESC: EspAppDesc = EspAppDesc {
     reserv2: [0; 18],
 };
 
-// Force a non-empty RAM-load segment between the two XIP segments. This is
-// the layout expected by the ESP-IDF v5.5 bootloader on the Tab5.
+// Leave a recognizable word at the start of normal RAM data.
 #[used]
 #[unsafe(link_section = ".data")]
 static BOOT_LAYOUT_MARKER: u32 = 0xEC02_0001;
+
+// Make the second XIP segment's image payload start at offset 0x1040. Its
+// virtual address has the same 64 KiB-page offset, so espflash does not create
+// an extra padding segment. Only the app descriptor and this padding are
+// flash-mapped; all regular Rust code and constants are loaded into HP SRAM.
+#[used]
+#[unsafe(link_section = ".eco2.pad")]
+static XIP_SEGMENT_PAD: [u8; 3864] = [0; 3864];
+
+// ESP-IDF v5.5.3 on ESP32-P4 ECO2 asserts unless it finds exactly two
+// external-memory-addressed image segments. This segment is never executed.
+#[used]
+#[unsafe(link_section = ".eco2.xip_stub")]
+static XIP_COMPATIBILITY_STUB: [u8; 4] = [0x01, 0x00, 0x01, 0x00];
 
 #[entry]
 fn main() -> ! {
     startup::init();
     uart::hello_world();
     if let Some(psram) = psram::init() {
-        lcd::run_framebuffer(psram);
-        // Establish the diagnostic pattern if direct DMA setup returned.
-        let _ = lcd::start_pattern();
+        lcd::run_console(psram);
     } else {
         // PSRAM failed, so keep the independent DSI VPG useful as a visible
         // diagnostic rather than attempting the framebuffer path.
@@ -91,6 +104,25 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    uart::log(b"PANIC\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[unsafe(export_name = "ExceptionHandler")]
+fn exception_handler(_: &riscv_rt::TrapFrame) -> ! {
+    let mcause: u32;
+    let mepc: u32;
+    let mtval: u32;
+    unsafe {
+        core::arch::asm!("csrr {0}, mcause", out(reg) mcause);
+        core::arch::asm!("csrr {0}, mepc", out(reg) mepc);
+        core::arch::asm!("csrr {0}, mtval", out(reg) mtval);
+    }
+    uart::log_hex(b"EXCEPTION mcause=", mcause);
+    uart::log_hex(b"EXCEPTION mepc=", mepc);
+    uart::log_hex(b"EXCEPTION mtval=", mtval);
     loop {
         core::hint::spin_loop();
     }

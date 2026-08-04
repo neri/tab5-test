@@ -1,19 +1,21 @@
-# M5Stack Tab5 `no_std` Rust template
+# M5Stack Tab5 CardKB コンソール（`no_std` Rust）
 
 M5Stack Tab5のESP32-P4 ECO2（revision v1.3）向け`no_std`テンプレートです。
-UARTへHello Worldを出力し、PSRAM上のRGB565ダブルバッファをMIPI-DSI LCDへ
-表示します。
+UARTへHello Worldを出力し、CardKB v1.1からの入力をPSRAM上のRGB565ダブル
+バッファを介してMIPI-DSI LCDへエコーする簡易コンソールです。
 
 ## できること
 
 - USB Serial/JTAGへのUARTログ出力
 - 1280×720 Landscape（CW回転）のRGB565ダブルバッファ
-- フレーム境界での表示面切り替え
-- ピクセル、直線、矩形、円、RGB565画像、5×7 ASCII文字の描画
-- LCD初期化失敗時のカラーバー表示
+- CardKB v1.1（PORT.A、GPIO53/54、I2C 0x5F）の入力エコー
+- 改行、Backspace、Tab、画面末尾でのスクロールに対応した5×7 ASCIIコンソール
+- 通常キー入力時の1セル部分描画・部分キャッシュ同期
+- PSRAM初期化失敗時のカラーバー表示
 
-PSRAMの準備後に4分割画像と座標校正用グリッドを直接表示し、その後は約2秒ごとに
-画像が切り替わります。カラーバーはフレームバッファ経路の失敗時だけ表示します。
+PSRAMの準備後にコンソール画面を表示します。CardKBが未接続の場合は約1秒ごとに
+再検出するため、起動後の接続にも対応します。カラーバーはPSRAM初期化に
+失敗した場合だけ表示します。
 
 ## 準備
 
@@ -45,7 +47,7 @@ python3 tools/monitor.py
 
 ```text
 LCD: RGB565 framebuffer DMA active
-LCD: framebuffer=0x00000001
+CardKB: ready
 ```
 
 ## 構成
@@ -54,6 +56,8 @@ LCD: framebuffer=0x00000001
 - `src/uart.rs`: UART出力
 - `src/psram.rs`: PSRAMとフレームバッファ領域
 - `src/framebuffer.rs`: RGB565描画API
+- `src/console.rs`: CardKB入力エコー用コンソール
+- `src/cardkb.rs`: PORT.AのソフトウェアI2C CardKBドライバ
 - `src/lcd.rs`: LCD、MIPI-DSI、GDMA
 - `src/interrupts.rs`: フレーム完了割り込み
 

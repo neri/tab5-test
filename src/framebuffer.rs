@@ -1,6 +1,9 @@
 //! CW-rotated RGB565 drawing primitives backed by external PSRAM.
 
-use crate::psram::{HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH};
+use crate::{
+    psram::{HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH},
+    uart,
+};
 
 mod font;
 
@@ -39,6 +42,36 @@ impl DoubleBuffer {
         };
         for offset in 0..NATIVE_WIDTH * NATIVE_HEIGHT {
             unsafe { pointer.add(offset).write_volatile(color) };
+        }
+    }
+
+    /// Clears the landscape console and paints its top band in one forward,
+    /// panel-native PSRAM pass.
+    ///
+    /// A logical horizontal band becomes the first `band_height` pixels of
+    /// every native scanline after the CW rotation.
+    pub fn fill_console_background(
+        &mut self,
+        index: usize,
+        band_height: usize,
+        band_color: u16,
+        body_color: u16,
+    ) {
+        let Some(pointer) = self.memory.framebuffer(index) else {
+            return;
+        };
+        let band_height = band_height.min(NATIVE_WIDTH);
+        let mut offset = 0;
+        for _native_y in 0..NATIVE_HEIGHT {
+            for native_x in 0..NATIVE_WIDTH {
+                let color = if native_x < band_height {
+                    band_color
+                } else {
+                    body_color
+                };
+                unsafe { pointer.add(offset).write_volatile(color) };
+                offset += 1;
+            }
         }
     }
 
@@ -260,14 +293,19 @@ impl DoubleBuffer {
                         background
                     };
                     if let Some(color) = color {
-                        self.fill_rect(
-                            index,
-                            cursor_x + column * scale,
-                            cursor_y + row * scale,
-                            scale,
-                            scale,
-                            color,
-                        );
+                        // Text consists of many tiny cells. Write those pixels
+                        // directly rather than repeatedly entering fill_rect;
+                        // this keeps PSRAM accesses predictable on ECO2.
+                        for offset_x in 0..scale {
+                            for offset_y in 0..scale {
+                                self.draw_pixel(
+                                    index,
+                                    cursor_x + column * scale + offset_x,
+                                    cursor_y + row * scale + offset_y,
+                                    color,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -275,8 +313,90 @@ impl DoubleBuffer {
         }
     }
 
+    /// Draws one scaled 5x7 ASCII glyph without the general text iterator.
+    ///
+    /// The console uses this smaller path because it renders individual runs
+    /// into PSRAM and does not need background-cell handling.
+    #[inline(never)]
+    pub fn draw_ascii_char(
+        &mut self,
+        index: usize,
+        x: usize,
+        y: usize,
+        byte: u8,
+        scale: usize,
+        foreground: u16,
+        trace: bool,
+    ) {
+        if trace {
+            uart::log(b"Glyph: enter\r\n");
+        }
+        let scale = scale.max(1);
+        let glyph = font::glyph(byte);
+        if trace {
+            uart::log(b"Glyph: lookup done\r\n");
+        }
+        let mut first_pixel = true;
+        for column in 0..5 {
+            let bits = glyph[column];
+            for row in 0..7 {
+                if bits & (1 << row) == 0 {
+                    continue;
+                }
+                for offset_x in 0..scale {
+                    for offset_y in 0..scale {
+                        if trace && first_pixel {
+                            uart::log(b"Glyph: first pixel begin\r\n");
+                        }
+                        self.draw_pixel(
+                            index,
+                            x + column * scale + offset_x,
+                            y + row * scale + offset_y,
+                            foreground,
+                        );
+                        if trace && first_pixel {
+                            uart::log(b"Glyph: first pixel done\r\n");
+                            first_pixel = false;
+                        }
+                    }
+                }
+            }
+        }
+        if trace {
+            uart::log(b"Glyph: done\r\n");
+        }
+    }
+
     pub fn flush(&self, index: usize) -> bool {
         self.memory.writeback(index)
+    }
+
+    /// Synchronises the native-memory span covering a logical rectangle.
+    /// Rotation makes the rows sparse, so this includes the short gaps
+    /// between them while remaining far smaller than a complete framebuffer.
+    pub fn flush_rect(
+        &self,
+        index: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> bool {
+        let x_start = x.min(WIDTH);
+        let y_start = y.min(HEIGHT);
+        let x_end = x.saturating_add(width).min(WIDTH);
+        let y_end = y.saturating_add(height).min(HEIGHT);
+        if x_start == x_end || y_start == y_end {
+            return false;
+        }
+
+        let first_pixel = (NATIVE_HEIGHT - x_end) * NATIVE_WIDTH + y_start;
+        let end_pixel = (NATIVE_HEIGHT - 1 - x_start) * NATIVE_WIDTH + y_end;
+        self.memory.writeback_range(
+            index,
+            first_pixel * core::mem::size_of::<u16>(),
+            (end_pixel - first_pixel) * core::mem::size_of::<u16>(),
+        )
     }
 
     pub fn draw_test_images(&mut self) -> bool {

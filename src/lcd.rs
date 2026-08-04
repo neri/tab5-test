@@ -5,7 +5,7 @@
 //! fallback diagnostic when framebuffer setup fails.
 
 use crate::uart;
-use crate::{framebuffer::DoubleBuffer, interrupts, psram::Psram};
+use crate::{cardkb::CardKb, console::Update, framebuffer::DoubleBuffer, interrupts, psram::Psram};
 
 mod st7121;
 
@@ -228,21 +228,37 @@ pub fn start_pattern() -> bool {
     true
 }
 
-/// Streams two RGB565 PSRAM framebuffers through DW-GDMA and alternates them.
+/// Runs the CardKB input echo console over the double-buffered DMA display.
 ///
-/// The normal path starts the panel directly in DMA video mode. It deliberately
-/// avoids the ECO2 Host's nondeterministic VPG-to-DPI source transition.
-pub fn run_framebuffer(psram: Psram) {
-    uart::log(b"FB: drawing two RGB565 test images in PSRAM\r\n");
-    uart::log(b"FB: logical size=1280x720, rotation=CW\r\n");
+/// Each keystroke is rendered into the inactive buffer, cache-synchronised,
+/// then selected at the next full-frame DMA completion. This never modifies a
+/// buffer while the display engine can read from it.
+pub fn run_console(psram: Psram) {
     let Some(mut framebuffers) = DoubleBuffer::new(psram) else {
         uart::log(b"FB: two buffers do not fit in mapped PSRAM\r\n");
         return;
     };
-    if !framebuffers.draw_test_images() {
+    // One foreground hart owns the singleton for the lifetime of the app.
+    let console = unsafe { crate::console::singleton() };
+    uart::log(b"Console: buffer 0 render begin\r\n");
+    console.render(&mut framebuffers, 0);
+    uart::log(b"Console: buffer 0 render done\r\n");
+    uart::log(b"Console: buffer 1 render begin\r\n");
+    console.render(&mut framebuffers, 1);
+    uart::log(b"Console: buffer 1 render done\r\n");
+    uart::log(b"Console: flush 0 begin\r\n");
+    if !framebuffers.flush(0) {
         uart::log(b"FB: cache sync failed\r\n");
         return;
     }
+    uart::log(b"Console: flush 0 done\r\n");
+    uart::log(b"Console: flush 1 begin\r\n");
+    if !framebuffers.flush(1) {
+        uart::log(b"FB: cache sync failed\r\n");
+        return;
+    }
+    uart::log(b"Console: flush 1 done\r\n");
+    uart::log(b"Console: buffers ready\r\n");
     let Some(fb0) = framebuffers.address(0) else {
         return;
     };
@@ -287,10 +303,24 @@ pub fn run_framebuffer(psram: Psram) {
     backlight_on();
     uart::log(b"LCD: RGB565 framebuffer DMA active\r\n");
 
-    let mut frame_count = 0u32;
-    let mut requested = 0usize;
     let mut sequence = interrupts::frame_sequence();
+    let mut keyboard = CardKb::init();
+    if keyboard.is_some() {
+        uart::log(b"CardKB: ready\r\n");
+    } else {
+        uart::log(b"CardKB: absent\r\n");
+    }
+    let mut reconnect_frames = 0u32;
     loop {
+        // An error IRQ can arrive while a key update is running. Check before
+        // WFI as well as after it so a status already acknowledged by the ISR
+        // cannot leave the foreground asleep forever.
+        let error = interrupts::dma_error();
+        if error != 0 {
+            uart::log_hex(b"LCD: DMA interrupt error=", error);
+            dma.log_status();
+            return;
+        }
         interrupts::wait_for_interrupt();
         let error = interrupts::dma_error();
         if error != 0 {
@@ -303,15 +333,58 @@ pub fn run_framebuffer(psram: Psram) {
             continue;
         }
         sequence = next_sequence;
-        frame_count += 1;
-        if frame_count == 120 {
-            frame_count = 0;
-            requested ^= 1;
-            interrupts::request_framebuffer(requested);
+        // Keep the CPU's view of the displayed side in sync with the ISR.
+        // Rendering is always directed to the opposite side below.
+        let displayed = interrupts::active_framebuffer();
+
+        if keyboard.is_none() {
+            reconnect_frames += 1;
+            if reconnect_frames == 60 {
+                reconnect_frames = 0;
+                keyboard = CardKb::init();
+                if keyboard.is_some() {
+                    uart::log(b"CardKB: connected\r\n");
+                }
+            }
+            continue;
         }
-        let active = interrupts::active_framebuffer();
-        if active == requested && frame_count == 1 {
-            uart::log_hex(b"LCD: framebuffer=", active as u32);
+
+        if let Some(byte) = keyboard.as_mut().and_then(CardKb::poll) {
+            uart::log_hex(b"CardKB: key=", byte as u32);
+            match console.push(byte) {
+                Update::None => {}
+                Update::Cell { column, row } => {
+                    // Both sides start identical. Update the inactive side
+                    // first, then the displayed side. Only the native span
+                    // covering this cell is written back, so GDMA retains
+                    // almost all PSRAM bandwidth and visible tearing is at
+                    // most one small glyph.
+                    let back_buffer = displayed ^ 1;
+                    console.render_cell(&mut framebuffers, back_buffer, column, row);
+                    if !console.flush_cell(&framebuffers, back_buffer, column, row) {
+                        uart::log(b"Console: cell flush failed\r\n");
+                        continue;
+                    }
+                    console.render_cell(&mut framebuffers, displayed, column, row);
+                    if !console.flush_cell(&framebuffers, displayed, column, row) {
+                        uart::log(b"Console: cell flush failed\r\n");
+                        continue;
+                    }
+                    uart::log(b"Console: cell updated\r\n");
+                }
+                Update::Full => {
+                    // Scrolling is infrequent. Keep both sides coherent so
+                    // subsequent cell updates can remain incremental.
+                    uart::log(b"Console: full redraw\r\n");
+                    for index in [displayed ^ 1, displayed] {
+                        console.render(&mut framebuffers, index);
+                        if !framebuffers.flush(index) {
+                            uart::log(b"Console: flush failed\r\n");
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
