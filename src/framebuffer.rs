@@ -1,7 +1,7 @@
 //! CW-rotated RGB565 drawing primitives backed by external PSRAM.
 
 use crate::{
-    psram::{HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH},
+    psram::{FRAMEBUFFER_BYTES, HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH},
     uart,
 };
 
@@ -367,8 +367,28 @@ impl DoubleBuffer {
         }
     }
 
+    /// Writes back the complete framebuffer in chunks rather than one
+    /// single-shot writeback.
+    ///
+    /// A full 1.8 MiB writeback contends with GDMA's concurrent PSRAM reads
+    /// for the buffer currently on screen, which has been seen to corrupt a
+    /// display frame (a flash of a wrong solid color) on this board during
+    /// earlier PSRAM/DMA bring-up. Per-cell updates, which only ever write
+    /// back tens of KiB at a time, have never shown this. Chunking keeps
+    /// each writeback burst closer to that size so GDMA's reads can
+    /// interleave between chunks instead of losing the bus for the whole
+    /// framebuffer at once.
     pub fn flush(&self, index: usize) -> bool {
-        self.memory.writeback(index)
+        const CHUNK_BYTES: usize = 64 * 1024;
+        let mut offset = 0;
+        while offset < FRAMEBUFFER_BYTES {
+            let bytes = CHUNK_BYTES.min(FRAMEBUFFER_BYTES - offset);
+            if !self.memory.writeback_range(index, offset, bytes) {
+                return false;
+            }
+            offset += bytes;
+        }
+        true
     }
 
     /// Synchronises the native-memory span covering a logical rectangle.

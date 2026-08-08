@@ -18,7 +18,17 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 
 現行のESP32-P4向けHALにはECO5以降を前提とする初期化が含まれるため、汎用の
 `riscv-rt`を使用しています。起動直後に`startup.rs`がブートローダーから継承した
-RTC watchdogを停止します。
+RTC watchdogを停止し、続けてCPUクロックを引き上げます。
+
+2nd-stage bootloaderはECO2上で`CPU_CLK_FREQ_MHZ_BTLD`(90 MHz)をCPLL/4として
+構成し、アプリ本体の起動処理でCPLL/1(360 MHz)へ引き上げる前提のままCPUを
+引き渡します。本プロジェクトはESP-IDFのアプリ起動処理をリンクしていないため、
+これを行わないと全ての`delay_ms`/`delay_us`（D-PHYやDCSの待ち時間、CardKBの
+I2Cビットタイミングを含む）が実時間で約4倍かかります。`startup::raise_cpu_clock`は
+CPLLの新規有効化やregi2cキャリブレーションを行わず、ブートローダーが既に
+キャリブレーション済みのCPLL(360 MHz)に対してCPU/MEM/APBの分周比だけを
+（APB→SYS→MEM→CPUの順に）書き換えます。CPUクロック源がCPLLでない場合は
+何もせず90 MHzのまま継続します。
 
 ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では次の配置を
 定義しています。
@@ -27,21 +37,53 @@ ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では�
 - `0x40001040`: 4 byteのXIP互換セグメント（実行しない）
 - `0x4ff40000`: 実行コード、読み取り専用データ、データ、BSS、スタック
 
-アプリケーション記述子は`src/main.rs`の`EspAppDesc`です。ESP-IDF v5.5.3の
-ESP32-P4ブートローダーは、XIP領域にあるセグメントがちょうど2本であることを
-要求します。そこでフラッシュ上には記述子セグメントと4 byteの互換セグメントだけを
-残し、Rust本体は2nd-stage bootloaderが内部HP SRAMへロードします。先頭セグメントの
+アプリケーション記述子は`src/main.rs`の`EspAppDesc`です。
+
+Rust本体はフラッシュから実行せず、2nd-stage bootloaderが内部HP SRAMへロードします。
+容量上の理由ではありません。本体は約34 KiB、イメージ全体でも約39 KiBで、16 MiBの
+フラッシュにも4 MiBのXIP窓にも収まります。SRAM実行を選ぶ理由は、`src/psram.rs`が
+実行中にMSPIのPHY電源とクロックを張り替え、ROMのキャッシュ・MMU操作を呼ぶためです。
+ESP-IDFはこの種のコードを`IRAM_ATTR`で内部RAMへ退避しますが、本プロジェクトには
+その仕分けがないため、全体をSRAMへ置く方が単純で安全です。GDMA完了ISRの応答時間が
+フラッシュキャッシュの状態に依存しなくなる利点もあります。
+
+一方でESP-IDF v5.5.3のESP32-P4ブートローダーは、XIP領域にあるセグメントが
+ちょうど2本であることを要求します（`bootloader_utility.c`の`unpack_load_app`、
+`assert(rom_index == 2)`）。SRAM実行にすると本来XIPセグメントは記述子だけの1本に
+なるため、4 byteの互換セグメントを追加して2本に揃えています。あわせて先頭セグメントの
 長さを調整し、次のイメージセグメントの物理アドレスと仮想アドレスの64 KiBページ内
 オフセットを一致させることで、`espflash`による余分なパディングセグメントを防ぎます。
-この構成ではイメージはXIP 2本とRAMロード1本になり、アプリ本体はフラッシュキャッシュ
+これが崩れるとXIPセグメントが3本になり、ビルドは通るのに起動しなくなるため、
+`memory.x`の末尾で両方の条件をリンク時に検査しています。
+
+結果としてイメージはXIP 2本とRAMロード1本になり、アプリ本体はフラッシュキャッシュ
 を経由せずに実行されます。`.data`先頭には`BOOT_LAYOUT_MARKER`も配置しています。
+
+## RAMの範囲
+
+ECO2ではL2キャッシュがL2MEMの上位から確保されるため、使用できるRAMは
+`0x4ffc0000`からキャッシュサイズを引いたアドレスで終わります。下端の
+`0x4ff40000`はROM予約領域（ROMスタック`0x4ff3cfc0`、ROMの`.data`/`.bss`が
+`0x4ff40000`の直前まで）の上端です。2nd-stage bootloader自身は`0x4ff2cbd0`から
+配置されるため、ロード先とは重なりません。
+
+キャッシュサイズを決めるのは2nd-stage bootloaderで、ESP-IDFの既定は128 KiB
+（上限`0x4ffa0000`）、ハードウェアのリセット値は256 KiB（上限`0x4ff80000`）です。
+リンク時には判別できないため、`memory.x`は両方で安全な`0x4ff80000`を上限として
+います。実際の分割は`startup::log_ram_limit`が起動時に出力するので、実機で
+128 KiBだと確認できれば`0x00060000`まで広げられます。
+
+なおchip revision v3以降はキャッシュがL2MEMの下位から確保され、上限は
+`0x4ffaefc0`になります。この値をECO2に適用してはいけません。
 
 ## 起動シーケンス
 
 ```text
 riscv-rt
   → RTC watchdog停止
+  → CPUクロックを90 MHzから360 MHz(CPLL/1)へ引き上げ
   → USB Serial/JTAG初期化
+  → L2キャッシュ分割とRAM上限をログ出力
   → PSRAM電源・クロック・DQS調整・MMU割り当て
   → 2面のRGB565コンソール画面を描画してキャッシュを同期
   → LCDリセット・D-PHY・パネル初期化
@@ -158,15 +200,26 @@ DSIの解像度やパネル初期化コマンドは変更せず、全描画プ�
 同じ座標変換を適用します。
 
 `src/console.rs` は 69 列 × 28 行の固定サイズ端末としてCardKBのASCII入力を保持します。
+各行の先頭には半角`"> "`プロンプトを自動で書き込み、Backspaceはプロンプトより前へは
+戻りません（5×7 ASCIIフォントのみのため、全角`＞`ではなく半角`>`を使用しています）。
 通常キーでは変更された1セルだけを非表示面、表示面の順に描画し、回転後のセルを含む
-約26 KiBのPSRAM範囲だけを書き戻します。毎キーの全画面再描画によるGDMA帯域不足を
-避けつつ、2面を同じ内容に保ちます。末尾スクロール時だけ全画面を再生成します。
-Carriage Return、Line Feed、Backspace、Tabと末尾スクロールを処理します。
+約26 KiBのPSRAM範囲だけを書き戻します。改行時も新しい行のプロンプト2セルだけを
+同様に描画・書き戻し、末尾スクロールが発生したときだけ全画面を再生成します。毎キーの
+全画面再描画によるGDMA帯域不足を避けつつ、2面を同じ内容に保ちます。Carriage Return、
+Line Feed、Backspace、Tabと末尾スクロールを処理します。
+
+画面上部の見出しには`"Tab5 Console"`を表示します（`render()`内で固定描画）。
+
+`src/lcd.rs`のCardKB入力ループは、起動シーケンスのUARTログとは別に、キー入力の
+たびに発生する診断ログ（キーコード、セル更新完了など）を出力していません。USB
+Serial/JTAGへの書き込みはホスト側が読み出していないとFIFOが埋まりタイムアウトまで
+スピンするため、これを毎キー実行するとキー入力から描画までの体感遅延が生じます。
+エラー系のログ（セル/フラッシュ失敗）のみ残しています。
 
 ## ファイル構成
 
 - `src/main.rs`: 起動順だけを定義
-- `src/startup.rs`: watchdog停止
+- `src/startup.rs`: watchdog停止、CPUクロック引き上げ、L2キャッシュ分割とRAM上限の確認
 - `src/uart.rs`: USB Serial/JTAG出力
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期
 - `src/framebuffer.rs`: ダブルバッファと描画API
@@ -187,6 +240,9 @@ Carriage Return、Line Feed、Backspace、Tabと末尾スクロールを処理�
 正常時の主要な通過点は次のとおりです。
 
 ```text
+RAM: L2 cache bytes=0x...
+RAM: usable top=0x...
+RAM: stack top=0x...
 PSRAM: ready for two RGB565 framebuffers
 LCD: D-PHY 4/4 ready
 LCD: DCS init complete
@@ -196,6 +252,8 @@ LCD: RGB565 framebuffer DMA active
 
 主な失敗ログ:
 
+- `CPU: unexpected boot clock source, staying at 90 MHz`: ブートローダーがCPLL/4以外の経路でCPUを構成した（分周比を書き換えず90 MHzのまま継続）
+- `RAM: stack top is inside the L2 cache area`: `memory.x`の`RAM`範囲が広すぎる
 - `PSRAM: mode-register transaction failed`: MSPI3コマンド経路
 - `PSRAM: no valid DQS phase`: DQS位相調整
 - `PSRAM: mapped memory test failed`: MMUまたはキャッシュ経路
@@ -203,6 +261,26 @@ LCD: RGB565 framebuffer DMA active
 - `LCD: D-PHY lock timeout`: D-PHY電源、クロック、PLL
 - `LCD: DCS FIFO timeout`: パネルコマンド経路
 - `LCD: DMA interrupt error`: DW-GDMA転送
+
+## 既知の問題
+
+末尾スクロール（`Update::Full`）の瞬間、画面の大半が一瞬水色になることがあります。以下をすべて
+個別に試しましたが、どれも解消しません。
+
+- 非表示面へ描画してから表示面を切り替える方式（表示中バッファへの直接書き込みをやめる）
+- 全画面書き戻しを64 KiBずつのチャンクに分割する
+- 書き込み中DW-GDMAチャンネルを停止し、書き込み完了後に再始動する
+- 停止から再始動までの間隔を空ける（20ms）
+
+再描画処理そのものを無効化し画面内容を変えないテストでも同じ現象が再現したため、原因は
+このコードパスが書き込む内容やPSRAMアクセスのタイミングそのものではなく、`Update::Full`
+という処理経路に入ること自体に関連した、まだ特定できていない要因だと考えられます。
+
+調査中にDW-GDMAチャンネルの停止方法に関する別の不具合を発見し、修正済みです。チャンネルが
+転送中の場合、`CHEN0`（`DW_GDMA+0x18`）の有効ビットをクリアするだけでは確実に停止せず、
+その後の再始動が不安定になります。正しくはESP-IDFの`dw_gdma_ll_channel_abort`と同じく
+`CHEN1`（`DW_GDMA+0x1C`）へアボート要求を書き込み、完了をポーリングする必要があります
+（この停止方式自体は現在のコードでは使用していません）。
 
 ## 制約
 

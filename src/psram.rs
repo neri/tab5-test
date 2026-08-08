@@ -65,10 +65,6 @@ pub struct Psram {
 }
 
 impl Psram {
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-
     pub fn framebuffer(&self, index: usize) -> Option<*mut u16> {
         if index >= FRAMEBUFFER_COUNT {
             return None;
@@ -78,11 +74,6 @@ impl Psram {
             return None;
         }
         Some((self.base + offset) as *mut u16)
-    }
-
-    /// Writes dirty CPU cache lines to PSRAM before a DMA transfer.
-    pub fn writeback(&self, index: usize) -> bool {
-        self.writeback_range(index, 0, FRAMEBUFFER_BYTES)
     }
 
     /// Writes back a bounded byte range within one framebuffer.
@@ -127,12 +118,10 @@ impl Psram {
 /// A failure is reported over USB serial and returns `None`; it never leaves a
 /// partially verified framebuffer for DMA to consume.
 pub fn init() -> Option<Psram> {
-    uart::log(b"PSRAM: 1/6 power and 80 MHz clock\r\n");
     enable_power_and_clock();
     configure_pins();
     configure_device_timing();
 
-    uart::log(b"PSRAM: 2/6 reading mode registers\r\n");
     let mut mr01 = AlignedBytes([0u8; 2]);
     let mut mr23 = AlignedBytes([0u8; 2]);
     let mut mr48 = AlignedBytes([0u8; 2]);
@@ -143,10 +132,6 @@ pub fn init() -> Option<Psram> {
         uart::log(b"PSRAM: mode-register transaction failed\r\n");
         return None;
     }
-    uart::log_hex(b"PSRAM: MR01=", u16::from_le_bytes(mr01.0) as u32);
-    uart::log_hex(b"PSRAM: MR23=", u16::from_le_bytes(mr23.0) as u32);
-    uart::log_hex(b"PSRAM: MR48=", u16::from_le_bytes(mr48.0) as u32);
-
     // Preserve vendor-defined bits while selecting fixed latency, 10-cycle
     // reads, 5-cycle writes and the 2048-byte x16 linear burst used by IDF.
     mr01.0[0] = (mr01.0[0] & !0x3F) | (2 << 2) | (1 << 5);
@@ -167,7 +152,6 @@ pub fn init() -> Option<Psram> {
         return None;
     }
 
-    uart::log(b"PSRAM: 3/6 command-path memory test\r\n");
     let reference = AlignedBytes(0x5A6B_7C8Du32.to_le_bytes());
     let mut received = AlignedBytes([0u8; 4]);
     if !common_write(SYNC_WRITE, 0, WRITE_DUMMY_BITS, &reference.0)
@@ -182,15 +166,8 @@ pub fn init() -> Option<Psram> {
         return None;
     }
 
-    uart::log(b"PSRAM: 4/6 tuning DQS\r\n");
-    let (phase, data_delay, dqs_delay) = tune_dqs()?;
-    uart::log_hex(b"PSRAM: DQS phase=", phase as u32);
-    uart::log_hex(
-        b"PSRAM: delay data/dqs=",
-        ((data_delay as u32) << 8) | dqs_delay as u32,
-    );
+    tune_dqs()?;
 
-    uart::log(b"PSRAM: 5/6 mapping 4 MiB\r\n");
     configure_cache_access();
     let map: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> i32 =
         unsafe { transmute(ROM_CACHE_PSRAM_MMU_SET) };
@@ -209,7 +186,6 @@ pub fn init() -> Option<Psram> {
         return None;
     }
 
-    uart::log(b"PSRAM: 6/6 cached memory test\r\n");
     if !mapped_memory_test() {
         uart::log(b"PSRAM: mapped memory test failed\r\n");
         return None;
@@ -219,7 +195,6 @@ pub fn init() -> Option<Psram> {
         base: PSRAM_VADDR,
         bytes: MAPPED_BYTES,
     };
-    uart::log_hex(b"PSRAM: usable bytes=", psram.bytes() as u32);
     uart::log(b"PSRAM: ready for two RGB565 framebuffers\r\n");
     Some(psram)
 }
@@ -341,7 +316,6 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     set_all_delays(PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY);
     if reference_matches(reference, 100) {
         modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
-        uart::log(b"PSRAM: preferred DQS point verified\r\n");
         return Some((PREFERRED_PHASE, PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY));
     }
     uart::log(b"PSRAM: preferred DQS point failed; running full sweep\r\n");

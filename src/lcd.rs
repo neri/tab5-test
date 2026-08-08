@@ -240,25 +240,12 @@ pub fn run_console(psram: Psram) {
     };
     // One foreground hart owns the singleton for the lifetime of the app.
     let console = unsafe { crate::console::singleton() };
-    uart::log(b"Console: buffer 0 render begin\r\n");
     console.render(&mut framebuffers, 0);
-    uart::log(b"Console: buffer 0 render done\r\n");
-    uart::log(b"Console: buffer 1 render begin\r\n");
     console.render(&mut framebuffers, 1);
-    uart::log(b"Console: buffer 1 render done\r\n");
-    uart::log(b"Console: flush 0 begin\r\n");
-    if !framebuffers.flush(0) {
+    if !framebuffers.flush(0) || !framebuffers.flush(1) {
         uart::log(b"FB: cache sync failed\r\n");
         return;
     }
-    uart::log(b"Console: flush 0 done\r\n");
-    uart::log(b"Console: flush 1 begin\r\n");
-    if !framebuffers.flush(1) {
-        uart::log(b"FB: cache sync failed\r\n");
-        return;
-    }
-    uart::log(b"Console: flush 1 done\r\n");
-    uart::log(b"Console: buffers ready\r\n");
     let Some(fb0) = framebuffers.address(0) else {
         return;
     };
@@ -266,12 +253,10 @@ pub fn run_console(psram: Psram) {
         return;
     };
 
-    uart::log(b"LCD: enabling PSRAM/DW-GDMA video...\r\n");
     if !init_panel() {
         return;
     }
     configure_video_dma();
-    uart::log(b"LCD: DMA 1/3 bridge configured\r\n");
     let mut dma = DmaDisplay::new(fb0, fb1);
     if !dma.initialize() {
         uart::log(b"LCD: DW-GDMA initialization failed\r\n");
@@ -298,7 +283,6 @@ pub fn run_console(psram: Psram) {
     write(DSI_BRG + 0x44, 1);
     sync_video_registers();
 
-    uart::log(b"LCD: DMA 2/3 first frame armed\r\n");
     uart::log(b"LCD: DMA 3/3 full-frame interrupt installed\r\n");
     backlight_on();
     uart::log(b"LCD: RGB565 framebuffer DMA active\r\n");
@@ -350,7 +334,6 @@ pub fn run_console(psram: Psram) {
         }
 
         if let Some(byte) = keyboard.as_mut().and_then(CardKb::poll) {
-            uart::log_hex(b"CardKB: key=", byte as u32);
             match console.push(byte) {
                 Update::None => {}
                 Update::Cell { column, row } => {
@@ -368,14 +351,31 @@ pub fn run_console(psram: Psram) {
                     console.render_cell(&mut framebuffers, displayed, column, row);
                     if !console.flush_cell(&framebuffers, displayed, column, row) {
                         uart::log(b"Console: cell flush failed\r\n");
+                    }
+                }
+                Update::Prompt { row } => {
+                    let back_buffer = displayed ^ 1;
+                    console.render_prompt(&mut framebuffers, back_buffer, row);
+                    if !console.flush_prompt(&framebuffers, back_buffer, row) {
+                        uart::log(b"Console: prompt flush failed\r\n");
                         continue;
                     }
-                    uart::log(b"Console: cell updated\r\n");
+                    console.render_prompt(&mut framebuffers, displayed, row);
+                    if !console.flush_prompt(&framebuffers, displayed, row) {
+                        uart::log(b"Console: prompt flush failed\r\n");
+                    }
                 }
                 Update::Full => {
-                    // Scrolling is infrequent. Keep both sides coherent so
-                    // subsequent cell updates can remain incremental.
-                    uart::log(b"Console: full redraw\r\n");
+                    // Only a bottom-row scroll reaches here; every visible
+                    // row moved, so both sides need a complete redraw to
+                    // stay coherent for subsequent incremental updates.
+                    //
+                    // A brief flash of a wrong solid color has been
+                    // observed here during scrolling. Buffer selection,
+                    // writeback chunking, and pausing/aborting GDMA for the
+                    // duration of the write have all been tried and none
+                    // change it, so it is not fixed by anything in this
+                    // function; see DESIGN.md's known-issues note.
                     for index in [displayed ^ 1, displayed] {
                         console.render(&mut framebuffers, index);
                         if !framebuffers.flush(index) {
@@ -394,13 +394,9 @@ fn init_panel() -> bool {
         uart::log(b"LCD: PI4IOE1 reset control failed\r\n");
         return false;
     }
-    uart::log(b"LCD: panel reset released\r\n");
-    uart::log(b"LCD: D-PHY 1/4 powering LDO_VO3\r\n");
     enable_dphy_ldo();
-    uart::log(b"LCD: D-PHY 2/4 enabling clocks\r\n");
     enable_dsi_clock();
 
-    uart::log(b"LCD: D-PHY 3/4 starting PLL\r\n");
     if !init_phy() {
         uart::log(b"LCD: D-PHY lock timeout\r\n");
         uart::log_hex(b"LCD: PHY status=", read(DSI_HOST + 0xB0));
@@ -413,14 +409,12 @@ fn init_panel() -> bool {
 
     // The official ST7121 driver performs a software reset even when the Tab5
     // board-level reset has already been pulsed through the I/O expander.
-    uart::log(b"LCD: DCS software reset\r\n");
     if !dcs_write(0x01, &[]) {
         uart::log(b"LCD: ST7121 software reset failed\r\n");
         return false;
     }
     delay_ms(120);
 
-    uart::log(b"LCD: DCS ST7121 init sequence\r\n");
     for init in st7121::INIT {
         if !dcs_write(init.command, init.data) {
             uart::log(b"LCD: DCS FIFO timeout\r\n");
@@ -665,7 +659,6 @@ fn init_phy() -> bool {
         uart::log(b"LCD: D-PHY PLL lock wait failed\r\n");
         return false;
     }
-    uart::log_hex(b"LCD: D-PHY PLL locked, status=", read(DSI_HOST + 0xB0));
     if !wait_for(
         DSI_HOST + 0xB0,
         (1 << 2) | (1 << 4) | (1 << 7),
@@ -923,7 +916,6 @@ impl DmaDisplay {
         );
         write(channel + 0x80, u32::MAX); // generate status events
         self.initialized = true;
-        uart::log(b"LCD: DMA controller initialized\r\n");
         true
     }
 
@@ -991,10 +983,11 @@ fn wait_for(address: usize, mask: u32, expected: u32) -> bool {
 }
 
 fn delay_ms(milliseconds: u32) {
-    // The ESP32-P4 bootloader leaves the HP core at its 400 MHz default.  A
-    // cycle-counter delay is therefore stable enough for panel reset/sleep
-    // timings, unlike the former loop-count approximation.
-    const CPU_CYCLES_PER_MS: u32 = 400_000;
+    // `startup::raise_cpu_clock` moves the HP core from the bootloader's
+    // 90 MHz boot tap to the full 360 MHz CPLL/1. A cycle-counter delay is
+    // therefore stable enough for panel reset/sleep timings, unlike the
+    // former loop-count approximation.
+    const CPU_CYCLES_PER_MS: u32 = 360_000;
     let start = cycle_count();
     let cycles = milliseconds.saturating_mul(CPU_CYCLES_PER_MS);
     while cycle_count().wrapping_sub(start) < cycles {
@@ -1003,7 +996,7 @@ fn delay_ms(milliseconds: u32) {
 }
 
 fn delay_us(microseconds: u32) {
-    const CPU_CYCLES_PER_US: u32 = 400;
+    const CPU_CYCLES_PER_US: u32 = 360;
     let start = cycle_count();
     let cycles = microseconds.saturating_mul(CPU_CYCLES_PER_US);
     while cycle_count().wrapping_sub(start) < cycles {

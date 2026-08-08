@@ -179,7 +179,8 @@ fn gpio_level(pin: u32) -> bool {
 }
 
 fn delay_us(microseconds: u32) {
-    const CPU_CYCLES_PER_US: u32 = 400;
+    // Matches `startup::raise_cpu_clock`'s 360 MHz CPU clock.
+    const CPU_CYCLES_PER_US: u32 = 360;
     let start = cycle_count();
     while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
         core::hint::spin_loop();

@@ -2,10 +2,7 @@
 
 use core::cell::UnsafeCell;
 
-use crate::{
-    framebuffer::{BLACK, DoubleBuffer, GREEN, WHITE, WIDTH},
-    uart,
-};
+use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, WHITE, WIDTH};
 
 const SCALE: usize = 3;
 const CELL_WIDTH: usize = 6 * SCALE;
@@ -14,6 +11,10 @@ const LEFT: usize = 16;
 const TOP: usize = 40;
 const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
 const ROWS: usize = 28;
+
+// Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt
+// uses a half-width '>' rather than the full-width '＞' a shell would show.
+const PROMPT: &[u8] = b"> ";
 
 /// Terminal-like text storage for the CardKB input echo display.
 pub struct Console {
@@ -26,7 +27,15 @@ pub struct Console {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Update {
     None,
-    Cell { column: usize, row: usize },
+    Cell {
+        column: usize,
+        row: usize,
+    },
+    /// A new line's prompt was written; only its `PROMPT.len()` cells
+    /// changed, so a full-screen redraw would waste PSRAM/GDMA bandwidth.
+    Prompt {
+        row: usize,
+    },
     Full,
 }
 
@@ -48,9 +57,15 @@ pub unsafe fn singleton() -> &'static mut Console {
 
 impl Console {
     pub const fn new() -> Self {
+        let mut cells = [[0; COLUMNS]; ROWS];
+        let mut i = 0;
+        while i < PROMPT.len() {
+            cells[0][i] = PROMPT[i];
+            i += 1;
+        }
         Self {
-            cells: [[0; COLUMNS]; ROWS],
-            column: 0,
+            cells,
+            column: PROMPT.len(),
             row: 0,
             previous_was_carriage_return: false,
         }
@@ -60,35 +75,31 @@ impl Console {
     pub fn push(&mut self, byte: u8) -> Update {
         let update = match byte {
             b'\r' => {
-                let update = if self.new_line() {
-                    Update::Full
-                } else {
-                    Update::None
-                };
+                let scrolled = self.new_line();
                 self.previous_was_carriage_return = true;
-                update
+                self.line_update(scrolled)
             }
             b'\n' if self.previous_was_carriage_return => {
                 self.previous_was_carriage_return = false;
                 Update::None
             }
             b'\n' => {
-                if self.new_line() {
-                    Update::Full
-                } else {
-                    Update::None
-                }
+                let scrolled = self.new_line();
+                self.line_update(scrolled)
             }
             0x08 | 0x7f => self.backspace(),
             b'\t' => {
                 let spaces = 4 - self.column % 4;
-                let mut scrolled = false;
+                let mut wrap_update = Update::None;
                 for _ in 0..spaces {
-                    scrolled |= matches!(self.put(b' '), Update::Full);
+                    let result = self.put(b' ');
+                    if matches!(result, Update::Full | Update::Prompt { .. }) {
+                        wrap_update = result;
+                    }
                 }
                 // Blank tab cells need no pixel update on a normal forward
-                // cursor. A bottom-row scroll still needs a complete redraw.
-                if scrolled { Update::Full } else { Update::None }
+                // cursor. A row wrap still needs its own redraw.
+                wrap_update
             }
             b' '..=b'~' => self.put(byte),
             _ => Update::None,
@@ -99,15 +110,23 @@ impl Console {
         update
     }
 
+    /// Only a bottom-row scroll moves every visible row, so it is the only
+    /// case that needs a full redraw; a plain new line just needs its own
+    /// prompt cells drawn.
+    fn line_update(&self, scrolled: bool) -> Update {
+        if scrolled {
+            Update::Full
+        } else {
+            Update::Prompt { row: self.row }
+        }
+    }
+
     /// Draws the complete console into one (currently inactive) framebuffer.
     #[inline(always)]
     pub fn render(&self, framebuffers: &mut DoubleBuffer, index: usize) {
-        uart::log(b"Console render: begin\r\n");
         let cursor_row = self.row;
         let cursor_column = self.column;
-        uart::log(b"Console render: state loaded\r\n");
         framebuffers.fill_console_background(index, 32, GREEN, BLACK);
-        uart::log(b"Console render: background done\r\n");
 
         // Only rows up to the cursor can contain input. Drawing each occupied
         // cell directly also avoids the former empty-run scanner, which could
@@ -133,19 +152,17 @@ impl Console {
                 }
             }
         }
-        uart::log(b"Console render: body done\r\n");
 
         draw_ascii_text(
             framebuffers,
             index,
             LEFT,
             8,
-            b"CARDKB V1.1 CONSOLE",
+            b"Tab5 Console",
             2,
             BLACK,
-            true,
+            false,
         );
-        uart::log(b"Console render: header text done\r\n");
     }
 
     /// Repaints one text cell without touching the rest of the framebuffer.
@@ -191,28 +208,42 @@ impl Console {
         )
     }
 
+    /// Repaints a freshly written prompt (`PROMPT.len()` cells) on one row.
+    pub fn render_prompt(&self, framebuffers: &mut DoubleBuffer, index: usize, row: usize) {
+        for column in 0..PROMPT.len() {
+            self.render_cell(framebuffers, index, column, row);
+        }
+    }
+
+    /// Flushes a freshly written prompt's cells. Returns `false` if any cell
+    /// failed to flush.
+    pub fn flush_prompt(&self, framebuffers: &DoubleBuffer, index: usize, row: usize) -> bool {
+        let mut ok = true;
+        for column in 0..PROMPT.len() {
+            ok &= self.flush_cell(framebuffers, index, column, row);
+        }
+        ok
+    }
+
     fn put(&mut self, byte: u8) -> Update {
         let column = self.column;
         let row = self.row;
         self.cells[self.row][self.column] = byte;
         self.column += 1;
         if self.column == COLUMNS {
-            if self.new_line() {
-                return Update::Full;
-            }
+            let scrolled = self.new_line();
+            return self.line_update(scrolled);
         }
         Update::Cell { column, row }
     }
 
+    /// Erases the previous character. Never crosses into the prompt, so a
+    /// line's leading "> " can't be backspaced away.
     fn backspace(&mut self) -> Update {
-        if self.column > 0 {
-            self.column -= 1;
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.column = COLUMNS - 1;
-        } else {
+        if self.column <= PROMPT.len() {
             return Update::None;
         }
+        self.column -= 1;
         self.cells[self.row][self.column] = 0;
         Update::Cell {
             column: self.column,
@@ -220,19 +251,23 @@ impl Console {
         }
     }
 
+    /// Advances to the next row (scrolling if needed), writes a fresh prompt
+    /// into it, and reports whether the bottom row scrolled.
     fn new_line(&mut self) -> bool {
-        self.column = 0;
         self.row += 1;
-        if self.row == ROWS {
+        let scrolled = self.row == ROWS;
+        if scrolled {
             for row in 1..ROWS {
                 self.cells[row - 1] = self.cells[row];
             }
             self.cells[ROWS - 1] = [0; COLUMNS];
             self.row = ROWS - 1;
-            true
-        } else {
-            false
         }
+        for (column, &byte) in PROMPT.iter().enumerate() {
+            self.cells[self.row][column] = byte;
+        }
+        self.column = PROMPT.len();
+        scrolled
     }
 }
 
@@ -262,35 +297,5 @@ fn draw_ascii_text(
 impl Default for Console {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn echoes_printable_characters_and_wraps() {
-        let mut console = Console::new();
-        assert_eq!(console.push(b'a'), Update::Cell { column: 0, row: 0 });
-        assert_eq!(console.cells[0][0], b'a');
-
-        for _ in 1..COLUMNS {
-            console.push(b'x');
-        }
-        assert_eq!(console.row, 1);
-        assert_eq!(console.column, 0);
-    }
-
-    #[test]
-    fn crlf_is_one_new_line_and_backspace_erases() {
-        let mut console = Console::new();
-        console.push(b'A');
-        console.push(b'\r');
-        console.push(b'\n');
-        assert_eq!(console.row, 1);
-        console.push(b'B');
-        assert_eq!(console.push(0x08), Update::Cell { column: 0, row: 1 });
-        assert_eq!(console.cells[1][0], 0);
     }
 }

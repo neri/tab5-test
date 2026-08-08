@@ -88,7 +88,11 @@ static XIP_COMPATIBILITY_STUB: [u8; 4] = [0x01, 0x00, 0x01, 0x00];
 #[entry]
 fn main() -> ! {
     startup::init();
+    if !startup::raise_cpu_clock() {
+        uart::log(b"CPU: unexpected boot clock source, staying at 90 MHz\r\n");
+    }
     uart::hello_world();
+    startup::log_ram_limit();
     if let Some(psram) = psram::init() {
         lcd::run_console(psram);
     } else {

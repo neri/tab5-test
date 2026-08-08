@@ -169,6 +169,7 @@ pub fn install(framebuffer_0: u32, framebuffer_1: u32) {
     }
 }
 
+#[allow(dead_code)]
 pub fn request_framebuffer(index: usize) {
     if index < 2 {
         REQUESTED.store(index, Ordering::Release);
