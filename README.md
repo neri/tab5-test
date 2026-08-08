@@ -1,8 +1,7 @@
-# M5Stack Tab5 CardKB コンソール（`no_std` Rust）
+# Tab5 実験レポジトリ
 
-M5Stack Tab5のESP32-P4 ECO2（revision v1.3）向け`no_std`テンプレートです。
-UARTへHello Worldを出力し、CardKB v1.1からの入力をPSRAM上のRGB565ダブル
-バッファを介してMIPI-DSI LCDへエコーする簡易コンソールです。
+これはM5Stack Tab5の機能を実験するためのプログラムです。
+明確なゴールはなく、思いついたことを色々実験します。
 
 ## できること
 
