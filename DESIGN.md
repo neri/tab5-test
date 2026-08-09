@@ -322,6 +322,9 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR
+- `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
+  経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
+  同じ構成。詳細・実機で踏んだ罠は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
 
@@ -357,6 +360,11 @@ LCD: DMA 3/3 full-frame interrupt installed
 LCD: RGB565 framebuffer DMA active
 ```
 
+SDカード関連は起動シーケンスに含まれず、シェルコマンド（`sdinfo`/`sdread`/
+`sdreadn`/`sdwritetest`/`sdzero`）実行時にのみ`SDMMC: ...`という接頭辞で
+UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値が続きます。
+失敗パターンの詳細は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
+
 主な失敗ログ:
 
 - `CPU: unexpected boot clock source, staying at 90 MHz`: ブートローダーがCPLL/4以外の経路でCPUを構成した（分周比を書き換えず90 MHzのまま継続）
@@ -389,9 +397,30 @@ LCD: RGB565 framebuffer DMA active
 `CHEN1`（`DW_GDMA+0x1C`）へアボート要求を書き込み、完了をポーリングする必要があります
 （この停止方式自体は現在のコードでは使用していません）。
 
+SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一度も踏んでいないと
+思われる実機固有の制約が2つ見つかっています（詳細と切り分け過程は
+[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 2/3を参照）。
+
+- `SDHOST_BUFFIFO_REG`へのCPU/APB直接読み出しはポップ動作をしない。
+  `STATUS.FIFO_COUNT`はカードからの実データ到着どおりに増え続けるのに、
+  固定アドレス・FIFO窓内でのインクリメントアドレスのどちらで読んでも同じ
+  ワードが返り続ける。ESP-IDFは常に内蔵DMA（IDMAC）を使っており、この
+  CPU直接読み出し経路を検証していないため、ドライバの誤りというより
+  この経路自体が実機で機能しないと考えられる。ブロック読み書きは
+  すべてIDMAC経由（`sdmmc.rs`の`read_block`/`read_blocks`/`write_blocks`）。
+- DMA転送が実際に成功していても（`STATUS.FIFO_EMPTY`が転送後に1へ戻る、
+  `RINTSTS`のDTOビットも正しく立つ）、`SDHOST_IDSTS_REG`のRI
+  （Receive Interrupt）ビットは実機で一度も立たない。`SDHOST_CTRL_REG`の
+  `int_enable`を含め試したが変化しなかった。DMA完了判定は`IDSTS`ではなく
+  `RINTSTS.DTO`のポーリングで行っている。
+
 ## 制約
 
 - ECO2で確認したレジスタ値とROM APIアドレスを使用しています。
 - PSRAMは先頭4 MiBだけを固定アドレスへ割り当て、汎用allocatorには登録しません。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
 - 日本語フォント、省電力制御は未実装です。
+- SDカードは識別クロック（400kHz）と1bitモードのみ動作確認済みです。
+  高速クロックへの切り替え、4bitモード、パーティション/ファイルシステム
+  （FAT/exFAT）の解析は未実装です（[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)の
+  Stage 4以降）。

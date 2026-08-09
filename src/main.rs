@@ -15,6 +15,7 @@ mod interrupts;
 mod lcd;
 mod paint;
 mod psram;
+mod sdmmc;
 mod shell;
 mod startup;
 mod touch;
