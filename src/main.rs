@@ -9,6 +9,8 @@ use riscv_rt::entry;
 mod cardkb;
 mod console;
 mod framebuffer;
+mod gpio;
+mod i2c;
 mod interrupts;
 mod lcd;
 mod psram;

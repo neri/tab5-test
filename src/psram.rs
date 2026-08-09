@@ -200,53 +200,63 @@ pub fn init() -> Option<Psram> {
 }
 
 fn enable_power_and_clock() {
-    // Tab5 connects PSRAM VDD and the optional MPLL domain to LDO channel 2.
-    // Channel 2 is unit 1 / ext_ldo[3].  Nominal ECO2 1.8 V is dref=6,mul=5.
-    write(PMU + 0x1D0, 0x4020_0180);
-    write(PMU + 0x1D4, (6 << 28) | (5 << 23));
-    // The dedicated MSPI PHY is powered separately from the digital MSPI
-    // registers. IDF enables it as part of rtc_clk_mpll_enable(), even before
-    // it programs or selects MPLL as the PSRAM clock source.
-    modify(PMU + 0x15C, 1 << 24, 1 << 24);
-    modify(LP_CLKRST + 0x40, 1 << 28, 1 << 28);
+    unsafe {
+        // Tab5 connects PSRAM VDD and the optional MPLL domain to LDO channel 2.
+        // Channel 2 is unit 1 / ext_ldo[3].  Nominal ECO2 1.8 V is dref=6,mul=5.
+        write(PMU + 0x1D0, 0x4020_0180);
+        write(PMU + 0x1D4, (6 << 28) | (5 << 23));
+        // The dedicated MSPI PHY is powered separately from the digital MSPI
+        // registers. IDF enables it as part of rtc_clk_mpll_enable(), even before
+        // it programs or selects MPLL as the PSRAM clock source.
+        modify(PMU + 0x15C, 1 << 24, 1 << 24);
+        modify(LP_CLKRST + 0x40, 1 << 28, 1 << 28);
+    }
     delay();
 
-    // Select the already-running 480 MHz SPLL, divide its core by one, then
-    // divide both PSRAM buses by six for an 80 MHz DDR clock.
-    modify(HP_SYS_CLKRST + 0x14, 1 << 31, 1 << 31);
-    modify(
-        HP_SYS_CLKRST + 0x30,
-        (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
-        (2 << 12) | (1 << 14) | (1 << 15),
-    );
+    unsafe {
+        // Select the already-running 480 MHz SPLL, divide its core by one, then
+        // divide both PSRAM buses by six for an 80 MHz DDR clock.
+        modify(HP_SYS_CLKRST + 0x14, 1 << 31, 1 << 31);
+        modify(
+            HP_SYS_CLKRST + 0x30,
+            (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
+            (2 << 12) | (1 << 14) | (1 << 15),
+        );
+    }
     set_bus_divider(MSPI2 + 0x50, 6);
     set_bus_divider(MSPI3 + 0x14, 6);
-    modify(MSPI2 + 0x190, 1 << 5, 1 << 5);
-    modify(MSPI2 + 0x180, 1 << 5, 1 << 5);
-    modify(MSPI3 + 0x200, 1, 1);
+    unsafe {
+        modify(MSPI2 + 0x190, 1 << 5, 1 << 5);
+        modify(MSPI2 + 0x180, 1 << 5, 1 << 5);
+        modify(MSPI3 + 0x200, 1, 1);
+    }
 }
 
 fn configure_pins() {
-    // D0..D7, CLK, CS and D8..D15 have the same two-bit drive field.
-    for offset in (0x1C..=0x38).step_by(4) {
-        modify(MSPI_IOMUX + offset, 3 << 12, 2 << 12);
-    }
-    for offset in (0x40..=0x64).step_by(4) {
-        modify(MSPI_IOMUX + offset, 3 << 12, 2 << 12);
-    }
-    for offset in [0x3C, 0x68] {
-        modify(MSPI_IOMUX + offset, (3 << 15) | 1, (2 << 15) | 1);
+    unsafe {
+        // D0..D7, CLK, CS and D8..D15 have the same two-bit drive field.
+        for offset in (0x1C..=0x38).step_by(4) {
+            modify(MSPI_IOMUX + offset, 3 << 12, 2 << 12);
+        }
+        for offset in (0x40..=0x64).step_by(4) {
+            modify(MSPI_IOMUX + offset, 3 << 12, 2 << 12);
+        }
+        for offset in [0x3C, 0x68] {
+            modify(MSPI_IOMUX + offset, (3 << 15) | 1, (2 << 15) | 1);
+        }
     }
 }
 
 fn configure_device_timing() {
-    // CS setup=4, hold=4, hold-delay=3, split transfers, 2048-byte pages.
-    modify(
-        MSPI2 + 0x1A0,
-        0x7FF | (0x3F << 25) | (1 << 31),
-        1 | (1 << 1) | (3 << 2) | (3 << 7) | (2 << 25) | (1 << 31),
-    );
-    modify(MSPI2 + 0x174, 3 << 18, 3 << 18);
+    unsafe {
+        // CS setup=4, hold=4, hold-delay=3, split transfers, 2048-byte pages.
+        modify(
+            MSPI2 + 0x1A0,
+            0x7FF | (0x3F << 25) | (1 << 31),
+            1 | (1 << 1) | (3 << 2) | (3 << 7) | (2 << 25) | (1 << 31),
+        );
+        modify(MSPI2 + 0x174, 3 << 18, 3 << 18);
+    }
 }
 
 fn configure_cache_access() {
@@ -259,19 +269,21 @@ fn configure_cache_access() {
         | (1 << 20)
         | (1 << 21)
         | ((WRITE_DUMMY_BITS - 1) << 22);
-    write(MSPI2 + 0x40, cache_sctrl);
-    modify(
-        MSPI2 + 0x44,
-        (0xF << 18) | (3 << 22) | (3 << 26),
-        (0xF << 18) | (3 << 22) | (3 << 26),
-    );
-    write(MSPI2 + 0x48, (15 << 28) | SYNC_READ);
-    write(MSPI2 + 0x4C, (15 << 28) | SYNC_WRITE);
-    modify(MSPI2 + 0xD8, 0xF, 3);
-    modify(MSPI2 + 0x3C, (1 << 31) | 1, 1);
-    modify(MSPI2 + 0x0C, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
-    // Cache and command engines both use fixed-latency mode after tuning.
-    modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+    unsafe {
+        write(MSPI2 + 0x40, cache_sctrl);
+        modify(
+            MSPI2 + 0x44,
+            (0xF << 18) | (3 << 22) | (3 << 26),
+            (0xF << 18) | (3 << 22) | (3 << 26),
+        );
+        write(MSPI2 + 0x48, (15 << 28) | SYNC_READ);
+        write(MSPI2 + 0x4C, (15 << 28) | SYNC_WRITE);
+        modify(MSPI2 + 0xD8, 0xF, 3);
+        modify(MSPI2 + 0x3C, (1 << 31) | 1, 1);
+        modify(MSPI2 + 0x0C, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
+        // Cache and command engines both use fixed-latency mode after tuning.
+        modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+    }
 }
 
 fn tune_dqs() -> Option<(u8, u8, u8)> {
@@ -310,12 +322,16 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     }
     set_bus_divider(MSPI2 + 0x50, 6);
     set_bus_divider(MSPI3 + 0x14, 6);
-    modify(MSPI3 + 0xD4, 1 << 1, 0);
+    unsafe {
+        modify(MSPI3 + 0xD4, 1 << 1, 0);
+    }
 
     set_dqs_phase(PREFERRED_PHASE);
     set_all_delays(PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY);
     if reference_matches(reference, 100) {
-        modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+        unsafe {
+            modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+        }
         return Some((PREFERRED_PHASE, PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY));
     }
     uart::log(b"PSRAM: preferred DQS point failed; running full sweep\r\n");
@@ -348,7 +364,9 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     let (best_data, best_dqs) = delay_pair(best_index as u8);
     set_dqs_phase(best_phase);
     set_all_delays(best_data, best_dqs);
-    modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+    unsafe {
+        modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+    }
     Some((best_phase, best_data, best_dqs))
 }
 
@@ -404,24 +422,28 @@ fn clear_tuning() {
 }
 
 fn set_dqs_phase(phase: u8) {
-    for offset in [0x3C, 0x68] {
-        modify(MSPI_IOMUX + offset, 3 << 1, (phase as u32) << 1);
+    unsafe {
+        for offset in [0x3C, 0x68] {
+            modify(MSPI_IOMUX + offset, 3 << 1, (phase as u32) << 1);
+        }
     }
 }
 
 fn set_all_delays(data: u8, dqs: u8) {
-    for offset in (0x1C..=0x38).step_by(4) {
-        modify(MSPI_IOMUX + offset, 0xF << 4, (data as u32) << 4);
-    }
-    for offset in (0x40..=0x64).step_by(4) {
-        modify(MSPI_IOMUX + offset, 0xF << 4, (data as u32) << 4);
-    }
-    for offset in [0x3C, 0x68] {
-        modify(
-            MSPI_IOMUX + offset,
-            (0xF << 7) | (0xF << 17),
-            ((dqs as u32) << 7) | ((dqs as u32) << 17),
-        );
+    unsafe {
+        for offset in (0x1C..=0x38).step_by(4) {
+            modify(MSPI_IOMUX + offset, 0xF << 4, (data as u32) << 4);
+        }
+        for offset in (0x40..=0x64).step_by(4) {
+            modify(MSPI_IOMUX + offset, 0xF << 4, (data as u32) << 4);
+        }
+        for offset in [0x3C, 0x68] {
+            modify(
+                MSPI_IOMUX + offset,
+                (0xF << 7) | (0xF << 17),
+                ((dqs as u32) << 7) | ((dqs as u32) << 17),
+            );
+        }
     }
 }
 
@@ -496,37 +518,38 @@ fn transaction(
     let set_mode: unsafe extern "C" fn(i32, i32) = unsafe { transmute(ROM_SPI_SET_OP_MODE) };
     let configure: unsafe extern "C" fn(i32, *mut RomSpiCommand) =
         unsafe { transmute(ROM_SPI_CMD_CONFIG) };
+
     unsafe {
         // ESP_ROM_SPIFLASH_OPI_DTR_MODE = 7; PSRAM is on CS1.
         set_mode(3, 7);
         configure(3, &mut config);
-    }
 
-    // The ROM start helper waits forever if the command engine has no clock.
-    // Select CS1 and perform the same trigger with a bounded poll instead.
-    modify(MSPI3 + 0x34, 3, 1);
-    modify(MSPI3, 1 << 18, 1 << 18);
-    let mut timeout = 5_000_000u32;
-    while read(MSPI3) & (1 << 18) != 0 {
-        if timeout == 0 {
-            uart::log(b"PSRAM: MSPI3 command timeout\r\n");
-            uart::log_hex(b"PSRAM: MSPI3 CMD=", read(MSPI3));
-            uart::log_hex(b"PSRAM: MSPI3 CLOCK=", read(MSPI3 + 0x14));
-            uart::log_hex(b"PSRAM: MSPI3 USER=", read(MSPI3 + 0x18));
-            uart::log_hex(b"PSRAM: MSPI3 MISC=", read(MSPI3 + 0x34));
-            uart::log_hex(b"PSRAM: HP CLK=", read(HP_SYS_CLKRST + 0x30));
-            uart::log_hex(b"PSRAM: LDO2=", read(PMU + 0x1D0));
-            uart::log_hex(b"PSRAM: LDO2 ANA=", read(PMU + 0x1D4));
-            uart::log_hex(b"PSRAM: RF PWC=", read(PMU + 0x15C));
-            return false;
+        // The ROM start helper waits forever if the command engine has no clock.
+        // Select CS1 and perform the same trigger with a bounded poll instead.
+        modify(MSPI3 + 0x34, 3, 1);
+        modify(MSPI3, 1 << 18, 1 << 18);
+        let mut timeout = 5_000_000u32;
+        while read(MSPI3) & (1 << 18) != 0 {
+            if timeout == 0 {
+                uart::log(b"PSRAM: MSPI3 command timeout\r\n");
+                uart::log_hex(b"PSRAM: MSPI3 CMD=", read(MSPI3));
+                uart::log_hex(b"PSRAM: MSPI3 CLOCK=", read(MSPI3 + 0x14));
+                uart::log_hex(b"PSRAM: MSPI3 USER=", read(MSPI3 + 0x18));
+                uart::log_hex(b"PSRAM: MSPI3 MISC=", read(MSPI3 + 0x34));
+                uart::log_hex(b"PSRAM: HP CLK=", read(HP_SYS_CLKRST + 0x30));
+                uart::log_hex(b"PSRAM: LDO2=", read(PMU + 0x1D0));
+                uart::log_hex(b"PSRAM: LDO2 ANA=", read(PMU + 0x1D4));
+                uart::log_hex(b"PSRAM: RF PWC=", read(PMU + 0x15C));
+                return false;
+            }
+            timeout -= 1;
         }
-        timeout -= 1;
-    }
 
-    if rx_len != 0 {
-        for index in 0..rx_len {
-            let word = read(MSPI3 + 0x58 + (index / 4) * 4);
-            unsafe { rx_bytes.add(index).write((word >> ((index % 4) * 8)) as u8) };
+        if rx_len != 0 {
+            for index in 0..rx_len {
+                let word = read(MSPI3 + 0x58 + (index / 4) * 4);
+                rx_bytes.add(index).write((word >> ((index % 4) * 8)) as u8);
+            }
         }
     }
     true
@@ -534,7 +557,9 @@ fn transaction(
 
 fn set_bus_divider(register: usize, divider: u32) {
     let value = ((divider - 1) << 16) | ((divider / 2 - 1) << 8) | (divider - 1);
-    write(register, value);
+    unsafe {
+        write(register, value);
+    }
 }
 
 fn delay() {
@@ -543,17 +568,25 @@ fn delay() {
     }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn read(address: usize) -> u32 {
+unsafe fn read(address: usize) -> u32 {
     unsafe { (address as *const u32).read_volatile() }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn write(address: usize, value: u32) {
+unsafe fn write(address: usize, value: u32) {
     unsafe { (address as *mut u32).write_volatile(value) }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn modify(address: usize, mask: u32, value: u32) {
-    write(address, (read(address) & !mask) | (value & mask));
+unsafe fn modify(address: usize, mask: u32, value: u32) {
+    unsafe {
+        write(address, (read(address) & !mask) | (value & mask));
+    }
 }

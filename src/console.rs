@@ -22,6 +22,13 @@ pub struct Console {
     column: usize,
     row: usize,
     previous_was_carriage_return: bool,
+    /// Current blink phase of the pseudo cursor block drawn at `(column,
+    /// row)`. The cursor cell itself never holds a printable character (it
+    /// is always the next write position, or a position `backspace` has
+    /// just cleared), so `render_cell` can use this flag to decide between
+    /// the cursor block and that cell's normal (blank) contents without
+    /// tracking the glyph underneath.
+    cursor_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,7 +75,24 @@ impl Console {
             column: PROMPT.len(),
             row: 0,
             previous_was_carriage_return: false,
+            cursor_visible: true,
         }
+    }
+
+    /// Current cursor cell, i.e. the next write position.
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.column, self.row)
+    }
+
+    /// Forces the cursor block on, e.g. so activity doesn't leave the
+    /// cursor mid-blink at its new position.
+    pub fn show_cursor(&mut self) {
+        self.cursor_visible = true;
+    }
+
+    /// Flips the blink phase for the idle blink timer.
+    pub fn toggle_cursor(&mut self) {
+        self.cursor_visible = !self.cursor_visible;
     }
 
     /// Adds one CardKB byte using familiar terminal control characters.
@@ -153,6 +177,10 @@ impl Console {
             }
         }
 
+        // The occupied-cell loop above stops before `cursor_column`, so the
+        // cursor cell (always blank) still needs its own pass here.
+        self.render_cell(framebuffers, index, cursor_column, cursor_row);
+
         draw_ascii_text(
             framebuffers,
             index,
@@ -178,13 +206,24 @@ impl Console {
         }
         let x = LEFT + column * CELL_WIDTH;
         let y = TOP + row * CELL_HEIGHT;
+        if self.cursor_visible && column == self.column && row == self.row {
+            // Always this cell's only content: it is either the untouched
+            // next write position or one `backspace` just cleared.
+            framebuffers.fill_rect(index, x, y, CELL_WIDTH, CELL_HEIGHT, WHITE);
+            return;
+        }
         let byte = self.cells[row][column];
         if byte == 0 || byte == b' ' {
-            // Backspace and explicit spaces erase the complete cell.
+            // Backspace and explicit spaces erase the complete cell. This
+            // also covers hiding the cursor block: the cell it vacates is
+            // always blank underneath.
             framebuffers.fill_rect(index, x, y, CELL_WIDTH, CELL_HEIGHT, BLACK);
         } else {
-            // Forward input always enters an already-clear cell. Avoid an
-            // unnecessary sparse PSRAM clear before drawing the glyph.
+            // A freshly typed character's cell was the cursor block moments
+            // ago. `draw_ascii_char` only paints the glyph's foreground
+            // pixels, so without this clear the cursor's white background
+            // would stay visible around the letter.
+            framebuffers.fill_rect(index, x, y, CELL_WIDTH, CELL_HEIGHT, BLACK);
             framebuffers.draw_ascii_char(index, x, y, byte, SCALE, WHITE, false);
         }
     }

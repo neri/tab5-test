@@ -50,43 +50,56 @@ pub fn init() {
 pub fn raise_cpu_clock() -> bool {
     const HP_ROOT_CLK_SRC_SEL: u32 = 0x3;
     const SRC_CPLL: u32 = 1;
-    if read(HP_CLK_CTRL) & HP_ROOT_CLK_SRC_SEL != SRC_CPLL {
-        return false;
+
+    unsafe {
+        if read(HP_CLK_CTRL) & HP_ROOT_CLK_SRC_SEL != SRC_CPLL {
+            return false;
+        }
+
+        const CPU_CLK_DIV_NUM: u32 = 0xFF << 5;
+        const SYS_CLK_DIV_NUM: u32 = 0xFF << 24;
+        const MEM_CLK_DIV_NUM: u32 = 0xFF;
+        const APB_CLK_DIV_NUM: u32 = 0xFF << 16;
+
+        modify(ROOT_CLK_CTRL2, APB_CLK_DIV_NUM, 1 << 16); // APB div 2 (was 1)
+        latch_dividers();
+        modify(ROOT_CLK_CTRL1, SYS_CLK_DIV_NUM, 0 << 24); // SYS div 1 (unchanged)
+        latch_dividers();
+        modify(ROOT_CLK_CTRL1, MEM_CLK_DIV_NUM, 1); // MEM div 2 (was 1)
+        latch_dividers();
+        modify(ROOT_CLK_CTRL0, CPU_CLK_DIV_NUM, 0 << 5); // CPU div 1 (was 4)
+        latch_dividers();
     }
-
-    const CPU_CLK_DIV_NUM: u32 = 0xFF << 5;
-    const SYS_CLK_DIV_NUM: u32 = 0xFF << 24;
-    const MEM_CLK_DIV_NUM: u32 = 0xFF;
-    const APB_CLK_DIV_NUM: u32 = 0xFF << 16;
-
-    modify(ROOT_CLK_CTRL2, APB_CLK_DIV_NUM, 1 << 16); // APB div 2 (was 1)
-    latch_dividers();
-    modify(ROOT_CLK_CTRL1, SYS_CLK_DIV_NUM, 0 << 24); // SYS div 1 (unchanged)
-    latch_dividers();
-    modify(ROOT_CLK_CTRL1, MEM_CLK_DIV_NUM, 1); // MEM div 2 (was 1)
-    latch_dividers();
-    modify(ROOT_CLK_CTRL0, CPU_CLK_DIV_NUM, 0 << 5); // CPU div 1 (was 4)
-    latch_dividers();
 
     true
 }
 
 fn latch_dividers() {
     const SOC_CLK_DIV_UPDATE: u32 = 1 << 4;
-    modify(ROOT_CLK_CTRL0, SOC_CLK_DIV_UPDATE, SOC_CLK_DIV_UPDATE);
-    while read(ROOT_CLK_CTRL0) & SOC_CLK_DIV_UPDATE != 0 {}
+    unsafe {
+        modify(ROOT_CLK_CTRL0, SOC_CLK_DIV_UPDATE, SOC_CLK_DIV_UPDATE);
+        while read(ROOT_CLK_CTRL0) & SOC_CLK_DIV_UPDATE != 0 {}
+    }
 }
 
-fn read(address: usize) -> u32 {
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+unsafe fn read(address: usize) -> u32 {
     unsafe { (address as *const u32).read_volatile() }
 }
 
-fn write(address: usize, value: u32) {
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+unsafe fn write(address: usize, value: u32) {
     unsafe { (address as *mut u32).write_volatile(value) }
 }
 
-fn modify(address: usize, mask: u32, value: u32) {
-    write(address, (read(address) & !mask) | (value & mask));
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+unsafe fn modify(address: usize, mask: u32, value: u32) {
+    unsafe {
+        write(address, (read(address) & !mask) | (value & mask));
+    }
 }
 
 /// Reports where usable L2 RAM actually ends on this device.

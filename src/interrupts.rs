@@ -136,33 +136,34 @@ pub fn install(framebuffer_0: u32, framebuffer_1: u32) {
     FRAME_SEQUENCE.store(0, Ordering::Relaxed);
     DMA_ERROR.store(0, Ordering::Relaxed);
 
-    // Generate and propagate full-transfer and error events from channel 0.
-    write(CHANNEL + 0x98, u32::MAX);
-    write(CHANNEL + 0x80, DMA_FULL_DONE | DMA_ERROR_MASK);
-    write(CHANNEL + 0x90, DMA_FULL_DONE | DMA_ERROR_MASK);
-
-    // Route peripheral source 24 to external CPU line 1 (CLIC interrupt 17).
-    write(INTERRUPT_CORE0 + DW_GDMA_SOURCE * 4, CLIC_INTERRUPT);
-
-    // Configure three interrupt-level bits, then disable any stale external
-    // enables inherited from the bootloader before enabling our level IRQ.
-    modify(CLIC_CONFIG, 0xF << 1, 3 << 1);
-    for interrupt in 16..48 {
-        modify(CLIC_CTRL + interrupt * 4, 1 << 8, 0);
-    }
-    modify(
-        CLIC_CTRL + CLIC_INTERRUPT as usize * 4,
-        (0xFF << 24) | (0x3 << 17) | (1 << 16) | (1 << 8),
-        (0x3F << 24) | (1 << 8),
-    );
-    // Priority 0 is masked; priority 1 and above can enter.
-    write(CLIC_THRESHOLD, 0x1F00_0000);
-
     unsafe extern "C" {
         fn _start_trap();
     }
-    let trap = _start_trap as *const () as usize | 3; // ESP32-P4 CLIC mode
+
     unsafe {
+        // Generate and propagate full-transfer and error events from channel 0.
+        write(CHANNEL + 0x98, u32::MAX);
+        write(CHANNEL + 0x80, DMA_FULL_DONE | DMA_ERROR_MASK);
+        write(CHANNEL + 0x90, DMA_FULL_DONE | DMA_ERROR_MASK);
+
+        // Route peripheral source 24 to external CPU line 1 (CLIC interrupt 17).
+        write(INTERRUPT_CORE0 + DW_GDMA_SOURCE * 4, CLIC_INTERRUPT);
+
+        // Configure three interrupt-level bits, then disable any stale external
+        // enables inherited from the bootloader before enabling our level IRQ.
+        modify(CLIC_CONFIG, 0xF << 1, 3 << 1);
+        for interrupt in 16..48 {
+            modify(CLIC_CTRL + interrupt * 4, 1 << 8, 0);
+        }
+        modify(
+            CLIC_CTRL + CLIC_INTERRUPT as usize * 4,
+            (0xFF << 24) | (0x3 << 17) | (1 << 16) | (1 << 8),
+            (0x3F << 24) | (1 << 8),
+        );
+        // Priority 0 is masked; priority 1 and above can enter.
+        write(CLIC_THRESHOLD, 0x1F00_0000);
+
+        let trap = _start_trap as *const () as usize | 3; // ESP32-P4 CLIC mode
         asm!("csrw mtvec, {trap}", trap = in(reg) trap, options(nostack));
         asm!("fence iorw, iorw", options(nostack));
         asm!("csrsi mstatus, 8", options(nostack));
@@ -194,45 +195,55 @@ pub fn wait_for_interrupt() {
 
 #[unsafe(no_mangle)]
 extern "C" fn esp32p4_interrupt(cause: u32) {
-    if cause & 0x8000_0000 == 0 || cause & 0x0FFF != CLIC_INTERRUPT {
-        loop {
-            core::hint::spin_loop();
+    unsafe {
+        if cause & 0x8000_0000 == 0 || cause & 0x0FFF != CLIC_INTERRUPT {
+            loop {
+                core::hint::spin_loop();
+            }
         }
-    }
 
-    let status = read(CHANNEL + 0x88);
-    write(CHANNEL + 0x98, status);
-    let errors = status & DMA_ERROR_MASK;
-    if errors != 0 {
-        DMA_ERROR.store(errors, Ordering::Release);
-        return;
-    }
+        let status = read(CHANNEL + 0x88);
+        write(CHANNEL + 0x98, status);
+        let errors = status & DMA_ERROR_MASK;
+        if errors != 0 {
+            DMA_ERROR.store(errors, Ordering::Release);
+            return;
+        }
 
-    if status & DMA_FULL_DONE != 0 {
-        let next = REQUESTED.load(Ordering::Acquire);
-        let address = if next == 0 {
-            FRAMEBUFFER_0.load(Ordering::Relaxed)
-        } else {
-            FRAMEBUFFER_1.load(Ordering::Relaxed)
-        };
-        write(CHANNEL, address);
-        write(DW_GDMA + 0x18, 0x101);
-        ACTIVE.store(next, Ordering::Release);
-        FRAME_SEQUENCE.fetch_add(1, Ordering::Release);
+        if status & DMA_FULL_DONE != 0 {
+            let next = REQUESTED.load(Ordering::Acquire);
+            let address = if next == 0 {
+                FRAMEBUFFER_0.load(Ordering::Relaxed)
+            } else {
+                FRAMEBUFFER_1.load(Ordering::Relaxed)
+            };
+            write(CHANNEL, address);
+            write(DW_GDMA + 0x18, 0x101);
+            ACTIVE.store(next, Ordering::Release);
+            FRAME_SEQUENCE.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn read(address: usize) -> u32 {
+unsafe fn read(address: usize) -> u32 {
     unsafe { (address as *const u32).read_volatile() }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn write(address: usize, value: u32) {
+unsafe fn write(address: usize, value: u32) {
     unsafe { (address as *mut u32).write_volatile(value) }
 }
 
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
 #[inline(always)]
-fn modify(address: usize, mask: u32, value: u32) {
-    write(address, (read(address) & !mask) | (value & mask));
+unsafe fn modify(address: usize, mask: u32, value: u32) {
+    unsafe {
+        write(address, (read(address) & !mask) | (value & mask));
+    }
 }

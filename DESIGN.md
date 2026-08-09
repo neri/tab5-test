@@ -225,8 +225,10 @@ Serial/JTAGへの書き込みはホスト側が読み出していないとFIFO�
 - `src/framebuffer.rs`: ダブルバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: CardKB入力エコー用コンソール
-- `src/cardkb.rs`: PORT.AのソフトウェアI2C CardKBドライバ
-- `src/lcd.rs`: I/O expander、D-PHY、パネル、DSI Bridge、DW-GDMA
+- `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
+- `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
+- `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
+- `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR
 - `memory.x`: ESP32-P4用メモリとイメージ配置
@@ -234,6 +236,18 @@ Serial/JTAGへの書き込みはホスト側が読み出していないとFIFO�
 
 `esp-idf-reference/`には、レジスタ設定との比較に使用したESP-IDF v5.5.3版の
 参照実装があります。
+
+`src/`以下のコードコメント（`//`・`///`・`//!`）はすべて英語で書きます。
+`DESIGN.md`・`README.md`など、この設計資料と人間向けドキュメントは日本語のままです。
+
+各ファイル末尾の`read`/`write`/`modify`（任意の`usize`アドレスを読み書きする
+MMIOプリミティブ）は`unsafe fn`として定義します。呼び出し元の`address`が
+有効なレジスタである保証はシグネチャからは得られないため、これはRustの
+安全性の観点で本来unsafeであるべき操作です。一方、これらを呼び出す各関数
+（`enable_dsi_clock`など）は、既知のハードウェア定数アドレスしか渡さない
+ことでその安全性を担保するので、`unsafe fn`にはせず、関数内で`unsafe { ... }`
+ブロックにまとめて使います（呼び出し1つずつを`unsafe`で囲むのではなく、
+関数単位でまとめるのが方針です）。
 
 `README.md`は人間がメンテします。AIは指示された場合を除き編集しないでください。
 
