@@ -4,6 +4,8 @@ use core::cell::UnsafeCell;
 
 use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, WHITE, WIDTH};
 
+const DEFAULT_HEADER_COLOR: u16 = GREEN;
+
 const SCALE: usize = 3;
 const CELL_WIDTH: usize = 6 * SCALE;
 const CELL_HEIGHT: usize = 8 * SCALE;
@@ -15,6 +17,9 @@ const ROWS: usize = 28;
 // Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt
 // uses a half-width '>' rather than the full-width '＞' a shell would show.
 const PROMPT: &[u8] = b"> ";
+
+/// Longest command line `submit` can capture: one row minus the prompt.
+const MAX_LINE: usize = COLUMNS - PROMPT.len();
 
 /// Terminal-like text storage for the CardKB input echo display.
 pub struct Console {
@@ -29,21 +34,44 @@ pub struct Console {
     /// the cursor block and that cell's normal (blank) contents without
     /// tracking the glyph underneath.
     cursor_visible: bool,
+    /// Header band color, changeable by the shell's `color` command.
+    header_color: u16,
+    /// Set by `submit` when Enter completes a command line; drained by
+    /// `take_submission`. Kept separate from `Update` since dispatching a
+    /// command is an application-level reaction, not a rendering hint.
+    pending_submission: Option<Submission>,
 }
 
+/// Describes which part of the screen changed, independent of *why* --
+/// callers decide how to react (dispatch a command, move the cursor, etc.)
+/// separately, e.g. via `take_submission`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Update {
+    /// Nothing on screen needs to change.
     None,
-    Cell {
-        column: usize,
+    /// Columns `start..end` of `row` changed; every other cell is
+    /// unaffected. Covers everything from a single typed character to a
+    /// freshly written prompt -- any contiguous run within one row.
+    Cells {
         row: usize,
+        start: usize,
+        end: usize,
     },
-    /// A new line's prompt was written; only its `PROMPT.len()` cells
-    /// changed, so a full-screen redraw would waste PSRAM/GDMA bandwidth.
-    Prompt {
-        row: usize,
-    },
+    /// Every row may have changed (a scroll, `clear`, or multi-line command
+    /// output); a full redraw is required.
     Full,
+}
+
+/// A command line captured by `submit`, ready for shell dispatch.
+pub struct Submission {
+    text: [u8; MAX_LINE],
+    len: usize,
+}
+
+impl Submission {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.text[..self.len]
+    }
 }
 
 struct ConsoleStorage(UnsafeCell<Console>);
@@ -76,7 +104,29 @@ impl Console {
             row: 0,
             previous_was_carriage_return: false,
             cursor_visible: true,
+            header_color: DEFAULT_HEADER_COLOR,
+            pending_submission: None,
         }
+    }
+
+    /// Takes the command line captured by the most recent `submit`, if any.
+    pub fn take_submission(&mut self) -> Option<Submission> {
+        self.pending_submission.take()
+    }
+
+    /// Changes the header band color, e.g. from the shell's `color` command.
+    pub fn set_header_color(&mut self, color: u16) {
+        self.header_color = color;
+    }
+
+    /// Clears every cell and returns to a fresh, empty first row (no
+    /// prompt: the caller writes it, same convention as `submit`).
+    pub fn clear(&mut self) {
+        self.cells = [[0; COLUMNS]; ROWS];
+        self.column = 0;
+        self.row = 0;
+        self.previous_was_carriage_return = false;
+        self.cursor_visible = true;
     }
 
     /// Current cursor cell, i.e. the next write position.
@@ -99,30 +149,32 @@ impl Console {
     pub fn push(&mut self, byte: u8) -> Update {
         let update = match byte {
             b'\r' => {
-                let scrolled = self.new_line();
+                self.submit();
                 self.previous_was_carriage_return = true;
-                self.line_update(scrolled)
+                Update::None
             }
             b'\n' if self.previous_was_carriage_return => {
                 self.previous_was_carriage_return = false;
                 Update::None
             }
             b'\n' => {
-                let scrolled = self.new_line();
-                self.line_update(scrolled)
+                self.submit();
+                Update::None
             }
             0x08 | 0x7f => self.backspace(),
             b'\t' => {
                 let spaces = 4 - self.column % 4;
                 let mut wrap_update = Update::None;
                 for _ in 0..spaces {
+                    let row_before = self.row;
                     let result = self.put(b' ');
-                    if matches!(result, Update::Full | Update::Prompt { .. }) {
+                    // Blank tab cells need no pixel update on a normal
+                    // forward cursor; only a row change (wrap or scroll)
+                    // still needs its own redraw.
+                    if self.row != row_before || matches!(result, Update::Full) {
                         wrap_update = result;
                     }
                 }
-                // Blank tab cells need no pixel update on a normal forward
-                // cursor. A row wrap still needs its own redraw.
                 wrap_update
             }
             b' '..=b'~' => self.put(byte),
@@ -141,7 +193,11 @@ impl Console {
         if scrolled {
             Update::Full
         } else {
-            Update::Prompt { row: self.row }
+            Update::Cells {
+                row: self.row,
+                start: 0,
+                end: PROMPT.len(),
+            }
         }
     }
 
@@ -150,7 +206,7 @@ impl Console {
     pub fn render(&self, framebuffers: &mut DoubleBuffer, index: usize) {
         let cursor_row = self.row;
         let cursor_column = self.column;
-        framebuffers.fill_console_background(index, 32, GREEN, BLACK);
+        framebuffers.fill_console_background(index, 32, self.header_color, BLACK);
 
         // Only rows up to the cursor can contain input. Drawing each occupied
         // cell directly also avoids the former empty-run scanner, which could
@@ -235,33 +291,46 @@ impl Console {
         column: usize,
         row: usize,
     ) -> bool {
-        if column >= COLUMNS || row >= ROWS {
-            return false;
-        }
-        framebuffers.flush_rect(
-            index,
-            LEFT + column * CELL_WIDTH,
-            TOP + row * CELL_HEIGHT,
-            CELL_WIDTH,
-            CELL_HEIGHT,
-        )
+        self.flush_cells(framebuffers, index, row, column, column + 1)
     }
 
-    /// Repaints a freshly written prompt (`PROMPT.len()` cells) on one row.
-    pub fn render_prompt(&self, framebuffers: &mut DoubleBuffer, index: usize, row: usize) {
-        for column in 0..PROMPT.len() {
+    /// Repaints columns `start..end` of one row without touching the rest
+    /// of the framebuffer.
+    pub fn render_cells(
+        &self,
+        framebuffers: &mut DoubleBuffer,
+        index: usize,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) {
+        for column in start..end {
             self.render_cell(framebuffers, index, column, row);
         }
     }
 
-    /// Flushes a freshly written prompt's cells. Returns `false` if any cell
-    /// failed to flush.
-    pub fn flush_prompt(&self, framebuffers: &DoubleBuffer, index: usize, row: usize) -> bool {
-        let mut ok = true;
-        for column in 0..PROMPT.len() {
-            ok &= self.flush_cell(framebuffers, index, column, row);
+    /// Flushes columns `start..end` of one row in a single writeback, since
+    /// they cover a contiguous native-memory span. Returns `false` if the
+    /// range is empty or out of bounds.
+    pub fn flush_cells(
+        &self,
+        framebuffers: &DoubleBuffer,
+        index: usize,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        if start >= end || start >= COLUMNS || row >= ROWS {
+            return false;
         }
-        ok
+        let end = end.min(COLUMNS);
+        framebuffers.flush_rect(
+            index,
+            LEFT + start * CELL_WIDTH,
+            TOP + row * CELL_HEIGHT,
+            (end - start) * CELL_WIDTH,
+            CELL_HEIGHT,
+        )
     }
 
     fn put(&mut self, byte: u8) -> Update {
@@ -273,7 +342,11 @@ impl Console {
             let scrolled = self.new_line();
             return self.line_update(scrolled);
         }
-        Update::Cell { column, row }
+        Update::Cells {
+            row,
+            start: column,
+            end: column + 1,
+        }
     }
 
     /// Erases the previous character. Never crosses into the prompt, so a
@@ -284,15 +357,17 @@ impl Console {
         }
         self.column -= 1;
         self.cells[self.row][self.column] = 0;
-        Update::Cell {
-            column: self.column,
+        Update::Cells {
             row: self.row,
+            start: self.column,
+            end: self.column + 1,
         }
     }
 
-    /// Advances to the next row (scrolling if needed), writes a fresh prompt
-    /// into it, and reports whether the bottom row scrolled.
-    fn new_line(&mut self) -> bool {
+    /// Advances to the next row (scrolling if needed) and reports whether
+    /// the bottom row scrolled. Leaves the row blank and `column` at 0; it
+    /// carries no prompt until `write_prompt` adds one.
+    fn advance_row(&mut self) -> bool {
         self.row += 1;
         let scrolled = self.row == ROWS;
         if scrolled {
@@ -302,11 +377,59 @@ impl Console {
             self.cells[ROWS - 1] = [0; COLUMNS];
             self.row = ROWS - 1;
         }
+        self.column = 0;
+        scrolled
+    }
+
+    /// Advances to the next row (scrolling if needed) and writes a fresh
+    /// prompt into it. Used for plain input newlines, where the next row is
+    /// always ready for more typing immediately.
+    fn new_line(&mut self) -> bool {
+        let scrolled = self.advance_row();
+        self.write_prompt();
+        scrolled
+    }
+
+    /// Writes the prompt into the current (assumed blank) row and positions
+    /// `column` after it, ready for input.
+    pub fn write_prompt(&mut self) {
         for (column, &byte) in PROMPT.iter().enumerate() {
             self.cells[self.row][column] = byte;
         }
         self.column = PROMPT.len();
-        scrolled
+    }
+
+    /// Handles Enter: captures the just-typed line (the cells between the
+    /// prompt and the cursor) into `pending_submission` for `take_submission`,
+    /// then advances to a fresh blank row. The row is deliberately left
+    /// without a prompt -- unlike `new_line` -- since command output, not
+    /// more input, comes next.
+    fn submit(&mut self) {
+        let mut text = [0u8; MAX_LINE];
+        let mut len = 0;
+        for column in PROMPT.len()..self.column {
+            text[len] = self.cells[self.row][column];
+            len += 1;
+        }
+        self.advance_row();
+        self.pending_submission = Some(Submission { text, len });
+    }
+
+    /// Writes one line of command output starting at column 0 of the
+    /// current (assumed blank) row, wrapping at the row width, and always
+    /// leaves the console on a fresh blank row afterward -- ready for
+    /// either the next output line or `write_prompt`.
+    pub fn write_output_line(&mut self, text: &[u8]) {
+        self.column = 0;
+        for &byte in text {
+            let byte = if (b' '..=b'~').contains(&byte) { byte } else { b' ' };
+            self.cells[self.row][self.column] = byte;
+            self.column += 1;
+            if self.column == COLUMNS {
+                self.advance_row();
+            }
+        }
+        self.advance_row();
     }
 }
 

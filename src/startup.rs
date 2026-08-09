@@ -26,6 +26,36 @@ pub fn init() {
     }
 }
 
+/// Forces a full chip reset by triggering HP CPU core 0's own software-reset
+/// bit -- `LP_CLKRST_HPCPU_RESET_CTRL0_REG`, bit 13 (`HPCORE0_SW_RESET`,
+/// write-1-to-trigger, self-clearing). This is not a guess: it is exactly
+/// `cpu_utility_ll_reset_cpu(0)`, the primitive ESP-IDF's own
+/// `esp_restart_noos` uses as its actual reset trigger on ESP32-P4, read
+/// from the real ESP32-P4 SoC register headers
+/// (`components/soc/esp32p4/register/soc/lp_clkrst_reg.h` in an ESP-IDF
+/// checkout), not inferred from another chip family.
+///
+/// An earlier version of this function instead armed the LP watchdog
+/// (`0x5011_6000`) and waited for it to fire, which hung on real hardware
+/// instead of resetting. Two things were wrong with it: the direct
+/// `CONFIG0` overwrite zeroed `WDT_SYS_RESET_LENGTH` (the reset pulse
+/// width) from its non-zero default down to the shortest setting, and more
+/// fundamentally, ESP-IDF itself only arms that same watchdog as a
+/// multi-second safety net *behind* this CPU-reset call -- never as the
+/// primary mechanism.
+pub fn reboot() -> ! {
+    const HPCPU_RESET_CTRL0: *mut u32 = (LP_CLKRST + 0x14) as *mut u32;
+    const HPCORE0_SW_RESET: u32 = 1 << 13;
+
+    unsafe {
+        let value = HPCPU_RESET_CTRL0.read_volatile();
+        HPCPU_RESET_CTRL0.write_volatile(value | HPCORE0_SW_RESET);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Raises the CPU clock from the bootloader's 90 MHz tap of CPLL (div 4) to
 /// the full 360 MHz (div 1).
 ///

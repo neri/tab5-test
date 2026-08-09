@@ -15,7 +15,7 @@ pub const FRAMEBUFFER_BYTES: usize = WIDTH * HEIGHT * BYTES_PER_PIXEL;
 pub const FRAMEBUFFER_COUNT: usize = 2;
 
 const PSRAM_VADDR: usize = 0x4800_0000;
-const MAPPED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAPPED_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_BYTES: usize = 64 * 1024;
 const CACHE_LINE_BYTES: usize = 64;
 

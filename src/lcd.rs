@@ -12,6 +12,7 @@ use crate::{
     framebuffer::DoubleBuffer,
     gpio, interrupts,
     psram::Psram,
+    shell,
 };
 
 mod st7121;
@@ -241,7 +242,7 @@ pub fn start_pattern() -> bool {
     // transition only disables VPG and re-enables this already-clean bridge.
     configure_video_dma();
     start_video_pattern();
-    backlight_on();
+    set_backlight(true);
     uart::log(b"LCD: ST7121 VPG vertical colour bars active\r\n");
     true
 }
@@ -306,7 +307,7 @@ pub fn run_console(psram: Psram) {
     sync_video_registers();
 
     uart::log(b"LCD: DMA 3/3 full-frame interrupt installed\r\n");
-    backlight_on();
+    set_backlight(true);
     uart::log(b"LCD: RGB565 framebuffer DMA active\r\n");
 
     let mut sequence = interrupts::frame_sequence();
@@ -367,35 +368,54 @@ pub fn run_console(psram: Psram) {
             let update = console.push(byte);
             // Typing always shows a solid cursor; only idle time blinks it.
             console.show_cursor();
-            match update {
-                Update::None => {}
-                Update::Cell { column, row } => {
-                    // Both sides start identical. Update the inactive side
-                    // first, then the displayed side. Only the native span
-                    // covering this cell is written back, so GDMA retains
-                    // almost all PSRAM bandwidth and visible tearing is at
-                    // most one small glyph.
-                    let back_buffer = displayed ^ 1;
-                    console.render_cell(&mut framebuffers, back_buffer, column, row);
-                    if !console.flush_cell(&framebuffers, back_buffer, column, row) {
-                        uart::log(b"Console: cell flush failed\r\n");
-                        continue;
-                    }
-                    console.render_cell(&mut framebuffers, displayed, column, row);
-                    if !console.flush_cell(&framebuffers, displayed, column, row) {
-                        uart::log(b"Console: cell flush failed\r\n");
+
+            // Enter completing a command line is an application-level
+            // reaction, not a rendering hint, so it is handled independently
+            // of `update` (which is always `None` for the byte that
+            // triggered it -- `Console::push` leaves any actual redraw to
+            // this dispatch instead).
+            if let Some(submission) = console.take_submission() {
+                // A command's output can span an arbitrary number of rows,
+                // so (like a scroll) this redraws both sides from scratch
+                // rather than tracking an incremental region.
+                let reboot = shell::execute(console, submission.as_bytes());
+                if !reboot {
+                    console.write_prompt();
+                }
+                for index in [displayed ^ 1, displayed] {
+                    console.render(&mut framebuffers, index);
+                    if !framebuffers.flush(index) {
+                        uart::log(b"Console: flush failed\r\n");
+                        break;
                     }
                 }
-                Update::Prompt { row } => {
+                if reboot {
+                    // Let the panel actually scan out the frame just
+                    // flushed (the "rebooting..." line) before the
+                    // watchdog fires.
+                    delay_ms(300);
+                    shell::reboot();
+                }
+                continue;
+            }
+
+            match update {
+                Update::None => {}
+                Update::Cells { row, start, end } => {
+                    // Both sides start identical. Update the inactive side
+                    // first, then the displayed side. Only the native span
+                    // covering this range is written back, so GDMA retains
+                    // almost all PSRAM bandwidth and visible tearing is at
+                    // most one small run of glyphs.
                     let back_buffer = displayed ^ 1;
-                    console.render_prompt(&mut framebuffers, back_buffer, row);
-                    if !console.flush_prompt(&framebuffers, back_buffer, row) {
-                        uart::log(b"Console: prompt flush failed\r\n");
+                    console.render_cells(&mut framebuffers, back_buffer, row, start, end);
+                    if !console.flush_cells(&framebuffers, back_buffer, row, start, end) {
+                        uart::log(b"Console: cell flush failed\r\n");
                         continue;
                     }
-                    console.render_prompt(&mut framebuffers, displayed, row);
-                    if !console.flush_prompt(&framebuffers, displayed, row) {
-                        uart::log(b"Console: prompt flush failed\r\n");
+                    console.render_cells(&mut framebuffers, displayed, row, start, end);
+                    if !console.flush_cells(&framebuffers, displayed, row, start, end) {
+                        uart::log(b"Console: cell flush failed\r\n");
                     }
                 }
                 Update::Full => {
@@ -419,7 +439,7 @@ pub fn run_console(psram: Psram) {
                 }
             }
             // `Update::Full` already redrew every cell, cursor included, so
-            // only the incremental paths need this separate cursor pass.
+            // only the incremental path needs this separate cursor pass.
             if !matches!(update, Update::Full) {
                 let current_cursor = console.cursor();
                 let back_buffer = displayed ^ 1;
@@ -978,10 +998,16 @@ impl DmaDisplay {
     }
 }
 
-fn backlight_on() {
-    // Tab5 backlight is GPIO22. GPIO matrix reset state selects GPIO output.
+/// Tab5 backlight is GPIO22. GPIO matrix reset state selects GPIO output.
+/// Exposed for the shell's `backlight` command as well as the two internal
+/// bring-up call sites below.
+pub fn set_backlight(on: bool) {
     gpio::enable_output(22);
-    gpio::set_high(22);
+    if on {
+        gpio::set_high(22);
+    } else {
+        gpio::set_low(22);
+    }
 }
 
 fn sync_video_registers() {

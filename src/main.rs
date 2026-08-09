@@ -14,6 +14,7 @@ mod i2c;
 mod interrupts;
 mod lcd;
 mod psram;
+mod shell;
 mod startup;
 mod uart;
 

@@ -208,7 +208,46 @@ DSIの解像度やパネル初期化コマンドは変更せず、全描画プ�
 全画面再描画によるGDMA帯域不足を避けつつ、2面を同じ内容に保ちます。Carriage Return、
 Line Feed、Backspace、Tabと末尾スクロールを処理します。
 
+`(column, row)`には疑似カーソル（白いブロック）を表示します。カーソル位置は常に
+空セル（次の書き込み位置、またはBackspaceが直前に消した位置）なので、`render_cell`は
+そのセルだけカーソルブロックかセル本来の内容かを選んで描画すれば、他のセルに手を
+入れずに済みます。文字を描画する側（`draw_ascii_char`）はグリフの前景ピクセルしか
+描かないため、直前までカーソルだった空セルにそのまま文字を重ねると背景の白が
+残ります。`render_cell`は文字を描く前に必ずセルをBLACKで塗り潰してからグリフを
+描画し、この「カーソルの塗り残し」を防いでいます。キー入力のたびに移動前後の
+2セルを明示的に再描画するため、Backspace・改行・スクロールでもカーソルの描き残しは
+残りません。点滅は`src/lcd.rs`のフレームループがアイドル時に約30フレーム
+（パネルの約57 Hzから逆算した約500ms）ごとに切り替えます。
+
+Enterを押すと、プロンプトより後ろに入力された文字列（コマンドライン）を
+`Console::submit`が切り出し、`Console`内部の`pending_submission`に保持します。
+`src/lcd.rs`は`push()`の戻り値（描画hint、`Update::None/Cells/Full`）とは
+独立に、毎キー`Console::take_submission`でこれを取り出して有無を判定します
+（コマンド実行はアプリケーション層の反応であって描画hintではないため、
+あえて`Update`に混ぜていません）。取り出せた場合は`src/shell.rs`が解析・実行し、
+結果は`Console::write_output_line`でプロンプトなしの出力行として書き込まれ、
+最後に`Console::write_prompt`で次のプロンプトを出します。コマンド出力は複数行・
+スクロールをまたぐことがあるため、この経路では常に全画面を再生成します
+（末尾スクロールと同じ理由）。対応コマンドは`help`で一覧できます
+（`echo`／`clear`／`about`／`mem`／`uptime`／`backlight on|off`／
+`color <name>`／`reboot`）。
+
+`reboot`は`src/startup.rs`の`reboot()`が実装しており、HPCPU 0自身の
+ソフトウェアリセットビット（`LP_CLKRST_HPCPU_RESET_CTRL0_REG`のbit13、
+`HPCORE0_SW_RESET`、write-1-to-trigger）を1回書き込むだけです。これは
+ESP-IDFの`esp_restart_noos`（ESP32-P4版）が実際に使っている
+`cpu_utility_ll_reset_cpu(0)`と同じレジスタ・同じビットで、ESP-IDFの
+`esp32p4/register/soc/lp_clkrst_reg.h`から確認済みです。当初はLPウォッチドッグ
+（`init`が無効化しているのと同じ`0x5011_6000`）にstage0=system resetを
+仕込んで発火を待つ実装でしたが、実機でリセットされずフリーズしました。
+原因は二つあり、(1) `CONFIG0`を丸ごと上書きしていたため`WDT_SYS_RESET_LENGTH`
+（既定値から0まで）が短くなりすぎてリセットパルスが伝播しなかった可能性、
+(2) そもそもESP-IDF自身もこのウォッチドッグ経路は`esp_cpu_reset()`の背後の
+数秒がかりの保険としてのみ使っており、主経路ではありません。現在の実装は
+この主経路（HPCORE0_SW_RESET）だけを使っています。
+
 画面上部の見出しには`"Tab5 Console"`を表示します（`render()`内で固定描画）。
+見出し帯の色は既定でGREENですが、`color`コマンドで変更できます。
 
 `src/lcd.rs`のCardKB入力ループは、起動シーケンスのUARTログとは別に、キー入力の
 たびに発生する診断ログ（キーコード、セル更新完了など）を出力していません。USB
@@ -224,7 +263,8 @@ Serial/JTAGへの書き込みはホスト側が読み出していないとFIFO�
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期
 - `src/framebuffer.rs`: ダブルバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
-- `src/console.rs`: CardKB入力エコー用コンソール
+- `src/console.rs`: CardKB入力エコーとコマンドライン切り出し用コンソール
+- `src/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
