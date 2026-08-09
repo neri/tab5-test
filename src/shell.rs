@@ -23,15 +23,28 @@ const HELP_LINES: &[&[u8]] = &[
     b"backlight on|off  LCD backlight",
     b"color <name>      change header color",
     b"                  green/red/blue/cyan/magenta/yellow/white",
+    b"paint             touch drawing screen",
     b"reboot            restart the board",
 ];
 
-/// Parses and runs one command line. Returns `true` if the board should
-/// reboot once this frame's output has reached the panel.
-pub fn execute(console: &mut Console, line: &[u8]) -> bool {
+/// What the display loop in `lcd::run_console` should do once a command has
+/// been dispatched.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Outcome {
+    /// Keep running the console; write a fresh prompt.
+    Continue,
+    /// Reboot once this frame's output has reached the panel.
+    Reboot,
+    /// Hand the display over to the touch paint screen.
+    Paint,
+}
+
+/// Parses and runs one command line, returning what the caller should do
+/// next.
+pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
-        return false;
+        return Outcome::Continue;
     }
     let (command, rest) = split_first_word(line);
     let argument = trim(rest);
@@ -44,13 +57,14 @@ pub fn execute(console: &mut Console, line: &[u8]) -> bool {
         b"uptime" => cmd_uptime(console),
         b"backlight" => cmd_backlight(console, argument),
         b"color" => cmd_color(console, argument),
+        b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line(b"rebooting...");
-            return true;
+            return Outcome::Reboot;
         }
         _ => console.write_output_line(b"unknown command (try 'help')"),
     }
-    false
+    Outcome::Continue
 }
 
 /// Reboots the board. The caller must have already flushed the "rebooting..."

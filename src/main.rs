@@ -13,9 +13,11 @@ mod gpio;
 mod i2c;
 mod interrupts;
 mod lcd;
+mod paint;
 mod psram;
 mod shell;
 mod startup;
+mod touch;
 mod uart;
 
 // ESP-IDF 2nd-stage bootloaders and espflash require this descriptor. The

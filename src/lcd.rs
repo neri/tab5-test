@@ -10,7 +10,7 @@ use crate::{
     cardkb::CardKb,
     console::{Console, Update},
     framebuffer::DoubleBuffer,
-    gpio, interrupts,
+    gpio, interrupts, paint,
     psram::Psram,
     shell,
 };
@@ -378,8 +378,15 @@ pub fn run_console(psram: Psram) {
                 // A command's output can span an arbitrary number of rows,
                 // so (like a scroll) this redraws both sides from scratch
                 // rather than tracking an incremental region.
-                let reboot = shell::execute(console, submission.as_bytes());
-                if !reboot {
+                let outcome = shell::execute(console, submission.as_bytes());
+                if outcome == shell::Outcome::Paint {
+                    // Blocks until a key is pressed, leaving both
+                    // framebuffers holding the finished drawing; clear them
+                    // back to a fresh console before the redraw below.
+                    paint::run(&mut framebuffers, &mut keyboard);
+                    console.clear();
+                }
+                if outcome != shell::Outcome::Reboot {
                     console.write_prompt();
                 }
                 for index in [displayed ^ 1, displayed] {
@@ -389,7 +396,7 @@ pub fn run_console(psram: Psram) {
                         break;
                     }
                 }
-                if reboot {
+                if outcome == shell::Outcome::Reboot {
                     // Let the panel actually scan out the frame just
                     // flushed (the "rebooting..." line) before the
                     // watchdog fires.
