@@ -52,6 +52,7 @@ const CLKDIV: usize = SDHOST + 0x08;
 const CLKSRC: usize = SDHOST + 0x0C;
 const CLKENA: usize = SDHOST + 0x10;
 const TMOUT: usize = SDHOST + 0x14;
+const CTYPE: usize = SDHOST + 0x18;
 const BLKSIZ: usize = SDHOST + 0x1C;
 const BYTCNT: usize = SDHOST + 0x20;
 const CMDARG: usize = SDHOST + 0x28;
@@ -178,6 +179,17 @@ pub struct SdCard {
     /// Approximate capacity in bytes, decoded from a CSD version 2.0
     /// (SDHC/SDXC) structure. `None` for CSD version 1.0 cards.
     pub capacity_bytes: Option<u64>,
+    /// Whether ACMD6 (SET_BUS_WIDTH) succeeded and `SDHOST_CTYPE_REG` was set
+    /// to match. `false` means the bus stayed in the default 1-bit width --
+    /// this is a soft failure, not a fatal one, so `init()` still returns a
+    /// usable card.
+    pub bus_width_4bit: bool,
+    /// Whether CMD6 (SWITCH_FUNC) negotiated High Speed (40 MHz host clock).
+    /// `false` means the card doesn't support it, rejected the switch, or
+    /// the check itself failed -- all non-fatal, staying at Default Speed.
+    pub high_speed: bool,
+    /// Card clock frequency currently in use (kHz).
+    pub clock_khz: u32,
 }
 
 /// Resets, clocks and activates the card in the Tab5's microSD slot,
@@ -290,6 +302,35 @@ pub fn init() -> Option<SdCard> {
     }
     wait_data_not_busy();
 
+    let bus_width_4bit = set_bus_width_4bit(rca_arg);
+
+    // 160 MHz / 8 = 20 MHz "Default Speed" (SD spec allows up to 25 MHz;
+    // this is ESP-IDF's own SDMMC_FREQ_DEFAULT divider choice, landing under
+    // the cap rather than exactly at it because 160/8 is a clean divisor).
+    // Unlike the bus-width switch, a failure here is not safely recoverable:
+    // `set_card_clock` disables the card clock before reprogramming it, so a
+    // failure partway can leave the clock off rather than merely unchanged.
+    if !set_card_clock(8, 0) {
+        uart::log(b"SDMMC: switch to 20 MHz Default Speed failed\r\n");
+        dump_diagnostics();
+        return None;
+    }
+
+    let high_speed = match set_high_speed() {
+        Ok(enabled) => enabled,
+        Err(()) => {
+            // The card already accepted the switch to High Speed by this
+            // point; only the following host clock reprogram failed, and
+            // (like the Default Speed switch above) that can leave the
+            // clock disabled rather than merely unchanged. Not safe to
+            // continue at any clock.
+            uart::log(b"SDMMC: High Speed host clock switch failed\r\n");
+            dump_diagnostics();
+            return None;
+        }
+    };
+    let clock_khz = if high_speed { 40_000 } else { 20_000 };
+
     let capacity_bytes = decode_csd_v2_capacity(csd);
 
     uart::log(b"SDMMC: card activated\r\n");
@@ -308,7 +349,169 @@ pub fn init() -> Option<SdCard> {
         cid,
         csd,
         capacity_bytes,
+        bus_width_4bit,
+        high_speed,
+        clock_khz,
     })
+}
+
+/// Tells the card to switch to 4-bit data width via ACMD6 (SET_BUS_WIDTH,
+/// argument 0b10), then matches the host side by setting
+/// `SDHOST_CTYPE_REG.CARD_WIDTH4` for card 0. Must run after CMD7
+/// (SELECT_CARD): ACMD6 is only valid once a card is selected. A failure
+/// here is not fatal to activation -- the bus already works at 1-bit, which
+/// is the register's power-on default -- so callers get `false` back rather
+/// than `None`.
+fn set_bus_width_4bit(rca_arg: u32) -> bool {
+    if send_command(55, rca_arg, CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC).is_err() {
+        uart::log(b"SDMMC: CMD55 (APP_CMD) before ACMD6 failed; staying 1-bit\r\n");
+        return false;
+    }
+    if send_command(6, 0b10, CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC).is_err() {
+        uart::log(b"SDMMC: ACMD6 (SET_BUS_WIDTH) failed; staying 1-bit\r\n");
+        return false;
+    }
+    unsafe { modify(CTYPE, 0x3, 0x1) }; // card 0 -> 4-bit
+    uart::log(b"SDMMC: switched to 4-bit bus width\r\n");
+    true
+}
+
+/// Byte offsets into a CMD6 (SWITCH_FUNC) 64-byte status block, per the SD
+/// Physical Layer spec's big-endian, MSB-first-transmitted numbering (bit
+/// 511 is the first bit on the wire, i.e. `status[0]`'s top bit). Verified
+/// against ESP-IDF's `MMC_RSP_BITS`-based accessors in
+/// `components/sdmmc/include/sd_protocol_defs.h`
+/// (`SD_SFUNC_SUPPORTED`/`SD_SFUNC_SELECTED`, bits 415:400 and 379:376 for
+/// function group 1 "Access Mode"), just re-expressed as direct byte
+/// offsets instead of 32-bit-word extraction, since this buffer is filled
+/// byte-for-byte by DMA in wire order (no word-swap like ESP-IDF applies to
+/// its own receive buffer).
+const SFUNC_GROUP1_SUPPORTED_HI: usize = 12; // bits 415:408
+const SFUNC_GROUP1_SUPPORTED_LO: usize = 13; // bits 407:400
+const SFUNC_GROUP1_SELECTED: usize = 16; // low nibble = bits 379:376
+
+const SD_ACCESS_MODE_HIGH_SPEED: u32 = 1; // SD_ACCESS_MODE_SDR25, 50 MHz
+
+/// Sends CMD6 (SWITCH_FUNC) and reads its 64-byte status block via the same
+/// single-descriptor DMA path as `read_block` (CMD6 is a single-block data
+/// transfer, not a plain command/response). `switch_mode` false = query
+/// only (no card-side effect); true = actually switch function group 1
+/// (Access Mode) to `group1_function`. Other function groups are always
+/// sent as "no change" (0xF), matching `other_func_mask` in ESP-IDF's
+/// `sdmmc_send_cmd_switch_func`.
+fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
+    let mut buffer = [0u8; 64];
+    cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
+
+    let mut descriptor = Descriptor {
+        control: DESC_OWNED_BY_IDMAC | DESC_FIRST | DESC_LAST | DESC_CHAINED,
+        buffer1_size: buffer.len() as u32,
+        buffer1_ptr: buffer.as_mut_ptr() as u32,
+        next_or_buffer2_ptr: 0,
+        reserved: [0; 12],
+    };
+    let descriptor_address = &raw mut descriptor as usize;
+    cache_writeback_invalidate(descriptor_address, size_of::<Descriptor>());
+
+    unsafe {
+        write(BLKSIZ, buffer.len() as u32);
+        write(BYTCNT, buffer.len() as u32);
+        write(CARDTHRCTL, (buffer.len() as u32) << 16 | CARDTHRCTL_CARDRDTHREN);
+        modify(CTRL, CTRL_USE_INTERNAL_DMA, CTRL_USE_INTERNAL_DMA);
+        modify(BMOD, BMOD_DE | BMOD_FB, BMOD_DE | BMOD_FB);
+        write(DBADDR, descriptor_address as u32);
+        write(PLDMND, 1);
+    }
+
+    // Group 1 (Access Mode) at bits[3:0], all other groups (2-6, bits[23:4])
+    // sent as 0xF ("no change"), matching ESP-IDF's group_shift=0 case.
+    let arg = ((switch_mode as u32) << 31) | 0x00FFFFF0 | (group1_function & 0xF);
+    let flags = CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC | CMD_DATA_EXPECTED
+        | CMD_WAIT_PRVDATA_COMPLETE;
+    if send_command(6, arg, flags).is_err() {
+        unsafe { modify(CTRL, CTRL_USE_INTERNAL_DMA, 0) };
+        uart::log(b"SDMMC: CMD6 (SWITCH_FUNC) failed\r\n");
+        return None;
+    }
+
+    let mut timeout = 2_000_000u32;
+    let ok = loop {
+        let raw = unsafe { read(RINTSTS) };
+        if raw & RINT_DATA_TRANSFER_OVER != 0 {
+            unsafe { write(RINTSTS, RINT_ALL) };
+            let failed = raw
+                & (RINT_DATA_CRC_ERROR
+                    | RINT_DATA_READ_TIMEOUT
+                    | RINT_FIFO_ERROR
+                    | RINT_START_BIT_ERROR);
+            if failed != 0 {
+                uart::log_hex(b"SDMMC: CMD6 data transfer error, RINTSTS=", raw);
+                break false;
+            }
+            break true;
+        }
+        if timeout == 0 {
+            uart::log_hex(b"SDMMC: CMD6 data-transfer-over timed out, RINTSTS=", raw);
+            unsafe { write(RINTSTS, RINT_ALL) };
+            break false;
+        }
+        timeout -= 1;
+    };
+    unsafe {
+        write(IDSTS, IDSTS_ALL);
+        modify(CTRL, CTRL_USE_INTERNAL_DMA, 0);
+    }
+    if !ok {
+        return None;
+    }
+    wait_data_not_busy();
+
+    cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
+    Some(buffer)
+}
+
+/// Negotiates SD "High Speed" (50 MHz signaling, function group 1 = Access
+/// Mode value 1): checks support with CMD6 in check mode, and if supported,
+/// switches with CMD6 in switch mode and raises the host clock to match.
+///
+/// `Ok(false)` covers every non-fatal outcome (check failed, card doesn't
+/// support it, card rejected the switch) -- the card is left exactly as it
+/// was at Default Speed, still usable. `Err(())` means the card *did*
+/// accept the switch but the following host clock reprogram failed, which
+/// (like `set_card_clock`'s other call sites) can leave the clock disabled
+/// rather than merely unchanged -- callers should treat that as fatal.
+fn set_high_speed() -> Result<bool, ()> {
+    let Some(status) = switch_func(false, 0) else {
+        uart::log(b"SDMMC: CMD6 check (SWITCH_FUNC) failed; staying at Default Speed\r\n");
+        return Ok(false);
+    };
+    let supported =
+        ((status[SFUNC_GROUP1_SUPPORTED_HI] as u16) << 8) | status[SFUNC_GROUP1_SUPPORTED_LO] as u16;
+    if supported & (1 << SD_ACCESS_MODE_HIGH_SPEED) == 0 {
+        uart::log(b"SDMMC: card does not advertise High Speed support\r\n");
+        return Ok(false);
+    }
+
+    let Some(status) = switch_func(true, SD_ACCESS_MODE_HIGH_SPEED) else {
+        uart::log(b"SDMMC: CMD6 switch to High Speed failed\r\n");
+        return Ok(false);
+    };
+    let selected = status[SFUNC_GROUP1_SELECTED] & 0xF;
+    if selected as u32 != SD_ACCESS_MODE_HIGH_SPEED {
+        uart::log_hex(
+            b"SDMMC: card did not accept High Speed switch, selected=",
+            selected as u32,
+        );
+        return Ok(false);
+    }
+
+    // 160 MHz / 4 = 40 MHz (ESP-IDF's SDMMC_FREQ_HIGHSPEED divider choice;
+    // SD spec allows up to 50 MHz).
+    if !set_card_clock(4, 0) {
+        return Err(());
+    }
+    uart::log(b"SDMMC: switched to High Speed (40 MHz)\r\n");
+    Ok(true)
 }
 
 /// Reads one 512-byte block via CMD17 (`READ_SINGLE_BLOCK`) using the
@@ -561,22 +764,49 @@ fn build_descriptor_chain(
     Some(count)
 }
 
-/// Logs a 512-byte block as 32 rows of 16 space-separated hex bytes.
-pub fn dump_block(buffer: &[u8; BLOCK_BYTES]) {
+/// Logs a 512-byte block as 32 `hexdump -C`-style rows: a 4-hex-digit
+/// offset starting at `base_offset` (so a multi-block dump can show a
+/// continuous running offset across calls instead of restarting at 0 for
+/// every block), 16 space-separated hex bytes, then the same 16 bytes as
+/// ASCII (`.` for anything outside printable-graphic-or-space).
+pub fn dump_block_at(buffer: &[u8; BLOCK_BYTES], base_offset: u16) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for row in buffer.chunks(16) {
-        let mut line = [0u8; 16 * 3 + 2];
+    for (row_index, row) in buffer.chunks(16).enumerate() {
+        let offset = base_offset.wrapping_add((row_index * 16) as u16);
+        let mut line = [0u8; 4 + 2 + 16 * 3 + 1 + 16 + 2];
         let mut pos = 0;
+        for shift in (0..4).rev() {
+            line[pos] = HEX[((offset >> (shift * 4)) & 0xF) as usize];
+            pos += 1;
+        }
+        line[pos] = b':';
+        line[pos + 1] = b' ';
+        pos += 2;
         for &byte in row {
             line[pos] = HEX[(byte >> 4) as usize];
             line[pos + 1] = HEX[(byte & 0xF) as usize];
             line[pos + 2] = b' ';
             pos += 3;
         }
+        line[pos] = b' ';
+        pos += 1;
+        for &byte in row {
+            line[pos] = if byte.is_ascii_graphic() || byte == b' ' {
+                byte
+            } else {
+                b'.'
+            };
+            pos += 1;
+        }
         line[pos] = b'\r';
         line[pos + 1] = b'\n';
         uart::log(&line[..pos + 2]);
     }
+}
+
+/// `dump_block_at` starting at offset 0, for a single standalone block.
+pub fn dump_block(buffer: &[u8; BLOCK_BYTES]) {
+    dump_block_at(buffer, 0);
 }
 
 /// SD Physical Layer Spec CSD version 2.0 (SDHC/SDXC): `C_SIZE` is bits

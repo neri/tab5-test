@@ -420,7 +420,9 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
 - PSRAMは先頭4 MiBだけを固定アドレスへ割り当て、汎用allocatorには登録しません。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
 - 日本語フォント、省電力制御は未実装です。
-- SDカードは識別クロック（400kHz）と1bitモードのみ動作確認済みです。
-  高速クロックへの切り替え、4bitモード、パーティション/ファイルシステム
-  （FAT/exFAT）の解析は未実装です（[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)の
-  Stage 4以降）。
+- SDカードは4bitモード・カード対応時はHigh Speed（50MHz、CMD6
+  SWITCH_FUNC使用）でのactivation・ブロック読み書きまで実機確認済みです
+  （複数枚のカードでHigh Speed対応・読み込み成功）。パーティション/
+  ファイルシステム（FAT/exFAT）の解析は未実装です
+  （[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 4）。UHS-Iモード
+  （SDR50/SDR104等、100MHz以上）は未実装です。

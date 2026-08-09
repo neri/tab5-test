@@ -29,6 +29,7 @@ const HELP_LINES: &[&[u8]] = &[
     b"sdreadn <lba> <n> read n blocks (DMA, n<=8), dump to UART log",
     b"sdwritetest <lba> write+verify+restore 1 block at lba (DMA)",
     b"sdzero <lba>      write a zeroed block at lba (DMA, no round-trip)",
+    b"sdmbr             show MBR partition table (LBA 0)",
     b"reboot            restart the board",
 ];
 
@@ -67,6 +68,7 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"sdreadn" => cmd_sdreadn(console, argument),
         b"sdwritetest" => cmd_sdwritetest(console, argument),
         b"sdzero" => cmd_sdzero(console, argument),
+        b"sdmbr" => cmd_sdmbr(console),
         b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line(b"rebooting...");
@@ -155,6 +157,22 @@ fn cmd_sdinfo(console: &mut Console) {
     } else {
         b"write-protected: no"
     });
+    console.write_output_line(if card.bus_width_4bit {
+        b"bus width: 4-bit"
+    } else {
+        b"bus width: 1-bit (ACMD6 failed or skipped)"
+    });
+    let mut line = Line::new();
+    line.push_str(b"clock: ");
+    line.push_u32(card.clock_khz);
+    line.push_str(b" kHz (");
+    line.push_str(if card.high_speed {
+        b"High Speed"
+    } else {
+        b"Default Speed"
+    });
+    line.push_str(b")");
+    console.write_output_line(line.as_bytes());
     console.write_output_line(b"full CID/CSD dump: see UART log");
 }
 
@@ -222,8 +240,8 @@ fn cmd_sdreadn(console: &mut Console, argument: &[u8]) {
         console.write_output_line(b"multi-block read failed, see UART log");
         return;
     }
-    for block in region.chunks_exact(512) {
-        sdmmc::dump_block(block.try_into().unwrap());
+    for (index, block) in region.chunks_exact(512).enumerate() {
+        sdmmc::dump_block_at(block.try_into().unwrap(), (index * 512) as u16);
     }
 
     let mut line = Line::new();
@@ -302,6 +320,84 @@ fn cmd_sdzero(console: &mut Console, argument: &[u8]) {
         return;
     }
     console.write_output_line(b"block zeroed");
+}
+
+/// Classic MBR layout: 4 fixed 16-byte partition entries at offset 446,
+/// each `[boot flag, 3 CHS bytes, type, 3 CHS bytes, start LBA (u32 LE),
+/// sector count (u32 LE)]`, followed by the `55 AA` signature at 510-511.
+/// Does not look past the MBR itself -- no GPT, no filesystem parsing.
+fn cmd_sdmbr(console: &mut Console) {
+    console.write_output_line(b"activating SD card...");
+    let Some(card) = sdmmc::init() else {
+        console.write_output_line(b"SD card activation failed, see UART log");
+        return;
+    };
+
+    let mut mbr = [0u8; 512];
+    if !sdmmc::read_block(&card, 0, &mut mbr) {
+        console.write_output_line(b"MBR read failed, see UART log");
+        return;
+    }
+
+    if mbr[510] != 0x55 || mbr[511] != 0xAA {
+        console.write_output_line(b"no 55 AA boot signature at LBA 0; not a valid MBR");
+        return;
+    }
+
+    let mut any_entry = false;
+    for entry in 0..4usize {
+        let offset = 446 + entry * 16;
+        let partition_type = mbr[offset + 4];
+        if partition_type == 0 {
+            continue;
+        }
+        any_entry = true;
+        let boot = mbr[offset];
+        let start_lba = u32::from_le_bytes(mbr[offset + 8..offset + 12].try_into().unwrap());
+        let sectors = u32::from_le_bytes(mbr[offset + 12..offset + 16].try_into().unwrap());
+        let size_mib = (sectors as u64) * 512 / (1024 * 1024);
+
+        let mut line = Line::new();
+        line.push_str(b"#");
+        line.push_u32((entry + 1) as u32);
+        line.push_str(if boot == 0x80 { b" * type 0x" } else { b"   type 0x" });
+        line.push_hex(partition_type as u32, 2);
+        line.push_str(b" ");
+        line.push_str(partition_type_name(partition_type));
+        console.write_output_line(line.as_bytes());
+
+        let mut line = Line::new();
+        line.push_str(b"   start LBA ");
+        line.push_u32(start_lba);
+        line.push_str(b", ");
+        line.push_u32(size_mib as u32);
+        line.push_str(b" MiB");
+        console.write_output_line(line.as_bytes());
+
+        if partition_type == 0xEE {
+            console.write_output_line(b"   (GPT protective MBR; GPT itself not parsed)");
+        }
+    }
+
+    if !any_entry {
+        console.write_output_line(b"no partition entries (all empty)");
+    }
+}
+
+/// Short names for common partition type bytes; not exhaustive.
+fn partition_type_name(partition_type: u8) -> &'static [u8] {
+    match partition_type {
+        0x01 => b"FAT12",
+        0x04 | 0x06 | 0x0E => b"FAT16",
+        0x0B | 0x0C => b"FAT32",
+        0x05 | 0x0F => b"Extended",
+        0x07 => b"NTFS/exFAT",
+        0x82 => b"Linux swap",
+        0x83 => b"Linux",
+        0xEE => b"GPT protective",
+        0xEF => b"EFI System",
+        _ => b"unknown",
+    }
 }
 
 fn cmd_backlight(console: &mut Console, argument: &[u8]) {
