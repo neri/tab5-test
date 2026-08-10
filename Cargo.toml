@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+linked_list_allocator = "0.10.6"
 # Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,
 # this does not invoke ECO5-only ROM functions before Rust reaches `main`.
 riscv-rt = "0.16"

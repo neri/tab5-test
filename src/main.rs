@@ -4,6 +4,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use linked_list_allocator::LockedHeap;
 use riscv_rt::entry;
 
 mod cardkb;
@@ -77,6 +80,10 @@ static APP_DESC: EspAppDesc = EspAppDesc {
 #[unsafe(link_section = ".data")]
 static BOOT_LAYOUT_MARKER: u32 = 0xEC02_0001;
 
+// Backed by PSRAM once `psram::init` succeeds; unused until then.
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
 // Make the second XIP segment's image payload start at offset 0x1040. Its
 // virtual address has the same 64 KiB-page offset, so espflash does not create
 // an extra padding segment. Only the app descriptor and this padding are
@@ -100,6 +107,10 @@ fn main() -> ! {
     uart::hello_world();
     startup::log_ram_limit();
     if let Some(psram) = psram::init() {
+        let (heap_start, heap_size) = psram.heap();
+        unsafe {
+            ALLOCATOR.lock().init(heap_start, heap_size);
+        }
         lcd::run_console(psram);
     } else {
         // PSRAM failed, so keep the independent DSI VPG useful as a visible

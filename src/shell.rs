@@ -6,6 +6,8 @@
 //! the caller should reboot the board once the current frame has actually
 //! reached the panel.
 
+use alloc::vec::Vec;
+
 use crate::console::Console;
 use crate::framebuffer::{BLUE, CYAN, GREEN, MAGENTA, RED, WHITE, YELLOW};
 use crate::{interrupts, lcd, psram, sdmmc, startup};
@@ -19,6 +21,7 @@ const HELP_LINES: &[&[u8]] = &[
     b"echo <text>       print text back",
     b"about             firmware banner",
     b"mem               PSRAM/RAM usage",
+    b"alloctest <MiB>   allocate N MiB on the PSRAM heap, verify read/write",
     b"uptime            time since boot",
     b"backlight on|off  LCD backlight",
     b"color <name>      change header color",
@@ -60,6 +63,7 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"echo" => console.write_output_line(argument),
         b"about" | b"version" => console.write_output_line(b"Tab5 CardKB Shell 0.1"),
         b"mem" => cmd_mem(console),
+        b"alloctest" => cmd_alloctest(console, argument),
         b"uptime" => cmd_uptime(console),
         b"backlight" => cmd_backlight(console, argument),
         b"color" => cmd_color(console, argument),
@@ -104,6 +108,86 @@ fn cmd_mem(console: &mut Console) {
     line.push_str(b" bytes x");
     line.push_u32(psram::FRAMEBUFFER_COUNT as u32);
     console.write_output_line(line.as_bytes());
+
+    let mut line = Line::new();
+    line.push_str(b"heap: ");
+    line.push_u32((heap_bytes() / (1024 * 1024)) as u32);
+    line.push_str(b" MiB");
+    console.write_output_line(line.as_bytes());
+}
+
+/// Bytes of PSRAM past the two framebuffers, matching `Psram::heap`'s split
+/// and backing the global allocator installed in `main`.
+fn heap_bytes() -> usize {
+    psram::MAPPED_BYTES - psram::FRAMEBUFFER_COUNT * psram::FRAMEBUFFER_BYTES
+}
+
+/// Allocates `mib` MiB from the PSRAM-backed global allocator, fills it with
+/// a per-byte pattern derived from its index, reads it back and reports any
+/// mismatch. Uses `try_reserve_exact` so a too-large request reports failure
+/// instead of aborting the firmware.
+fn cmd_alloctest(console: &mut Console, argument: &[u8]) {
+    let Some(mib) = parse_u32(argument) else {
+        console.write_output_line(b"usage: alloctest <MiB>");
+        return;
+    };
+    if mib == 0 {
+        console.write_output_line(b"MiB must be at least 1");
+        return;
+    }
+    let bytes = mib as usize * 1024 * 1024;
+
+    let mut line = Line::new();
+    line.push_str(b"allocating ");
+    line.push_u32(mib);
+    line.push_str(b" MiB (heap has ");
+    line.push_u32((heap_bytes() / (1024 * 1024)) as u32);
+    line.push_str(b" MiB)...");
+    console.write_output_line(line.as_bytes());
+
+    let mut buffer: Vec<u8> = Vec::new();
+    if buffer.try_reserve_exact(bytes).is_err() {
+        console.write_output_line(b"allocation failed (not enough contiguous heap)");
+        return;
+    }
+    buffer.resize(bytes, 0);
+
+    console.write_output_line(b"writing pattern...");
+    for (index, byte) in buffer.iter_mut().enumerate() {
+        *byte = pattern_byte(index);
+    }
+
+    console.write_output_line(b"verifying...");
+    let mut mismatches: u32 = 0;
+    let mut first_mismatch = None;
+    for (index, &byte) in buffer.iter().enumerate() {
+        if byte != pattern_byte(index) {
+            mismatches += 1;
+            if first_mismatch.is_none() {
+                first_mismatch = Some(index);
+            }
+        }
+    }
+    drop(buffer);
+
+    let mut line = Line::new();
+    if mismatches == 0 {
+        line.push_str(b"OK: ");
+        line.push_u32(mib);
+        line.push_str(b" MiB allocated, written and read back correctly");
+    } else {
+        line.push_str(b"FAILED: ");
+        line.push_u32(mismatches);
+        line.push_str(b" mismatch(es), first at offset 0x");
+        line.push_hex(first_mismatch.unwrap_or(0) as u32, 8);
+    }
+    console.write_output_line(line.as_bytes());
+}
+
+/// A well-mixed byte per index so nearby or aliased addresses are unlikely
+/// to share a value; a plain `index as u8` would just repeat every 256 bytes.
+fn pattern_byte(index: usize) -> u8 {
+    ((index as u32).wrapping_mul(2_654_435_761) >> 24) as u8
 }
 
 fn cmd_uptime(console: &mut Console) {

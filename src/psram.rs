@@ -1,8 +1,9 @@
 //! Minimal ESP32-P4 ECO2 Hex-DDR PSRAM bring-up.
 //!
-//! This is intentionally independent from an allocator.  It maps the first
-//! four MiB at `0x4800_0000`, which is enough for two 720x1280 RGB565 frame
-//! buffers, and verifies the mapping before returning it to the LCD module.
+//! Maps the Tab5's full 32 MiB PSRAM at `0x4800_0000` (well within the chip's
+//! 64 MiB PSRAM MMU window) and verifies the mapping before returning it to
+//! the caller. The first two framebuffer-sized slots back the LCD module;
+//! [`Psram::heap`] exposes everything after them for a global allocator.
 
 use core::mem::transmute;
 
@@ -15,7 +16,7 @@ pub const FRAMEBUFFER_BYTES: usize = WIDTH * HEIGHT * BYTES_PER_PIXEL;
 pub const FRAMEBUFFER_COUNT: usize = 2;
 
 const PSRAM_VADDR: usize = 0x4800_0000;
-pub const MAPPED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAPPED_BYTES: usize = 32 * 1024 * 1024;
 const PAGE_BYTES: usize = 64 * 1024;
 const CACHE_LINE_BYTES: usize = 64;
 
@@ -74,6 +75,12 @@ impl Psram {
             return None;
         }
         Some((self.base + offset) as *mut u16)
+    }
+
+    /// Returns the PSRAM span after the two framebuffers, for use as a heap.
+    pub fn heap(&self) -> (*mut u8, usize) {
+        let offset = FRAMEBUFFER_COUNT * FRAMEBUFFER_BYTES;
+        ((self.base + offset) as *mut u8, self.bytes - offset)
     }
 
     /// Writes back a bounded byte range within one framebuffer.
@@ -195,7 +202,7 @@ pub fn init() -> Option<Psram> {
         base: PSRAM_VADDR,
         bytes: MAPPED_BYTES,
     };
-    uart::log(b"PSRAM: ready for two RGB565 framebuffers\r\n");
+    uart::log(b"PSRAM: ready (2 framebuffers + heap)\r\n");
     Some(psram)
 }
 

@@ -10,7 +10,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 
 - ESP32-P4 ECO2、eFuse block revision v0.3
 - 16 MiB SPI Flash
-- Hex-DDR PSRAM
+- Hex-DDR PSRAM（32 MiB）
 - ネイティブ走査720×1280のMIPI-DSI LCD
 - USB Serial/JTAG
 
@@ -106,11 +106,12 @@ modeとBridge出力を初めて有効化します。VPGのカラーバーはPSRA
 3. MSPI3経由でモードレジスタを読み書き
 4. コマンド経路の読み書き試験
 5. DQS位相とdata/DQS delayの実機調整
-6. 先頭4 MiBを`0x48000000`へMMU割り当て
+6. `0x48000000`へ32 MiB（チップの64 MiB PSRAM MMU窓の半分。ECO2の
+   `SOC_MMU_ENTRY_NUM`＝1024エントリ、1エントリ64 KiBに対し512エントリを使用）を
+   MMU割り当て
 7. キャッシュ経由の読み書き試験
 
-1面は720×1280×2 byteで1,843,200 byteです。2面で3,686,400 byteを使用し、
-4 MiBの割り当て内に収めています。
+1面は720×1280×2 byteで1,843,200 byteです。2面で3,686,400 byteを使用します。
 
 DQS調整では、この実機で繰り返し選択された`phase=0, data=0, dqs=0`を最初に
 100回読み出して検証します。合格時は31点の全探索を省略し、不合格時だけ従来の
@@ -119,6 +120,24 @@ DQS調整では、この実機で繰り返し選択された`phase=0, data=0, dq
 CPUが描画した内容をGDMAから参照できるよう、転送前にROMの
 `Cache_WriteBack_Invalidate_Addr`をL1 DCache、L2 Cacheの順に呼び出します。
 その後、両面の既知画素を再読出しし、外部PSRAMへ同期されたことを確認します。
+
+### ヒープ（グローバルアロケータ）
+
+32 MiBの割り当てのうち残り約28.48 MiB（`Psram::heap`が返す、2面のフレーム
+バッファ直後から割り当て末尾までの範囲）は`src/main.rs`のグローバル
+アロケータへ渡します。
+
+`src/main.rs`は`extern crate alloc`を宣言し、`linked_list_allocator`crateの
+`LockedHeap`（spinロック付き）を`#[global_allocator]`として静的に配置します。
+初期化は`psram::init()`成功後、`psram.heap()`が返す`(*mut u8, usize)`で
+`ALLOCATOR.lock().init(...)`を呼ぶだけで、`lcd::run_console`を呼ぶ前に完了します。
+`psram::init()`が失敗した経路（VPGフォールバック）ではヒープは初期化されず、
+`alloc`を使うコードは実行されません。
+
+シェルの`alloctest <MiB>`コマンドは、この確保済みヒープから実際に
+`Vec<u8>`を`try_reserve_exact`で確保し、インデックス由来のパターンを書き込んで
+読み直すことで、PSRAM全域の読み書きを実機検証します（`src/shell.rs`）。
+`mem`コマンドはヒープ容量（約28 MiB）も表示します。
 
 ## LCDとパネル初期化
 
@@ -229,8 +248,8 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 最後に`Console::write_prompt`で次のプロンプトを出します。コマンド出力は複数行・
 スクロールをまたぐことがあるため、この経路では常に全画面を再生成します
 （末尾スクロールと同じ理由）。対応コマンドは`help`で一覧できます
-（`echo`／`clear`／`about`／`mem`／`uptime`／`backlight on|off`／
-`color <name>`／`paint`／`reboot`）。
+（`echo`／`clear`／`about`／`mem`／`alloctest <MiB>`／`uptime`／
+`backlight on|off`／`color <name>`／`paint`／`reboot`）。
 
 `shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`）で、
 `reboot`と同様に`paint`もコンソール本体ではなく`lcd::run_console`側の分岐で
@@ -306,10 +325,12 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 
 ## ファイル構成
 
-- `src/main.rs`: 起動順だけを定義
+- `src/main.rs`: 起動順の定義、グローバルアロケータ（`linked_list_allocator`の
+  `LockedHeap`）の宣言とPSRAMヒープでの初期化
 - `src/startup.rs`: watchdog停止、CPUクロック引き上げ、L2キャッシュ分割とRAM上限の確認
 - `src/uart.rs`: USB Serial/JTAG出力
-- `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期
+- `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。フレームバッファと
+  ヒープ用領域（`Psram::heap`）の両方を提供
 - `src/framebuffer.rs`: ダブルバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: CardKB入力エコーとコマンドライン切り出し用コンソール
@@ -353,7 +374,7 @@ MMIOプリミティブ）は`unsafe fn`として定義します。呼び出し�
 RAM: L2 cache bytes=0x...
 RAM: usable top=0x...
 RAM: stack top=0x...
-PSRAM: ready for two RGB565 framebuffers
+PSRAM: ready (2 framebuffers + heap)
 LCD: D-PHY 4/4 ready
 LCD: DCS init complete
 LCD: DMA 3/3 full-frame interrupt installed
@@ -417,7 +438,8 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
 ## 制約
 
 - ECO2で確認したレジスタ値とROM APIアドレスを使用しています。
-- PSRAMは先頭4 MiBだけを固定アドレスへ割り当て、汎用allocatorには登録しません。
+- PSRAMは32 MiB全体を固定アドレスへMMU割り当てします。フレームバッファ以外
+  （約28.48 MiB）は`linked_list_allocator`によるグローバルアロケータのヒープです。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
 - 日本語フォント、省電力制御は未実装です。
 - SDカードは4bitモード・カード対応時はHigh Speed（50MHz、CMD6
