@@ -205,6 +205,29 @@ High Speed（値1）対応かを確認する。対応していればスイッチ
 実機で複数枚（自宅にあった手持ちのSDカード数枚）を試し、全てHigh Speedに
 対応しており、切り替え後も`sdreadn`で正しい内容が読めることを確認した。
 
+### 追加: SD→PSRAM直接DMA転送 ✅ 完了（実機確認済み）
+
+`sdmmc::read_blocks`/`write_blocks`はディスクリプタの転送先アドレスを
+渡されたスライスのポインタからそのまま生成するだけで、内蔵SRAMかPSRAMかで
+分岐する処理は元々無かった。そのため「動くかどうか」は実装ではなく
+IDMAC（SDHOST内蔵DMA）がPSRAMのキャッシュマップ済みウィンドウ
+（`0x4800_0000`〜、`psram.rs`のPSRAM_VADDR）へバス到達できるかという
+ハードウェア側の問題だった。
+
+検証用に`shell.rs`の`sdreadpsram <lba> <n>`コマンドを追加した。同じブロックを
+①スタック（内蔵SRAM）バッファと②PSRAMヒープ上の`Vec`（`extern crate alloc`＋
+`linked_list_allocator`、`Psram::heap()`で確保）の両方へ、同一の
+`sdmmc::read_blocks`経路でDMA読み込みし、バイト単位で一致するか比較する
+（目でダンプを見比べるのではなく自動判定）。実機で一致（`match`）を確認し、
+**IDMACはPSRAMへ直接DMA転送できる**ことが分かった。内蔵RAM経由のコピーは
+不要。キャッシュのwriteback/invalidateは既存の`cache_writeback_invalidate`
+（PSRAMかSRAMかで分岐しない、アドレス指定のROM関数呼び出しのみ）がそのまま
+機能した。
+
+この結果により、将来大きなファイルをSDから読んでPSRAM上で扱う（画像表示など）
+実装は、`read_blocks`を呼ぶ側がPSRAMヒープ上のバッファを渡すだけで済み、
+`sdmmc.rs`側の追加対応は不要と分かった。
+
 **補足（microSDとHigh Speedの関係）**: High Speed（50MHz）を定義したSD
 Physical Layer Spec 1.10は2003年策定。microSD規格自体（旧TransFlash）が
 SD Associationで標準化されたのは2004〜2005年頃で、High Speedが規格に

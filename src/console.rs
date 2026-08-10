@@ -16,14 +16,14 @@ const ROWS: usize = 28;
 
 // Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt
 // uses a half-width '>' rather than the full-width '＞' a shell would show.
-const PROMPT: &[u8] = b"> ";
+const PROMPT: [char; 2] = ['>', ' '];
 
 /// Longest command line `submit` can capture: one row minus the prompt.
 const MAX_LINE: usize = COLUMNS - PROMPT.len();
 
 /// Terminal-like text storage for the CardKB input echo display.
 pub struct Console {
-    cells: [[u8; COLUMNS]; ROWS],
+    cells: [[char; COLUMNS]; ROWS],
     column: usize,
     row: usize,
     previous_was_carriage_return: bool,
@@ -92,7 +92,7 @@ pub unsafe fn singleton() -> &'static mut Console {
 
 impl Console {
     pub const fn new() -> Self {
-        let mut cells = [[0; COLUMNS]; ROWS];
+        let mut cells = [['\0'; COLUMNS]; ROWS];
         let mut i = 0;
         while i < PROMPT.len() {
             cells[0][i] = PROMPT[i];
@@ -122,7 +122,7 @@ impl Console {
     /// Clears every cell and returns to a fresh, empty first row (no
     /// prompt: the caller writes it, same convention as `submit`).
     pub fn clear(&mut self) {
-        self.cells = [[0; COLUMNS]; ROWS];
+        self.cells = [['\0'; COLUMNS]; ROWS];
         self.column = 0;
         self.row = 0;
         self.previous_was_carriage_return = false;
@@ -145,29 +145,29 @@ impl Console {
         self.cursor_visible = !self.cursor_visible;
     }
 
-    /// Adds one CardKB byte using familiar terminal control characters.
-    pub fn push(&mut self, byte: u8) -> Update {
-        let update = match byte {
-            b'\r' => {
+    /// Adds one CardKB character using familiar terminal control characters.
+    pub fn push(&mut self, ch: char) -> Update {
+        let update = match ch {
+            '\r' => {
                 self.submit();
                 self.previous_was_carriage_return = true;
                 Update::None
             }
-            b'\n' if self.previous_was_carriage_return => {
+            '\n' if self.previous_was_carriage_return => {
                 self.previous_was_carriage_return = false;
                 Update::None
             }
-            b'\n' => {
+            '\n' => {
                 self.submit();
                 Update::None
             }
-            0x08 | 0x7f => self.backspace(),
-            b'\t' => {
+            '\u{8}' | '\u{7f}' => self.backspace(),
+            '\t' => {
                 let spaces = 4 - self.column % 4;
                 let mut wrap_update = Update::None;
                 for _ in 0..spaces {
                     let row_before = self.row;
-                    let result = self.put(b' ');
+                    let result = self.put(' ');
                     // Blank tab cells need no pixel update on a normal
                     // forward cursor; only a row change (wrap or scroll)
                     // still needs its own redraw.
@@ -177,10 +177,10 @@ impl Console {
                 }
                 wrap_update
             }
-            b' '..=b'~' => self.put(byte),
+            ' '..='~' => self.put(ch),
             _ => Update::None,
         };
-        if byte != b'\r' {
+        if ch != '\r' {
             self.previous_was_carriage_return = false;
         }
         update
@@ -218,13 +218,13 @@ impl Console {
                 COLUMNS
             };
             for column in 0..end {
-                let byte = self.cells[row][column];
-                if byte != 0 && byte != b' ' {
+                let ch = self.cells[row][column];
+                if ch != '\0' && ch != ' ' {
                     framebuffers.draw_ascii_char(
                         index,
                         LEFT + column * CELL_WIDTH,
                         TOP + row * CELL_HEIGHT,
-                        byte,
+                        ch,
                         SCALE,
                         WHITE,
                         false,
@@ -242,7 +242,7 @@ impl Console {
             index,
             LEFT,
             8,
-            b"Tab5 Console",
+            "Tab5 Console",
             2,
             BLACK,
             false,
@@ -268,8 +268,8 @@ impl Console {
             framebuffers.fill_rect(index, x, y, CELL_WIDTH, CELL_HEIGHT, WHITE);
             return;
         }
-        let byte = self.cells[row][column];
-        if byte == 0 || byte == b' ' {
+        let ch = self.cells[row][column];
+        if ch == '\0' || ch == ' ' {
             // Backspace and explicit spaces erase the complete cell. This
             // also covers hiding the cursor block: the cell it vacates is
             // always blank underneath.
@@ -280,7 +280,7 @@ impl Console {
             // pixels, so without this clear the cursor's white background
             // would stay visible around the letter.
             framebuffers.fill_rect(index, x, y, CELL_WIDTH, CELL_HEIGHT, BLACK);
-            framebuffers.draw_ascii_char(index, x, y, byte, SCALE, WHITE, false);
+            framebuffers.draw_ascii_char(index, x, y, ch, SCALE, WHITE, false);
         }
     }
 
@@ -333,10 +333,10 @@ impl Console {
         )
     }
 
-    fn put(&mut self, byte: u8) -> Update {
+    fn put(&mut self, ch: char) -> Update {
         let column = self.column;
         let row = self.row;
-        self.cells[self.row][self.column] = byte;
+        self.cells[self.row][self.column] = ch;
         self.column += 1;
         if self.column == COLUMNS {
             let scrolled = self.new_line();
@@ -356,7 +356,7 @@ impl Console {
             return Update::None;
         }
         self.column -= 1;
-        self.cells[self.row][self.column] = 0;
+        self.cells[self.row][self.column] = '\0';
         Update::Cells {
             row: self.row,
             start: self.column,
@@ -374,7 +374,7 @@ impl Console {
             for row in 1..ROWS {
                 self.cells[row - 1] = self.cells[row];
             }
-            self.cells[ROWS - 1] = [0; COLUMNS];
+            self.cells[ROWS - 1] = ['\0'; COLUMNS];
             self.row = ROWS - 1;
         }
         self.column = 0;
@@ -393,8 +393,8 @@ impl Console {
     /// Writes the prompt into the current (assumed blank) row and positions
     /// `column` after it, ready for input.
     pub fn write_prompt(&mut self) {
-        for (column, &byte) in PROMPT.iter().enumerate() {
-            self.cells[self.row][column] = byte;
+        for (column, &ch) in PROMPT.iter().enumerate() {
+            self.cells[self.row][column] = ch;
         }
         self.column = PROMPT.len();
     }
@@ -408,7 +408,9 @@ impl Console {
         let mut text = [0u8; MAX_LINE];
         let mut len = 0;
         for column in PROMPT.len()..self.column {
-            text[len] = self.cells[self.row][column];
+            // Only ASCII printable chars (or blanks) ever land in a cell via
+            // `put`, so this narrowing cast never loses information.
+            text[len] = self.cells[self.row][column] as u8;
             len += 1;
         }
         self.advance_row();
@@ -419,11 +421,11 @@ impl Console {
     /// current (assumed blank) row, wrapping at the row width, and always
     /// leaves the console on a fresh blank row afterward -- ready for
     /// either the next output line or `write_prompt`.
-    pub fn write_output_line(&mut self, text: &[u8]) {
+    pub fn write_output_line(&mut self, text: &str) {
         self.column = 0;
-        for &byte in text {
-            let byte = if (b' '..=b'~').contains(&byte) { byte } else { b' ' };
-            self.cells[self.row][self.column] = byte;
+        for ch in text.chars() {
+            let ch = if (' '..='~').contains(&ch) { ch } else { ' ' };
+            self.cells[self.row][self.column] = ch;
             self.column += 1;
             if self.column == COLUMNS {
                 self.advance_row();
@@ -438,17 +440,17 @@ fn draw_ascii_text(
     index: usize,
     x: usize,
     y: usize,
-    text: &[u8],
+    text: &str,
     scale: usize,
     color: u16,
     trace_first: bool,
 ) {
-    for (column, &byte) in text.iter().enumerate() {
+    for (column, ch) in text.chars().enumerate() {
         framebuffers.draw_ascii_char(
             index,
             x + column * 6 * scale,
             y,
-            byte,
+            ch,
             scale,
             color,
             trace_first && column == 0,

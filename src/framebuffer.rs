@@ -21,6 +21,13 @@ pub const CYAN: u16 = 0x07FF;
 pub const MAGENTA: u16 = 0xF81F;
 pub const YELLOW: u16 = 0xFFE0;
 
+/// Maps a `char` onto the 5x7 ASCII font's byte-indexed glyph table. Only
+/// ASCII is defined there today, so anything outside that range falls back
+/// to a blank space; real non-ASCII glyph rendering is future work.
+fn ascii_or_space(ch: char) -> u8 {
+    if ch.is_ascii() { ch as u8 } else { b' ' }
+}
+
 pub struct DoubleBuffer {
     memory: Psram,
 }
@@ -277,13 +284,13 @@ impl DoubleBuffer {
         let scale = scale.max(1);
         let origin_x = x;
         let (mut cursor_x, mut cursor_y) = (x, y);
-        for byte in text.bytes() {
-            if byte == b'\n' {
+        for ch in text.chars() {
+            if ch == '\n' {
                 cursor_x = origin_x;
                 cursor_y = cursor_y.saturating_add(8 * scale);
                 continue;
             }
-            let glyph = font::glyph(byte);
+            let glyph = font::glyph(ascii_or_space(ch));
             for column in 0..6 {
                 let bits = if column < 5 { glyph[column] } else { 0 };
                 for row in 0..7 {
@@ -323,7 +330,7 @@ impl DoubleBuffer {
         index: usize,
         x: usize,
         y: usize,
-        byte: u8,
+        ch: char,
         scale: usize,
         foreground: u16,
         trace: bool,
@@ -332,7 +339,7 @@ impl DoubleBuffer {
             uart::log(b"Glyph: enter\r\n");
         }
         let scale = scale.max(1);
-        let glyph = font::glyph(byte);
+        let glyph = font::glyph(ascii_or_space(ch));
         if trace {
             uart::log(b"Glyph: lookup done\r\n");
         }

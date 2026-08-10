@@ -247,9 +247,10 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 結果は`Console::write_output_line`でプロンプトなしの出力行として書き込まれ、
 最後に`Console::write_prompt`で次のプロンプトを出します。コマンド出力は複数行・
 スクロールをまたぐことがあるため、この経路では常に全画面を再生成します
-（末尾スクロールと同じ理由）。対応コマンドは`help`で一覧できます
-（`echo`／`clear`／`about`／`mem`／`alloctest <MiB>`／`uptime`／
-`backlight on|off`／`color <name>`／`paint`／`reboot`）。
+（末尾スクロールと同じ理由）。対応コマンドは`help`で一覧できます。コマンド数が
+増えて全文表示が長くなったため、引数なしの`help`はコマンド名だけを列挙し、
+`help <name>`で個別コマンドの使用法と説明を表示する二段構成にしています
+（`src/shell.rs`の`HELP_ENTRIES`）。
 
 `shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`）で、
 `reboot`と同様に`paint`もコンソール本体ではなく`lcd::run_console`側の分岐で
