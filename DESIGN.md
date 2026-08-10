@@ -347,6 +347,24 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 - `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
   経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
   同じ構成。詳細・実機で踏んだ罠は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照
+- `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
+  「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
+  親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート
+  だけを持つ薄いファイル。ホストコントローラー・USBプロトコル・クラスドライバの
+  3層に分離している（元は1ファイルだったが、肥大化したため分割した）
+    - `src/usb/hcd.rs`: ESP32-P4 High-Speed USB-DWCホストコントローラー
+      ドライバー（Stage 1相当）。VBUS電源（`i2c.rs`のI2Cバス経由で
+      PI4IOE5V6408、2個目、0x44を叩く）、コア初期化・ホストポート電源投入・
+      接続検出・リセット・速度判定、チャネル/パケット実行のプリミティブ
+      （`run_packet`）。レジスタ・チャネル・パケットのことだけを知っており、
+      USBデバイスや記述子の意味は一切知らない
+    - `src/usb/protocol.rs`: 汎用USBプロトコル層（Stage 2相当）。コントロール
+      転送（SETUP/DATA/STATUS）の組み立てと標準記述子（USB2.0 chapter 9）に
+      よる列挙。デバイスクラスについては何も知らない
+    - `src/usb/hid_keyboard.rs`: HID Bootキーボードのクラスドライバー
+      （Stage 3相当）。クラス固有リクエスト・キーコード変換・`UsbKeyboard`
+      （`lcd.rs`のフレームループから`CardKb`と並列にポーリングされる）
+  段階分けと実装上の判断は[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
 
@@ -386,6 +404,10 @@ SDカード関連は起動シーケンスに含まれず、シェルコマンド
 `sdreadn`/`sdwritetest`/`sdzero`）実行時にのみ`SDMMC: ...`という接頭辞で
 UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値が続きます。
 失敗パターンの詳細は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
+
+USB-Aホスト関連も同様に起動シーケンスに含まれず、シェルコマンド（`usbinfo`/
+`usbvbus`）実行時にのみ`USB: ...`という接頭辞でUARTへ出ます。段階分けと
+未確定事項は[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照してください。
 
 主な失敗ログ:
 
@@ -449,3 +471,16 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
   ファイルシステム（FAT/exFAT）の解析は未実装です
   （[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 4）。UHS-Iモード
   （SDR50/SDR104等、100MHz以上）は未実装です。
+- USB-Aホストは[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)のStage 3（HID Boot
+  Protocolキーボードからのキー入力）まで実機確認済みです。ただし
+  Interrupt INエンドポイントのポーリングは`HCCHAR.eptype=INTR`ではなく
+  `BULK`を使っています（periodic scheduler/frame list基盤が未実装のため、
+  INTR型のままだとポーリングが一切完了しない不具合を実機で確認し、回避策
+  として変更、詳細はUSB_HOST_PLAN.md Stage 3参照）。`usbinfo`/`usbvbus`実行中に
+  `UsbKeyboard`が生きていると、`probe_port`のバスリセットでセッションが
+  無効化されキーボードが一時的に反応しなくなる問題も実機で確認済みです。
+  これに対しては、連続したUSBトランザクションエラーを検出すると自動的に
+  再列挙して数秒で復帰する自己回復（`needs_reinit`）を実装済みですが、
+  この自己回復自体の実機確認はまだです。文字列記述子（製品名）取得、
+  periodic scheduler基盤の実装、HIDマウス・USB Mass Storage・複数デバイスは
+  未実装です（`USB_HOST_PLAN.md`の「将来検討」）。

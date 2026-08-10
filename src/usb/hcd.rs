@@ -1,0 +1,816 @@
+//! ESP32-P4 High-Speed USB-DWC host controller driver: VBUS power, core
+//! bring-up, host port management, and the raw channel/packet primitive
+//! everything above this layer (`protocol.rs`, `hid_keyboard.rs`) is built
+//! on. This layer knows about registers, channels, and packets -- it does
+//! not know what a USB device, descriptor, or endpoint means; `run_packet`
+//! just runs one packet on channel 0 and reports what happened.
+//!
+//! Tab5's USB-A connector is wired to this controller (internal UTMI PHY,
+//! dedicated DM/DP pins); the Full-Speed OTG controller on GPIO26/27
+//! (Tab5's USB-C port) is out of scope, as is the USB Serial/JTAG
+//! controller on GPIO24/25 that `uart.rs` already uses for
+//! flashing/logging.
+//!
+//! This is Stage 1 of `USB_HOST_PLAN.md`: core bring-up and host-port
+//! connect/reset/speed detection only, driven by polling (no interrupt
+//! routing yet).
+//!
+//! The USB-A 5V (VBUS) switch is one bit of the second PI4IOE5V6408 I/O
+//! expander (I2C address 0x44, "E2"), the counterpart to `lcd.rs`'s PI4IOE1
+//! (0x43) which drives the LCD reset line. Confirmed on real hardware with
+//! the `usbvbus` shell command: bit 3 raises USB-A's VBUS to 5V
+//! (`VBUS_ENABLE_BIT` below).
+
+use crate::gpio;
+use crate::i2c::SoftI2c;
+use crate::uart;
+
+// ------------------------------------------------------------------------
+// USB-A VBUS power switch (PI4IOE5V6408 "E2", I2C 0x44)
+// ------------------------------------------------------------------------
+
+const I2C_SDA: u32 = 31;
+const I2C_SCL: u32 = 32;
+// Same board I2C bus as `lcd.rs` (PI4IOE1) and `touch.rs`; timing copied
+// from `lcd.rs`'s tuned PI4IOE1_BUS since it is the same chip family on the
+// same bus.
+const PI4IOE2_BUS: SoftI2c = SoftI2c::new(I2C_SDA, I2C_SCL, 3, 10_000);
+const PI4IOE2_ADDRESS: u8 = 0x44;
+
+// PI4IOE5V6408 register map, confirmed on this board's PI4IOE1 by
+// `lcd.rs::reset_lcd_panel`.
+const PI4IOE2_REG_DIRECTION: u8 = 0x03; // 1 = pin is an output
+const PI4IOE2_REG_OUTPUT: u8 = 0x05; // driven level when direction = output
+const PI4IOE2_REG_HIZ: u8 = 0x07; // 1 = output stage high-impedance (must be 0 to actually drive)
+
+/// Confirmed on real hardware (see the module doc comment).
+const VBUS_ENABLE_BIT: u8 = 3;
+
+/// Enables or disables the USB-A 5V rail through a specific E2 output bit.
+///
+/// Unlike `lcd.rs`'s PI4IOE1 writes (which own every pin on that expander
+/// and can overwrite the whole output byte), E2 also carries WiFi chip,
+/// speaker amp, and expansion-port 5V power on other pins. Every register
+/// touched here is read-modify-write of a single bit so the other pins'
+/// configuration is left exactly as found.
+pub fn set_vbus_bit(bit: u8, on: bool) -> bool {
+    if bit > 7 || !recover_bus() {
+        return false;
+    }
+    rmw_bit(PI4IOE2_REG_DIRECTION, bit, true)
+        && rmw_bit(PI4IOE2_REG_HIZ, bit, false)
+        && rmw_bit(PI4IOE2_REG_OUTPUT, bit, on)
+}
+
+fn set_vbus(on: bool) -> bool {
+    set_vbus_bit(VBUS_ENABLE_BIT, on)
+}
+
+fn rmw_bit(register: u8, bit: u8, set_bit: bool) -> bool {
+    let Some(current) = pi4ioe2_read(register) else {
+        return false;
+    };
+    let mask = 1u8 << bit;
+    let updated = if set_bit { current | mask } else { current & !mask };
+    pi4ioe2_write(register, updated)
+}
+
+/// Configures the shared board I2C bus for open-drain operation and clocks
+/// out a bus-recovery sequence, matching `cardkb::CardKb::init`.
+fn recover_bus() -> bool {
+    gpio::configure_open_drain(I2C_SDA);
+    gpio::configure_open_drain(I2C_SCL);
+    gpio::release(I2C_SDA);
+    gpio::release(I2C_SCL);
+    delay_us(20);
+
+    for _ in 0..9 {
+        gpio::drive_low(I2C_SCL);
+        PI4IOE2_BUS.delay();
+        gpio::release(I2C_SCL);
+        if !PI4IOE2_BUS.wait_scl_high() {
+            return false;
+        }
+        PI4IOE2_BUS.delay();
+    }
+    PI4IOE2_BUS.stop();
+    true
+}
+
+fn pi4ioe2_write(register: u8, value: u8) -> bool {
+    if !PI4IOE2_BUS.start() {
+        return false;
+    }
+    let ok = PI4IOE2_BUS.write_byte(PI4IOE2_ADDRESS << 1)
+        && PI4IOE2_BUS.write_byte(register)
+        && PI4IOE2_BUS.write_byte(value);
+    PI4IOE2_BUS.stop();
+    ok
+}
+
+fn pi4ioe2_read(register: u8) -> Option<u8> {
+    if !PI4IOE2_BUS.start() {
+        return None;
+    }
+    let addressed = PI4IOE2_BUS.write_byte(PI4IOE2_ADDRESS << 1)
+        && PI4IOE2_BUS.write_byte(register)
+        && PI4IOE2_BUS.start() // repeated start, switching the transaction to a read
+        && PI4IOE2_BUS.write_byte((PI4IOE2_ADDRESS << 1) | 1);
+    if !addressed {
+        PI4IOE2_BUS.stop();
+        return None;
+    }
+    let value = PI4IOE2_BUS.read_byte(false);
+    PI4IOE2_BUS.stop();
+    value
+}
+
+// ------------------------------------------------------------------------
+// USB-DWC High-Speed core (UTMI PHY) register map
+// ------------------------------------------------------------------------
+
+const USB_DWC_HS: usize = 0x5000_0000;
+const GAHBCFG: usize = USB_DWC_HS + 0x08;
+const GUSBCFG: usize = USB_DWC_HS + 0x0C;
+const GRSTCTL: usize = USB_DWC_HS + 0x10;
+const GRXFSIZ: usize = USB_DWC_HS + 0x24;
+const GNPTXFSIZ: usize = USB_DWC_HS + 0x28;
+const GSNPSID: usize = USB_DWC_HS + 0x40;
+const GHWCFG2: usize = USB_DWC_HS + 0x48;
+const GHWCFG3: usize = USB_DWC_HS + 0x4C;
+const HPTXFSIZ: usize = USB_DWC_HS + 0x100;
+const HCFG: usize = USB_DWC_HS + 0x400;
+const HPRT: usize = USB_DWC_HS + 0x440;
+
+const GAHBCFG_DMAEN: u32 = 1 << 5;
+const GAHBCFG_HBSTLEN_MASK: u32 = 0xF << 1;
+
+const GUSBCFG_TOUTCAL_MASK: u32 = 0x7;
+const GUSBCFG_PHYIF: u32 = 1 << 3;
+const GUSBCFG_ULPIUTMISEL: u32 = 1 << 4;
+const GUSBCFG_PHYSEL: u32 = 1 << 6;
+const GUSBCFG_SRPCAP: u32 = 1 << 8;
+const GUSBCFG_HNPCAP: u32 = 1 << 9;
+const GUSBCFG_FORCEHSTMODE: u32 = 1 << 29;
+
+const GRSTCTL_CSFTRST: u32 = 1 << 0;
+const GRSTCTL_RXFFLSH: u32 = 1 << 4;
+const GRSTCTL_TXFFLSH: u32 = 1 << 5;
+const GRSTCTL_TXFNUM_MASK: u32 = 0x1F << 6;
+const GRSTCTL_CSFTRSTDONE: u32 = 1 << 29;
+const GRSTCTL_AHBIDLE: u32 = 1 << 31;
+
+// Core version at which the soft-reset sequence gained the CSftRstDone bit
+// (from ESP-IDF's `usb_dwc_ll.h`). ESP32-P4's HS core is v4.30a.
+const GSNPSID_4_20A: u32 = 0x4F54_420A;
+
+const GHWCFG2_NUMHSTCHNL_MASK: u32 = 0xF << 14;
+const GHWCFG3_DFIFODEPTH_SHIFT: u32 = 16;
+
+const HCFG_DESCDMA: u32 = 1 << 23;
+const HCFG_PERSCHEDENA: u32 = 1 << 26;
+
+const HPRT_PRTCONNSTS: u32 = 1 << 0;
+const HPRT_PRTENA: u32 = 1 << 2;
+const HPRT_PRTRST: u32 = 1 << 8;
+const HPRT_PRTPWR: u32 = 1 << 12;
+const HPRT_PRTSPD_SHIFT: u32 = 17;
+const HPRT_PRTSPD_MASK: u32 = 0x3 << HPRT_PRTSPD_SHIFT;
+// Write-1-to-clear status bits (prtconndet, prtena, prtenchng,
+// prtovrcurrchng) that must be preserved as 0 whenever a non-W1C field
+// (prtpwr, prtrst, ...) is written, or a stale status bit gets cleared as a
+// side effect.
+const HPRT_W1C_MASK: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
+
+// Host channel registers. Only channel 0 is ever used (control transfers
+// and, from Stage 3, Interrupt IN polling to a single directly-attached
+// device -- no hub, no channel allocator needed), so these are fixed
+// offsets rather than a per-channel accessor.
+const HOST_CHANS: usize = USB_DWC_HS + 0x500; // channel stride is 0x20; channel 0 needs no offset
+const CHAN0_HCCHAR: usize = HOST_CHANS;
+const CHAN0_HCINT: usize = HOST_CHANS + 0x08;
+const CHAN0_HCTSIZ: usize = HOST_CHANS + 0x10;
+const CHAN0_HCDMA: usize = HOST_CHANS + 0x14;
+
+const HCCHAR_CHDIS: u32 = 1 << 30;
+const HCCHAR_CHENA: u32 = 1 << 31;
+const HCCHAR_EPDIR_IN: u32 = 1 << 15;
+// usb_dwc_xfer_type_t: CTRL = 0, BULK = 2 (pre-shifted into HCCHAR's
+// eptype field, bits[19:18]). There is no periodic-scheduler/frame-list
+// infrastructure implemented (`probe_port` explicitly disables
+// HCFG.PerSchedEna and never sets up HFLBAddr), and periodic (INTR/ISOC)
+// channels are believed to depend on that frame-list scheduling to be
+// serviced by the core at all in Scatter/Gather DMA mode -- a manually
+// `CHENA`-activated INTR-type channel with no frame list entry may simply
+// never be attempted (confirmed on real hardware: polling never completed
+// with `eptype=INTR`). `hid_keyboard.rs` therefore polls the HID
+// keyboard's Interrupt IN endpoint using BULK classification instead of
+// INTR: at the FS/LS transaction level a bare IN token is identical
+// regardless of which "channel type" the host locally used to schedule
+// it (only SETUP has a distinct token type), so the device -- which knows
+// its own endpoint as Interrupt-type from its own descriptor -- responds
+// the same way either way, and this is confirmed working on real
+// hardware.
+pub const HCCHAR_EPTYPE_CTRL: u32 = 0 << 18;
+pub const HCCHAR_EPTYPE_BULK: u32 = 2 << 18;
+
+// Bounds `force_halt_channel`'s wait for the halt it explicitly requested;
+// short, since by that point the transfer has already been given up on
+// and this is just cleanup.
+const HALT_CONFIRM_ITERATIONS: u32 = 5_000;
+
+const HCINT_CHHLTD: u32 = 1 << 1;
+const HCINT_STALL: u32 = 1 << 3;
+const HCINT_XACTERR: u32 = 1 << 7;
+const HCINT_BBLERR: u32 = 1 << 8;
+const HCINT_XCS_XACT_ERR: u32 = 1 << 12;
+const HCINT_ERROR_MASK: u32 = HCINT_STALL | HCINT_XACTERR | HCINT_BBLERR | HCINT_XCS_XACT_ERR;
+
+// HCTSIZi in Scatter/Gather DMA mode repurposes the low byte as SCHED_INFO
+// (bits[7:0], must be 0xFF for non-periodic channels or the channel can
+// freeze -- ESP-IDF's `usb_dwc_ll_hctsiz_init` comment) and bits[15:8] as
+// NTD (number of transfer descriptors - 1). `run_packet` always runs one
+// QTD per packet, so NTD is always 0.
+const HCTSIZ_SCHED_INFO_ALL: u32 = 0xFF;
+const HCTSIZ_PID_DATA1: u32 = 2 << 29; // 2'b10; DATA0 is 2'b00
+
+// QTD (Queue Transfer Descriptor), 8 bytes: control word + buffer pointer.
+// The list this points into must be 512-byte aligned (`HCDMAi.dmaaddr`
+// packs the list base into bits[31:9]); `run_packet` only ever uses a
+// single-entry list, so a single over-aligned local is enough.
+const QTD_XFER_SIZE_MASK: u32 = 0x1_FFFF; // bits[16:0]
+const QTD_IS_SETUP: u32 = 1 << 24;
+const QTD_INTR_CPLT: u32 = 1 << 25;
+const QTD_EOL: u32 = 1 << 26;
+const QTD_STATUS_SHIFT: u32 = 28;
+const QTD_STATUS_MASK: u32 = 0x3 << QTD_STATUS_SHIFT;
+const QTD_STATUS_SUCCESS: u32 = 0;
+const QTD_ACTIVE: u32 = 1 << 31;
+
+#[repr(C, align(512))]
+struct QtdSlot {
+    control: u32,
+    buffer: u32,
+}
+
+impl QtdSlot {
+    const fn zeroed() -> Self {
+        Self { control: 0, buffer: 0 }
+    }
+}
+
+// ------------------------------------------------------------------------
+// USB UTMI PHY and clock/reset control
+// ------------------------------------------------------------------------
+
+const USB_UTMI: usize = 0x5009_C000;
+const USB_UTMI_FC06: usize = USB_UTMI + 0x18;
+const UTMI_FC06_LS_PAR_EN: u32 = 1 << 0;
+const UTMI_FC06_LS_KPALV_EN: u32 = 1 << 3;
+
+// Shared with `lcd.rs`'s `HP_SYS_CLKRST` constant (same peripheral).
+const HP_SYS_CLKRST: usize = 0x500E_6000;
+const HP_SYS_CLKRST_SOC_CLK_CTRL1: usize = HP_SYS_CLKRST + 0x18;
+const SOC_CLK_CTRL1_USB_OTG20_SYS_CLK_EN: u32 = 1 << 16;
+
+const LP_CLKRST: usize = 0x5011_1000;
+const LP_CLKRST_HP_USB_CTRL1: usize = LP_CLKRST + 0x48;
+const HP_USB_CTRL1_RST_OTG20_PHY: u32 = 1 << 1;
+const HP_USB_CTRL1_RST_OTG20: u32 = 1 << 2;
+const HP_USB_CTRL1_PHYREF_CLK_EN: u32 = 1 << 30;
+
+const HP_SYSTEM: usize = 0x500E_5000;
+const HP_SYSTEM_USBOTG20_CTRL: usize = HP_SYSTEM + 0x15C;
+// Fixes a missing-disconnect-event errata on ESP32-P4 (ESP-IDF IDF-9953):
+// HP_SYSTEM_OTG_SUSPENDM is not tied to 1 by hardware, so software must set
+// it for the core to notice a device detaching.
+const USBOTG20_CTRL_OTG_SUSPENDM: u32 = 1 << 21;
+
+// ESP-IDF's `hcd_dwc.c` Kconfig defaults (`CONFIG_USB_HOST_*_MS`).
+const RESET_HOLD_MS: u32 = 30;
+const RESET_RECOVERY_MS: u32 = 30;
+const DEBOUNCE_DELAY_MS: u32 = 250;
+// "A delay of at least 25ms to enter Host mode" (ESP-IDF `INIT_DELAY_MS`).
+const FORCE_HOST_MODE_DELAY_MS: u32 = 30;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    High,
+    Full,
+    Low,
+    Unknown,
+}
+
+pub struct HostPort {
+    pub vbus_enable_acked: bool,
+    pub core_alive: bool,
+    pub core_id: u32,
+    pub fifo_depth_words: u32,
+    pub channel_count: u32,
+    pub connected: bool,
+    pub enabled: bool,
+    pub speed: Speed,
+}
+
+fn dead_port(vbus_enable_acked: bool, core_alive: bool, core_id: u32) -> HostPort {
+    HostPort {
+        vbus_enable_acked,
+        core_alive,
+        core_id,
+        fifo_depth_words: 0,
+        channel_count: 0,
+        connected: false,
+        enabled: false,
+        speed: Speed::Unknown,
+    }
+}
+
+/// Runs the full Stage 1 sequence from scratch: VBUS on, UTMI PHY and
+/// USB-DWC core bring-up, host port power-on, and (if a device is already
+/// plugged into USB-A) connect debounce, port reset, and speed read.
+///
+/// Like `sdmmc::init`, this re-initializes everything on every call; there
+/// is no persistent handle at this layer (that is `hid_keyboard::UsbKeyboard`,
+/// built on top).
+pub fn probe_port() -> HostPort {
+    let vbus_enable_acked = set_vbus(true);
+    if !vbus_enable_acked {
+        uart::log(b"USB: VBUS enable (PI4IOE2 @ 0x44) not acknowledged; continuing anyway\r\n");
+    }
+    delay_ms(50); // let VBUS settle before touching the host port
+
+    enable_utmi_clocks();
+    reset_utmi_and_core();
+    configure_utmi_phy();
+
+    let core_id = unsafe { read(GSNPSID) };
+    let core_alive = (core_id & 0xFFFF_0000) == 0x4F54_0000;
+    if !core_alive {
+        uart::log_hex(b"USB: DWC core not responding, GSNPSID=", core_id);
+        return dead_port(vbus_enable_acked, core_alive, core_id);
+    }
+
+    if !core_soft_reset() {
+        uart::log(b"USB: core soft reset did not complete\r\n");
+        return dead_port(vbus_enable_acked, core_alive, core_id);
+    }
+    set_core_defaults();
+
+    let hwcfg2 = unsafe { read(GHWCFG2) };
+    let hwcfg3 = unsafe { read(GHWCFG3) };
+    let channel_count = ((hwcfg2 & GHWCFG2_NUMHSTCHNL_MASK) >> 14) + 1;
+    let fifo_depth_words = hwcfg3 >> GHWCFG3_DFIFODEPTH_SHIFT;
+
+    configure_fifos(fifo_depth_words);
+    delay_ms(FORCE_HOST_MODE_DELAY_MS);
+
+    hprt_modify(HPRT_PRTPWR, HPRT_PRTPWR); // port power on
+
+    if !wait_for_connect() {
+        uart::log(b"USB: no device detected on USB-A within timeout\r\n");
+        return HostPort {
+            vbus_enable_acked,
+            core_alive,
+            core_id,
+            fifo_depth_words,
+            channel_count,
+            connected: false,
+            enabled: false,
+            speed: Speed::Unknown,
+        };
+    }
+
+    delay_ms(DEBOUNCE_DELAY_MS);
+    if unsafe { read(HPRT) } & HPRT_PRTCONNSTS == 0 {
+        uart::log(b"USB: connection bounced away during debounce\r\n");
+        return HostPort {
+            vbus_enable_acked,
+            core_alive,
+            core_id,
+            fifo_depth_words,
+            channel_count,
+            connected: false,
+            enabled: false,
+            speed: Speed::Unknown,
+        };
+    }
+
+    reset_pulse();
+
+    let hprt = unsafe { read(HPRT) };
+    let enabled = hprt & HPRT_PRTENA != 0;
+    let speed = match (hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT {
+        0 => Speed::High,
+        1 => Speed::Full,
+        2 => Speed::Low,
+        _ => Speed::Unknown,
+    };
+    if enabled {
+        finish_port_enable();
+    } else {
+        uart::log(b"USB: port reset completed but the port did not enable\r\n");
+    }
+
+    HostPort {
+        vbus_enable_acked,
+        core_alive,
+        core_id,
+        fifo_depth_words,
+        channel_count,
+        connected: true,
+        enabled,
+        speed,
+    }
+}
+
+/// Cheap liveness check (one HPRT read, no transaction) used by
+/// `hid_keyboard::UsbKeyboard::is_connected`.
+pub fn port_connected() -> bool {
+    unsafe { read(HPRT) & HPRT_PRTCONNSTS != 0 }
+}
+
+fn enable_utmi_clocks() {
+    unsafe {
+        modify(
+            HP_SYS_CLKRST_SOC_CLK_CTRL1,
+            SOC_CLK_CTRL1_USB_OTG20_SYS_CLK_EN,
+            SOC_CLK_CTRL1_USB_OTG20_SYS_CLK_EN,
+        );
+        modify(
+            LP_CLKRST_HP_USB_CTRL1,
+            HP_USB_CTRL1_PHYREF_CLK_EN,
+            HP_USB_CTRL1_PHYREF_CLK_EN,
+        );
+    }
+}
+
+fn reset_utmi_and_core() {
+    unsafe {
+        // Assert both resets, then release PHY before controller, matching
+        // ESP-IDF's `_usb_utmi_ll_reset_register`.
+        modify(LP_CLKRST_HP_USB_CTRL1, HP_USB_CTRL1_RST_OTG20, HP_USB_CTRL1_RST_OTG20);
+        modify(
+            LP_CLKRST_HP_USB_CTRL1,
+            HP_USB_CTRL1_RST_OTG20_PHY,
+            HP_USB_CTRL1_RST_OTG20_PHY,
+        );
+        modify(LP_CLKRST_HP_USB_CTRL1, HP_USB_CTRL1_RST_OTG20_PHY, 0);
+        modify(LP_CLKRST_HP_USB_CTRL1, HP_USB_CTRL1_RST_OTG20, 0);
+    }
+}
+
+fn configure_utmi_phy() {
+    unsafe {
+        modify(HP_SYSTEM_USBOTG20_CTRL, USBOTG20_CTRL_OTG_SUSPENDM, USBOTG20_CTRL_OTG_SUSPENDM);
+        modify(
+            USB_UTMI_FC06,
+            UTMI_FC06_LS_PAR_EN | UTMI_FC06_LS_KPALV_EN,
+            UTMI_FC06_LS_PAR_EN | UTMI_FC06_LS_KPALV_EN,
+        );
+    }
+}
+
+/// Core soft reset, following the version-dependent sequence from
+/// ESP-IDF's `usb_dwc_ll_grstctl_core_soft_reset` (our core is >= v4.20a,
+/// so it uses the CSftRstDone handshake).
+fn core_soft_reset() -> bool {
+    let core_id = unsafe { read(GSNPSID) };
+    unsafe {
+        modify(GRSTCTL, GRSTCTL_CSFTRST, GRSTCTL_CSFTRST);
+    }
+    if core_id < GSNPSID_4_20A {
+        if !poll_until(GRSTCTL, GRSTCTL_CSFTRST, false, 200_000) {
+            return false;
+        }
+    } else {
+        if !poll_until(GRSTCTL, GRSTCTL_CSFTRSTDONE, true, 200_000) {
+            return false;
+        }
+        unsafe {
+            let mut value = read(GRSTCTL);
+            value &= !GRSTCTL_CSFTRST;
+            value |= GRSTCTL_CSFTRSTDONE; // W1C
+            write(GRSTCTL, value);
+        }
+    }
+    poll_until(GRSTCTL, GRSTCTL_AHBIDLE, true, 200_000)
+}
+
+fn set_core_defaults() {
+    unsafe {
+        modify(GAHBCFG, GAHBCFG_DMAEN, GAHBCFG_DMAEN);
+        modify(GAHBCFG, GAHBCFG_HBSTLEN_MASK, 0); // AHB burst = SINGLE
+
+        modify(GUSBCFG, GUSBCFG_HNPCAP, 0);
+        modify(GUSBCFG, GUSBCFG_SRPCAP, 0);
+        modify(GUSBCFG, GUSBCFG_TOUTCAL_MASK, 5); // 5 PHY clocks, matching ESP-IDF's HS PHY setting
+        modify(GUSBCFG, GUSBCFG_PHYIF, GUSBCFG_PHYIF); // 16-bit interface
+        modify(GUSBCFG, GUSBCFG_ULPIUTMISEL, 0); // UTMI+
+        modify(GUSBCFG, GUSBCFG_PHYSEL, 0); // HS PHY
+        modify(GUSBCFG, GUSBCFG_FORCEHSTMODE, GUSBCFG_FORCEHSTMODE);
+    }
+}
+
+fn configure_fifos(fifo_depth_words: u32) {
+    // No channels are allocated yet at core init, so the exact split does
+    // not matter functionally. An even three-way split just needs to fit
+    // within the core's total FIFO depth (from GHWCFG3).
+    let rx_lines = fifo_depth_words / 2;
+    let remaining = fifo_depth_words - rx_lines;
+    let nptx_lines = remaining / 2;
+    let ptx_lines = remaining - nptx_lines;
+
+    unsafe {
+        write(GRXFSIZ, rx_lines);
+        write(GNPTXFSIZ, (rx_lines & 0xFFFF) | (nptx_lines << 16));
+        write(HPTXFSIZ, ((rx_lines + nptx_lines) & 0xFFFF) | (ptx_lines << 16));
+    }
+    flush_fifos();
+}
+
+fn flush_fifos() {
+    unsafe {
+        modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 0); // select non-periodic TX FIFO
+        modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
+    }
+    if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
+        uart::log(b"USB: non-periodic TX FIFO flush timed out\r\n");
+    }
+    unsafe {
+        modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 1 << 6); // select periodic TX FIFO
+        modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
+    }
+    if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
+        uart::log(b"USB: periodic TX FIFO flush timed out\r\n");
+    }
+    unsafe {
+        modify(GRSTCTL, GRSTCTL_RXFFLSH, GRSTCTL_RXFFLSH);
+    }
+    if !poll_until(GRSTCTL, GRSTCTL_RXFFLSH, false, 100_000) {
+        uart::log(b"USB: RX FIFO flush timed out\r\n");
+    }
+}
+
+fn wait_for_connect() -> bool {
+    const POLL_INTERVAL_US: u32 = 2_000;
+    const MAX_POLLS: u32 = 250; // ~500ms; run `usbinfo` after plugging in the device
+    for _ in 0..MAX_POLLS {
+        if unsafe { read(HPRT) } & HPRT_PRTCONNSTS != 0 {
+            return true;
+        }
+        delay_us(POLL_INTERVAL_US);
+    }
+    false
+}
+
+fn reset_pulse() {
+    hprt_modify(HPRT_PRTRST, HPRT_PRTRST);
+    delay_ms(RESET_HOLD_MS);
+    hprt_modify(HPRT_PRTRST, 0);
+    delay_ms(RESET_RECOVERY_MS);
+}
+
+fn finish_port_enable() {
+    unsafe {
+        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+        modify(HCFG, HCFG_PERSCHEDENA, 0); // periodic scheduler stays off; see HCCHAR_EPTYPE_BULK's doc comment
+    }
+}
+
+/// Writes one non-W1C HPRT field (power, reset, suspend, resume, test
+/// control) without clobbering the interrupt-status bits that share the
+/// register, mirroring ESP-IDF's `usb_dwc_ll_hprt_*` setters.
+fn hprt_modify(field_mask: u32, field_value: u32) {
+    unsafe {
+        let current = read(HPRT);
+        let base = current & !HPRT_W1C_MASK;
+        write(HPRT, (base & !field_mask) | (field_value & field_mask));
+    }
+}
+
+fn poll_until(address: usize, mask: u32, want_set: bool, timeout_iterations: u32) -> bool {
+    let mut timeout = timeout_iterations;
+    loop {
+        let bit_set = unsafe { read(address) } & mask != 0;
+        if bit_set == want_set {
+            return true;
+        }
+        if timeout == 0 {
+            return false;
+        }
+        timeout -= 1;
+    }
+}
+
+// ------------------------------------------------------------------------
+// Channel / packet primitive
+// ------------------------------------------------------------------------
+
+/// What one `run_packet` call produced. Kept distinct from a plain
+/// `Option<usize>` so callers that care (`hid_keyboard::UsbKeyboard::poll`)
+/// can tell "the device just hasn't NAK-retried into a real response yet"
+/// apart from "the core reported an actual transaction error" -- the
+/// former is routine while idle, the latter usually means the session is
+/// stale (see `UsbKeyboard::needs_reinit`).
+pub enum PacketOutcome {
+    Ok(usize),
+    Timeout,
+    Error,
+}
+
+/// Runs one packet (a single-entry, halt-on-complete QTD) on channel 0 to
+/// completion and returns the number of bytes actually transferred.
+///
+/// Every field is rewritten from scratch on every call (HCCHAR, HCTSIZ,
+/// the QTD) rather than incrementally patched, so a single packet is fully
+/// self-describing and there is no cross-call state to get out of sync.
+///
+/// `quiet_timeout` suppresses the "timed out" log on a `timeout_iterations`
+/// expiry: interrupt polling hits this whenever the device is simply still
+/// NAKing (nothing new to report yet, expected while idle since
+/// `SET_IDLE(0)` disables auto-repeat), which is routine and not worth a
+/// UART line every time (unlike a control transfer actually failing to
+/// complete).
+///
+/// `quiet_errors` similarly suppresses the STALL/transaction-error/QTD-
+/// error logs. Unlike a timeout these are never routine, but a stale
+/// `UsbKeyboard` session (e.g. after something else ran `probe_port`) hits
+/// the *same* real error on every poll until `needs_reinit` gives up and
+/// re-enumerates -- logging every repeat of an already-diagnosed error
+/// adds nothing, so callers doing repeated polling pass `true` here once
+/// they have already logged the first one in a streak.
+#[allow(clippy::too_many_arguments)]
+pub fn run_packet(
+    device_address: u8,
+    endpoint_number: u8,
+    endpoint_type: u32,
+    mps: u16,
+    is_in: bool,
+    is_setup: bool,
+    pid_data1: bool,
+    timeout_iterations: u32,
+    quiet_timeout: bool,
+    quiet_errors: bool,
+    buffer: &mut [u8],
+) -> PacketOutcome {
+    let xfer_len = buffer.len();
+    let data_ptr = buffer.as_mut_ptr();
+    if xfer_len > 0 {
+        cache_writeback_invalidate(data_ptr as usize, xfer_len);
+    }
+
+    let mut qtd_control = xfer_len as u32 & QTD_XFER_SIZE_MASK;
+    if is_setup {
+        qtd_control |= QTD_IS_SETUP;
+    }
+    qtd_control |= QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
+
+    let mut qtd = QtdSlot::zeroed();
+    let qtd_address = &raw mut qtd as usize;
+    unsafe {
+        write(qtd_address, qtd_control);
+        write(qtd_address + 4, data_ptr as u32);
+    }
+    cache_writeback_invalidate(qtd_address, 8);
+
+    let hcchar = (mps as u32 & 0x7FF) // bits[10:0]: MPS
+        | ((endpoint_number as u32 & 0xF) << 11)
+        | (if is_in { HCCHAR_EPDIR_IN } else { 0 })
+        | endpoint_type
+        | ((device_address as u32 & 0x7F) << 22);
+    let hctsiz = HCTSIZ_SCHED_INFO_ALL | (if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 });
+
+    unsafe {
+        write(CHAN0_HCINT, 0xFFFF_FFFF); // clear stale status from a previous packet
+        write(CHAN0_HCCHAR, hcchar);
+        write(CHAN0_HCTSIZ, hctsiz);
+        write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
+        modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+    }
+
+    if !poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, timeout_iterations) {
+        if !quiet_timeout {
+            uart::log(b"USB: control transfer timed out waiting for channel halt\r\n");
+        }
+        // Leave the channel in a known-idle state regardless of why we gave
+        // up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is not
+        // racing whatever the core was still doing.
+        force_halt_channel();
+        return PacketOutcome::Timeout;
+    }
+
+    let hcint = unsafe { read(CHAN0_HCINT) };
+    unsafe { write(CHAN0_HCINT, hcint) }; // W1C
+
+    cache_writeback_invalidate(qtd_address, 8); // see the QTD fields the core wrote back
+    let control_after = unsafe { read(qtd_address) };
+    let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+    let status = control_after & QTD_STATUS_MASK;
+    let transferred = xfer_len.saturating_sub(remaining);
+
+    if hcint & HCINT_STALL != 0 {
+        if !quiet_errors {
+            uart::log(b"USB: transfer STALL\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+    if hcint & HCINT_ERROR_MASK != 0 {
+        if !quiet_errors {
+            uart::log_hex(b"USB: transfer transaction error, HCINT=", hcint);
+        }
+        return PacketOutcome::Error;
+    }
+    if status != QTD_STATUS_SUCCESS {
+        if !quiet_errors {
+            uart::log_hex(b"USB: transfer QTD error, status=", status >> QTD_STATUS_SHIFT);
+        }
+        return PacketOutcome::Error;
+    }
+    if is_in && transferred > 0 {
+        cache_writeback_invalidate(data_ptr as usize, transferred);
+    }
+    PacketOutcome::Ok(transferred)
+}
+
+/// Explicitly requests a channel halt and waits (briefly) for it, so a
+/// channel left mid-transaction by a timed-out packet does not race the
+/// next packet's configuration. Best-effort: even if the halt never
+/// confirms, `HCINT` is still cleared so stale bits cannot be misread as
+/// belonging to the next transfer.
+fn force_halt_channel() {
+    unsafe {
+        modify(CHAN0_HCCHAR, HCCHAR_CHDIS, HCCHAR_CHDIS);
+    }
+    let _ = poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, HALT_CONFIRM_ITERATIONS);
+    unsafe {
+        write(CHAN0_HCINT, 0xFFFF_FFFF);
+    }
+}
+
+// ------------------------------------------------------------------------
+// Cache sync, timing, and raw MMIO
+// ------------------------------------------------------------------------
+
+const ROM_CACHE_WRITEBACK_INVALIDATE_ADDR: usize = 0x4FC0_03FC;
+const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
+const CACHE_MAP_L2_CACHE: u32 = 1 << 5;
+
+/// Writes back dirty cache lines over `address..address+length` and
+/// invalidates them, matching `sdmmc.rs`'s helper of the same name (same
+/// ROM call, same reasoning: the QTD list and transfer buffers here are
+/// DMA-shared memory, exactly like SD's IDMAC descriptors).
+fn cache_writeback_invalidate(address: usize, length: usize) {
+    let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
+        unsafe { core::mem::transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
+    unsafe {
+        writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
+        writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
+    }
+}
+
+/// `pub` for `protocol.rs`'s post-`SET_ADDRESS` settle delay; every other
+/// user of timing in this subsystem is internal to this file.
+pub fn delay_ms(milliseconds: u32) {
+    delay_us(milliseconds.saturating_mul(1000));
+}
+
+fn delay_us(microseconds: u32) {
+    // Matches `startup::raise_cpu_clock`'s 360 MHz CPU clock.
+    const CPU_CYCLES_PER_US: u32 = 360;
+    let start = cycle_count();
+    while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline(always)]
+fn cycle_count() -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+#[inline(always)]
+unsafe fn read(address: usize) -> u32 {
+    unsafe { (address as *const u32).read_volatile() }
+}
+
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+#[inline(always)]
+unsafe fn write(address: usize, value: u32) {
+    unsafe { (address as *mut u32).write_volatile(value) }
+}
+
+/// # Safety
+/// `address` must be a valid, mapped, 4-byte-aligned MMIO register.
+#[inline(always)]
+unsafe fn modify(address: usize, mask: u32, value: u32) {
+    unsafe {
+        write(address, (read(address) & !mask) | (value & mask));
+    }
+}

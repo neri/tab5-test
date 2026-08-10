@@ -23,6 +23,7 @@ mod shell;
 mod startup;
 mod touch;
 mod uart;
+mod usb;
 
 // ESP-IDF 2nd-stage bootloaders and espflash require this descriptor. The
 // linker rule in `memory.x` keeps it immediately after the 32-byte image

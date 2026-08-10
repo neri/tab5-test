@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::console::Console;
 use crate::framebuffer::{BLUE, CYAN, GREEN, MAGENTA, RED, WHITE, YELLOW};
-use crate::{interrupts, lcd, psram, sdmmc, startup};
+use crate::{interrupts, lcd, psram, sdmmc, startup, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 const FRAMES_PER_SECOND: u32 = 57;
@@ -82,6 +82,22 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "sdreadpsram <lba> <n>",
         lines: &["DMA n blocks (n<=8) into PSRAM, verify vs SRAM"],
     },
+    HelpEntry {
+        name: "usbinfo",
+        usage: "usbinfo",
+        lines: &[
+            "bring up USB-A, enumerate the attached device (VID/PID,",
+            "HID Boot keyboard interface if found); plug in a device first",
+        ],
+    },
+    HelpEntry {
+        name: "usbvbus",
+        usage: "usbvbus <0-7> on|off",
+        lines: &[
+            "raw PI4IOE2 (0x44) output-bit toggle; bit 3 = USB-A VBUS",
+            "mainly useful for diagnostics; usbinfo drives bit 3 itself",
+        ],
+    },
     HelpEntry { name: "reboot", usage: "reboot", lines: &["restart the board"] },
 ];
 
@@ -123,6 +139,8 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"sdzero" => cmd_sdzero(console, argument),
         b"sdmbr" => cmd_sdmbr(console),
         b"sdreadpsram" => cmd_sdreadpsram(console, argument),
+        b"usbinfo" => cmd_usbinfo(console),
+        b"usbvbus" => cmd_usbvbus(console, argument),
         b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
@@ -623,6 +641,126 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
     }
     console.write_output_line("first block of the SRAM reference, for reference:");
     sdmmc::dump_block_at((&sram_region[..512]).try_into().unwrap(), 0);
+}
+
+fn cmd_usbinfo(console: &mut Console) {
+    console.write_output_line("probing USB-A host port (USB-DWC HS)...");
+    let port = usb::probe_port();
+
+    console.write_output_line(if port.vbus_enable_acked {
+        "VBUS enable: I2C ok"
+    } else {
+        "VBUS enable: I2C not acked (PI4IOE2 @ 0x44 not responding)"
+    });
+
+    if !port.core_alive {
+        let mut line = Line::new();
+        line.push_str("DWC core not responding, GSNPSID=0x");
+        line.push_hex(port.core_id, 8);
+        console.write_output_line(line.as_str());
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("core id: 0x");
+    line.push_hex(port.core_id, 8);
+    line.push_str("  channels: ");
+    line.push_u32(port.channel_count);
+    line.push_str("  fifo: ");
+    line.push_u32(port.fifo_depth_words);
+    line.push_str("w");
+    console.write_output_line(line.as_str());
+
+    if !port.connected {
+        console.write_output_line("no device detected (plug in USB-A and retry)");
+        return;
+    }
+    console.write_output_line(if port.enabled {
+        "device connected, port reset and enabled"
+    } else {
+        "device connected, but port did not enable after reset"
+    });
+    if !port.enabled {
+        return;
+    }
+    console.write_output_line(match port.speed {
+        usb::Speed::High => "speed: High-Speed",
+        usb::Speed::Full => "speed: Full-Speed",
+        usb::Speed::Low => "speed: Low-Speed",
+        usb::Speed::Unknown => "speed: unknown",
+    });
+
+    console.write_output_line("enumerating device (control transfers)...");
+    let Some(device) = usb::enumerate_device() else {
+        console.write_output_line("enumeration failed, see UART log");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("VID:PID = 0x");
+    line.push_hex(device.vendor_id as u32, 4);
+    line.push_str(":0x");
+    line.push_hex(device.product_id as u32, 4);
+    line.push_str("  EP0 MPS: ");
+    line.push_u32(device.max_packet_size0 as u32);
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("class ");
+    line.push_hex(device.device_class as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_subclass as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_protocol as u32, 2);
+    line.push_str("  configs: ");
+    line.push_u32(device.num_configurations as u32);
+    line.push_str("  interfaces: ");
+    line.push_u32(device.num_interfaces as u32);
+    line.push_str("  config bytes: ");
+    line.push_u32(device.config_total_length as u32);
+    console.write_output_line(line.as_str());
+
+    match usb::find_hid_keyboard(device.config_bytes()) {
+        Some(hid) => {
+            let mut line = Line::new();
+            line.push_str("HID Boot keyboard: interface ");
+            line.push_u32(hid.interface_number as u32);
+            line.push_str(", EP 0x");
+            line.push_hex(hid.endpoint_address as u32, 2);
+            line.push_str(", MPS ");
+            line.push_u32(hid.max_packet_size as u32);
+            line.push_str(", interval ");
+            line.push_u32(hid.interval as u32);
+            console.write_output_line(line.as_str());
+        }
+        None => console.write_output_line("no HID Boot keyboard interface found"),
+    }
+}
+
+fn cmd_usbvbus(console: &mut Console, argument: &[u8]) {
+    let (bit_text, rest) = split_first_word(argument);
+    let state = trim(rest);
+    let Some(bit) = parse_u32(bit_text) else {
+        console.write_output_line("usage: usbvbus <0-7> on|off");
+        return;
+    };
+    if bit > 7 {
+        console.write_output_line("bit must be 0-7");
+        return;
+    }
+    let on = match state {
+        b"on" => true,
+        b"off" => false,
+        _ => {
+            console.write_output_line("usage: usbvbus <0-7> on|off");
+            return;
+        }
+    };
+    if usb::set_vbus_bit(bit as u8, on) {
+        console.write_output_line("ok; check USB-A 5V with a meter/current tester");
+    } else {
+        console.write_output_line("I2C write failed (PI4IOE2 @ 0x44 not acked)");
+    }
 }
 
 fn cmd_backlight(console: &mut Console, argument: &[u8]) {
