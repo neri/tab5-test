@@ -13,7 +13,9 @@
 //!
 //! This is Stage 1 of `USB_HOST_PLAN.md`: core bring-up and host-port
 //! connect/reset/speed detection only, driven by polling (no interrupt
-//! routing yet).
+//! routing yet). Stage 4 added one knob here, `FORCE_FS_LS_ONLY_HOST`,
+//! which holds the whole bus at Full-Speed so that hub support does not
+//! need split transactions.
 //!
 //! The USB-A 5V (VBUS) switch is one bit of the second PI4IOE5V6408 I/O
 //! expander (I2C address 0x44, "E2"), the counterpart to `lcd.rs`'s PI4IOE1
@@ -168,11 +170,37 @@ const GSNPSID_4_20A: u32 = 0x4F54_420A;
 const GHWCFG2_NUMHSTCHNL_MASK: u32 = 0xF << 14;
 const GHWCFG3_DFIFODEPTH_SHIFT: u32 = 16;
 
+const HCFG_FSLSSUPP: u32 = 1 << 2;
 const HCFG_DESCDMA: u32 = 1 << 23;
 const HCFG_PERSCHEDENA: u32 = 1 << 26;
 
+/// Stage 4 of `USB_HOST_PLAN.md`: when true, the host is restricted to
+/// Full/Low-Speed operation (`HCFG.FSLSSupp`), so it never drives the
+/// High-Speed chirp during a port reset and every attached device --
+/// including High-Speed-capable ones -- falls back to Full-Speed, which
+/// USB2.0 requires all of them to support.
+///
+/// This exists only to make the High-Speed hub on hand usable: a
+/// Full/Low-Speed device behind a *High-Speed* hub needs split
+/// transactions (`HCSPLT`, SSPLIT/CSPLIT), which are out of scope, while
+/// the same hub forced to Full-Speed behaves exactly like a Full-Speed
+/// hub and needs none.
+///
+/// Setting this back to `false` restores the plain High-Speed-capable
+/// behaviour verified in Stages 1-3 -- it is the only thing in this
+/// project that branches on host speed support, and nothing above
+/// `hcd.rs` (including hub and class drivers) depends on it either way.
+///
+/// Note that ESP-IDF's own host driver never sets this bit, so unlike
+/// most of this file there is no reference implementation behind it.
+pub const FORCE_FS_LS_ONLY_HOST: bool = true;
+
 const HPRT_PRTCONNSTS: u32 = 1 << 0;
 const HPRT_PRTENA: u32 = 1 << 2;
+// Bit 4 (prtovrcurract) is not acted on, but it is included in the HPRT
+// value logged when a transfer fails: a device that stops answering
+// because the board's 5V switch current-limited looks exactly like one
+// that stopped answering for protocol reasons, except for this bit.
 const HPRT_PRTRST: u32 = 1 << 8;
 const HPRT_PRTPWR: u32 = 1 << 12;
 const HPRT_PRTSPD_SHIFT: u32 = 17;
@@ -188,6 +216,10 @@ const HPRT_W1C_MASK: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
 // device -- no hub, no channel allocator needed), so these are fixed
 // offsets rather than a per-channel accessor.
 const HOST_CHANS: usize = USB_DWC_HS + 0x500; // channel stride is 0x20; channel 0 needs no offset
+// Note that offset 0x04, HCSPLT on a stock DWC OTG core, is reserved on
+// this one (`usb_dwc_struct.h`'s `usb_dwc_host_chan_regs_t` has
+// `reserved_0x04` there): split transactions are not implemented in this
+// host's channel registers at all, so there is nothing to clear.
 const CHAN0_HCCHAR: usize = HOST_CHANS;
 const CHAN0_HCINT: usize = HOST_CHANS + 0x08;
 const CHAN0_HCTSIZ: usize = HOST_CHANS + 0x10;
@@ -196,6 +228,17 @@ const CHAN0_HCDMA: usize = HOST_CHANS + 0x14;
 const HCCHAR_CHDIS: u32 = 1 << 30;
 const HCCHAR_CHENA: u32 = 1 << 31;
 const HCCHAR_EPDIR_IN: u32 = 1 << 15;
+// A Low-Speed device reached *over a Full-Speed bus*: the core prefixes
+// each of its transactions with a PRE token, which is what makes the hub
+// in between repeat them onto its Low-Speed port.
+//
+// This is not simply "the device is Low-Speed". A Low-Speed device
+// plugged straight into USB-A puts the whole bus at Low-Speed, where no
+// preamble exists and this bit must stay clear -- ESP-IDF's equivalent
+// flag is named `ls_via_fs_hub` and is likewise only set when the port is
+// Full-Speed while the device is Low-Speed (`hcd_dwc.c`'s
+// `pipe_set_ep_char`).
+const HCCHAR_LSPDDEV: u32 = 1 << 17;
 // usb_dwc_xfer_type_t: CTRL = 0, BULK = 2 (pre-shifted into HCCHAR's
 // eptype field, bits[19:18]). There is no periodic-scheduler/frame-list
 // infrastructure implemented (`probe_port` explicitly disables
@@ -267,6 +310,23 @@ impl QtdSlot {
 const USB_UTMI: usize = 0x5009_C000;
 const USB_UTMI_FC06: usize = USB_UTMI + 0x18;
 const UTMI_FC06_LS_PAR_EN: u32 = 1 << 0;
+/// The PHY's preamble control, `pre_hphy_lsie` in ESP-IDF's
+/// `usb_utmi_struct.h` ("Dis_preamble enable"), which resets to 0.
+///
+/// Without it set, every transaction to a Low-Speed device behind a
+/// Full-Speed hub fails at its first packet with `XCS_XACT_ERR`: the
+/// preamble the core asks for never makes it onto the wire. With it set,
+/// the same device enumerates and reports keystrokes normally (both
+/// confirmed on real hardware).
+///
+/// ESP-IDF leaves it alone because nothing it does on this chip ever
+/// sends a preamble -- it drives the port at High-Speed, where Low-Speed
+/// devices behind a hub are reached with split transactions instead, and
+/// its hub driver simply rejects them since this core has no `HCSPLT`
+/// register. Holding the bus at Full-Speed (`FORCE_FS_LS_ONLY_HOST`)
+/// makes preambles the mechanism in play, so this project needs the bit
+/// that ESP-IDF never does.
+const UTMI_FC06_PRE_HPHY_LSIE: u32 = 1 << 2;
 const UTMI_FC06_LS_KPALV_EN: u32 = 1 << 3;
 
 // Shared with `lcd.rs`'s `HP_SYS_CLKRST` constant (same peripheral).
@@ -365,6 +425,7 @@ pub fn probe_port() -> HostPort {
     configure_fifos(fifo_depth_words);
     delay_ms(FORCE_HOST_MODE_DELAY_MS);
 
+    configure_host_speed_support();
     hprt_modify(HPRT_PRTPWR, HPRT_PRTPWR); // port power on
 
     if !wait_for_connect() {
@@ -463,11 +524,12 @@ fn reset_utmi_and_core() {
 fn configure_utmi_phy() {
     unsafe {
         modify(HP_SYSTEM_USBOTG20_CTRL, USBOTG20_CTRL_OTG_SUSPENDM, USBOTG20_CTRL_OTG_SUSPENDM);
-        modify(
-            USB_UTMI_FC06,
-            UTMI_FC06_LS_PAR_EN | UTMI_FC06_LS_KPALV_EN,
-            UTMI_FC06_LS_PAR_EN | UTMI_FC06_LS_KPALV_EN,
-        );
+        // ESP-IDF's `usb_utmi_ll_configure_ls(hw, true)`: parallel
+        // Low-Speed mode plus Low-Speed keep-alive, and then the preamble
+        // bit it does not set.
+        const LOW_SPEED_BITS: u32 =
+            UTMI_FC06_LS_PAR_EN | UTMI_FC06_LS_KPALV_EN | UTMI_FC06_PRE_HPHY_LSIE;
+        modify(USB_UTMI_FC06, LOW_SPEED_BITS, LOW_SPEED_BITS);
     }
 }
 
@@ -509,6 +571,24 @@ fn set_core_defaults() {
         modify(GUSBCFG, GUSBCFG_ULPIUTMISEL, 0); // UTMI+
         modify(GUSBCFG, GUSBCFG_PHYSEL, 0); // HS PHY
         modify(GUSBCFG, GUSBCFG_FORCEHSTMODE, GUSBCFG_FORCEHSTMODE);
+    }
+}
+
+/// Applies `FORCE_FS_LS_ONLY_HOST`. Runs after the force-host-mode delay
+/// (HCFG is a host-mode register) but before the port is powered and
+/// reset, since `HCFG.FSLSSupp` is what decides whether the core chirps
+/// during that reset.
+///
+/// `HCFG.FSLSPclkSel` is deliberately left at its reset value (30/60 MHz):
+/// its 48 MHz setting is for a dedicated Full-Speed PHY, whereas this core
+/// keeps running its UTMI+ High-Speed PHY at 30/60 MHz and merely refrains
+/// from chirping. `finish_port_enable`'s later HCFG writes are
+/// read-modify-write, so they preserve this bit.
+fn configure_host_speed_support() {
+    if FORCE_FS_LS_ONLY_HOST {
+        unsafe {
+            modify(HCFG, HCFG_FSLSSUPP, HCFG_FSLSSUPP);
+        }
     }
 }
 
@@ -619,6 +699,27 @@ pub enum PacketOutcome {
     Error,
 }
 
+/// Where a packet is going. Grouped into one value because the same
+/// destination is reused across the packets of a transfer (and, for an
+/// interrupt endpoint, across every poll), while only the per-packet
+/// details -- SETUP or not, which data toggle -- change.
+///
+/// `is_in` lives here too even though a control transfer flips direction
+/// between its stages: `Endpoint` is `Copy`, so a stage can just say
+/// `Endpoint { is_in: true, ..pipe }`.
+#[derive(Clone, Copy)]
+pub struct Endpoint {
+    pub device_address: u8,
+    pub endpoint_number: u8,
+    /// `HCCHAR_EPTYPE_CTRL` or `HCCHAR_EPTYPE_BULK`.
+    pub endpoint_type: u32,
+    pub mps: u16,
+    pub is_in: bool,
+    /// A Low-Speed device behind a Full-Speed hub, which needs PRE tokens
+    /// -- *not* just "the device is Low-Speed". See `HCCHAR_LSPDDEV`.
+    pub low_speed_via_hub: bool,
+}
+
 /// Runs one packet (a single-entry, halt-on-complete QTD) on channel 0 to
 /// completion and returns the number of bytes actually transferred.
 ///
@@ -640,13 +741,8 @@ pub enum PacketOutcome {
 /// re-enumerates -- logging every repeat of an already-diagnosed error
 /// adds nothing, so callers doing repeated polling pass `true` here once
 /// they have already logged the first one in a streak.
-#[allow(clippy::too_many_arguments)]
 pub fn run_packet(
-    device_address: u8,
-    endpoint_number: u8,
-    endpoint_type: u32,
-    mps: u16,
-    is_in: bool,
+    endpoint: &Endpoint,
     is_setup: bool,
     pid_data1: bool,
     timeout_iterations: u32,
@@ -674,11 +770,12 @@ pub fn run_packet(
     }
     cache_writeback_invalidate(qtd_address, 8);
 
-    let hcchar = (mps as u32 & 0x7FF) // bits[10:0]: MPS
-        | ((endpoint_number as u32 & 0xF) << 11)
-        | (if is_in { HCCHAR_EPDIR_IN } else { 0 })
-        | endpoint_type
-        | ((device_address as u32 & 0x7F) << 22);
+    let hcchar = (endpoint.mps as u32 & 0x7FF) // bits[10:0]: MPS
+        | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+        | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
+        | (if endpoint.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
+        | endpoint.endpoint_type
+        | ((endpoint.device_address as u32 & 0x7F) << 22);
     let hctsiz = HCTSIZ_SCHED_INFO_ALL | (if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 });
 
     unsafe {
@@ -692,6 +789,7 @@ pub fn run_packet(
     if !poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, timeout_iterations) {
         if !quiet_timeout {
             uart::log(b"USB: control transfer timed out waiting for channel halt\r\n");
+            log_port_state();
         }
         // Leave the channel in a known-idle state regardless of why we gave
         // up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is not
@@ -718,6 +816,7 @@ pub fn run_packet(
     if hcint & HCINT_ERROR_MASK != 0 {
         if !quiet_errors {
             uart::log_hex(b"USB: transfer transaction error, HCINT=", hcint);
+            log_port_state();
         }
         return PacketOutcome::Error;
     }
@@ -727,10 +826,20 @@ pub fn run_packet(
         }
         return PacketOutcome::Error;
     }
-    if is_in && transferred > 0 {
+    if endpoint.is_in && transferred > 0 {
         cache_writeback_invalidate(data_ptr as usize, transferred);
     }
     PacketOutcome::Ok(transferred)
+}
+
+/// Logs the raw root-port register alongside a failed transfer. A device
+/// that has stopped answering says nothing about *why* on its own, while
+/// HPRT distinguishes the main cases at a glance: still connected and
+/// enabled (bits 0 and 2 set) means the failure is a protocol-level one,
+/// a cleared enable bit means the core dropped the port, and
+/// prtovrcurract (bit 4) means the board's 5V supply gave up.
+fn log_port_state() {
+    uart::log_hex(b"USB:   HPRT=", unsafe { read(HPRT) });
 }
 
 /// Explicitly requests a channel halt and waits (briefly) for it, so a

@@ -14,7 +14,7 @@ use crate::{
     gpio, interrupts, paint,
     psram::Psram,
     shell,
-    usb::UsbKeyboard,
+    usb::{self, UsbKeyboard},
 };
 
 mod st7121;
@@ -138,7 +138,7 @@ pub fn run_console(psram: Psram) {
     } else {
         uart::log(b"CardKB: absent\r\n");
     }
-    let mut usb_keyboard = UsbKeyboard::init();
+    let mut usb_keyboard = usb::connect_keyboard();
     if usb_keyboard.is_some() {
         uart::log(b"USB: keyboard ready\r\n");
     } else {
@@ -191,7 +191,7 @@ pub fn run_console(psram: Psram) {
         //   through to the throttled retry below, same as never having
         //   found a keyboard at all.
         // - Something else (`usbinfo`, `usbvbus`, another
-        //   `UsbKeyboard::init`) ran `probe_port` and reset the bus out
+        //   `usb::connect_keyboard`) ran `probe_port` and reset the bus out
         //   from under an otherwise-still-plugged-in device
         //   (`needs_reinit`, from `poll`'s error tracking). The device is
         //   almost certainly still there, so this re-enumerates
@@ -202,7 +202,7 @@ pub fn run_console(psram: Psram) {
             uart::log(b"USB: keyboard disconnected\r\n");
         } else if usb_keyboard.as_ref().is_some_and(UsbKeyboard::needs_reinit) {
             uart::log(b"USB: keyboard session went stale, re-enumerating...\r\n");
-            usb_keyboard = UsbKeyboard::init();
+            usb_keyboard = usb::connect_keyboard();
             usb_reconnect_frames = 0;
             if usb_keyboard.is_some() {
                 uart::log(b"USB: keyboard connected\r\n");
@@ -219,7 +219,7 @@ pub fn run_console(psram: Psram) {
             // the "still plugged in, just needs re-enumerating" case.)
             if usb_reconnect_frames == 300 {
                 usb_reconnect_frames = 0;
-                usb_keyboard = UsbKeyboard::init();
+                usb_keyboard = usb::connect_keyboard();
                 if usb_keyboard.is_some() {
                     uart::log(b"USB: keyboard connected\r\n");
                 }

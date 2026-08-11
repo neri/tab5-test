@@ -8,8 +8,8 @@
 //! feeds decoded keystrokes into the same `Console::push` path `cardkb.rs`
 //! uses, polled from `lcd.rs`'s frame loop alongside `CardKb`.
 
-use super::hcd::{self, HCCHAR_EPTYPE_BULK, PacketOutcome};
-use super::protocol::{self, DEVICE_ADDRESS, REQUEST_SET_CONFIGURATION};
+use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome};
+use super::protocol::{self, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::uart;
 
 // HID class-specific requests (HID 1.11 section 7.2), used only during
@@ -119,8 +119,11 @@ pub fn find_hid_keyboard(config: &[u8]) -> Option<HidKeyboardInterface> {
 }
 
 pub struct UsbKeyboard {
-    endpoint_number: u8,
-    max_packet_size: u16,
+    /// The Interrupt IN endpoint this polls, including the device address
+    /// and speed it was enumerated with -- which is all `poll` needs to
+    /// keep talking to it, whether it is plugged into USB-A directly or
+    /// into a hub port.
+    endpoint: Endpoint,
     next_pid_data1: bool,
     previous_keys: [u8; 6],
     pending: [u8; 6],
@@ -133,23 +136,23 @@ pub struct UsbKeyboard {
 }
 
 impl UsbKeyboard {
-    /// Runs `hcd::probe_port` and `protocol::enumerate_device` from
-    /// scratch, and if a HID Boot Protocol keyboard interface turned up,
+    /// Takes a device that `protocol::enumerate_device` has already
+    /// addressed and, if it has a HID Boot Protocol keyboard interface,
     /// activates its configuration, switches it to Boot Protocol, and
     /// disables its idle auto-repeat (report only on change) before
     /// returning a handle ready for `poll`.
-    pub fn init() -> Option<Self> {
-        let port = hcd::probe_port();
-        if !port.enabled {
-            return None;
-        }
-        let device = protocol::enumerate_device()?;
+    ///
+    /// Where the device sits -- USB-A directly or a hub port -- is already
+    /// baked into `device`'s address and speed, so this is the same code
+    /// either way; `usb::connect_keyboard` is what decides which one to
+    /// enumerate.
+    pub fn attach(device: &EnumeratedDevice) -> Option<Self> {
         let hid = find_hid_keyboard(device.config_bytes())?;
-        let mps0 = device.max_packet_size0 as u16;
+        let pipe = device.control_pipe();
 
         let setup =
             protocol::build_standard_out_setup(REQUEST_SET_CONFIGURATION, device.configuration_value as u16, 0);
-        if !protocol::control_transfer_out_no_data(DEVICE_ADDRESS, mps0, &setup) {
+        if !protocol::control_transfer_out_no_data(&pipe, &setup) {
             uart::log(b"USB: SET_CONFIGURATION failed\r\n");
             return None;
         }
@@ -159,7 +162,7 @@ impl UsbKeyboard {
             HID_PROTOCOL_BOOT as u16,
             hid.interface_number,
         );
-        if !protocol::control_transfer_out_no_data(DEVICE_ADDRESS, mps0, &setup) {
+        if !protocol::control_transfer_out_no_data(&pipe, &setup) {
             uart::log(b"USB: HID SET_PROTOCOL(Boot) failed\r\n");
             return None;
         }
@@ -167,14 +170,20 @@ impl UsbKeyboard {
         // wValue = (Duration << 8) | ReportID; Duration 0 = report only on
         // change, no idle auto-repeat.
         let setup = build_hid_out_setup(REQUEST_HID_SET_IDLE, 0, hid.interface_number);
-        if !protocol::control_transfer_out_no_data(DEVICE_ADDRESS, mps0, &setup) {
+        if !protocol::control_transfer_out_no_data(&pipe, &setup) {
             uart::log(b"USB: HID SET_IDLE failed\r\n");
             return None;
         }
 
         Some(Self {
-            endpoint_number: hid.endpoint_address & 0x0F,
-            max_packet_size: hid.max_packet_size,
+            endpoint: Endpoint {
+                device_address: device.device_address,
+                endpoint_number: hid.endpoint_address & 0x0F,
+                endpoint_type: HCCHAR_EPTYPE_BULK,
+                mps: hid.max_packet_size,
+                is_in: true,
+                low_speed_via_hub: device.low_speed_via_hub,
+            },
             // Every endpoint's data toggle resets to DATA0 on
             // SET_CONFIGURATION (USB2.0 9.4.5).
             next_pid_data1: false,
@@ -190,6 +199,12 @@ impl UsbKeyboard {
     /// `lcd.rs` notice a physical unplug and fall back to `None` the same
     /// way a `CardKb` bus failure does, without waiting for a poll to
     /// time out first.
+    ///
+    /// This is the *root* port, so for a keyboard behind a hub it reports
+    /// whether the hub is still plugged into USB-A, not whether the
+    /// keyboard is still in its hub port. Unplugging from a hub port
+    /// surfaces through `needs_reinit` instead, once polling starts
+    /// erroring -- asking the hub would cost a control transfer per frame.
     pub fn is_connected(&self) -> bool {
         hcd::port_connected()
     }
@@ -232,11 +247,7 @@ impl UsbKeyboard {
         // `needs_reinit` finally gives up.
         let quiet_errors = self.consecutive_hard_errors > 0;
         let outcome = hcd::run_packet(
-            DEVICE_ADDRESS,
-            self.endpoint_number,
-            HCCHAR_EPTYPE_BULK,
-            self.max_packet_size,
-            true,
+            &self.endpoint,
             false,
             self.next_pid_data1,
             INTERRUPT_POLL_TIMEOUT_ITERATIONS,

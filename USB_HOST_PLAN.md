@@ -224,6 +224,304 @@ Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの
 - 物理的な抜去は`UsbKeyboard::is_connected`（`HPRT.PRTCONNSTS`を読むだけ）
   で検出し、`lcd.rs`側が`poll`のタイムアウトを待たずに毎フレーム判定する
 
+## Stage 4: USBハブ対応（FS限定、実機にFS-onlyハブが無いための制約）
+
+Stage 3までの前提（`protocol::DEVICE_ADDRESS`固定値・チャネル0のみ・単一デバイス）を
+崩し、複数デバイスを列挙・ポーリングできるようにする。ただし手元の検証機材は
+High-Speed対応ハブのみで、Full-Speed専用ハブを持っていない。HSハブ配下に
+FS/LSデバイスがぶら下がるケースを正しく扱うにはSplit Transaction
+（`HCSPLT`レジスタを使ったSSPLIT/CSPLITのハンドシェイク）が必要だが、これは
+現状のDWC OTGコアの使い方（周期スケジューラ/frame list未実装、都度
+アクティベート・poll方式）と相性が悪く単体でも大きな実装項目になるため、
+今回は範囲外とする。
+
+代わりに、**ホスト自身をFS/LS専用動作に強制し、手元のHSハブをFSハブとして
+振る舞わせる**方針を採る。USB2.0のHS検出はリセット中のチャープ
+（ホストがK、対応デバイスがKJKJKJ...で応答）で成立するため、ホストが
+チャープを送らなければHS対応デバイスはFSのまま通常のリセット/enable
+シーケンスを続ける（規格上必須の後方互換動作。全てのHS認証デバイスは
+これに応答できなければならない）。DWC OTGコアにはこれをそのまま実現する
+`HCFG.FSLSSupp`（FS/LS-Only Support）ビットがあり、ESP-IDFの
+`usb_dwc_ll.h`にも`usb_dwc_ll_hcfg_set_fsls_supp_only()`という専用の
+setterが存在することを確認済み（`hw->hcfg_reg.fslssupp = 1`、
+`usb_dwc_hcfg_reg_t`のbit 2）。
+
+**注意**: ESP-IDFの実ホストドライバ（`hcd_dwc.c`）自身はこのビットを
+一度も呼んでいない。ESP-IDFは常にHS対応ホストとして動作し、FS/LS
+デバイスは（チャープに応答しないことで）自然にフォールバックする経路
+しか使っていない。つまり「HS対応PHY・HS対応コアで、意図的にチャープ
+そのものを止める」という今回の使い方はESP-IDFの実績が無い組み合わせで、
+`DESIGN.md`の言う「実機でしか踏めない罠」に該当する可能性が高い。
+
+### 将来の復帰を前提にした実装方針（今回のユーザー指示）
+
+このFS/LS強制は「FS-onlyハブが手に入るまでの暫定措置」であり、将来
+Split Transactionを実装してHSハブ本来の速度を使えるようにする際は
+外せる必要がある。そのため:
+
+- `hcd.rs`に`FORCE_FS_LS_ONLY_HOST: bool`のような名前付き定数を1つ置き、
+  `HCFG.FSLSSupp`の設定箇所はこの定数の分岐だけにする（コンパイル時に
+  畳み込まれるので実行時オーバーヘッドは無い）
+- 定数を`false`に戻すだけで元のHS対応動作（Stage 1〜3で実機確認済みの
+  経路）にそのまま復帰できることを保証する。既存のHS関連コード
+  （`GUSBCFG_FORCEHSTMODE`、UTMI PHYのHS選択、`Speed::High`列挙子、
+  `HPRT_PRTSPD_MASK`の判定など）は一切削除・変更しない
+- Stage 5以降で新設するハブ・複数デバイス関連のコードも、`FSLSSupp`の
+  ON/OFFに依存する分岐は作らない（ハブのポート管理自体はホストの
+  動作速度に関係なく同じプロトコルなので、Split Transaction実装時に
+  Stage 5〜8の成果を作り直す必要はない想定。追加が必要になるのは
+  `hcd::run_packet`層のSplit対応だけのはず）
+
+### Stage 4-1: FS/LS専用動作への切り替え ✅ 完了（実機確認済み）
+
+- `hcd.rs`の`set_core_defaults()`（またはその近辺）に`HCFG_FSLSSUPP`
+  （`1 << 2`）を条件付きで設定する処理を追加
+- ゴール: 手元のHS対応ハブをUSB-Aに直結し、`usbinfo`で`HPRT.PrtSpd`が
+  Full-Speed（従来ならHighと判定されていたはず）と報告されることを
+  実機で確認する。これが確認できて初めてStage 5以降のハブ検証が可能になる
+  → **完了。実機でHSハブ（Genesys Logic 05E3:0610）を直結し、`usbinfo`が
+  `speed: Full-Speed`を報告することを確認した**
+
+**実装上の判断・実機で分かったこと**:
+- 設定箇所は`set_core_defaults()`本体ではなく、force host mode待ちの後・
+  ポート電源投入とリセットの前に置いた新関数`configure_host_speed_support()`
+  にした。HCFGはホストモードのレジスタであり、かつチャープを出すか否かが
+  決まるのはポートリセット時なので、その間でなければならない
+- `HCFG.FSLSPclkSel`は既定値（30/60MHz）のまま変更しない。48MHz設定は
+  FS専用PHY向けで、今回はUTMI+ HS PHYを動かしたままチャープだけ止める形の
+  ため。`finish_port_enable`のHCFG書き込みはread-modify-writeなので
+  `FSLSSupp`を壊さない
+- ESP-IDFに前例が無いビットなので不発を警戒していたが、`HPRT.PrtSpd`だけ
+  でなくハブが返すデバイス記述子も`bDeviceProtocol=0`（＝FSハブ）となり、
+  HS動作時の値（01/02、Single/Multi TT）ではないことから、チャープが実際に
+  行われていないことを2重に確認できた
+
+### Stage 4-2: ハブ自身の列挙とハブクラスディスクリプタ取得 ✅ 完了（実機確認済み）
+
+新規モジュール`src/usb/hub.rs`（`hid_keyboard.rs`と同じ「`protocol.rs`の
+上に乗るクラスドライバ」という位置付け）。
+
+- `protocol::enumerate_device`でハブを列挙し、`bDeviceClass == 9`
+  （Hub）であることを確認する
+- クラス固有`GET_DESCRIPTOR`（wValue = `0x29 << 8`、Hub Descriptor）で
+  `bNbrPorts`・`wHubCharacteristics`・`bPwrOn2PwrGood`・
+  `bHubContrCurrent`を取得する。`DeviceRemovable`/`PortPwrCtrlMask`は
+  ポート数に応じた可変長ビットマップなので、まず固定長ヘッダ部分だけ
+  読んで`bNbrPorts`を確定させてから、必要バイト数だけ読み直す
+  （`protocol.rs`の設定記述子ヘッダ→フル読み出しの2段階パターンを踏襲）
+- 標準`GET_STATUS`（ハブ自身宛て）でローカル電源・過電流状態を取得する
+- `shell.rs`に`usbhub`のようなコマンドを追加し、ポート数・電源特性が
+  ログ/コンソールに出ることを確認する
+  → **完了。実機のHSハブで`usbhub`が「4ポート、power-good 100ms、
+  hub current 100mA、per-portの電源スイッチング・過電流保護、compound、
+  ポートインジケータあり、DeviceRemovable＝ポート1〜3のみ着脱可能、
+  hub status＝ローカル電源good・過電流なし」を表示することを確認した**
+
+**実装上、計画時点から具体化した判断**:
+- 計画では触れていなかったが、`Hub::open`で`SET_CONFIGURATION`まで行う。
+  Addressステートのデバイスが応答を保証されるのは標準リクエストだけで、
+  ハブディスクリプタ取得を含むクラスリクエストはconfigured後が前提の
+  ため（`UsbKeyboard::init`と同じ位置付け。Stage 4-3のポート制御でも
+  どのみち必要）
+- `protocol.rs`への変更は`control_transfer_in`を`pub`にしただけ。
+  クラス固有のINリクエスト（ハブディスクリプタ・GET_STATUS）を
+  同じSETUP/DATA/STATUSの組み立てに乗せるため、setupパケットは
+  呼び出し側（`hub.rs`の`build_class_in_setup`）が作る形にした
+- `DeviceRemovable`は`bNbrPorts / 8 + 1`バイト。ここを固定長と誤ると
+  直後の`PortPwrCtrlMask`をビットマップに取り込んでしまう（実装中に
+  一度踏んだ）
+- **実機のハブが`compound = yes`かつポート4が`non-removable`だった**。
+  4ポートのうち1つに何かが常時ぶら下がっている構成のため、Stage 4-3で
+  「接続を検出した最初のポート」を選ぶ方針だと、ユーザーが挿した機器
+  ではなくこの内蔵デバイスを掴む可能性がある。そのため着脱可能な
+  ポートを優先して選ぶ（見つからない場合のみ non-removable ポートに
+  フォールバックし、その旨をログに出す）
+
+**あわせて入れたインフラ変更（Stage 4固有ではない）**:
+- `console.rs`の`Console::write_output_line`が各行をUARTログにも
+  ミラーするようにした。シェル出力の唯一の出口（呼び出し元は`shell.rs`
+  だけ）なので1箇所の変更で全コマンドの結果がシリアルに出る。実機の
+  画面から目視で書き写す必要が無くなり、以降のStageの動作確認ログは
+  そのまま貼れる。`shell::execute`は実行したコマンド行を`> usbhub`の
+  形で先にUARTへ出し、ログがトランスクリプトとして読めるようにしている
+
+### Stage 4-3: 単一ポートの電源投入・接続検出・リセット・速度判定 ✅ 完了（実機確認済み）
+
+複数ポート同時対応は範囲外とし、まず1ポートだけを対象にする。
+
+- `SET_FEATURE(PORT_POWER)`でポート電源を投入し、`bPwrOn2PwrGood`
+  （2msit単位）分待つ
+- `GET_PORT_STATUS`をポーリングして接続検出（`hcd.rs`の
+  `wait_for_connect`と同じ発想でポート接続ビットを見る）→デバウンス
+- `SET_FEATURE(PORT_RESET)`→ポートステータス変化ビット
+  （`C_PORT_RESET`）をポーリングして完了検出→
+  `CLEAR_FEATURE(C_PORT_RESET)`
+- `GET_PORT_STATUS`の`PORT_LOW_SPEED`/`PORT_HIGH_SPEED`ビットで速度
+  判定する。Stage 4-1でHSを抑止済みのため`PORT_HIGH_SPEED`は立たない
+  想定だが、ビット自体は読んでおき、想定外に立った場合はログを出して
+  そのポートは扱わない（安全側に倒す）
+- ゴール: ハブの1ポートに何らかのUSB機器を挿した状態で、電源投入から
+  リセット完了・速度判定までのログが実機で出ることを確認する
+  → **完了。VIA Labs 2109:2813のハブ（4ポート、per-port電源スイッチング、
+  全ポートremovable）で、全ポートへの`PORT_POWER`投入 → ポート1の接続検出
+  （`st=0x0301`）→ リセット → enable＋速度判定（`st=0x0303`）まで
+  `usbhub`が完走することを確認した**
+
+**踏んだ罠（実機、修正済み）**:
+- **最初に使ったハブ（Genesys Logic 05E3:0610、compound・ポート4が
+  non-removable）では、ポート1への`SET_FEATURE(PORT_POWER)`は通るが、
+  以降ハブが一切応答しなくなる**という壊れ方をした。別のハブ
+  （VIA Labs 2109:2813）に替えたところ問題なく動いたため、このハブ固有の
+  問題として深追いはしていない。Stage 4のスコープは「1ポート・1デバイス」
+  なので、対応ハブの一般性はいったん問わない
+- 上記の症状を報告する際、**ログが延々と出続ける**という二次的な問題が
+  あった。原因は`find_connected_port`が`port_status`の失敗を「まだ接続
+  されていない」として扱って再スキャンしていたこと。1回のコントロール
+  転送タイムアウトが約0.2秒かかる一方、待ち時間カウンタはスキャン1周
+  あたり5msしか進まないため、4ポート×100周＝約400回のタイムアウトログを
+  出す計算になっていた。ハブ自身への転送が失敗した時点で即座に打ち切る
+  ように修正（`power_on_all_ports`・シェルのポート一覧も同様）
+- 切り分けのため、`hcd::run_packet`のタイムアウト時・トランザクション
+  エラー時に`HPRT`の生値をログするようにした（接続・enableが維持されて
+  いるか、過電流ビット（bit 4）が立っていないかで、電気的な問題と
+  プロトコルの問題を区別できる）。`quiet_timeout`/`quiet_errors`が
+  立っている経路（キーボードの毎フレームポーリング）では出ない
+
+**実装上、計画時点から具体化した判断**:
+- ポートは全ポートに電源を入れてから選ぶ。per-port電源スイッチングの
+  ハブでは電源を入れるまで接続状態が読めないため、「どのポートを使うか」
+  を決めるより前に電源投入が必要になる
+- ポート電源投入の間に20msの間隔を空けている（バスパワーのハブに
+  全ポート分の突入電流を同時に要求しないため）
+- 接続検出後は250msのデバウンス＋`C_PORT_CONNECTION`クリアを行い、
+  デバウンス中に接続が消えた場合は中止する（`hcd::probe_port`の
+  ルートポート側と同じ扱い）
+- リセット完了は`C_PORT_RESET`のセットまたは`PORT_RESET`の落ちで検出し、
+  `CLEAR_FEATURE(C_PORT_RESET)`＋回復30msの後に**ポートステータスを
+  読み直して**enableと速度を確定する（リセット直後の値は確定前）
+
+### Stage 4-4: マルチデバイスアドレス管理の一般化とハブ経由デバイスの列挙 ✅ 完了（実機確認済み）
+
+- `protocol::DEVICE_ADDRESS`の固定値運用をやめる。動的なアドレス
+  プールまでは作らず、まず「ハブ＝アドレス1、ポート1のデバイス＝
+  アドレス2」の2枠固定で十分とする（複数ポート・複数デバイスへの
+  一般化は将来検討）
+- `protocol::enumerate_device`をデバイスアドレス引数化する
+  （`hcd::run_packet`・`control_transfer_*`は既にアドレスを引数で
+  受け取る設計になっているため、`protocol.rs`内の`DEVICE_ADDRESS`
+  直接参照を外すだけで済む見込み）
+- **想定される罠**: ハブ経由デバイスがLow-Speedの場合、
+  `HCCHAR.LSpeed`（Low-Speed Device、PREトークンの要否に関わる
+  ビット）の扱いが新たに問題になる可能性がある。現状の`hcd.rs`は
+  このビットを一度も設定していない。これまで直結LSデバイスで問題が
+  出なかったのは「ホスト自身の動作速度とデバイスの速度が一致していた
+  （またはコアが自動処理していた）」だけの可能性があり、FS動作の
+  ホスト経由でLSデバイスに話しかける今回のハブ構成で初めて表面化する
+  かもしれない。実機で原因不明のSTALL/XACTERRが出た場合はまずここを
+  疑うこと
+- ゴール: ハブの1ポートに挿したデバイスが`SET_ADDRESS`（アドレス2）
+  〜configuration記述子取得まで実機で完走する
+  → **完了（実機確認済み）。ハブのポート1に挿したUSBメモリ
+  （Sony 054C:0243、Full-Speed）が`usbhub`でアドレス2の割り当て・
+  デバイス記述子・configuration記述子（32バイト）まで完走した。
+  Low-Speedキーボードも、下記の罠を解決した後に同様に完走している**
+
+**踏んだ罠: Low-Speedデバイス（PREトークン）— PHY側のビットが必要だった**
+
+計画書が「想定される罠」に挙げていた`HCCHAR.LSpeed`（PREトークン）が
+実際に問題になった。`HCCHAR.LSpdDev`を立てるだけでは足りず、**UTMI PHY
+側のプリアンブル制御ビットを別途有効にする必要がある**というのが結論。
+
+- 症状: ハブのポートに挿したLow-Speedキーボードに対し、**最初の
+  コントロール転送のSETUPステージ**が`HCINT=0x00001002`
+  （CHHLTD＋XCS_XACT_ERR）で失敗する。`HPRT=0x0002140F`で
+  ルートポートは接続・enable・FS・過電流なしと健全、ハブから見た
+  ポートも`conn pwr ena Low-Speed`のまま
+- 切り分け: 動く経路との差分はPREトークンだけに絞り込めた
+
+  | 経路 | バス速度 | デバイス速度 | PRE | 結果 |
+  |---|---|---|---|---|
+  | ハブ自身へのコントロール転送 | FS | FS | 不要 | 動く |
+  | キーボード直結 | LS | LS | 不要 | 動く |
+  | ハブ配下のUSBメモリ | FS | FS | 不要 | 動く |
+  | ハブ配下のキーボード | FS | LS | **必要** | SETUPで失敗 |
+
+  Scatter/Gather DMA・`HCTSIZ`・QTD・アドレス割り当て・MPS=8は
+  動く経路と全て共通。`HCCHAR`のビット配置（`lspddev`=bit17、
+  `ec`=bits21:20、`devaddr`=bits28:22）も`usb_dwc_struct.h`で
+  確認済みで、ESP-IDFの`usb_dwc_ll_hcchar_init`が書く内容とも一致する
+- ESP-IDFの状況（この結論の根拠）:
+  - `ls_via_fs_hub`（＝FSポート配下のLSデバイス）というフラグは存在し、
+    `HCCHAR.LSpdDev`を立てる唯一の条件になっている。ただしこれが
+    実際に走るのはFS専用コアのESP32-S2/S3であって、**P4では一度も
+    通らない**
+  - `hcd_dwc.c`の`_buffer_check_done`は`ls_via_fs_hub`のとき
+    コントロール転送のステージ間に`esp_rom_delay_us(1000)`を挟む
+    （"The HW can't handle two transactions with preamble in one
+    frame"、IDF-12986）。本実装でも同じ間隔を入れたが症状は変わらず、
+    SETPUステージ自体が通らないため間隔の問題ではない
+  - **ESP-IDFにはSplit Transactionのコードが存在しない**
+    （`usb/`・`hal/`に`HCSPLT`/splitの記述が皆無）。`usb/hub.c:348`は
+    HSハブ配下に速度の異なるデバイスが繋がった場合、
+    "transaction translator (TT) is not supported"として明示的に
+    拒否する
+  - P4のチャネルレジスタには`HCSPLT`自体が無い
+    （`usb_dwc_struct.h`の`usb_dwc_host_chan_regs_t`はオフセット
+    0x04が`reserved_0x04`）
+- **原因と解決**: UTMI PHYの`fc_06.pre_hphy_lsie`（bit 2、ESP-IDFの
+  `usb_utmi_struct.h`に "**Dis_preamble enable**" と記載、リセット値0）
+  を1にすると動作した。実機で `usbexp 1` → `usbhub` の一発で、SETUPの
+  失敗が消えてLSキーボードのキー入力まで通ることを確認している。
+  ESP-IDFはこのビットを触らない（`usb_utmi_ll_configure_ls`が設定するのは
+  `ls_par_en`と`ls_kpalv_en`だけ）が、それはP4でPREを一度も送らないため。
+  現在は`configure_utmi_phy`で他のLS用ビットと並べて常時設定している
+- レジスタ側（`HCCHAR.LSpdDev`、`lspddev`=bit17）の設定も必要で、これは
+  「LSデバイス」ではなく「**FSバス上のLSデバイス**」でのみ立てる。
+  直結LSデバイスはバス全体がLSになりPRE自体が存在しないため、立てては
+  いけない（ESP-IDFのフラグ名も`ls_via_fs_hub`、条件は
+  `port_speed == FULL && dev_speed == LOW`）。実装では
+  `hcd::Endpoint::low_speed_via_hub`という名前でこの区別を型に持たせた
+- **「FS-onlyハブを入手する」は解決にならない**（Stage 4着手時点の
+  想定の誤り）。LSデバイスがハブ配下にある限り、ハブがFS専用かHSかに
+  関係なくホストはPREを送る必要がある。PREを回避できるのはHSハブの
+  TTを使うSplit Transactionだけで、それがこのコアに無い。つまり
+  PREを動かすこと自体が唯一の道だった
+- 切り分けの過程で、`usbexp <mask>`という実験用コマンドを一時的に追加した
+  （PHYのプリアンブルビット／`HCCHAR.EC`／フレーム境界揃えの3つを実行時に
+  組み合わせられるようにし、再フラッシュせずに試せるようにしたもの）。
+  1つ目で解決したため、残り2つは不要と確認できた時点でコマンドごと削除した
+
+### Stage 4-5: 既存HID Bootキーボードクラスドライバをハブ経由へ適用 ✅ 完了（実機確認済み）
+
+- `hid_keyboard.rs`の`DEVICE_ADDRESS`直接参照を、ハブ経由で確定した
+  アドレスを受け取る引数に差し替える
+- `lcd.rs`のフレームループに、ハブ経由`UsbKeyboard`のポーリングを
+  追加する。直結USBキーボードとハブ経由デバイスの同時使用は範囲外とし、
+  まず「ハブ経由のみ」での動作を確認する
+- ゴール: 実機でハブの1ポートに挿したHID Bootキーボードのキー入力が
+  `console.rs`へエコーされることを確認する（Stage 3のマイルストーンの
+  ハブ経由版）
+  → **完了。Low-Speedキーボードをハブのポートに挿した状態でキー入力が
+  コンソールへエコーされることを実機で確認した**
+
+**実装上、計画時点から具体化した判断**:
+- `lcd.rs`にハブ経由専用のポーリングを足すのではなく、`usb.rs`に
+  `connect_keyboard`を新設して直結／ハブ経由の判断をそこに閉じ込めた。
+  `UsbKeyboard`が持つのは`hcd::Endpoint`（アドレス・EP番号・速度を含む）
+  なので、どちらの経路で列挙されたかは`poll`以降のコードに影響しない。
+  結果として`lcd.rs`の変更は`UsbKeyboard::init()`→`usb::connect_keyboard()`
+  の差し替えだけで済み、フレームループのポーリング・再接続ロジックは
+  Stage 3のまま
+- `UsbKeyboard::init`（自分で`probe_port`する）を`attach(&device)`
+  （列挙済みデバイスに取り付く）に分解した。ポート立ち上げと列挙は
+  クラスドライバの仕事ではないという整理
+- ハブ経由の場合、`is_connected`（`HPRT`を読むだけ）が見ているのは
+  「ハブがUSB-Aに挿さっているか」であって、キーボードがハブのポートに
+  挿さっているかではない。ハブのポートから抜いた場合はポーリングが
+  エラーを返し始め、`needs_reinit`（連続10回）経由で再列挙される。
+  毎フレーム`GET_PORT_STATUS`を撃つのはコストが見合わないための割り切り
+  （ハブのホットプラグ検出は計画どおり範囲外）
+
 ## 想定される罠（実装前メモ、実機で要検証）
 
 `DESIGN.md`・`SD_CARD_PLAN.md`同様、以下は「シミュレーションではなく実機でしか
@@ -244,6 +542,9 @@ Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの
   High-Speedポート越しに扱う場合の分周・プリアンブル設定はESP-IDFでも
   複雑な部分なので、まずはFull-Speedキーボードでの動作を優先し、
   Low-Speedキーボードは追加検証項目とする
+  → **これが実際に一番手強い罠だった。`HCCHAR.LSpdDev`に加えてUTMI PHYの
+  `pre_hphy_lsie`が必要で、後者はESP-IDFに前例が無い。Stage 4-4の記録を
+  参照**
 
 ## モジュール構成（実際）
 
@@ -255,7 +556,10 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
 `lcd.rs`・`lcd/st7121.rs`と同じ「親ファイルが`mod`宣言、実体はサブ
 ディレクトリ」という構成に合わせている。
 
-- `src/usb.rs`: サブモジュール宣言と再エクスポートだけの薄い親ファイル
+- `src/usb.rs`: サブモジュール宣言と再エクスポート、および4層を組み合わせる
+  唯一の関数`connect_keyboard`（Stage 4-5。「USB-Aに何が挿さっているか」を
+  判断してキーボードのハンドルを返す。直結かハブ経由かはここだけが知って
+  いて、`lcd.rs`からは同じ1関数に見える）
 - `src/usb/hcd.rs`: ESP32-P4 High-Speed USB-DWCホストコントローラー
   ドライバー（Stage 1）。VBUS、コア/ポート初期化、チャネル・パケット実行
   プリミティブ（`run_packet`、`PacketOutcome`）。USBデバイス・記述子の意味は
@@ -271,9 +575,74 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
   `protocol.rs`を経由しない
 - `src/shell.rs`: `usbinfo`（`hcd::probe_port`→`protocol::enumerate_device`→
   `usb::find_hid_keyboard`の順で呼び、Stage 1/2の確認用）・`usbvbus`
-  （VBUS制御ビットの実機発見用）
+  （VBUS制御ビットの実機発見用）。Stage 4以降は`usbhub`（ハブディスクリプタ・
+  ポート状態の確認用）を追加する想定
+- `src/usb/hub.rs`（Stage 4で新規追加予定）: USBハブのクラスドライバー。
+  ハブディスクリプタ取得、ポート電源投入・接続検出・リセット・速度判定
+  （ハブ自身のクラス固有リクエストのみを扱う。`hcd.rs`/`protocol.rs`は
+  変更しない、または最小限の一般化に留める想定）
 - `src/lcd.rs`: フレームループに`UsbKeyboard`のポーリング・再接続ロジックを
-  `CardKb`と並列に追加。コンソールへの合流点（`Console::push`）は共通
+  `CardKb`と並列に追加。コンソールへの合流点（`Console::push`）は共通。
+  Stage 4-5でハブ経由`UsbKeyboard`のポーリングもここに追加する想定
+
+## Stage 5（将来）: Interrupt転送の割り込み駆動化
+
+Stage 1〜4は一貫してポーリング方式で通してきたが（`DESIGN.md`の「まず
+ポーリングで動作確認し、必要になった時点でのみ割り込み化を検討する」に
+従ったもの）、Interrupt転送についてはコアが本来持っている自動スケジューリング
+機能を使っていない。着手するとしたらStage 4のコミット後、独立したStageとして
+扱う。
+
+### 動機（実害が2つある）
+
+- **フレームループがブロックされる**: `UsbKeyboard::poll`は`HCINT`を最大
+  `INTERRUPT_POLL_TIMEOUT_ITERATIONS`（50,000）回スピンする。キーが無い
+  アイドル時にも毎フレーム発生する
+- **キー入力を取りこぼしうる**: `SET_IDLE(0)`によりデバイスは状態変化時
+  にしかレポートしないため、約17.5ms（57Hz）のポーリング間隔の間に
+  「押して離す」が完了すると中間状態が失われる。LSキーボードの
+  `bInterval`は通常10ms前後で、こちらの方が遅い
+
+### コア側の機能（ESP-IDFで確認済み）
+
+Scatter/Gather DMAモードにはperiodic frame listがあり、xHCIと同じく
+「事前に登録しておけば、コアが自動でスケジューリングし、実際にデータが
+来たときだけ割り込む」動作ができる。
+
+- `HFLBAddr`にフレームリストの先頭アドレス、`HCFG.FrListEn`でエントリ数
+  （8/16/32/64）、`HCFG.PerSchedEna`で巡回を有効化
+- 各エントリは「そのUSBフレームでサービスするチャネルのビットマップ」。
+  ESP-IDFは`bInterval`を2の冪に丸めて
+  `frame_list[offset + i*interval] |= 1 << chan_idx`と埋めている
+  （`usb_dwc_hal.c`の`usb_dwc_hal_chan_set_ep_char`）
+- 割り込みマスクは3段（`GINTMSK`→`HAINTMSK`→`HCINTMSK`）。ESP-IDFが
+  有効にする`CHAN_INTRS_EN_MSK`は`XFERCOMPL | CHHLTD | BNAINTR`で、
+  **NAKを含まない**＝実際に転送が完了したときだけCPUが起きる
+- Stage 3で「`eptype`を`INTR`にすると列挙は成功するのにキー入力に一切
+  反応しない」という壊れ方をしたのは、まさにこのフレームリストに登録して
+  いなかったため。`BULK`扱いにした回避策はここで解消できる
+
+### 必要な作業（現ドライバの不変条件を崩す）
+
+`hcd.rs`は「チャネル0だけを使い、1パケットごとに全レジスタを書き切り、
+呼び出し間に状態を持たない」という前提で書かれている。ここを崩す必要がある。
+
+- DMA可視・キャッシュ整合の取れたフレームリスト領域（QTDと同様の
+  アライメント要件を確認すること）
+- チャネルアロケータ。フレームリストはチャネル番号のビットマップなので、
+  割り込みエンドポイントに専用チャネルを固定する必要があり、コントロール
+  転送とチャネル0を共有できなくなる
+- ISRを`interrupts.rs`（既にLCD/DSIで使用中）経由で配線し、ISRと
+  `lcd::run_console`のループの間にHIDレポートのキューを置く
+
+### 着手前に確認すべき点
+
+- ESP-IDFのコードに "LS endpoints do not support periodic transfers"
+  というコメントがある（`usb_dwc_hal.c`の`sched_info`設定箇所）。現在の
+  検証機材のキーボードはLow-Speedなので、periodicスケジューリングの
+  対象にできるかを最初に確かめる必要がある
+- LS＋PRE＋periodicという組み合わせはESP-IDFに前例が無い（Stage 4-4で
+  踏んだPHYビットと同種の未知が残っている可能性がある）
 
 ## 将来検討（範囲外）
 
@@ -281,9 +650,23 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
 - USB Mass Storage（MSC）。将来的にSDカード同様「USBメモリの生ブロック
   読み書き」まで実機確認できれば、`sdmmc.rs`のブロックI/O層と同じ抽象で
   上位（ファイルシステム）を共有できる可能性がある
-- USBハブ経由での複数デバイス接続
-- High-Speedデバイスのchirp/ネゴシエーション（HID Bootキーボードの
-  マイルストーンでは不要）
+- **ハブ配下でのHigh-Speed動作**。Stage 4は`HCFG.FSLSSupp`でバス全体を
+  Full-Speedに固定しているため、ハブ配下のデバイスは最大12Mbpsに制限
+  される。HSで動かすにはSplit Transactionが必要だが、**このコアには
+  `HCSPLT`レジスタ自体が存在しない**（`usb_dwc_struct.h`の
+  `usb_dwc_host_chan_regs_t`はオフセット0x04が`reserved_0x04`）ため、
+  ソフトウェアで解決できる項目ではない。ESP-IDF自身もsplitを実装しておらず、
+  HSハブ配下に速度の異なるデバイスが繋がると`usb/hub.c`で拒否している。
+  したがって`FORCE_FS_LS_ONLY_HOST`は当面`true`のまま。HS対応が必要に
+  なった場合、選択肢は「ハブ配下はHSデバイスのみに限定して`false`に戻す」
+  （その場合FS/LSデバイスはハブ経由で使えなくなる）しかない
+  ※ Stage 4着手時点では「FS-onlyハブを入手すれば済む」と想定していたが、
+  これは誤り。LSデバイスがハブ配下にある限りハブの種類に関係なくPREが
+  必要で、PREを回避できるのはsplitだけだった（Stage 4-4の記録を参照）
+- ハブの複数ポート同時使用（Stage 4は1ポートのみを対象とする）
+- ハブのカスケード接続（ハブの下にハブ）
+- ハブ自身のInterrupt INステータス変更エンドポイントを使った割り込み駆動の
+  ポート変化検出（Stage 4は`GET_PORT_STATUS`の直接ポーリングのみ）
 - Full-Speed OTGコントローラ（USB-C側）を使った同時ホスト動作
   （ESP32-P4は2系統同時ホスト動作が可能とされるが、本計画のマイルストーンでは
   USB-A/High-Speedコントローラのみを対象とする）

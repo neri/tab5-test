@@ -2,16 +2,18 @@
 //!
 //! Every command reads or writes only through `Console`'s output-line API,
 //! so results share the same wrapping/scrolling/rendering as the rest of
-//! the console. `execute` runs once per `Enter` keypress and returns whether
-//! the caller should reboot the board once the current frame has actually
-//! reached the panel.
+//! the console -- and, since that API mirrors each line to the UART log,
+//! every command's output is also readable over serial without having to
+//! transcribe it off the panel. `execute` runs once per `Enter` keypress
+//! and returns whether the caller should reboot the board once the current
+//! frame has actually reached the panel.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::console::Console;
 use crate::framebuffer::{BLUE, CYAN, GREEN, MAGENTA, RED, WHITE, YELLOW};
-use crate::{interrupts, lcd, psram, sdmmc, startup, usb};
+use crate::{interrupts, lcd, psram, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 const FRAMES_PER_SECOND: u32 = 57;
@@ -98,6 +100,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "mainly useful for diagnostics; usbinfo drives bit 3 itself",
         ],
     },
+    HelpEntry {
+        name: "usbhub",
+        usage: "usbhub",
+        lines: &[
+            "bring up USB-A, enumerate an attached USB hub, power its ports,",
+            "then reset the first occupied one and enumerate what is on it",
+        ],
+    },
     HelpEntry { name: "reboot", usage: "reboot", lines: &["restart the board"] },
 ];
 
@@ -120,6 +130,13 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
     if line.is_empty() {
         return Outcome::Continue;
     }
+    // `Console::write_output_line` mirrors every result line to the UART
+    // log; echoing the command itself first makes that log read as a
+    // transcript instead of anonymous output.
+    uart::log(b"> ");
+    uart::log(line);
+    uart::log(b"\r\n");
+
     let (command, rest) = split_first_word(line);
     let argument = trim(rest);
     match command {
@@ -141,6 +158,7 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"sdreadpsram" => cmd_sdreadpsram(console, argument),
         b"usbinfo" => cmd_usbinfo(console),
         b"usbvbus" => cmd_usbvbus(console, argument),
+        b"usbhub" => cmd_usbhub(console),
         b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
@@ -643,7 +661,10 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
     sdmmc::dump_block_at((&sram_region[..512]).try_into().unwrap(), 0);
 }
 
-fn cmd_usbinfo(console: &mut Console) {
+/// Shared front half of `usbinfo` and `usbhub`: runs the full host port
+/// bring-up and reports what came back, returning true only if the port
+/// ended up enabled and ready for control transfers.
+fn report_host_port(console: &mut Console) -> bool {
     console.write_output_line("probing USB-A host port (USB-DWC HS)...");
     let port = usb::probe_port();
 
@@ -658,7 +679,7 @@ fn cmd_usbinfo(console: &mut Console) {
         line.push_str("DWC core not responding, GSNPSID=0x");
         line.push_hex(port.core_id, 8);
         console.write_output_line(line.as_str());
-        return;
+        return false;
     }
 
     let mut line = Line::new();
@@ -671,9 +692,17 @@ fn cmd_usbinfo(console: &mut Console) {
     line.push_str("w");
     console.write_output_line(line.as_str());
 
+    // The speed line below only means what it says once it is clear
+    // whether the host was allowed to negotiate High-Speed at all.
+    console.write_output_line(if usb::FORCE_FS_LS_ONLY_HOST {
+        "host: FS/LS-only forced (HCFG.FSLSSupp, for hub support)"
+    } else {
+        "host: High-Speed capable"
+    });
+
     if !port.connected {
         console.write_output_line("no device detected (plug in USB-A and retry)");
-        return;
+        return false;
     }
     console.write_output_line(if port.enabled {
         "device connected, port reset and enabled"
@@ -681,17 +710,33 @@ fn cmd_usbinfo(console: &mut Console) {
         "device connected, but port did not enable after reset"
     });
     if !port.enabled {
+        return false;
+    }
+    let mut line = Line::new();
+    line.push_str("speed: ");
+    line.push_str(speed_text(port.speed));
+    console.write_output_line(line.as_str());
+    true
+}
+
+fn speed_text(speed: usb::Speed) -> &'static str {
+    match speed {
+        usb::Speed::High => "High-Speed",
+        usb::Speed::Full => "Full-Speed",
+        usb::Speed::Low => "Low-Speed",
+        usb::Speed::Unknown => "unknown",
+    }
+}
+
+fn cmd_usbinfo(console: &mut Console) {
+    if !report_host_port(console) {
         return;
     }
-    console.write_output_line(match port.speed {
-        usb::Speed::High => "speed: High-Speed",
-        usb::Speed::Full => "speed: Full-Speed",
-        usb::Speed::Low => "speed: Low-Speed",
-        usb::Speed::Unknown => "speed: unknown",
-    });
 
     console.write_output_line("enumerating device (control transfers)...");
-    let Some(device) = usb::enumerate_device() else {
+    // Nothing plugged into USB-A directly ever needs preambles; see
+    // `usb::connect_keyboard`.
+    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
         console.write_output_line("enumeration failed, see UART log");
         return;
     };
@@ -735,6 +780,253 @@ fn cmd_usbinfo(console: &mut Console) {
         }
         None => console.write_output_line("no HID Boot keyboard interface found"),
     }
+}
+
+/// `USB_HOST_PLAN.md` Stage 4-2: enumerate an attached hub and dump its
+/// class descriptor and status. Port power-up and downstream devices are
+/// Stage 4-3 onwards.
+fn cmd_usbhub(console: &mut Console) {
+    if !report_host_port(console) {
+        return;
+    }
+
+    console.write_output_line("enumerating hub (control transfers)...");
+    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
+        console.write_output_line("enumeration failed, see UART log");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("VID:PID = 0x");
+    line.push_hex(device.vendor_id as u32, 4);
+    line.push_str(":0x");
+    line.push_hex(device.product_id as u32, 4);
+    line.push_str("  class ");
+    line.push_hex(device.device_class as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_subclass as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_protocol as u32, 2);
+    console.write_output_line(line.as_str());
+
+    let Some(hub) = usb::Hub::open(&device) else {
+        console.write_output_line("not a hub, or the hub descriptor read failed (see UART log)");
+        return;
+    };
+    let descriptor = &hub.descriptor;
+
+    let mut line = Line::new();
+    line.push_str("ports: ");
+    line.push_u32(descriptor.port_count as u32);
+    line.push_str("  power-good delay: ");
+    line.push_u32(descriptor.power_on_to_power_good_ms as u32);
+    line.push_str("ms  hub current: ");
+    line.push_u32(descriptor.control_current_ma as u32);
+    line.push_str("mA");
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("power switching: ");
+    line.push_str(match descriptor.power_switching() {
+        usb::PowerSwitching::Ganged => "ganged",
+        usb::PowerSwitching::PerPort => "per-port",
+        usb::PowerSwitching::AlwaysOn => "always on",
+    });
+    line.push_str("  over-current: ");
+    line.push_str(match descriptor.over_current_protection() {
+        usb::OverCurrentProtection::Global => "global",
+        usb::OverCurrentProtection::PerPort => "per-port",
+        usb::OverCurrentProtection::Unsupported => "none",
+    });
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("compound: ");
+    line.push_str(if descriptor.is_compound_device() { "yes" } else { "no" });
+    line.push_str("  indicators: ");
+    line.push_str(if descriptor.has_port_indicators() { "yes" } else { "no" });
+    line.push_str("  TT think time: ");
+    line.push_u32(descriptor.tt_think_time_bits() as u32);
+    line.push_str(" FS bits  hubdesc: ");
+    line.push_u32(descriptor.descriptor_len as u32);
+    line.push_str("b");
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("removable ports:");
+    let mut any_removable = false;
+    for port in 1..=descriptor.port_count {
+        if descriptor.port_is_removable(port) {
+            any_removable = true;
+            line.push_str(" ");
+            line.push_u32(port as u32);
+        }
+    }
+    if !any_removable {
+        line.push_str(" none (all permanently attached)");
+    }
+    console.write_output_line(line.as_str());
+
+    let Some(status) = hub.status() else {
+        console.write_output_line("hub GET_STATUS failed, see UART log");
+        return;
+    };
+    let mut line = Line::new();
+    line.push_str("hub status: local power ");
+    line.push_str(if status.local_power_lost() { "lost" } else { "good" });
+    line.push_str(", over-current ");
+    line.push_str(if status.over_current() { "YES" } else { "no" });
+    if status.local_power_changed() || status.over_current_changed() {
+        line.push_str("  (change bits set: 0x");
+        line.push_hex(status.change as u32, 4);
+        line.push_str(")");
+    }
+    console.write_output_line(line.as_str());
+
+    report_hub_ports(console, &hub);
+}
+
+/// `USB_HOST_PLAN.md` Stage 4-3: power the hub's ports, list what each one
+/// reports, then reset the one port that is going to be used and show the
+/// speed it came up at.
+fn report_hub_ports(console: &mut Console, hub: &usb::Hub) {
+    let mut line = Line::new();
+    line.push_str("powering ports (power-good wait ");
+    line.push_u32(hub.descriptor.power_on_to_power_good_ms as u32);
+    line.push_str("ms)...");
+    console.write_output_line(line.as_str());
+    if !hub.power_on_all_ports() {
+        console.write_output_line("PORT_POWER failed, see UART log");
+        // One more request tells apart "that request hung" from "the hub
+        // is gone", which point at completely different causes.
+        console.write_output_line(if hub.status().is_some() {
+            "hub still answers GET_STATUS: it is alive, PORT_POWER itself failed"
+        } else {
+            "hub no longer answers GET_STATUS: it dropped off the bus entirely"
+        });
+        return;
+    }
+
+    for port in 1..=hub.port_count() {
+        // One failure means the hub itself went away, so stop instead of
+        // spending a control-transfer timeout on each remaining port.
+        let Some(status) = hub.port_status(port) else {
+            let mut line = Line::new();
+            line.push_str("port ");
+            line.push_u32(port as u32);
+            line.push_str(": GET_PORT_STATUS failed, see UART log");
+            console.write_output_line(line.as_str());
+            return;
+        };
+        console.write_output_line(port_status_text(port, &status).as_str());
+    }
+
+    let Some(port) = hub.find_connected_port() else {
+        console.write_output_line("no usable device on any hub port; see UART log");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("resetting port ");
+    line.push_u32(port as u32);
+    line.push_str("...");
+    console.write_output_line(line.as_str());
+
+    let Some(status) = hub.reset_port(port) else {
+        console.write_output_line("port reset failed or the port is unusable, see UART log");
+        if let Some(status) = hub.port_status(port) {
+            console.write_output_line(port_status_text(port, &status).as_str());
+        }
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("port ");
+    line.push_u32(port as u32);
+    line.push_str(" enabled after reset, device speed: ");
+    line.push_str(speed_text(status.speed()));
+    console.write_output_line(line.as_str());
+    console.write_output_line(port_status_text(port, &status).as_str());
+
+    report_downstream_device(console, hub, port, status.speed());
+}
+
+/// `USB_HOST_PLAN.md` Stage 4-4: enumerate the device sitting on the hub
+/// port that was just reset. It gets its own address, and the speed the
+/// hub reported for it rather than the bus's.
+fn report_downstream_device(console: &mut Console, hub: &usb::Hub, port: u8, speed: usb::Speed) {
+    console.write_output_line("enumerating device behind the hub (address 2)...");
+    let Some(device) = usb::enumerate_device(usb::DOWNSTREAM_DEVICE_ADDRESS, speed == usb::Speed::Low)
+    else {
+        console.write_output_line("enumeration failed, see UART log");
+        // The hub's own view of the port says whether the failure was on
+        // our side of it or the device's: a port the hub has since
+        // disabled (or flagged over-current) means it saw something wrong
+        // on the wire, while a port still connected and enabled means the
+        // transactions simply never got a usable answer.
+        if let Some(status) = hub.port_status(port) {
+            console.write_output_line(port_status_text(port, &status).as_str());
+        }
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("VID:PID = 0x");
+    line.push_hex(device.vendor_id as u32, 4);
+    line.push_str(":0x");
+    line.push_hex(device.product_id as u32, 4);
+    line.push_str("  EP0 MPS: ");
+    line.push_u32(device.max_packet_size0 as u32);
+    line.push_str("  class ");
+    line.push_hex(device.device_class as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_subclass as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_protocol as u32, 2);
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("interfaces: ");
+    line.push_u32(device.num_interfaces as u32);
+    line.push_str("  config bytes: ");
+    line.push_u32(device.config_total_length as u32);
+    console.write_output_line(line.as_str());
+
+    match usb::find_hid_keyboard(device.config_bytes()) {
+        Some(hid) => {
+            let mut line = Line::new();
+            line.push_str("HID Boot keyboard: interface ");
+            line.push_u32(hid.interface_number as u32);
+            line.push_str(", EP 0x");
+            line.push_hex(hid.endpoint_address as u32, 2);
+            line.push_str(", MPS ");
+            line.push_u32(hid.max_packet_size as u32);
+            console.write_output_line(line.as_str());
+        }
+        None => console.write_output_line("no HID Boot keyboard interface found"),
+    }
+}
+
+fn port_status_text(port: u8, status: &usb::PortStatus) -> Line {
+    let mut line = Line::new();
+    line.push_str("port ");
+    line.push_u32(port as u32);
+    line.push_str(": ");
+    line.push_str(if status.connected() { "conn " } else { "---- " });
+    line.push_str(if status.powered() { "pwr " } else { "--- " });
+    line.push_str(if status.enabled() { "ena " } else { "--- " });
+    line.push_str(if status.suspended() { "susp " } else { "" });
+    line.push_str(if status.in_reset() { "rst " } else { "" });
+    line.push_str(if status.over_current() { "OVERCURRENT " } else { "" });
+    if status.connected() {
+        line.push_str(speed_text(status.speed()));
+        line.push_str(" ");
+    }
+    line.push_str("st=0x");
+    line.push_hex(status.status as u32, 4);
+    line.push_str(" chg=0x");
+    line.push_hex(status.change as u32, 4);
+    line
 }
 
 fn cmd_usbvbus(console: &mut Console, argument: &[u8]) {
