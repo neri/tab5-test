@@ -482,5 +482,12 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
   これに対しては、連続したUSBトランザクションエラーを検出すると自動的に
   再列挙して数秒で復帰する自己回復（`needs_reinit`）を実装済みですが、
   この自己回復自体の実機確認はまだです。文字列記述子（製品名）取得、
-  periodic scheduler基盤の実装、HIDマウス・USB Mass Storage・複数デバイスは
-  未実装です（`USB_HOST_PLAN.md`の「将来検討」）。
+  periodic scheduler基盤の実装、HIDマウス・複数デバイスは未実装です
+  （`USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
+  [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)のStage 1〜6（Bulk-Only Transport
+  でのSCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)、
+  SDカードとのMBRパース共通化（`src/mbr.rs`）、`usbmsc`/`usbread`/
+  `usbmbr`コマンド）まで実機確認済みです。**USBハブ経由のMSC接続は
+  意図的に未実装のまま**（`usbmsc`/`usbread`/`usbmbr`はUSB-A直結
+  デバイスのみが対象）です。書き込み（WRITE(10)）、FAT/exFAT
+  ファイルシステムの解釈も未実装です。

@@ -3,6 +3,7 @@
 use core::cell::UnsafeCell;
 
 use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, HEIGHT, WHITE, WIDTH};
+use crate::uart;
 
 const DEFAULT_HEADER_COLOR: u16 = GREEN;
 
@@ -421,7 +422,18 @@ impl Console {
     /// current (assumed blank) row, wrapping at the row width, and always
     /// leaves the console on a fresh blank row afterward -- ready for
     /// either the next output line or `write_prompt`.
+    ///
+    /// Every line is also mirrored to the UART log. This is the single
+    /// funnel for all shell command output, so mirroring here (rather than
+    /// at each of `shell.rs`'s call sites) means hardware bring-up results
+    /// can be read off the serial log instead of squinting at the panel
+    /// and retyping them -- which is how every other module in this
+    /// project already reports itself. Unlike the panel, the UART gets the
+    /// line unwrapped and in full.
     pub fn write_output_line(&mut self, text: &str) {
+        uart::log(text.as_bytes());
+        uart::log(b"\r\n");
+
         self.column = 0;
         for ch in text.chars() {
             let ch = if (' '..='~').contains(&ch) { ch } else { ' ' };

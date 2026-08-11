@@ -12,6 +12,9 @@
 //!   `USB_HOST_PLAN.md` Stage 3 milestone.
 //! - `hub`: the USB hub class driver, a sibling of `hid_keyboard` on top
 //!   of the same two layers.
+//! - `msc`: the USB Mass Storage (Bulk-Only Transport) class driver, another
+//!   sibling of `hid_keyboard`/`hub`. `USB_MSC_PLAN.md` Stage 1 only --
+//!   interface/endpoint discovery, no Bulk I/O yet.
 //!
 //! `connect_keyboard` below is the one place that combines all four, since
 //! deciding *what is plugged in* is not any single layer's job.
@@ -19,15 +22,18 @@
 //! Staged per `USB_HOST_PLAN.md`: `hcd::probe_port` is Stage 1,
 //! `protocol::enumerate_device` is Stage 2, `hid_keyboard::UsbKeyboard` is
 //! Stage 3, and `hub::Hub` (plus `hcd::FORCE_FS_LS_ONLY_HOST`) is Stage 4.
+//! `msc` follows a separate plan, `USB_MSC_PLAN.md`.
 
 mod hcd;
 mod hid_keyboard;
 mod hub;
+mod msc;
 mod protocol;
 
 pub use hcd::{FORCE_FS_LS_ONLY_HOST, Speed, probe_port, set_vbus_bit};
 pub use hid_keyboard::{UsbKeyboard, find_hid_keyboard};
 pub use hub::{Hub, OverCurrentProtection, PortStatus, PowerSwitching};
+pub use msc::{UsbMassStorage, find_msc_interface};
 pub use protocol::{DOWNSTREAM_DEVICE_ADDRESS, ROOT_DEVICE_ADDRESS, enumerate_device};
 
 use crate::uart;

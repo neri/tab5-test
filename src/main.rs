@@ -17,6 +17,7 @@ mod gpio;
 mod i2c;
 mod interrupts;
 mod lcd;
+mod mbr;
 mod paint;
 mod psram;
 mod sdmmc;

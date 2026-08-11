@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::console::Console;
 use crate::framebuffer::{BLUE, CYAN, GREEN, MAGENTA, RED, WHITE, YELLOW};
-use crate::{interrupts, lcd, psram, sdmmc, startup, uart, usb};
+use crate::{interrupts, lcd, mbr, psram, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 const FRAMES_PER_SECOND: u32 = 57;
@@ -108,6 +108,24 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "then reset the first occupied one and enumerate what is on it",
         ],
     },
+    HelpEntry {
+        name: "usbmsc",
+        usage: "usbmsc",
+        lines: &[
+            "bring up USB-A, enumerate the attached Mass Storage (Bulk-Only",
+            "Transport) device: SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10)",
+        ],
+    },
+    HelpEntry {
+        name: "usbread",
+        usage: "usbread <lba>",
+        lines: &["USB MSC: read one 512-byte block (SCSI READ(10)), dump to UART log"],
+    },
+    HelpEntry {
+        name: "usbmbr",
+        usage: "usbmbr",
+        lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
+    },
     HelpEntry { name: "reboot", usage: "reboot", lines: &["restart the board"] },
 ];
 
@@ -159,6 +177,9 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"usbinfo" => cmd_usbinfo(console),
         b"usbvbus" => cmd_usbvbus(console, argument),
         b"usbhub" => cmd_usbhub(console),
+        b"usbmsc" => cmd_usbmsc(console),
+        b"usbread" => cmd_usbread(console, argument),
+        b"usbmbr" => cmd_usbmbr(console),
         b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
@@ -515,10 +536,10 @@ fn cmd_sdzero(console: &mut Console, argument: &[u8]) {
     console.write_output_line("block zeroed");
 }
 
-/// Classic MBR layout: 4 fixed 16-byte partition entries at offset 446,
-/// each `[boot flag, 3 CHS bytes, type, 3 CHS bytes, start LBA (u32 LE),
-/// sector count (u32 LE)]`, followed by the `55 AA` signature at 510-511.
-/// Does not look past the MBR itself -- no GPT, no filesystem parsing.
+/// Reads LBA 0 from the SD card and hands it to `mbr::show` -- the
+/// device-specific half of the SD/USB split described in
+/// `USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
+/// knows nothing about SD.
 fn cmd_sdmbr(console: &mut Console) {
     console.write_output_line("activating SD card...");
     let Some(card) = sdmmc::init() else {
@@ -526,71 +547,12 @@ fn cmd_sdmbr(console: &mut Console) {
         return;
     };
 
-    let mut mbr = [0u8; 512];
-    if !sdmmc::read_block(&card, 0, &mut mbr) {
+    let mut sector = [0u8; 512];
+    if !sdmmc::read_block(&card, 0, &mut sector) {
         console.write_output_line("MBR read failed, see UART log");
         return;
     }
-
-    if mbr[510] != 0x55 || mbr[511] != 0xAA {
-        console.write_output_line("no 55 AA boot signature at LBA 0; not a valid MBR");
-        return;
-    }
-
-    let mut any_entry = false;
-    for entry in 0..4usize {
-        let offset = 446 + entry * 16;
-        let partition_type = mbr[offset + 4];
-        if partition_type == 0 {
-            continue;
-        }
-        any_entry = true;
-        let boot = mbr[offset];
-        let start_lba = u32::from_le_bytes(mbr[offset + 8..offset + 12].try_into().unwrap());
-        let sectors = u32::from_le_bytes(mbr[offset + 12..offset + 16].try_into().unwrap());
-        let size_mib = (sectors as u64) * 512 / (1024 * 1024);
-
-        let mut line = Line::new();
-        line.push_str("#");
-        line.push_u32((entry + 1) as u32);
-        line.push_str(if boot == 0x80 { " * type 0x" } else { "   type 0x" });
-        line.push_hex(partition_type as u32, 2);
-        line.push_str(" ");
-        line.push_str(partition_type_name(partition_type));
-        console.write_output_line(line.as_str());
-
-        let mut line = Line::new();
-        line.push_str("   start LBA ");
-        line.push_u32(start_lba);
-        line.push_str(", ");
-        line.push_u32(size_mib as u32);
-        line.push_str(" MiB");
-        console.write_output_line(line.as_str());
-
-        if partition_type == 0xEE {
-            console.write_output_line("   (GPT protective MBR; GPT itself not parsed)");
-        }
-    }
-
-    if !any_entry {
-        console.write_output_line("no partition entries (all empty)");
-    }
-}
-
-/// Short names for common partition type bytes; not exhaustive.
-fn partition_type_name(partition_type: u8) -> &'static str {
-    match partition_type {
-        0x01 => "FAT12",
-        0x04 | 0x06 | 0x0E => "FAT16",
-        0x0B | 0x0C => "FAT32",
-        0x05 | 0x0F => "Extended",
-        0x07 => "NTFS/exFAT",
-        0x82 => "Linux swap",
-        0x83 => "Linux",
-        0xEE => "GPT protective",
-        0xEF => "EFI System",
-        _ => "unknown",
-    }
+    mbr::show(console, &sector);
 }
 
 /// Reads the same blocks twice -- once into a stack (internal SRAM) buffer,
@@ -780,6 +742,207 @@ fn cmd_usbinfo(console: &mut Console) {
         }
         None => console.write_output_line("no HID Boot keyboard interface found"),
     }
+}
+
+/// `USB_MSC_PLAN.md` Stage 1: enumerate the device plugged directly into
+/// USB-A and report its Bulk-Only Transport Mass Storage interface, if any
+/// (Bulk IN/OUT endpoint addresses and max packet sizes). Does not issue any
+/// Bulk transfers -- that starts at Stage 2.
+fn cmd_usbmsc(console: &mut Console) {
+    if !report_host_port(console) {
+        return;
+    }
+
+    console.write_output_line("enumerating device (control transfers)...");
+    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
+        console.write_output_line("enumeration failed, see UART log");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("VID:PID = 0x");
+    line.push_hex(device.vendor_id as u32, 4);
+    line.push_str(":0x");
+    line.push_hex(device.product_id as u32, 4);
+    line.push_str("  class ");
+    line.push_hex(device.device_class as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_subclass as u32, 2);
+    line.push_str("/");
+    line.push_hex(device.device_protocol as u32, 2);
+    console.write_output_line(line.as_str());
+
+    let Some(msc) = usb::find_msc_interface(device.config_bytes()) else {
+        console.write_output_line("no Mass Storage (Bulk-Only Transport) interface found");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("MSC (BOT) interface ");
+    line.push_u32(msc.interface_number as u32);
+    line.push_str(": bulk IN 0x");
+    line.push_hex(msc.bulk_in_endpoint as u32, 2);
+    line.push_str(" (MPS ");
+    line.push_u32(msc.bulk_in_mps as u32);
+    line.push_str("), bulk OUT 0x");
+    line.push_hex(msc.bulk_out_endpoint as u32, 2);
+    line.push_str(" (MPS ");
+    line.push_u32(msc.bulk_out_mps as u32);
+    line.push_str(")");
+    console.write_output_line(line.as_str());
+
+    console.write_output_line("configuring device and sending SCSI INQUIRY (bulk transfers)...");
+    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
+        console.write_output_line("SET_CONFIGURATION failed, see UART log");
+        return;
+    };
+    let Some(inquiry) = mass_storage.inquiry() else {
+        console.write_output_line("INQUIRY failed, see UART log");
+        return;
+    };
+
+    // Standard INQUIRY data (SPC): Vendor Identification is bytes 8-15,
+    // Product Identification is bytes 16-31, Product Revision Level is
+    // bytes 32-35 -- fixed offsets, same spirit as `cmd_sdmbr`'s fixed MBR
+    // offsets.
+    let mut line = Line::new();
+    line.push_str("Vendor: ");
+    line.push_ascii(&inquiry[8..16]);
+    line.push_str("  Product: ");
+    line.push_ascii(&inquiry[16..32]);
+    line.push_str("  Rev: ");
+    line.push_ascii(&inquiry[32..36]);
+    console.write_output_line(line.as_str());
+
+    console.write_output_line("checking media (TEST UNIT READY)...");
+    match mass_storage.test_unit_ready() {
+        Some(true) => console.write_output_line("media ready"),
+        Some(false) => {
+            console.write_output_line("media not ready");
+            if let Some(sense) = mass_storage.request_sense() {
+                let mut line = Line::new();
+                line.push_str("sense key: 0x");
+                line.push_hex((sense[2] & 0x0F) as u32, 1);
+                console.write_output_line(line.as_str());
+            } else {
+                console.write_output_line("REQUEST SENSE failed, see UART log");
+            }
+        }
+        None => {
+            console.write_output_line("TEST UNIT READY command failed, see UART log");
+            return;
+        }
+    }
+
+    console.write_output_line("reading capacity (READ CAPACITY(10))...");
+    let Some(capacity) = mass_storage.read_capacity() else {
+        console.write_output_line("READ CAPACITY(10) failed, see UART log");
+        return;
+    };
+    let block_count = capacity.last_lba as u64 + 1;
+    let total_mib = block_count * capacity.block_length as u64 / (1024 * 1024);
+
+    let mut line = Line::new();
+    line.push_str("capacity: ");
+    line.push_u32(block_count as u32);
+    line.push_str(" blocks x ");
+    line.push_u32(capacity.block_length);
+    line.push_str(" bytes = ");
+    line.push_u32(total_mib as u32);
+    line.push_str(" MiB");
+    console.write_output_line(line.as_str());
+}
+
+/// `USB_MSC_PLAN.md` Stage 5: read one 512-byte block via SCSI READ(10) and
+/// dump it, mirroring `cmd_sdread`'s shape (and reusing `sdmmc::dump_block`
+/// for the UART hex dump -- the dump format itself has nothing SD-specific
+/// about it).
+fn cmd_usbread(console: &mut Console, argument: &[u8]) {
+    let Some(lba) = parse_u32(argument) else {
+        console.write_output_line("usage: usbread <lba>");
+        return;
+    };
+
+    if !report_host_port(console) {
+        return;
+    }
+    console.write_output_line("enumerating device (control transfers)...");
+    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
+        console.write_output_line("enumeration failed, see UART log");
+        return;
+    };
+    console.write_output_line("configuring device (bulk transfers)...");
+    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
+        console.write_output_line("not a Mass Storage device, or SET_CONFIGURATION failed");
+        return;
+    };
+
+    // Some drives are not immediately ready to service a data-phase Bulk
+    // command right after SET_CONFIGURATION; skipping this made an
+    // immediate `usbread` unreliable on real hardware (see
+    // `UsbMassStorage::wait_until_ready`'s doc comment).
+    console.write_output_line("waiting for media ready (TEST UNIT READY)...");
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line("media not ready after retries, attempting read anyway");
+    }
+
+    let mut buffer = [0u8; 512];
+    if !mass_storage.read_blocks(lba, &mut buffer) {
+        console.write_output_line("block read failed, see UART log");
+        return;
+    }
+    sdmmc::dump_block(&buffer);
+
+    let mut line = Line::new();
+    line.push_str("read LBA ");
+    line.push_u32(lba);
+    line.push_str(": ");
+    for &byte in &buffer[..8] {
+        line.push_hex(byte as u32, 2);
+        line.push_str(" ");
+    }
+    line.push_str("...");
+    console.write_output_line(line.as_str());
+
+    let boot_signature = buffer[510] == 0x55 && buffer[511] == 0xAA;
+    console.write_output_line(if boot_signature {
+        "bytes 510-511 = 55 AA (MBR/boot-sector signature)"
+    } else {
+        "no 55 AA signature at bytes 510-511"
+    });
+    console.write_output_line("full 512-byte hex dump: see UART log");
+}
+
+/// `USB_MSC_PLAN.md` Stage 6 (this plan's goal): reads LBA 0 from the USB
+/// Mass Storage device and hands it to the same `mbr::show` that `cmd_sdmbr`
+/// uses, so the two commands print partition tables in an identical format
+/// despite reading them through entirely different block-I/O stacks.
+fn cmd_usbmbr(console: &mut Console) {
+    if !report_host_port(console) {
+        return;
+    }
+    console.write_output_line("enumerating device (control transfers)...");
+    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
+        console.write_output_line("enumeration failed, see UART log");
+        return;
+    };
+    console.write_output_line("configuring device (bulk transfers)...");
+    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
+        console.write_output_line("not a Mass Storage device, or SET_CONFIGURATION failed");
+        return;
+    };
+
+    console.write_output_line("waiting for media ready (TEST UNIT READY)...");
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line("media not ready after retries, attempting read anyway");
+    }
+
+    let mut sector = [0u8; 512];
+    if !mass_storage.read_blocks(0, &mut sector) {
+        console.write_output_line("MBR read failed, see UART log");
+        return;
+    }
+    mbr::show(console, &sector);
 }
 
 /// `USB_HOST_PLAN.md` Stage 4-2: enumerate an attached hub and dump its
@@ -1136,20 +1299,24 @@ fn as_str(bytes: &[u8]) -> &str {
 /// Small stack-allocated line builder: this crate has no allocator and
 /// deliberately avoids `core::fmt`, so command output is assembled a few
 /// bytes at a time instead.
-struct Line {
+/// Fixed-buffer ASCII line builder shared by every command's output
+/// formatting -- `pub(crate)` (rather than local to `shell.rs`) so
+/// `mbr.rs` can format its own output lines the same way, without either
+/// module owning the other's display concerns.
+pub(crate) struct Line {
     buffer: [u8; 80],
     len: usize,
 }
 
 impl Line {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buffer: [0; 80],
             len: 0,
         }
     }
 
-    fn push_str(&mut self, text: &str) {
+    pub(crate) fn push_str(&mut self, text: &str) {
         for byte in text.bytes() {
             if self.len < self.buffer.len() {
                 self.buffer[self.len] = byte;
@@ -1158,7 +1325,7 @@ impl Line {
         }
     }
 
-    fn push_u32(&mut self, value: u32) {
+    pub(crate) fn push_u32(&mut self, value: u32) {
         if value == 0 {
             self.push_str("0");
             return;
@@ -1179,7 +1346,21 @@ impl Line {
         }
     }
 
-    fn push_hex(&mut self, value: u32, digits: u32) {
+    /// Pushes raw bytes as ASCII, substituting `.` for anything outside
+    /// printable-graphic-or-space -- mirrors `sdmmc::dump_block_at`'s ASCII
+    /// column. Used for SCSI INQUIRY vendor/product/revision fields, which
+    /// are device-supplied and not guaranteed clean.
+    pub(crate) fn push_ascii(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            let ch = if byte.is_ascii_graphic() || byte == b' ' { byte } else { b'.' };
+            if self.len < self.buffer.len() {
+                self.buffer[self.len] = ch;
+                self.len += 1;
+            }
+        }
+    }
+
+    pub(crate) fn push_hex(&mut self, value: u32, digits: u32) {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         for index in 0..digits {
             let nibble = (value >> (4 * (digits - 1 - index))) & 0xF;
@@ -1192,7 +1373,7 @@ impl Line {
 
     /// All bytes ever written come from ASCII literals or the digit/hex
     /// tables above, so this is always valid UTF-8.
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buffer[..self.len]).unwrap_or("")
     }
 }
