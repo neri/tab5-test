@@ -362,6 +362,7 @@ pub enum Speed {
     Unknown,
 }
 
+#[derive(Clone, Copy)]
 pub struct HostPort {
     pub vbus_enable_acked: bool,
     pub core_alive: bool,

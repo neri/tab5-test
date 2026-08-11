@@ -24,11 +24,19 @@ pub const REQUEST_SET_CONFIGURATION: u8 = 0x09;
 /// Address given to whatever is plugged into USB-A itself: a keyboard, or
 /// the hub everything else hangs off.
 pub const ROOT_DEVICE_ADDRESS: u8 = 1;
-/// Address given to the one device behind the hub. Two fixed slots are
-/// enough for `USB_HOST_PLAN.md` Stage 4 (one hub, one downstream port);
-/// a real address pool only becomes worthwhile with several ports in use
-/// at once.
-pub const DOWNSTREAM_DEVICE_ADDRESS: u8 = 2;
+
+/// Address given to the device behind a specific hub port (1-based).
+///
+/// A real free-list address pool is not worth it here: a device's hub port
+/// number is already a stable, unique identifier for as long as it stays
+/// plugged in (`usb::registry::UsbHost` re-derives every address from
+/// scratch on every rescan anyway, so there is no "free and reuse" case to
+/// get wrong). `usb::registry::MAX_HUB_PORTS` bounds how many of these are
+/// ever handed out, so the resulting addresses (2..=that+1) stay well
+/// inside the 7-bit USB address space.
+pub fn downstream_address(port: u8) -> u8 {
+    ROOT_DEVICE_ADDRESS + port
+}
 
 /// A device's default control pipe (endpoint 0). Bundled because every
 /// control transfer needs all three parts, and after `enumerate_device`
@@ -78,7 +86,6 @@ pub struct EnumeratedDevice {
     pub device_class: u8,
     pub device_subclass: u8,
     pub device_protocol: u8,
-    pub num_configurations: u8,
     pub config_total_length: u16,
     pub num_interfaces: u8,
     pub configuration_value: u8,
@@ -192,7 +199,6 @@ pub fn enumerate_device(address: u8, low_speed_via_hub: bool) -> Option<Enumerat
         device_class: device_descriptor[4],
         device_subclass: device_descriptor[5],
         device_protocol: device_descriptor[6],
-        num_configurations: device_descriptor[17],
         config_total_length: total_length as u16,
         num_interfaces: config_header[4],
         configuration_value: config_header[5],

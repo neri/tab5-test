@@ -2,12 +2,14 @@
 //! control transfers -- the hub-side counterpart to `hid_keyboard.rs`, and
 //! the only module that knows what a downstream port is.
 //!
-//! This is Stage 4 of `USB_HOST_PLAN.md`. The hub is reached at Full-Speed
-//! (`hcd::FORCE_FS_LS_ONLY_HOST` keeps the whole bus there) so that
-//! devices behind it need no split transactions; nothing in this file
-//! depends on that choice, since hub port management is identical at every
-//! speed. Only one downstream port is driven at a time, and hubs behind
-//! hubs are out of scope.
+//! This is Stage 4 of `USB_HOST_PLAN.md`, generalized to every port by
+//! `USB_REFACTOR_PLAN.md` Stage C: `usb::registry::UsbHost` walks every
+//! port with `debounce_connected_port`/`reset_port` rather than driving
+//! just one. The hub is reached at Full-Speed (`hcd::FORCE_FS_LS_ONLY_HOST`
+//! keeps the whole bus there) so that devices behind it need no split
+//! transactions; nothing in this file depends on that choice, since hub
+//! port management is identical at every speed. Hubs behind hubs are still
+//! out of scope.
 
 use super::hcd::Speed;
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
@@ -60,11 +62,6 @@ const PORT_POWER_INTERVAL_MS: u32 = 20;
 /// (ESP-IDF's default) and there is no reason for a hub port to be less
 /// tolerant.
 const PORT_DEBOUNCE_MS: u32 = 250;
-/// How long to keep looking for a device after powering the ports, so a
-/// slow-to-appear connection is not missed. Matches `hcd::wait_for_connect`'s
-/// ~500ms on the root port; as there, the expectation is that the device is
-/// already plugged in when the command runs.
-const PORT_CONNECT_TIMEOUT_MS: u32 = 500;
 /// The hub drives reset for 10-20ms on its own and then sets
 /// `C_PORT_RESET`; this only bounds how long to wait for that.
 const PORT_RESET_TIMEOUT_MS: u32 = 500;
@@ -375,70 +372,32 @@ impl Hub {
         true
     }
 
-    /// Picks a port to work with: the first one reporting a device, with
-    /// removable ports preferred over permanently attached ones, then
-    /// debounces it.
+    /// Checks one port for a connected device and, if there is one, lets it
+    /// settle before confirming it is still there -- the per-port building
+    /// block `usb::registry::UsbHost` uses to attach every occupied port
+    /// instead of picking a single one (`USB_REFACTOR_PLAN.md` Stage C).
     ///
-    /// The preference matters on compound devices (the hub on hand is one,
-    /// with a permanently attached function on its last port): scanning in
-    /// plain port order would keep selecting that built-in function
-    /// instead of whatever was just plugged in. Ports are assumed to be
-    /// powered already (`power_on_all_ports`).
+    /// Returns `Some(true)` if a device is connected and stayed connected
+    /// through debounce, `Some(false)` if the port is simply empty (no
+    /// debounce wait spent), and `None` if the hub itself stopped
+    /// answering -- which the caller should treat as "stop scanning
+    /// further ports", not "keep trying this one", the same way
+    /// `port_status`'s other callers already do.
     ///
-    /// Only one port is used at a time, per `USB_HOST_PLAN.md` Stage 4.
-    pub fn find_connected_port(&self) -> Option<u8> {
-        let mut waited_ms = 0;
-        loop {
-            // A permanently attached port is only taken once every port
-            // has been looked at, so a removable one anywhere on the hub
-            // wins over a built-in function on a lower port number.
-            let mut permanently_attached = None;
-            for port in 1..=self.descriptor.port_count {
-                // A failed read is the hub not answering at all, not "no
-                // device here yet": retrying would spend a full control
-                // transfer timeout per port per round until the wait
-                // expires. Give up immediately and let the caller report
-                // it.
-                let status = self.port_status(port)?;
-                if !status.connected() {
-                    continue;
-                }
-                if self.descriptor.port_is_removable(port) {
-                    return self.debounce_port(port);
-                }
-                if permanently_attached.is_none() {
-                    permanently_attached = Some(port);
-                }
-            }
-            if let Some(port) = permanently_attached {
-                uart::log_hex(
-                    b"USB: only a permanently attached device found, using hub port ",
-                    port as u32,
-                );
-                return self.debounce_port(port);
-            }
-
-            if waited_ms >= PORT_CONNECT_TIMEOUT_MS {
-                return None;
-            }
-            delay_ms(PORT_STATUS_POLL_INTERVAL_MS);
-            waited_ms += PORT_STATUS_POLL_INTERVAL_MS;
+    /// Ports are assumed to be powered already (`power_on_all_ports`).
+    pub fn debounce_connected_port(&self, port: u8) -> Option<bool> {
+        if !self.port_status(port)?.connected() {
+            return Some(false);
         }
-    }
-
-    /// Lets a fresh connection settle, then confirms it is still there and
-    /// clears the connect-change bit so a later `port_status` reports the
-    /// steady state rather than the insertion event. Mirrors
-    /// `hcd::probe_port`'s debounce (including its "bounced away" case) on
-    /// the root port.
-    fn debounce_port(&self, port: u8) -> Option<u8> {
+        // Mirrors `hcd::probe_port`'s debounce (including its "bounced
+        // away" case) on the root port.
         delay_ms(PORT_DEBOUNCE_MS);
         if !self.port_status(port)?.connected() {
-            uart::log(b"USB: hub port connection bounced away during debounce\r\n");
-            return None;
+            uart::log_hex(b"USB: hub port connection bounced away during debounce, port ", port as u32);
+            return Some(false);
         }
         self.clear_port_feature(port, FEATURE_C_PORT_CONNECTION);
-        Some(port)
+        Some(true)
     }
 
     /// Resets one port and reports the status it came up with, which is

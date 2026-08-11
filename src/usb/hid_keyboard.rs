@@ -54,7 +54,6 @@ pub struct HidKeyboardInterface {
     pub interface_number: u8,
     pub endpoint_address: u8,
     pub max_packet_size: u16,
-    pub interval: u8,
 }
 
 /// Walks a configuration descriptor's interface/endpoint chain (see
@@ -105,7 +104,6 @@ pub fn find_hid_keyboard(config: &[u8]) -> Option<HidKeyboardInterface> {
                                     config[endpoint_offset + 4],
                                     config[endpoint_offset + 5],
                                 ]),
-                                interval: config[endpoint_offset + 6],
                             });
                         }
                     }
@@ -195,33 +193,24 @@ impl UsbKeyboard {
         })
     }
 
-    /// Cheap liveness check (one HPRT read, no transaction): lets
-    /// `lcd.rs` notice a physical unplug and fall back to `None` the same
-    /// way a `CardKb` bus failure does, without waiting for a poll to
-    /// time out first.
-    ///
-    /// This is the *root* port, so for a keyboard behind a hub it reports
-    /// whether the hub is still plugged into USB-A, not whether the
-    /// keyboard is still in its hub port. Unplugging from a hub port
-    /// surfaces through `needs_reinit` instead, once polling starts
-    /// erroring -- asking the hub would cost a control transfer per frame.
-    pub fn is_connected(&self) -> bool {
-        hcd::port_connected()
-    }
-
     /// True once polling has failed for long enough that the session
     /// itself -- not just "no key pressed yet" -- is almost certainly
     /// stale and worth re-enumerating from scratch.
     ///
-    /// The device stays physically connected (`is_connected` alone would
-    /// not notice) but this handle's cached address/configuration can be
-    /// invalidated out from under it: anything that runs `hcd::probe_port`
-    /// directly (`usbinfo`, `usbvbus`, or another `UsbKeyboard::init`)
-    /// does a full core soft reset and bus reset, which drops the device
-    /// back to its unaddressed default state. `lcd.rs` checks this
-    /// alongside `is_connected` and re-runs `UsbKeyboard::init` once it's
-    /// true, which re-enumerates the (still physically present) device
-    /// and recovers within a few seconds.
+    /// A physical unplug is caught separately and more cheaply, at the
+    /// registry level: `usb::registry::UsbHost::root_disconnected` reads
+    /// the root port's connect bit once for the whole bus rather than
+    /// asking each keyboard individually (and, for a keyboard behind a
+    /// hub, that root-port bit does not even reflect *this* device's own
+    /// hub port). What `needs_reinit` catches instead is this handle's
+    /// cached address/configuration going stale while the device is still
+    /// physically present -- normally only `UsbHost::rescan` can cause
+    /// that now (`USB_REFACTOR_PLAN.md` Stage A made it the sole owner of
+    /// `hcd::probe_port`), so in practice this now means a genuine
+    /// transaction error rather than another command resetting the bus
+    /// out from under an active session. `lcd.rs` checks this and calls
+    /// `UsbHost::rescan` once it's true, which re-enumerates every still
+    /// physically present device and recovers within a few frames.
     pub fn needs_reinit(&self) -> bool {
         self.consecutive_hard_errors >= POLL_FAILURE_GIVE_UP_THRESHOLD
     }

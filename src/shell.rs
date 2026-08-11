@@ -88,8 +88,16 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "usbinfo",
         usage: "usbinfo",
         lines: &[
-            "bring up USB-A, enumerate the attached device (VID/PID,",
-            "HID Boot keyboard interface if found); plug in a device first",
+            "show every device currently attached to USB-A (direct or behind",
+            "a hub) from the last scan; run usbrescan first if just plugged in",
+        ],
+    },
+    HelpEntry {
+        name: "usbrescan",
+        usage: "usbrescan",
+        lines: &[
+            "force a fresh USB-A probe: reset the port, re-enumerate whatever",
+            "is plugged in (and every occupied port if it is a hub)",
         ],
     },
     HelpEntry {
@@ -97,23 +105,23 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "usbvbus <0-7> on|off",
         lines: &[
             "raw PI4IOE2 (0x44) output-bit toggle; bit 3 = USB-A VBUS",
-            "mainly useful for diagnostics; usbinfo drives bit 3 itself",
+            "mainly useful for diagnostics; usbrescan drives bit 3 itself",
         ],
     },
     HelpEntry {
         name: "usbhub",
         usage: "usbhub",
         lines: &[
-            "bring up USB-A, enumerate an attached USB hub, power its ports,",
-            "then reset the first occupied one and enumerate what is on it",
+            "show the attached USB hub's descriptor and every port's live",
+            "status, plus which class driver (if any) is attached to it",
         ],
     },
     HelpEntry {
         name: "usbmsc",
         usage: "usbmsc",
         lines: &[
-            "bring up USB-A, enumerate the attached Mass Storage (Bulk-Only",
-            "Transport) device: SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10)",
+            "SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10) against the",
+            "attached Mass Storage device (direct or behind a hub port)",
         ],
     },
     HelpEntry {
@@ -143,7 +151,13 @@ pub enum Outcome {
 
 /// Parses and runs one command line, returning what the caller should do
 /// next.
-pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
+///
+/// `usb_host` is the single registry `lcd.rs`'s frame loop owns
+/// (`USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
+/// devices already in it instead of probing the bus independently, which
+/// is what used to let a diagnostic command reset a live keyboard/Mass
+/// Storage session out from under itself.
+pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
         return Outcome::Continue;
@@ -174,12 +188,13 @@ pub fn execute(console: &mut Console, line: &[u8]) -> Outcome {
         b"sdzero" => cmd_sdzero(console, argument),
         b"sdmbr" => cmd_sdmbr(console),
         b"sdreadpsram" => cmd_sdreadpsram(console, argument),
-        b"usbinfo" => cmd_usbinfo(console),
+        b"usbinfo" => cmd_usbinfo(console, usb_host),
+        b"usbrescan" => cmd_usbrescan(console, usb_host),
         b"usbvbus" => cmd_usbvbus(console, argument),
-        b"usbhub" => cmd_usbhub(console),
-        b"usbmsc" => cmd_usbmsc(console),
-        b"usbread" => cmd_usbread(console, argument),
-        b"usbmbr" => cmd_usbmbr(console),
+        b"usbhub" => cmd_usbhub(console, usb_host),
+        b"usbmsc" => cmd_usbmsc(console, usb_host),
+        b"usbread" => cmd_usbread(console, argument, usb_host),
+        b"usbmbr" => cmd_usbmbr(console, usb_host),
         b"paint" => return Outcome::Paint,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
@@ -623,12 +638,23 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
     sdmmc::dump_block_at((&sram_region[..512]).try_into().unwrap(), 0);
 }
 
-/// Shared front half of `usbinfo` and `usbhub`: runs the full host port
-/// bring-up and reports what came back, returning true only if the port
-/// ended up enabled and ready for control transfers.
-fn report_host_port(console: &mut Console) -> bool {
-    console.write_output_line("probing USB-A host port (USB-DWC HS)...");
-    let port = usb::probe_port();
+/// Shared by every read-only USB command: prints the most recent root-port
+/// probe (`UsbHost::rescan`, which runs automatically at startup and
+/// periodically thereafter -- see `lcd.rs`) instead of running a fresh one
+/// itself. Returns true only if that probe ended up enabled and ready for
+/// control transfers.
+///
+/// This -- together with every other USB command reading or driving
+/// devices already in `usb_host` instead of calling `usb::probe_port`/
+/// `usb::enumerate_device` on its own -- is `USB_REFACTOR_PLAN.md` Stage
+/// A: only `UsbHost::rescan` (via `usbrescan`, or `lcd.rs`'s frame loop)
+/// ever resets the bus, so no USB command can invalidate another device's
+/// live session anymore.
+fn report_last_probe(console: &mut Console, usb_host: &usb::UsbHost) -> bool {
+    let Some(port) = usb_host.last_probe() else {
+        console.write_output_line("USB-A not probed yet; try 'usbrescan'");
+        return false;
+    };
 
     console.write_output_line(if port.vbus_enable_acked {
         "VBUS enable: I2C ok"
@@ -663,7 +689,7 @@ fn report_host_port(console: &mut Console) -> bool {
     });
 
     if !port.connected {
-        console.write_output_line("no device detected (plug in USB-A and retry)");
+        console.write_output_line("no device detected (plug in USB-A and try 'usbrescan')");
         return false;
     }
     console.write_output_line(if port.enabled {
@@ -690,112 +716,99 @@ fn speed_text(speed: usb::Speed) -> &'static str {
     }
 }
 
-fn cmd_usbinfo(console: &mut Console) {
-    if !report_host_port(console) {
+/// Read-only: shows every device the last scan attached, root or hub port
+/// alike. Run `usbrescan` first if something was just plugged in.
+fn cmd_usbinfo(console: &mut Console, usb_host: &usb::UsbHost) {
+    report_usb_state(console, usb_host);
+}
+
+/// Forces a fresh probe (`UsbHost::rescan`: port reset, every address
+/// reassigned) and then shows the same report as `usbinfo`. This is the
+/// only USB shell command that resets the bus -- run it after plugging
+/// something in, not routinely, since it briefly drops whatever else was
+/// already attached and working.
+fn cmd_usbrescan(console: &mut Console, usb_host: &mut usb::UsbHost) {
+    console.write_output_line("probing USB-A host port (USB-DWC HS)...");
+    usb_host.rescan();
+    report_usb_state(console, usb_host);
+}
+
+/// Shared by `usbinfo` and `usbrescan`.
+fn report_usb_state(console: &mut Console, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, usb_host) {
         return;
     }
+    if usb_host.hub().is_some() {
+        console.write_output_line("hub attached; see 'usbhub' for per-port detail");
+    }
 
-    console.write_output_line("enumerating device (control transfers)...");
-    // Nothing plugged into USB-A directly ever needs preambles; see
-    // `usb::connect_keyboard`.
-    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
-        console.write_output_line("enumeration failed, see UART log");
-        return;
-    };
-
-    let mut line = Line::new();
-    line.push_str("VID:PID = 0x");
-    line.push_hex(device.vendor_id as u32, 4);
-    line.push_str(":0x");
-    line.push_hex(device.product_id as u32, 4);
-    line.push_str("  EP0 MPS: ");
-    line.push_u32(device.max_packet_size0 as u32);
-    console.write_output_line(line.as_str());
-
-    let mut line = Line::new();
-    line.push_str("class ");
-    line.push_hex(device.device_class as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_subclass as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_protocol as u32, 2);
-    line.push_str("  configs: ");
-    line.push_u32(device.num_configurations as u32);
-    line.push_str("  interfaces: ");
-    line.push_u32(device.num_interfaces as u32);
-    line.push_str("  config bytes: ");
-    line.push_u32(device.config_total_length as u32);
-    console.write_output_line(line.as_str());
-
-    match usb::find_hid_keyboard(device.config_bytes()) {
-        Some(hid) => {
-            let mut line = Line::new();
-            line.push_str("HID Boot keyboard: interface ");
-            line.push_u32(hid.interface_number as u32);
-            line.push_str(", EP 0x");
-            line.push_hex(hid.endpoint_address as u32, 2);
-            line.push_str(", MPS ");
-            line.push_u32(hid.max_packet_size as u32);
-            line.push_str(", interval ");
-            line.push_u32(hid.interval as u32);
-            console.write_output_line(line.as_str());
-        }
-        None => console.write_output_line("no HID Boot keyboard interface found"),
+    let mut any = false;
+    for device in usb_host.attached_devices() {
+        any = true;
+        console.write_output_line(location_text(device.location).as_str());
+        console.write_output_line(device_summary_text(device.summary).as_str());
+        console.write_output_line(device_kind_text(device.kind).as_str());
+    }
+    if !any {
+        console.write_output_line("no supported device attached (unsupported device, or nothing plugged in)");
     }
 }
 
-/// `USB_MSC_PLAN.md` Stage 1: enumerate the device plugged directly into
-/// USB-A and report its Bulk-Only Transport Mass Storage interface, if any
-/// (Bulk IN/OUT endpoint addresses and max packet sizes). Does not issue any
-/// Bulk transfers -- that starts at Stage 2.
-fn cmd_usbmsc(console: &mut Console) {
-    if !report_host_port(console) {
-        return;
+fn location_text(location: usb::Location) -> Line {
+    let mut line = Line::new();
+    match location {
+        usb::Location::Direct => line.push_str("USB-A direct:"),
+        usb::Location::HubPort(port) => {
+            line.push_str("hub port ");
+            line.push_u32(port as u32);
+            line.push_str(":");
+        }
     }
+    line
+}
 
-    console.write_output_line("enumerating device (control transfers)...");
-    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
-        console.write_output_line("enumeration failed, see UART log");
-        return;
-    };
-
+fn device_summary_text(summary: &usb::DeviceSummary) -> Line {
     let mut line = Line::new();
-    line.push_str("VID:PID = 0x");
-    line.push_hex(device.vendor_id as u32, 4);
+    line.push_str("  VID:PID = 0x");
+    line.push_hex(summary.vendor_id as u32, 4);
     line.push_str(":0x");
-    line.push_hex(device.product_id as u32, 4);
+    line.push_hex(summary.product_id as u32, 4);
     line.push_str("  class ");
-    line.push_hex(device.device_class as u32, 2);
+    line.push_hex(summary.device_class as u32, 2);
     line.push_str("/");
-    line.push_hex(device.device_subclass as u32, 2);
+    line.push_hex(summary.device_subclass as u32, 2);
     line.push_str("/");
-    line.push_hex(device.device_protocol as u32, 2);
-    console.write_output_line(line.as_str());
+    line.push_hex(summary.device_protocol as u32, 2);
+    line.push_str("  interfaces: ");
+    line.push_u32(summary.num_interfaces as u32);
+    line.push_str("  config bytes: ");
+    line.push_u32(summary.config_total_length as u32);
+    line
+}
 
-    let Some(msc) = usb::find_msc_interface(device.config_bytes()) else {
-        console.write_output_line("no Mass Storage (Bulk-Only Transport) interface found");
-        return;
-    };
-
+fn device_kind_text(kind: &usb::DeviceKind) -> Line {
     let mut line = Line::new();
-    line.push_str("MSC (BOT) interface ");
-    line.push_u32(msc.interface_number as u32);
-    line.push_str(": bulk IN 0x");
-    line.push_hex(msc.bulk_in_endpoint as u32, 2);
-    line.push_str(" (MPS ");
-    line.push_u32(msc.bulk_in_mps as u32);
-    line.push_str("), bulk OUT 0x");
-    line.push_hex(msc.bulk_out_endpoint as u32, 2);
-    line.push_str(" (MPS ");
-    line.push_u32(msc.bulk_out_mps as u32);
-    line.push_str(")");
-    console.write_output_line(line.as_str());
+    line.push_str("  driver: ");
+    line.push_str(match kind {
+        usb::DeviceKind::Keyboard(_) => "HID Boot keyboard",
+        usb::DeviceKind::MassStorage(_) => "Mass Storage (Bulk-Only Transport)",
+    });
+    line
+}
 
-    console.write_output_line("configuring device and sending SCSI INQUIRY (bulk transfers)...");
-    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
-        console.write_output_line("SET_CONFIGURATION failed, see UART log");
+/// `USB_MSC_PLAN.md` Stage 1-4, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// runs SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10) against the Mass
+/// Storage device `UsbHost::rescan` already attached, wherever it is --
+/// USB-A directly or a hub port -- instead of enumerating one fresh. See
+/// `usbinfo` for VID/PID and interface identity; if nothing shows up here,
+/// plug a device in and run `usbrescan` first.
+fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
         return;
     };
+
+    console.write_output_line("sending SCSI INQUIRY (bulk transfers)...");
     let Some(inquiry) = mass_storage.inquiry() else {
         console.write_output_line("INQUIRY failed, see UART log");
         return;
@@ -853,27 +866,18 @@ fn cmd_usbmsc(console: &mut Console) {
     console.write_output_line(line.as_str());
 }
 
-/// `USB_MSC_PLAN.md` Stage 5: read one 512-byte block via SCSI READ(10) and
-/// dump it, mirroring `cmd_sdread`'s shape (and reusing `sdmmc::dump_block`
-/// for the UART hex dump -- the dump format itself has nothing SD-specific
-/// about it).
-fn cmd_usbread(console: &mut Console, argument: &[u8]) {
+/// `USB_MSC_PLAN.md` Stage 5, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// read one 512-byte block via SCSI READ(10) from whichever Mass Storage
+/// device `UsbHost::rescan` already attached, and dump it, mirroring
+/// `cmd_sdread`'s shape (and reusing `sdmmc::dump_block` for the UART hex
+/// dump -- the dump format itself has nothing SD-specific about it).
+fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHost) {
     let Some(lba) = parse_u32(argument) else {
         console.write_output_line("usage: usbread <lba>");
         return;
     };
-
-    if !report_host_port(console) {
-        return;
-    }
-    console.write_output_line("enumerating device (control transfers)...");
-    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
-        console.write_output_line("enumeration failed, see UART log");
-        return;
-    };
-    console.write_output_line("configuring device (bulk transfers)...");
-    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
-        console.write_output_line("not a Mass Storage device, or SET_CONFIGURATION failed");
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
         return;
     };
 
@@ -913,22 +917,14 @@ fn cmd_usbread(console: &mut Console, argument: &[u8]) {
     console.write_output_line("full 512-byte hex dump: see UART log");
 }
 
-/// `USB_MSC_PLAN.md` Stage 6 (this plan's goal): reads LBA 0 from the USB
-/// Mass Storage device and hands it to the same `mbr::show` that `cmd_sdmbr`
-/// uses, so the two commands print partition tables in an identical format
-/// despite reading them through entirely different block-I/O stacks.
-fn cmd_usbmbr(console: &mut Console) {
-    if !report_host_port(console) {
-        return;
-    }
-    console.write_output_line("enumerating device (control transfers)...");
-    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
-        console.write_output_line("enumeration failed, see UART log");
-        return;
-    };
-    console.write_output_line("configuring device (bulk transfers)...");
-    let Some(mut mass_storage) = usb::UsbMassStorage::attach(&device) else {
-        console.write_output_line("not a Mass Storage device, or SET_CONFIGURATION failed");
+/// `USB_MSC_PLAN.md` Stage 6, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// reads LBA 0 from whichever Mass Storage device `UsbHost::rescan` already
+/// attached and hands it to the same `mbr::show` that `cmd_sdmbr` uses, so
+/// the two commands print partition tables in an identical format despite
+/// reading them through entirely different block-I/O stacks.
+fn cmd_usbmbr(console: &mut Console, usb_host: &mut usb::UsbHost) {
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
         return;
     };
 
@@ -945,37 +941,23 @@ fn cmd_usbmbr(console: &mut Console) {
     mbr::show(console, &sector);
 }
 
-/// `USB_HOST_PLAN.md` Stage 4-2: enumerate an attached hub and dump its
-/// class descriptor and status. Port power-up and downstream devices are
-/// Stage 4-3 onwards.
-fn cmd_usbhub(console: &mut Console) {
-    if !report_host_port(console) {
+/// `USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `USB_REFACTOR_PLAN.md`
+/// Stage C: reports the hub `UsbHost::rescan` already opened, and every
+/// port's live status alongside which class driver (if any) is attached to
+/// it. `Hub::status`/`Hub::port_status` are plain `GET_STATUS` reads, safe
+/// to run here without disturbing any attached device's address -- unlike
+/// `rescan`, nothing below this command resets the bus.
+fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, usb_host) {
         return;
     }
-
-    console.write_output_line("enumerating hub (control transfers)...");
-    let Some(device) = usb::enumerate_device(usb::ROOT_DEVICE_ADDRESS, false) else {
-        console.write_output_line("enumeration failed, see UART log");
+    let Some(hub) = usb_host.hub() else {
+        console.write_output_line("no hub attached; plug one into USB-A and run 'usbrescan'");
         return;
     };
-
-    let mut line = Line::new();
-    line.push_str("VID:PID = 0x");
-    line.push_hex(device.vendor_id as u32, 4);
-    line.push_str(":0x");
-    line.push_hex(device.product_id as u32, 4);
-    line.push_str("  class ");
-    line.push_hex(device.device_class as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_subclass as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_protocol as u32, 2);
-    console.write_output_line(line.as_str());
-
-    let Some(hub) = usb::Hub::open(&device) else {
-        console.write_output_line("not a hub, or the hub descriptor read failed (see UART log)");
-        return;
-    };
+    if let Some(summary) = usb_host.hub_summary() {
+        console.write_output_line(device_summary_text(summary).as_str());
+    }
     let descriptor = &hub.descriptor;
 
     let mut line = Line::new();
@@ -1046,127 +1028,33 @@ fn cmd_usbhub(console: &mut Console) {
     }
     console.write_output_line(line.as_str());
 
-    report_hub_ports(console, &hub);
-}
-
-/// `USB_HOST_PLAN.md` Stage 4-3: power the hub's ports, list what each one
-/// reports, then reset the one port that is going to be used and show the
-/// speed it came up at.
-fn report_hub_ports(console: &mut Console, hub: &usb::Hub) {
-    let mut line = Line::new();
-    line.push_str("powering ports (power-good wait ");
-    line.push_u32(hub.descriptor.power_on_to_power_good_ms as u32);
-    line.push_str("ms)...");
-    console.write_output_line(line.as_str());
-    if !hub.power_on_all_ports() {
-        console.write_output_line("PORT_POWER failed, see UART log");
-        // One more request tells apart "that request hung" from "the hub
-        // is gone", which point at completely different causes.
-        console.write_output_line(if hub.status().is_some() {
-            "hub still answers GET_STATUS: it is alive, PORT_POWER itself failed"
-        } else {
-            "hub no longer answers GET_STATUS: it dropped off the bus entirely"
-        });
-        return;
-    }
-
-    for port in 1..=hub.port_count() {
-        // One failure means the hub itself went away, so stop instead of
-        // spending a control-transfer timeout on each remaining port.
+    // Live per-port status (safe: a plain GET_STATUS, not a reset) next to
+    // whichever slot `rescan` attached there, if any.
+    for port in 1..=descriptor.port_count.min(usb::MAX_HUB_PORTS) {
         let Some(status) = hub.port_status(port) else {
             let mut line = Line::new();
             line.push_str("port ");
             line.push_u32(port as u32);
             line.push_str(": GET_PORT_STATUS failed, see UART log");
             console.write_output_line(line.as_str());
-            return;
+            break;
         };
-        console.write_output_line(port_status_text(port, &status).as_str());
+        let mut line = port_status_text(port, &status);
+        if let Some(device) = usb_host
+            .attached_devices()
+            .find(|device| device.location == usb::Location::HubPort(port))
+        {
+            line.push_str("  [");
+            line.push_str(match device.kind {
+                usb::DeviceKind::Keyboard(_) => "keyboard",
+                usb::DeviceKind::MassStorage(_) => "mass storage",
+            });
+            line.push_str("]");
+        }
+        console.write_output_line(line.as_str());
     }
-
-    let Some(port) = hub.find_connected_port() else {
-        console.write_output_line("no usable device on any hub port; see UART log");
-        return;
-    };
-
-    let mut line = Line::new();
-    line.push_str("resetting port ");
-    line.push_u32(port as u32);
-    line.push_str("...");
-    console.write_output_line(line.as_str());
-
-    let Some(status) = hub.reset_port(port) else {
-        console.write_output_line("port reset failed or the port is unusable, see UART log");
-        if let Some(status) = hub.port_status(port) {
-            console.write_output_line(port_status_text(port, &status).as_str());
-        }
-        return;
-    };
-
-    let mut line = Line::new();
-    line.push_str("port ");
-    line.push_u32(port as u32);
-    line.push_str(" enabled after reset, device speed: ");
-    line.push_str(speed_text(status.speed()));
-    console.write_output_line(line.as_str());
-    console.write_output_line(port_status_text(port, &status).as_str());
-
-    report_downstream_device(console, hub, port, status.speed());
-}
-
-/// `USB_HOST_PLAN.md` Stage 4-4: enumerate the device sitting on the hub
-/// port that was just reset. It gets its own address, and the speed the
-/// hub reported for it rather than the bus's.
-fn report_downstream_device(console: &mut Console, hub: &usb::Hub, port: u8, speed: usb::Speed) {
-    console.write_output_line("enumerating device behind the hub (address 2)...");
-    let Some(device) = usb::enumerate_device(usb::DOWNSTREAM_DEVICE_ADDRESS, speed == usb::Speed::Low)
-    else {
-        console.write_output_line("enumeration failed, see UART log");
-        // The hub's own view of the port says whether the failure was on
-        // our side of it or the device's: a port the hub has since
-        // disabled (or flagged over-current) means it saw something wrong
-        // on the wire, while a port still connected and enabled means the
-        // transactions simply never got a usable answer.
-        if let Some(status) = hub.port_status(port) {
-            console.write_output_line(port_status_text(port, &status).as_str());
-        }
-        return;
-    };
-
-    let mut line = Line::new();
-    line.push_str("VID:PID = 0x");
-    line.push_hex(device.vendor_id as u32, 4);
-    line.push_str(":0x");
-    line.push_hex(device.product_id as u32, 4);
-    line.push_str("  EP0 MPS: ");
-    line.push_u32(device.max_packet_size0 as u32);
-    line.push_str("  class ");
-    line.push_hex(device.device_class as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_subclass as u32, 2);
-    line.push_str("/");
-    line.push_hex(device.device_protocol as u32, 2);
-    console.write_output_line(line.as_str());
-
-    let mut line = Line::new();
-    line.push_str("interfaces: ");
-    line.push_u32(device.num_interfaces as u32);
-    line.push_str("  config bytes: ");
-    line.push_u32(device.config_total_length as u32);
-    console.write_output_line(line.as_str());
-
-    match usb::find_hid_keyboard(device.config_bytes()) {
-        Some(hid) => {
-            let mut line = Line::new();
-            line.push_str("HID Boot keyboard: interface ");
-            line.push_u32(hid.interface_number as u32);
-            line.push_str(", EP 0x");
-            line.push_hex(hid.endpoint_address as u32, 2);
-            line.push_str(", MPS ");
-            line.push_u32(hid.max_packet_size as u32);
-            console.write_output_line(line.as_str());
-        }
-        None => console.write_output_line("no HID Boot keyboard interface found"),
+    if descriptor.port_count > usb::MAX_HUB_PORTS {
+        console.write_output_line("(ports beyond the tracked limit are not shown; see UART log)");
     }
 }
 

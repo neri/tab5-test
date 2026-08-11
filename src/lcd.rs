@@ -14,7 +14,7 @@ use crate::{
     gpio, interrupts, paint,
     psram::Psram,
     shell,
-    usb::{self, UsbKeyboard},
+    usb,
 };
 
 mod st7121;
@@ -138,12 +138,9 @@ pub fn run_console(psram: Psram) {
     } else {
         uart::log(b"CardKB: absent\r\n");
     }
-    let mut usb_keyboard = usb::connect_keyboard();
-    if usb_keyboard.is_some() {
-        uart::log(b"USB: keyboard ready\r\n");
-    } else {
-        uart::log(b"USB: keyboard absent\r\n");
-    }
+    let mut usb_host = usb::UsbHost::new();
+    usb_host.rescan();
+    uart::log(b"USB: initial scan complete\r\n");
     let mut reconnect_frames = 0u32;
     let mut usb_reconnect_frames = 0u32;
     let mut blink_frames = 0u32;
@@ -184,52 +181,51 @@ pub fn run_console(psram: Psram) {
             }
         }
 
-        // A live handle can go stale two different ways, and they call for
+        // The registry can go stale two different ways, and they call for
         // different urgency:
-        // - The cable comes out (`is_connected`, a single cheap register
-        //   read). Nothing is plugged in, so there is no rush; fall
-        //   through to the throttled retry below, same as never having
-        //   found a keyboard at all.
-        // - Something else (`usbinfo`, `usbvbus`, another
-        //   `usb::connect_keyboard`) ran `probe_port` and reset the bus out
-        //   from under an otherwise-still-plugged-in device
-        //   (`needs_reinit`, from `poll`'s error tracking). The device is
-        //   almost certainly still there, so this re-enumerates
-        //   immediately rather than leaving the keyboard dead for the
-        //   throttle's full ~5s interval.
-        if usb_keyboard.as_ref().is_some_and(|kb| !kb.is_connected()) {
-            usb_keyboard = None;
-            uart::log(b"USB: keyboard disconnected\r\n");
-        } else if usb_keyboard.as_ref().is_some_and(UsbKeyboard::needs_reinit) {
-            uart::log(b"USB: keyboard session went stale, re-enumerating...\r\n");
-            usb_keyboard = usb::connect_keyboard();
-            usb_reconnect_frames = 0;
-            if usb_keyboard.is_some() {
-                uart::log(b"USB: keyboard connected\r\n");
+        // - The cable comes out (`root_disconnected`, a single cheap
+        //   register read). Nothing is plugged in at all, so there is no
+        //   rush; fall through to the throttled rescan below, same as
+        //   never having found anything. `is_empty` guards the log line so
+        //   it fires once on the transition, not every frame the cable
+        //   stays out.
+        // - A keyboard slot's session goes stale (`needs_reinit`, from
+        //   `UsbKeyboard::poll`'s error tracking). Now that `UsbHost` is
+        //   the only thing that ever resets the bus (`usbinfo`/`usbhub`/
+        //   `usbrescan` all read or drive the same registry instead of
+        //   probing independently), this should only fire on a genuine
+        //   hardware error -- but whatever is plugged in is almost
+        //   certainly still there, so this rescans immediately rather than
+        //   leaving everything dead for the throttle's full ~5s interval.
+        if usb_host.root_disconnected() {
+            if !usb_host.is_empty() {
+                usb_host.clear();
+                uart::log(b"USB: nothing connected to USB-A\r\n");
             }
+        } else if usb_host.needs_reinit() {
+            uart::log(b"USB: a device session went stale, rescanning...\r\n");
+            usb_host.rescan();
+            usb_reconnect_frames = 0;
         }
-        if usb_keyboard.is_none() {
+        if usb_host.has_room() {
             usb_reconnect_frames += 1;
             // Much coarser than CardKB's 60-frame retry: a full USB
-            // enumeration is a few hundred ms of blocking work (VBUS
-            // settle, connect wait, debounce, reset), not a cheap I2C
-            // probe, and re-running it every second would make the whole
-            // console visibly stutter while no keyboard is plugged in.
+            // rescan is a few hundred ms of blocking work per device
+            // (VBUS settle, connect wait, debounce, reset), not a cheap
+            // I2C probe, and re-running it every second would make the
+            // whole console visibly stutter while a port sits empty.
             // (The immediate `needs_reinit` retry above bypasses this for
             // the "still plugged in, just needs re-enumerating" case.)
             if usb_reconnect_frames == 300 {
                 usb_reconnect_frames = 0;
-                usb_keyboard = usb::connect_keyboard();
-                if usb_keyboard.is_some() {
-                    uart::log(b"USB: keyboard connected\r\n");
-                }
+                usb_host.rescan();
             }
         }
 
         let key = keyboard
             .as_mut()
             .and_then(CardKb::poll)
-            .or_else(|| usb_keyboard.as_mut().and_then(UsbKeyboard::poll));
+            .or_else(|| usb_host.poll_keyboards());
 
         if let Some(byte) = key {
             blink_frames = 0;
@@ -252,7 +248,7 @@ pub fn run_console(psram: Psram) {
                 // A command's output can span an arbitrary number of rows,
                 // so (like a scroll) this redraws both sides from scratch
                 // rather than tracking an incremental region.
-                let outcome = shell::execute(console, submission.as_bytes());
+                let outcome = shell::execute(console, submission.as_bytes(), &mut usb_host);
                 if outcome == shell::Outcome::Paint {
                     // Blocks until a key is pressed, leaving both
                     // framebuffers holding the finished drawing; clear them

@@ -43,7 +43,6 @@ pub struct ReadCapacity {
 }
 
 pub struct MscInterface {
-    pub interface_number: u8,
     pub bulk_in_endpoint: u8,
     pub bulk_in_mps: u16,
     pub bulk_out_endpoint: u8,
@@ -70,11 +69,8 @@ pub fn find_msc_interface(config: &[u8]) -> Option<MscInterface> {
             let is_target_interface = interface_class == INTERFACE_CLASS_MASS_STORAGE
                 && interface_subclass == INTERFACE_SUBCLASS_SCSI_TRANSPARENT
                 && interface_protocol == INTERFACE_PROTOCOL_BULK_ONLY;
-            if is_target_interface {
-                let interface_number = config[offset + 2];
-                if let Some(msc) = scan_bulk_endpoints(config, offset + length, interface_number) {
-                    return Some(msc);
-                }
+            if is_target_interface && let Some(msc) = scan_bulk_endpoints(config, offset + length) {
+                return Some(msc);
             }
         }
         offset += length;
@@ -87,7 +83,7 @@ pub fn find_msc_interface(config: &[u8]) -> Option<MscInterface> {
 /// descriptor (or the end of the buffer). Returns `None` if either
 /// direction is missing -- a malformed or non-BOT descriptor set this
 /// project does not know how to drive.
-fn scan_bulk_endpoints(config: &[u8], start: usize, interface_number: u8) -> Option<MscInterface> {
+fn scan_bulk_endpoints(config: &[u8], start: usize) -> Option<MscInterface> {
     let mut bulk_in: Option<(u8, u16)> = None;
     let mut bulk_out: Option<(u8, u16)> = None;
     let mut offset = start;
@@ -121,7 +117,6 @@ fn scan_bulk_endpoints(config: &[u8], start: usize, interface_number: u8) -> Opt
     let (bulk_in_endpoint, bulk_in_mps) = bulk_in?;
     let (bulk_out_endpoint, bulk_out_mps) = bulk_out?;
     Some(MscInterface {
-        interface_number,
         bulk_in_endpoint,
         bulk_in_mps,
         bulk_out_endpoint,
