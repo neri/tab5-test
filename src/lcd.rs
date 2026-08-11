@@ -4,6 +4,7 @@
 //! DW-GDMA. The DSI Host's Video Pattern Generator remains available as a
 //! fallback diagnostic when framebuffer setup fails.
 
+use crate::delay::{delay_ms, delay_us};
 use crate::i2c::SoftI2c;
 use crate::uart;
 use crate::{
@@ -917,37 +918,6 @@ fn wait_for(address: usize, mask: u32, expected: u32) -> bool {
         }
     }
     false
-}
-
-fn delay_ms(milliseconds: u32) {
-    // `startup::raise_cpu_clock` moves the HP core from the bootloader's
-    // 90 MHz boot tap to the full 360 MHz CPLL/1. A cycle-counter delay is
-    // therefore stable enough for panel reset/sleep timings, unlike the
-    // former loop-count approximation.
-    const CPU_CYCLES_PER_MS: u32 = 360_000;
-    let start = cycle_count();
-    let cycles = milliseconds.saturating_mul(CPU_CYCLES_PER_MS);
-    while cycle_count().wrapping_sub(start) < cycles {
-        core::hint::spin_loop();
-    }
-}
-
-fn delay_us(microseconds: u32) {
-    const CPU_CYCLES_PER_US: u32 = 360;
-    let start = cycle_count();
-    let cycles = microseconds.saturating_mul(CPU_CYCLES_PER_US);
-    while cycle_count().wrapping_sub(start) < cycles {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline(always)]
-fn cycle_count() -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
-    }
-    value
 }
 
 /// # Safety

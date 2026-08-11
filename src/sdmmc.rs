@@ -40,6 +40,7 @@
 
 use core::mem::size_of;
 
+use crate::delay::delay_us;
 use crate::uart;
 
 const SDHOST: usize = 0x5008_3000;
@@ -1062,23 +1063,6 @@ fn wait_data_not_busy() {
         }
         timeout -= 1;
     }
-}
-
-fn delay_us(microseconds: u32) {
-    const CPU_CYCLES_PER_US: u32 = 360; // matches `startup::raise_cpu_clock`'s 360 MHz
-    let start = cycle_count();
-    while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline(always)]
-fn cycle_count() -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
-    }
-    value
 }
 
 /// # Safety

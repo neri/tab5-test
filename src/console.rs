@@ -2,17 +2,17 @@
 
 use core::cell::UnsafeCell;
 
-use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, WHITE, WIDTH};
+use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, HEIGHT, WHITE, WIDTH};
 
 const DEFAULT_HEADER_COLOR: u16 = GREEN;
 
-const SCALE: usize = 3;
+const SCALE: usize = 2;
 const CELL_WIDTH: usize = 6 * SCALE;
 const CELL_HEIGHT: usize = 8 * SCALE;
 const LEFT: usize = 16;
 const TOP: usize = 40;
 const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
-const ROWS: usize = 28;
+const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 
 // Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt
 // uses a half-width '>' rather than the full-width '＞' a shell would show.

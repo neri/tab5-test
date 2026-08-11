@@ -3,6 +3,7 @@
 //! The connector exposes GPIO53 as SDA and GPIO54 as SCL.  CardKB returns one
 //! key byte directly when addressed for reading at I2C address 0x5F.
 
+use crate::delay::delay_us;
 use crate::gpio;
 use crate::i2c::SoftI2c;
 
@@ -61,22 +62,4 @@ impl CardKb {
         self.bus.stop();
         (byte != 0).then_some(byte)
     }
-}
-
-fn delay_us(microseconds: u32) {
-    // Matches `startup::raise_cpu_clock`'s 360 MHz CPU clock.
-    const CPU_CYCLES_PER_US: u32 = 360;
-    let start = cycle_count();
-    while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline(always)]
-fn cycle_count() -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
-    }
-    value
 }

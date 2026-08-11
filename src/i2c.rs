@@ -123,24 +123,6 @@ impl SoftI2c {
     /// Waits this bus's configured bit-time. Exposed for the same
     /// bus-recovery callers as `wait_scl_high`.
     pub fn delay(&self) {
-        delay_us(self.delay_us);
+        crate::delay::delay_us(self.delay_us);
     }
-}
-
-fn delay_us(microseconds: u32) {
-    // Matches `startup::raise_cpu_clock`'s 360 MHz CPU clock.
-    const CPU_CYCLES_PER_US: u32 = 360;
-    let start = cycle_count();
-    while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline(always)]
-fn cycle_count() -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
-    }
-    value
 }

@@ -8,6 +8,7 @@
 //! This is Stage 2 of `USB_HOST_PLAN.md`.
 
 use super::hcd::{self, HCCHAR_EPTYPE_CTRL, PacketOutcome};
+use crate::delay::delay_ms;
 use crate::uart;
 
 // Standard USB descriptor type codes (USB2.0 table 9-5).
@@ -87,7 +88,7 @@ pub fn enumerate_device() -> Option<EnumeratedDevice> {
     // USB2.0 9.2.6.3 allows the device up to 2ms to be ready to respond at
     // its new address; padded generously, matching this project's general
     // preference for margin over spec minimums.
-    hcd::delay_ms(10);
+    delay_ms(10);
 
     let mut device_descriptor = [0u8; 18];
     let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_DEVICE, 0, 18);

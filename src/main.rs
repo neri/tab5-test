@@ -11,6 +11,7 @@ use riscv_rt::entry;
 
 mod cardkb;
 mod console;
+mod delay;
 mod framebuffer;
 mod gpio;
 mod i2c;

@@ -21,6 +21,7 @@
 //! the `usbvbus` shell command: bit 3 raises USB-A's VBUS to 5V
 //! (`VBUS_ENABLE_BIT` below).
 
+use crate::delay::{delay_ms, delay_us};
 use crate::gpio;
 use crate::i2c::SoftI2c;
 use crate::uart;
@@ -766,30 +767,6 @@ fn cache_writeback_invalidate(address: usize, length: usize) {
         writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
         writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
     }
-}
-
-/// `pub` for `protocol.rs`'s post-`SET_ADDRESS` settle delay; every other
-/// user of timing in this subsystem is internal to this file.
-pub fn delay_ms(milliseconds: u32) {
-    delay_us(milliseconds.saturating_mul(1000));
-}
-
-fn delay_us(microseconds: u32) {
-    // Matches `startup::raise_cpu_clock`'s 360 MHz CPU clock.
-    const CPU_CYCLES_PER_US: u32 = 360;
-    let start = cycle_count();
-    while cycle_count().wrapping_sub(start) < microseconds.saturating_mul(CPU_CYCLES_PER_US) {
-        core::hint::spin_loop();
-    }
-}
-
-#[inline(always)]
-fn cycle_count() -> u32 {
-    let value: u32;
-    unsafe {
-        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
-    }
-    value
 }
 
 /// # Safety
