@@ -4,7 +4,7 @@
 //! is not a control transfer and so does not go through `protocol.rs` at
 //! all).
 //!
-//! This is Stage 3 of `USB_HOST_PLAN.md`, the actual milestone: `UsbKeyboard`
+//! This is Stage 3 of `docs/USB_HOST_PLAN.md`, the actual milestone: `UsbKeyboard`
 //! feeds decoded keystrokes into the same `Console::push` path `cardkb.rs`
 //! uses, polled from `lcd.rs`'s frame loop alongside `CardKb`.
 
@@ -40,6 +40,21 @@ const KEYCODE_ROLLOVER_ERROR: u8 = 0x01;
 // (see `hcd::run_packet`'s `quiet_timeout`) or the UART would be spammed
 // dozens of times a second.
 const INTERRUPT_POLL_TIMEOUT_ITERATIONS: u32 = 50_000;
+
+/// How many SSPLIT/CSPLIT round trips one poll of a keyboard behind a
+/// High-Speed hub's TT may take (`hcd::run_packet`'s `max_split_rounds`).
+///
+/// One attempt per poll. `hcd::run_packet`'s budget is a soft one -- it
+/// stops at the first *safe* boundary at or after this many rounds, never
+/// mid-handshake -- so 1 means "run the split through to its first NAK and
+/// stop there", which is exactly one question asked of the keyboard.
+///
+/// That is the right shape for per-frame polling: an idle keyboard NAKs
+/// (`SET_IDLE(0)` means it reports only on change), and the frame loop is
+/// back in ~17.5ms to ask again. Retrying harder inside one frame would
+/// spend the display's budget waiting on a device that has already said it
+/// has nothing.
+const INTERRUPT_POLL_SPLIT_ROUNDS: u32 = 1;
 // Consecutive *hard* transaction errors (STALL/XACTERR/BBLERR/
 // XCS_XACT_ERR; see `PacketOutcome::Error`), not plain NAK timeouts --
 // those are routine while idle and never count here. A correctly-addressed
@@ -180,7 +195,7 @@ impl UsbKeyboard {
                 endpoint_type: HCCHAR_EPTYPE_BULK,
                 mps: hid.max_packet_size,
                 is_in: true,
-                low_speed_via_hub: device.low_speed_via_hub,
+                route: device.route,
             },
             // Every endpoint's data toggle resets to DATA0 on
             // SET_CONFIGURATION (USB2.0 9.4.5).
@@ -205,7 +220,7 @@ impl UsbKeyboard {
     /// hub port). What `needs_reinit` catches instead is this handle's
     /// cached address/configuration going stale while the device is still
     /// physically present -- normally only `UsbHost::rescan` can cause
-    /// that now (`USB_REFACTOR_PLAN.md` Stage A made it the sole owner of
+    /// that now (`docs/USB_REFACTOR_PLAN.md` Stage A made it the sole owner of
     /// `hcd::probe_port`), so in practice this now means a genuine
     /// transaction error rather than another command resetting the bus
     /// out from under an active session. `lcd.rs` checks this and calls
@@ -240,6 +255,7 @@ impl UsbKeyboard {
             false,
             self.next_pid_data1,
             INTERRUPT_POLL_TIMEOUT_ITERATIONS,
+            INTERRUPT_POLL_SPLIT_ROUNDS,
             true,
             quiet_errors,
             &mut report,
@@ -329,7 +345,7 @@ impl UsbKeyboard {
 /// the same control characters `console.rs` already recognizes
 /// (Backspace, Tab, Enter); function keys, arrows, and modifiers-as-keys
 /// have no ASCII form and translate to `None`, matching this project's
-/// current console scope (`USB_HOST_PLAN.md` Stage 3).
+/// current console scope (`docs/USB_HOST_PLAN.md` Stage 3).
 fn translate_keycode(keycode: u8, shift: bool) -> Option<u8> {
     match keycode {
         0x04..=0x1D => {

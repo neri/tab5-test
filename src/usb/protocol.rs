@@ -5,9 +5,9 @@
 //! this, the same way a real HID class driver would sit above a generic
 //! USB core.
 //!
-//! This is Stage 2 of `USB_HOST_PLAN.md`.
+//! This is Stage 2 of `docs/USB_HOST_PLAN.md`.
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome};
+use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome, Route};
 use crate::delay::{delay_ms, delay_us};
 use crate::uart;
 
@@ -45,10 +45,10 @@ pub fn downstream_address(port: u8) -> u8 {
 pub struct ControlPipe {
     pub device_address: u8,
     pub mps: u16,
-    /// A Low-Speed device behind a Full-Speed hub; see
-    /// `hcd::Endpoint::low_speed_via_hub`, and
-    /// `PREAMBLE_TRANSACTION_GAP_US` for what it costs here.
-    pub low_speed_via_hub: bool,
+    /// How the controller reaches this device; see `hcd::Route`, and
+    /// `PREAMBLE_TRANSACTION_GAP_US` for what a Low-Speed device behind a
+    /// Full-Speed hub costs here.
+    pub route: Route,
 }
 
 // Generous for a single HID keyboard's configuration (typically config +
@@ -77,9 +77,23 @@ const CONTROL_TIMEOUT_ITERATIONS: u32 = 2_000_000;
 /// are unaffected either way.
 const PREAMBLE_TRANSACTION_GAP_US: u32 = 1_000;
 
+/// How many SSPLIT/CSPLIT round trips one control packet to a device behind
+/// a High-Speed hub's TT may take (`hcd::run_packet`'s `max_split_rounds`).
+///
+/// Generous, because for a control transfer a NAK means "busy, ask again"
+/// and retrying is the whole point -- this stands in for the hardware NAK
+/// retrying an unsplit control packet gets for free.
+///
+/// A successful split takes at least three rounds and a NAK restart costs
+/// two, so the useful floor is well under ten; the headroom here is for a
+/// device that NAKs its way through a slow moment, which enumeration hits
+/// in practice. Measured on real hardware: a Low-Speed keyboard behind a
+/// High-Speed hub enumerates fully at this budget, and failed to at 32.
+const CONTROL_SPLIT_ROUNDS: u32 = 512;
+
 pub struct EnumeratedDevice {
     pub device_address: u8,
-    pub low_speed_via_hub: bool,
+    pub route: Route,
     pub max_packet_size0: u8,
     pub vendor_id: u16,
     pub product_id: u16,
@@ -101,7 +115,7 @@ impl EnumeratedDevice {
         ControlPipe {
             device_address: self.device_address,
             mps: self.max_packet_size0 as u16,
-            low_speed_via_hub: self.low_speed_via_hub,
+            route: self.route,
         }
     }
 
@@ -121,12 +135,12 @@ impl EnumeratedDevice {
 /// EP0's real max packet size, USB2.0 9.2.6.3), `SET_ADDRESS`, the full
 /// device descriptor, and the configuration descriptor.
 ///
-/// `address` is the address to assign. `low_speed_via_hub` says the port
-/// reported a Low-Speed device *while the bus runs at Full-Speed*, which
-/// the host controller needs to know for every transaction it sends it
-/// (`hcd::Endpoint::low_speed_via_hub`) -- it is false for anything
-/// plugged into USB-A directly, whatever its speed, since then the bus
-/// itself runs at the device's speed.
+/// `address` is the address to assign. `route` says how the controller has
+/// to reach the device -- preambles, split transactions, or neither -- and
+/// is `Route::default()` for anything plugged into USB-A directly, whatever
+/// its speed, since then the bus itself runs at the device's speed. The
+/// caller derives it from where the device turned up; see
+/// `hcd::Route` and `usb::registry::UsbHost::attach_hub`.
 ///
 /// Only one device may be in the unaddressed default state at a time, so
 /// this must not be interleaved with another enumeration.
@@ -135,11 +149,11 @@ impl EnumeratedDevice {
 /// descriptor beyond its header; the class driver does both once it has
 /// decided it actually wants to talk to an interface found in
 /// `config_bytes()`.
-pub fn enumerate_device(address: u8, low_speed_via_hub: bool) -> Option<EnumeratedDevice> {
+pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
     // Before SET_ADDRESS the device answers on address 0, and EP0's real
     // packet size is not known yet -- 8 bytes is the one size every
     // device supports (USB2.0 5.5.3).
-    let mut pipe = ControlPipe { device_address: 0, mps: 8, low_speed_via_hub };
+    let mut pipe = ControlPipe { device_address: 0, mps: 8, route };
 
     let mut peek = [0u8; 8];
     let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_DEVICE, 0, 8);
@@ -192,7 +206,7 @@ pub fn enumerate_device(address: u8, low_speed_via_hub: bool) -> Option<Enumerat
 
     Some(EnumeratedDevice {
         device_address: address,
-        low_speed_via_hub,
+        route,
         max_packet_size0: pipe.mps as u8,
         vendor_id: u16::from_le_bytes([device_descriptor[8], device_descriptor[9]]),
         product_id: u16::from_le_bytes([device_descriptor[10], device_descriptor[11]]),
@@ -337,7 +351,11 @@ fn run_control_packet(
     pid_data1: bool,
     buffer: &mut [u8],
 ) -> Option<usize> {
-    if pipe.low_speed_via_hub {
+    // Only the preamble path needs the inter-packet gap. A split transfer
+    // never puts a PRE token on the wire at all: the host talks High-Speed
+    // to the hub, and it is the hub's TT that does the Low-Speed signalling
+    // downstream, entirely out of this core's frame budget.
+    if pipe.route.low_speed_via_hub && pipe.route.split.is_none() {
         delay_us(PREAMBLE_TRANSACTION_GAP_US);
     }
     let endpoint = Endpoint {
@@ -346,13 +364,14 @@ fn run_control_packet(
         endpoint_type: HCCHAR_EPTYPE_CTRL,
         mps: pipe.mps,
         is_in,
-        low_speed_via_hub: pipe.low_speed_via_hub,
+        route: pipe.route,
     };
     match hcd::run_packet(
         &endpoint,
         is_setup,
         pid_data1,
         CONTROL_TIMEOUT_ITERATIONS,
+        CONTROL_SPLIT_ROUNDS,
         false,
         false,
         buffer,

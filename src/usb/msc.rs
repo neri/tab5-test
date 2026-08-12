@@ -4,14 +4,14 @@
 //! not control transfers and so do not go through `protocol.rs` at all) --
 //! the storage-class counterpart to `hid_keyboard.rs`/`hub.rs`.
 //!
-//! Staged per `USB_MSC_PLAN.md`: `find_msc_interface` (Bulk IN/OUT endpoint
+//! Staged per `docs/USB_MSC_PLAN.md`: `find_msc_interface` (Bulk IN/OUT endpoint
 //! discovery) is Stage 1. `UsbMassStorage::bulk_transfer_in`/
 //! `bulk_transfer_out` (the Bulk transfer primitive and per-endpoint
 //! data-toggle bookkeeping) are Stage 2. Bulk-Only Transport's CBW/CSW
 //! framing and the first SCSI command, INQUIRY (`UsbMassStorage::inquiry`),
 //! are Stage 3.
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome};
+use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::delay::delay_ms;
 use crate::uart;
@@ -209,7 +209,7 @@ const SCSI_READ_CAPACITY_10: u8 = 0x25;
 /// and keeping it fixed here (rather than plumbing the value `read_capacity`
 /// returns through every call) lets `read_blocks` match
 /// `sdmmc::read_block`/`read_blocks`'s exact signature and contract, which
-/// is the point of `USB_MSC_PLAN.md` Stage 5.
+/// is the point of `docs/USB_MSC_PLAN.md` Stage 5.
 const BLOCK_BYTES: usize = 512;
 
 /// Standard INQUIRY data, fixed portion (SPC): enough to reach the Product
@@ -250,6 +250,30 @@ const READ_CAPACITY_10_NEEDS_CAPACITY_16: u32 = 0xFFFF_FFFF;
 /// the ones timing out).
 const BULK_TIMEOUT_ITERATIONS: u32 = 20_000_000;
 
+/// How many SSPLIT/CSPLIT round trips one Bulk packet to a drive behind a
+/// High-Speed hub's TT may take (`hcd::run_packet`'s `max_split_rounds`).
+///
+/// Sized for the same reason `BULK_TIMEOUT_ITERATIONS` is large: a drive
+/// that is busy touching flash NAKs, and under a split each NAK costs a
+/// round trip here instead of a hardware retry. Roughly one microframe per
+/// round makes this a wall-clock budget of a few seconds.
+///
+/// Note that a Full-Speed drive behind a High-Speed hub is a slow
+/// combination regardless -- the TT, not this budget, is the bottleneck.
+///
+/// **Unverified on real hardware.** Every other split path here has been
+/// exercised (control transfers and Interrupt IN, via a Low-Speed keyboard
+/// behind a High-Speed hub), but Bulk-over-split needs a Full/Low-Speed
+/// mass storage device behind a High-Speed hub, and no such drive was
+/// available -- the drive on hand is High-Speed, so it is addressed
+/// directly and never takes this path. Bulk differs from the tested paths
+/// in ways that could matter: it is the only split direction that carries a
+/// payload *out* (`bulk_transfer_out`), and `hcd::await_packet` treats a
+/// bare `ACK` as "run the complete split" rather than as the completion it
+/// is for a split OUT, relying on the core to raise `XferCompl` instead.
+/// Treat a failure here as expected-to-need-work, not as a regression.
+const BULK_SPLIT_ROUNDS: u32 = 20_000;
+
 /// Delay between `wait_until_ready`'s TEST UNIT READY polls. No spec value
 /// to anchor this to (unlike, say, SD's `bPwrOn2PwrGood`) -- picked in the
 /// same spirit as this project's other polling intervals, short enough not
@@ -258,7 +282,7 @@ const READY_POLL_INTERVAL_MS: u32 = 100;
 
 pub struct UsbMassStorage {
     device_address: u8,
-    low_speed_via_hub: bool,
+    route: Route,
     /// EP0's max packet size, for the `CLEAR_FEATURE(ENDPOINT_HALT)`
     /// control transfer issued on a Bulk STALL -- separate from the Bulk
     /// endpoints' own MPS values.
@@ -302,7 +326,7 @@ impl UsbMassStorage {
 
         Some(Self {
             device_address: device.device_address,
-            low_speed_via_hub: device.low_speed_via_hub,
+            route: device.route,
             control_mps: device.max_packet_size0 as u16,
             bulk_in_endpoint: msc.bulk_in_endpoint,
             bulk_in_mps: msc.bulk_in_mps,
@@ -429,7 +453,7 @@ impl UsbMassStorage {
     /// starting at `lba` into `buffer`, whose length must be a nonzero
     /// multiple of 512 bytes -- the same contract as
     /// `sdmmc::read_block`/`read_blocks`, which is what lets a future
-    /// `BlockDevice` abstraction (`USB_MSC_PLAN.md` Stage 6) dispatch to
+    /// `BlockDevice` abstraction (`docs/USB_MSC_PLAN.md` Stage 6) dispatch to
     /// either with the same call shape.
     pub fn read_blocks(&mut self, lba: u32, buffer: &mut [u8]) -> bool {
         if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
@@ -530,6 +554,7 @@ impl UsbMassStorage {
                 false,
                 self.out_toggle,
                 BULK_TIMEOUT_ITERATIONS,
+                BULK_SPLIT_ROUNDS,
                 false,
                 false,
                 &mut data[offset..offset + chunk_len],
@@ -568,6 +593,7 @@ impl UsbMassStorage {
                 false,
                 self.in_toggle,
                 BULK_TIMEOUT_ITERATIONS,
+                BULK_SPLIT_ROUNDS,
                 false,
                 false,
                 &mut buffer[received..received + chunk_len],
@@ -618,7 +644,7 @@ impl UsbMassStorage {
         ControlPipe {
             device_address: self.device_address,
             mps: self.control_mps,
-            low_speed_via_hub: self.low_speed_via_hub,
+            route: self.route,
         }
     }
 
@@ -629,7 +655,7 @@ impl UsbMassStorage {
             endpoint_type: HCCHAR_EPTYPE_BULK,
             mps: self.bulk_in_mps,
             is_in: true,
-            low_speed_via_hub: self.low_speed_via_hub,
+            route: self.route,
         }
     }
 
@@ -640,7 +666,7 @@ impl UsbMassStorage {
             endpoint_type: HCCHAR_EPTYPE_BULK,
             mps: self.bulk_out_mps,
             is_in: false,
-            low_speed_via_hub: self.low_speed_via_hub,
+            route: self.route,
         }
     }
 }

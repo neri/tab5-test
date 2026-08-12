@@ -6,7 +6,16 @@ USB-A**直結**のUSBメモリで、列挙・Bulk-Only Transport・SCSI
 （INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)）・SDカードと共通の
 MBRパース（`mbr::show`、`usbmbr`/`sdmbr`）まで実機確認済み。
 
-**USBハブ経由の接続は意図的に後回しにした（未実装・未検証）。**
+**USBハブ経由の接続は本計画では意図的に後回しにしたが、その後
+[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md) Stage Fで対応済みである。**
+以下の「未実装」の記述は本計画完了時点のもので、現在は当てはまらない。
+`connect_mass_storage`のような関数を書く代わりに、`usb::registry::UsbHost`が
+ハブの全ポートを走査してMSCもレジストリに載せ、`usbmsc`/`usbread`/`usbmbr`は
+`mass_storage_mut()`でレジストリを引く（直結・ハブ経由を区別しない）形に
+なった。実機ではハブのポートに挿したUSBメモリが認識されるところまで
+確認している。
+
+以下、本計画完了時点の記録:
 `usb::connect_keyboard`が持つ直結/ハブ経由の自動判定に相当する
 `connect_mass_storage`は書いておらず、`usbmsc`/`usbread`/`usbmbr`は
 すべてUSB-A直結デバイスのみを対象にする。技術的な障害があるわけではなく
@@ -16,7 +25,7 @@ MBRパース（`mbr::show`、`usbmbr`/`sdmbr`）まで実機確認済み。
 
 ## 方針
 
-`DESIGN.md`の方針（ESP-IDF/RTOSをリンクせずレジスタ操作で実装、1機能=1モジュール=
+`../DESIGN.md`の方針（ESP-IDF/RTOSをリンクせずレジスタ操作で実装、1機能=1モジュール=
 実機確認可能な単位でコミット）を踏襲する。[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)の
 「将来検討」に挙げていた項目の着手であり、`hcd.rs`（チャネル/パケットプリミティブ）・
 `protocol.rs`（コントロール転送・標準列挙）は変更せず、その上にクラスドライバ
@@ -213,7 +222,7 @@ TEST UNIT READY、REQUEST SENSE、READ CAPACITY(10)、READ(10)）。今回はレ
   `mbr::show(console: &mut Console, sector: &[u8; 512])`）
 - SD/USB間でディスパッチする最小限の抽象を用意する。このプロジェクトは
   現状`dyn`/トレイトオブジェクトを一切使っておらず（`usb::connect_keyboard`の
-  直結/ハブ分岐も`if`で完結する具体型のみ）、`DESIGN.md`の「最小限の抽象化」
+  直結/ハブ分岐も`if`で完結する具体型のみ）、`../DESIGN.md`の「最小限の抽象化」
   という方針にも合わせ、trait objectではなく列挙型で表現することを推奨する:
 
   ```rust
@@ -255,7 +264,7 @@ TEST UNIT READY、REQUEST SENSE、READ CAPACITY(10)、READ(10)）。今回はレ
 常に`sdmmc::read_block`、`usbmbr`は常に`UsbMassStorage::read_blocks`）、
 実行時にSD/USBを切り替える呼び出し元が1つも無い。この状態で
 `BlockDevice`を導入すると、一度も`match`されない列挙型と一度も呼ばれない
-メソッドが残るだけになり（`dead_code`警告の対象）、`DESIGN.md`の
+メソッドが残るだけになり（`dead_code`警告の対象）、`../DESIGN.md`の
 「タスクが要求する以上の抽象化をしない」という方針に反する。そのため
 Stage 6は「`mbr::show`によるパース処理の共通化」だけを実装し、
 デバイス選択の抽象化はまだ導入していない。将来Stage 4b（ファイル
@@ -289,7 +298,8 @@ Stage 6は「`mbr::show`によるパース処理の共通化」だけを実装�
   「コマンドのたびに再初期化」で十分とする
 - リムーバブルメディア（USBカードリーダー等）のメディア差し替え検出
   （UNIT ATTENTION、SCSIのメディア変更通知）
-- **USB MSCのハブ経由接続**。`usb::connect_keyboard`が持つ「直結／ハブ経由の
+- **USB MSCのハブ経由接続**（→ `USB_REFACTOR_PLAN.md` Stage Fで対応済み。
+  以下は本計画完了時点の記録）。`usb::connect_keyboard`が持つ「直結／ハブ経由の
   判定」（`enumerate_device`をハブのポート越しに呼ぶ分岐、
   `USB_HOST_PLAN.md`Stage 4-5）に相当する`connect_mass_storage`のような
   関数は未実装。`usbmsc`/`usbread`/`usbmbr`はいずれも`usbinfo`と同じく

@@ -1,7 +1,7 @@
 //! Single owner of the USB-A bus, and the device registry that replaces
 //! the old "one keyboard, driven from the top of `usb.rs`" model.
 //!
-//! `USB_HOST_PLAN.md`/`USB_MSC_PLAN.md` staged this project one device at a
+//! `docs/USB_HOST_PLAN.md`/`docs/USB_MSC_PLAN.md` staged this project one device at a
 //! time, which left two gaps once real hardware had more than one device
 //! plugged in: `hub::Hub` only ever drove a single chosen port
 //! (`hub.rs`'s old `find_connected_port`), so which device got noticed
@@ -9,13 +9,13 @@
 //! shell command (`usbinfo`, `usbhub`, `usbmsc`, ...) called
 //! `hcd::probe_port`/`protocol::enumerate_device` independently, which does
 //! a full bus reset and silently invalidated whatever `UsbKeyboard` the
-//! frame loop had going (`USB_HOST_PLAN.md`'s "Stage 3, trap #2").
+//! frame loop had going (`docs/USB_HOST_PLAN.md`'s "Stage 3, trap #2").
 //!
 //! `UsbHost` fixes both by being the *only* thing that ever calls
 //! `hcd::probe_port`/`hub::Hub::open`, and by attaching every occupied
-//! port instead of one. See `USB_REFACTOR_PLAN.md` Stages A-D and F.
+//! port instead of one. See `docs/USB_REFACTOR_PLAN.md` Stages A-D and F.
 
-use super::hcd::{self, HostPort, Speed};
+use super::hcd::{self, HostPort, Route, Speed, SplitTarget};
 use super::hid_keyboard::UsbKeyboard;
 use super::hub::{self, Hub};
 use super::msc::UsbMassStorage;
@@ -103,10 +103,15 @@ pub struct AttachedDevice<'a> {
 /// in `shell.rs` takes a `&UsbHost`/`&mut UsbHost` and reads or drives
 /// devices already in the registry instead of touching `hcd`/`hub`/
 /// `protocol` directly -- so nothing can reset the bus out from under a
-/// live session anymore (`USB_REFACTOR_PLAN.md` Stage A).
+/// live session anymore (`docs/USB_REFACTOR_PLAN.md` Stage A).
 pub struct UsbHost {
     last_probe: Option<HostPort>,
     hub: Option<Hub>,
+    /// The speed the hub's own upstream link came up at, kept because
+    /// `scan_empty_hub_ports` needs it to route a device found later and
+    /// cannot re-derive it without another bus reset. `Speed::Unknown`
+    /// whenever `hub` is `None`.
+    hub_speed: Speed,
     /// The hub's own VID/PID/class, captured at attach time -- the hub
     /// occupies the root port but (unlike a direct device) is tracked
     /// separately from `slots`, since it is not itself something a class
@@ -121,6 +126,7 @@ impl UsbHost {
         Self {
             last_probe: None,
             hub: None,
+            hub_speed: Speed::Unknown,
             hub_summary: None,
             slots: [NONE_SLOT; SLOT_COUNT],
         }
@@ -155,7 +161,7 @@ impl UsbHost {
     /// The first attached Mass Storage device, if any -- `usbmsc`/
     /// `usbread`/`usbmbr` no longer enumerate their own device fresh on
     /// every call; they share whatever `rescan` already attached, wherever
-    /// it is (USB-A directly or a hub port). `USB_REFACTOR_PLAN.md` Stage F.
+    /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
         self.slots.iter_mut().flatten().find_map(|slot| match &mut slot.kind {
             DeviceKind::MassStorage(storage) => Some(storage),
@@ -177,6 +183,7 @@ impl UsbHost {
     /// itself came out.
     pub fn clear(&mut self) {
         self.hub = None;
+        self.hub_speed = Speed::Unknown;
         self.hub_summary = None;
         for slot in self.slots.iter_mut() {
             *slot = None;
@@ -201,7 +208,7 @@ impl UsbHost {
     /// Mass Storage slots have no per-frame polling session to go stale
     /// between shell commands, so they do not contribute here; a stale MSC
     /// handle just fails its next command and is only cleared by the next
-    /// `rescan` (see `USB_REFACTOR_PLAN.md`'s notes on this gap).
+    /// `rescan` (see `docs/USB_REFACTOR_PLAN.md`'s notes on this gap).
     pub fn needs_reinit(&self) -> bool {
         self.slots.iter().flatten().any(|slot| match &slot.kind {
             DeviceKind::Keyboard(keyboard) => keyboard.needs_reinit(),
@@ -256,15 +263,17 @@ impl UsbHost {
             return;
         }
 
-        // Nothing plugged into USB-A directly ever needs preambles: the
-        // bus itself runs at the device's speed.
-        let Some(device) = protocol::enumerate_device(protocol::ROOT_DEVICE_ADDRESS, false) else {
+        // Nothing plugged into USB-A directly ever needs preambles or
+        // splits: the bus itself runs at the device's speed.
+        let Some(device) =
+            protocol::enumerate_device(protocol::ROOT_DEVICE_ADDRESS, Route::default())
+        else {
             uart::log(b"USB: root device enumeration failed\r\n");
             return;
         };
 
         if device.device_class == hub::DEVICE_CLASS_HUB {
-            self.attach_hub(&device);
+            self.attach_hub(&device, port.speed);
         } else if let Some(kind) = attach_class_driver(&device) {
             self.slots[0] = Some(Slot { location: Location::Direct, summary: DeviceSummary::from(&device), kind });
         } else {
@@ -275,12 +284,19 @@ impl UsbHost {
     /// Opens the hub plugged into USB-A, powers its ports, and attaches
     /// whatever is connected on each one in turn -- up to `MAX_HUB_PORTS`
     /// of them, unlike the old `hub::Hub::find_connected_port`'s "first
-    /// port only" (`USB_REFACTOR_PLAN.md` Stage C).
+    /// port only" (`docs/USB_REFACTOR_PLAN.md` Stage C).
     ///
     /// Ports are enumerated one at a time, never interleaved, per
     /// `protocol::enumerate_device`'s "only one device may be in the
     /// unaddressed default state at a time" constraint.
-    fn attach_hub(&mut self, device: &EnumeratedDevice) {
+    ///
+    /// `hub_speed` is the speed the *root port* came up at, which is the
+    /// speed of the hub's own upstream link since the hub is plugged
+    /// straight into USB-A. It decides how each downstream device has to be
+    /// reached: a High-Speed hub relays traffic for anything slower through
+    /// its Transaction Translator, while a hub running at the same speed as
+    /// its devices is a plain repeater. See `route_behind_hub`.
+    fn attach_hub(&mut self, device: &EnumeratedDevice, hub_speed: Speed) {
         let Some(hub) = Hub::open(device) else { return };
         self.hub_summary = Some(DeviceSummary::from(device));
         if hub.descriptor.port_count > MAX_HUB_PORTS {
@@ -307,27 +323,128 @@ impl UsbHost {
                     break;
                 }
             }
-
-            let Some(status) = hub.reset_port(port) else { continue };
-            let address = protocol::downstream_address(port);
-            let Some(downstream) = protocol::enumerate_device(address, status.speed() == Speed::Low) else {
-                uart::log_hex(b"USB: enumeration failed for device on hub port ", port as u32);
-                continue;
-            };
-
-            match attach_class_driver(&downstream) {
-                Some(kind) => {
-                    self.slots[port as usize] = Some(Slot {
-                        location: Location::HubPort(port),
-                        summary: DeviceSummary::from(&downstream),
-                        kind,
-                    });
-                }
-                None => uart::log_hex(b"USB: no class driver for device on hub port ", port as u32),
-            }
+            self.attach_hub_port(&hub, port, hub_speed);
         }
 
         self.hub = Some(hub);
+        self.hub_speed = hub_speed;
+    }
+
+    /// Picks up devices plugged into hub ports that were empty last time,
+    /// leaving every already-attached device exactly as it is.
+    ///
+    /// This is what the frame loop polls with, instead of the `rescan` it
+    /// used to call on a timer. `rescan` resets the bus, which
+    /// invalidates every device address on it, so running it on a timer
+    /// tore down and re-enumerated working devices every few seconds --
+    /// visible as a stall, and long enough to drop a keystroke.
+    ///
+    /// Nothing here touches the bus state: an empty port costs one
+    /// `GET_STATUS` control transfer to the hub and no delay at all
+    /// (`Hub::debounce_connected_port` returns immediately when the port
+    /// reads as unoccupied), and only a port that has actually gained a
+    /// device gets reset and enumerated.
+    pub fn scan_empty_hub_ports(&mut self) {
+        // Taken out of `self` for the duration so the loop can borrow the
+        // hub while filling in `self.slots`; nothing else can run in
+        // between (this is all synchronous, single-threaded polling).
+        let Some(hub) = self.hub.take() else { return };
+        let hub_speed = self.hub_speed;
+
+        let port_count = hub.port_count().min(MAX_HUB_PORTS);
+        for port in 1..=port_count {
+            if self.slots[port as usize].is_some() {
+                continue; // already driving something here
+            }
+            match hub.debounce_connected_port(port) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    uart::log(b"USB: hub stopped answering while scanning ports\r\n");
+                    break;
+                }
+            }
+            self.attach_hub_port(&hub, port, hub_speed);
+        }
+
+        self.hub = Some(hub);
+    }
+
+    /// Resets one already-known-occupied hub port, enumerates whatever is
+    /// on it, and files it in the matching slot. Shared by the full
+    /// `attach_hub` sweep and the incremental `scan_empty_hub_ports`, so
+    /// that a device found later is set up identically to one that was
+    /// present at rescan time -- routing included.
+    fn attach_hub_port(&mut self, hub: &Hub, port: u8, hub_speed: Speed) {
+        let Some(status) = hub.reset_port(port) else { return };
+        let address = protocol::downstream_address(port);
+        let route = route_behind_hub(hub.device_address(), port, hub_speed, status.speed());
+        if route.split.is_some() {
+            // Worth a line: this is the path that was believed impossible
+            // on this chip, and it is the first thing to look at if a
+            // device behind a High-Speed hub misbehaves.
+            uart::log(match status.speed() {
+                Speed::Low => b"USB: Low-Speed device behind a High-Speed hub" as &[u8],
+                Speed::Full => b"USB: Full-Speed device behind a High-Speed hub",
+                _ => b"USB: slower device behind a High-Speed hub",
+            });
+            uart::log_hex(b", reached with split transactions; hub port ", port as u32);
+        }
+        let Some(downstream) = protocol::enumerate_device(address, route) else {
+            uart::log_hex(b"USB: enumeration failed for device on hub port ", port as u32);
+            return;
+        };
+
+        match attach_class_driver(&downstream) {
+            Some(kind) => {
+                uart::log(match kind {
+                    DeviceKind::Keyboard(_) => b"USB: keyboard attached on hub port " as &[u8],
+                    DeviceKind::MassStorage(_) => b"USB: mass storage attached on hub port ",
+                });
+                uart::log_hex(b"", port as u32);
+                self.slots[port as usize] = Some(Slot {
+                    location: Location::HubPort(port),
+                    summary: DeviceSummary::from(&downstream),
+                    kind,
+                });
+            }
+            None => uart::log_hex(b"USB: no class driver for device on hub port ", port as u32),
+        }
+    }
+}
+
+/// Works out how the controller has to reach a device on a hub port, from
+/// the two speeds involved.
+///
+/// A device slower than the hub it hangs off cannot be addressed directly:
+/// the hub's Transaction Translator has to run the transaction on the
+/// host's behalf, and the host reaches that TT with a split transaction
+/// naming the hub and the port (`hcd::SplitTarget`). A device at the hub's
+/// own speed needs nothing special, except that Low-Speed on a Full-Speed
+/// bus still needs PRE tokens.
+///
+/// Both conditions can hold at once -- a Low-Speed keyboard behind a
+/// High-Speed hub is split *and* Low-Speed -- which is why these are two
+/// independent fields of `hcd::Route` rather than one enum.
+///
+/// `low_speed_via_hub` is required even under a split, despite the field's
+/// PRE-token rationale suggesting it should only apply on a Full-Speed bus:
+/// clearing it for split routes was tried on real hardware and the very
+/// first SETUP came back STALL, so the core does need `HCCHAR.LSpdDev` to
+/// describe the device at the far end of the TT.
+fn route_behind_hub(
+    hub_address: u8,
+    port: u8,
+    hub_speed: Speed,
+    device_speed: Speed,
+) -> Route {
+    Route {
+        low_speed_via_hub: device_speed == Speed::Low,
+        split: if hub_speed == Speed::High && device_speed != Speed::High {
+            Some(SplitTarget { hub_address, port_number: port })
+        } else {
+            None
+        },
     }
 }
 

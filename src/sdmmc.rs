@@ -1,5 +1,5 @@
 //! ESP32-P4 SDHOST controller bring-up, SD card activation and DMA block I/O
-//! (stages 1-3 of `SD_CARD_PLAN.md`).
+//! (stages 1-3 of `docs/SD_CARD_PLAN.md`).
 //!
 //! Targets the Tab5's microSD slot: SDIO1, IOMUX-routed (bypasses the GPIO
 //! matrix), 4-bit capable, GPIO39..44 = D0,D1,D2,D3,CLK,CMD (confirmed from

@@ -11,11 +11,14 @@
 //! controller on GPIO24/25 that `uart.rs` already uses for
 //! flashing/logging.
 //!
-//! This is Stage 1 of `USB_HOST_PLAN.md`: core bring-up and host-port
+//! This is Stage 1 of `docs/USB_HOST_PLAN.md`: core bring-up and host-port
 //! connect/reset/speed detection only, driven by polling (no interrupt
 //! routing yet). Stage 4 added one knob here, `FORCE_FS_LS_ONLY_HOST`,
-//! which holds the whole bus at Full-Speed so that hub support does not
-//! need split transactions.
+//! which holds the whole bus at Full-Speed. That is how FS/LS devices
+//! behind a hub work here today: this driver implements no split
+//! transactions, so it avoids ever needing one. The hardware itself does
+//! support them -- see `probe_split_support`, which contradicts
+//! Espressif's documentation on real silicon.
 //!
 //! The USB-A 5V (VBUS) switch is one bit of the second PI4IOE5V6408 I/O
 //! expander (I2C address 0x44, "E2"), the counterpart to `lcd.rs`'s PI4IOE1
@@ -139,8 +142,10 @@ const GRSTCTL: usize = USB_DWC_HS + 0x10;
 const GRXFSIZ: usize = USB_DWC_HS + 0x24;
 const GNPTXFSIZ: usize = USB_DWC_HS + 0x28;
 const GSNPSID: usize = USB_DWC_HS + 0x40;
+const GHWCFG1: usize = USB_DWC_HS + 0x44;
 const GHWCFG2: usize = USB_DWC_HS + 0x48;
 const GHWCFG3: usize = USB_DWC_HS + 0x4C;
+const GHWCFG4: usize = USB_DWC_HS + 0x50;
 const HPTXFSIZ: usize = USB_DWC_HS + 0x100;
 const HCFG: usize = USB_DWC_HS + 0x400;
 const HPRT: usize = USB_DWC_HS + 0x440;
@@ -168,32 +173,46 @@ const GRSTCTL_AHBIDLE: u32 = 1 << 31;
 const GSNPSID_4_20A: u32 = 0x4F54_420A;
 
 const GHWCFG2_NUMHSTCHNL_MASK: u32 = 0xF << 14;
+// The core's own read-only report of the `OTG_SINGLE_POINT` synthesis
+// parameter: 1 = single-point (no hub, no split transactions), 0 =
+// multi-point. See `probe_split_support`.
+const GHWCFG2_SINGPNT: u32 = 1 << 5;
 const GHWCFG3_DFIFODEPTH_SHIFT: u32 = 16;
 
 const HCFG_FSLSSUPP: u32 = 1 << 2;
 const HCFG_DESCDMA: u32 = 1 << 23;
 const HCFG_PERSCHEDENA: u32 = 1 << 26;
 
-/// Stage 4 of `USB_HOST_PLAN.md`: when true, the host is restricted to
+/// Stage 4 of `docs/USB_HOST_PLAN.md`: when true, the host is restricted to
 /// Full/Low-Speed operation (`HCFG.FSLSSupp`), so it never drives the
 /// High-Speed chirp during a port reset and every attached device --
 /// including High-Speed-capable ones -- falls back to Full-Speed, which
 /// USB2.0 requires all of them to support.
 ///
-/// This exists only to make the High-Speed hub on hand usable: a
-/// Full/Low-Speed device behind a *High-Speed* hub needs split
-/// transactions (`HCSPLT`, SSPLIT/CSPLIT), which are out of scope, while
-/// the same hub forced to Full-Speed behaves exactly like a Full-Speed
-/// hub and needs none.
+/// It is now off, because it is no longer needed. It was Stage 4's way of
+/// reaching a Full/Low-Speed device behind a hub without split transactions
+/// (`HCSPLT`, SSPLIT/CSPLIT): a High-Speed hub whose *upstream* link is
+/// Full-Speed acts as a plain Full-Speed repeater, so nothing downstream of
+/// it needs a TT. The cost was that every device on the bus, High-Speed
+/// ones included, dropped to 12 Mbps.
 ///
-/// Setting this back to `false` restores the plain High-Speed-capable
-/// behaviour verified in Stages 1-3 -- it is the only thing in this
-/// project that branches on host speed support, and nothing above
-/// `hcd.rs` (including hub and class drivers) depends on it either way.
+/// What made that look permanent rather than provisional was that
+/// Espressif's synthesis parameters (`soc/esp32p4/.../usb_dwc_cfg.h`:
+/// `OTG20_SINGLE_POINT 1`), their maintainer notes ("Split transfers not
+/// supported"), and their host stack (`components/usb/hub.c`, which refuses
+/// a speed-mismatched port with "transaction translator (TT) is not
+/// supported") all say this core cannot split. The silicon disagrees --
+/// `probe_split_support` measures `GHWCFG2.SingPnt` = 0 and a fully
+/// functional `HCSPLT` -- and `Route`/`await_packet` now use it, so the bus
+/// runs at High-Speed while slower devices behind a hub are reached through
+/// that hub's TT.
 ///
-/// Note that ESP-IDF's own host driver never sets this bit, so unlike
-/// most of this file there is no reference implementation behind it.
-pub const FORCE_FS_LS_ONLY_HOST: bool = true;
+/// The knob is kept rather than deleted: it stays the fallback if a
+/// particular hub's TT misbehaves, and it is still the only thing in this
+/// project that branches on host speed support. Note that ESP-IDF's own
+/// host driver never sets this bit, so unlike most of this file there is no
+/// reference implementation behind it.
+pub const FORCE_FS_LS_ONLY_HOST: bool = false;
 
 const HPRT_PRTCONNSTS: u32 = 1 << 0;
 const HPRT_PRTENA: u32 = 1 << 2;
@@ -216,10 +235,11 @@ const HPRT_W1C_MASK: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
 // device -- no hub, no channel allocator needed), so these are fixed
 // offsets rather than a per-channel accessor.
 const HOST_CHANS: usize = USB_DWC_HS + 0x500; // channel stride is 0x20; channel 0 needs no offset
-// Note that offset 0x04, HCSPLT on a stock DWC OTG core, is reserved on
-// this one (`usb_dwc_struct.h`'s `usb_dwc_host_chan_regs_t` has
-// `reserved_0x04` there): split transactions are not implemented in this
-// host's channel registers at all, so there is nothing to clear.
+// Offset 0x04 is HCSPLT, the split-transaction control register. Nothing
+// here programs it yet, but -- contrary to every piece of Espressif
+// documentation -- it is present and functional on this silicon. See
+// `probe_split_support` for the measurement.
+const CHAN0_HCSPLT: usize = HOST_CHANS + 0x04;
 const CHAN0_HCCHAR: usize = HOST_CHANS;
 const CHAN0_HCINT: usize = HOST_CHANS + 0x08;
 const CHAN0_HCTSIZ: usize = HOST_CHANS + 0x10;
@@ -258,17 +278,43 @@ const HCCHAR_LSPDDEV: u32 = 1 << 17;
 pub const HCCHAR_EPTYPE_CTRL: u32 = 0 << 18;
 pub const HCCHAR_EPTYPE_BULK: u32 = 2 << 18;
 
+/// HCCHAR bits[21:20], the field the databook calls MC/EC. With
+/// `HCSPLT.SpltEna` clear it is a periodic multi-count and 0 is harmless
+/// (every unsplit transfer in this driver leaves it there). With SpltEna
+/// set it becomes the split transaction's retry count, which the databook
+/// requires to be at least 1 -- and Linux's dwc2 initializes to 1 for every
+/// channel it allocates, split or not.
+const HCCHAR_MC_ONE: u32 = 1 << 20;
+
 // Bounds `force_halt_channel`'s wait for the halt it explicitly requested;
 // short, since by that point the transfer has already been given up on
 // and this is just cleanup.
 const HALT_CONFIRM_ITERATIONS: u32 = 5_000;
 
+const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD: u32 = 1 << 1;
 const HCINT_STALL: u32 = 1 << 3;
+const HCINT_NAK: u32 = 1 << 4;
 const HCINT_XACTERR: u32 = 1 << 7;
 const HCINT_BBLERR: u32 = 1 << 8;
 const HCINT_XCS_XACT_ERR: u32 = 1 << 12;
 const HCINT_ERROR_MASK: u32 = HCINT_STALL | HCINT_XACTERR | HCINT_BBLERR | HCINT_XCS_XACT_ERR;
+
+// HCSPLT: the split-transaction control register, present and functional on
+// this silicon despite Espressif's documentation (see
+// `probe_split_support`).
+//
+// XactPos selects which part of a Full-Speed transaction a split carries.
+// Only "ALL" is ever used here: it means the whole payload fits in one
+// Full-Speed transaction, which is always true for the control and bulk
+// transfers this driver runs (MPS <= 64 <= the 188-byte limit that would
+// force a BEGIN/MID/END sequence). Isochronous OUT is the only transfer
+// type that needs the others, and this driver has none.
+const HCSPLT_PRTADDR_MASK: u32 = 0x7F; // bits[6:0]
+const HCSPLT_HUBADDR_SHIFT: u32 = 7; // bits[13:7]
+const HCSPLT_XACTPOS_ALL: u32 = 3 << 14;
+const HCSPLT_COMPSPLT: u32 = 1 << 16;
+const HCSPLT_SPLTENA: u32 = 1 << 31;
 
 // HCTSIZi in Scatter/Gather DMA mode repurposes the low byte as SCHED_INFO
 // (bits[7:0], must be 0xFF for non-periodic channels or the channel can
@@ -277,6 +323,16 @@ const HCINT_ERROR_MASK: u32 = HCINT_STALL | HCINT_XACTERR | HCINT_BBLERR | HCINT
 // QTD per packet, so NTD is always 0.
 const HCTSIZ_SCHED_INFO_ALL: u32 = 0xFF;
 const HCTSIZ_PID_DATA1: u32 = 2 << 29; // 2'b10; DATA0 is 2'b00
+
+// The same register's *buffer* DMA meaning, used only by `run_split_packet`
+// (see there for why splits cannot use Scatter/Gather DMA). Here the low
+// bits really are a byte count rather than SCHED_INFO, and the core needs
+// to be told the packet count as well.
+const HCTSIZ_XFERSIZE_MASK: u32 = 0x7_FFFF; // bits[18:0]
+const HCTSIZ_PKTCNT_SHIFT: u32 = 19; // bits[28:19]
+/// Buffer DMA marks a SETUP packet with a PID of 2'b11, where Scatter/Gather
+/// DMA used the QTD's `QTD_IS_SETUP` bit.
+const HCTSIZ_PID_SETUP: u32 = 3 << 29;
 
 // QTD (Queue Transfer Descriptor), 8 bytes: control word + buffer pointer.
 // The list this points into must be 512-byte aligned (`HCDMAi.dmaaddr`
@@ -372,6 +428,87 @@ pub struct HostPort {
     pub connected: bool,
     pub enabled: bool,
     pub speed: Speed,
+}
+
+/// What the silicon itself reports about split-transaction support, as
+/// gathered by `probe_split_support`.
+#[derive(Clone, Copy)]
+pub struct SplitSupport {
+    pub hwcfg1: u32,
+    pub hwcfg2: u32,
+    pub hwcfg3: u32,
+    pub hwcfg4: u32,
+    /// `GHWCFG2.SingPnt`: the core's read-only report of its
+    /// `OTG_SINGLE_POINT` synthesis parameter. True means no hub and no
+    /// split transactions.
+    pub single_point: bool,
+    /// What `CHAN0_HCSPLT` reads back after an all-ones write. A real
+    /// HCSPLT would return the mask of its implemented fields
+    /// (`SpltEna` | `CompSplt` | `XactPos` | `HubAddr` | `PrtAddr` =
+    /// `0x8001_FFFF`); an unimplemented register reads 0.
+    pub hcsplt_readback: u32,
+    /// What `CHAN0_HCSPLT` reads back after writing `0x1234_5678`. A real
+    /// register storing values through the same field mask returns
+    /// `0x1234_5678 & 0x8001_FFFF` = `0x0000_5678`; a constant or an
+    /// aliased read returns something else.
+    pub hcsplt_pattern_readback: u32,
+}
+
+/// Asks the hardware directly whether it can do split transactions, which
+/// is what a Full/Low-Speed device behind a *High-Speed* hub would need
+/// (see `FORCE_FS_LS_ONLY_HOST`).
+///
+/// **The answer on real silicon is yes**, which contradicts all of
+/// Espressif's documentation. Measured on this board (ESP32-P4 v1.3):
+///
+/// ```text
+/// GHWCFG2=0x215FFFD0  SingPnt(bit5)=0
+/// HCSPLT ch0: wrote 0xFFFFFFFF -> 0x8001FFFF; wrote 0x12345678 -> 0x00005678
+/// ```
+///
+/// Both checks agree, and each is hard to explain away:
+///
+/// 1. `GHWCFG2.SingPnt` is the core's own read-only report of its
+///    `OTG_SINGLE_POINT` synthesis parameter. It reads 0 -- multi-point,
+///    i.e. hub and split transactions supported. Every other field of the
+///    same register decodes to the documented value (architecture 2, 16
+///    host channels, dynamic FIFO, multi-processor interrupt), so the
+///    decode is not misaligned; `SingPnt` simply disagrees with
+///    `soc/esp32p4/.../usb_dwc_cfg.h`'s `OTG20_SINGLE_POINT 1`.
+/// 2. `CHAN0_HCSPLT` behaves as a real register, not as a missing one
+///    (which would read 0). The all-ones write returns exactly the
+///    databook's implemented-field mask -- `SpltEna` | `CompSplt` |
+///    `XactPos` | `HubAddr` | `PrtAddr` = `0x8001_FFFF`, with reserved
+///    bits [30:17] correctly reading back 0 -- and an arbitrary pattern
+///    is stored through that same mask
+///    (`0x1234_5678 & 0x8001_FFFF` = `0x0000_5678`).
+///
+/// What this does *not* prove is that the core actually emits SSPLIT and
+/// CSPLIT tokens on the wire; only a transfer to a Full/Low-Speed device
+/// behind a High-Speed hub can show that.
+///
+/// The register writes are safe: channel 0 is idle whenever this runs
+/// (`run_packet` is synchronous and the shell calls this between polls),
+/// HCSPLT has no effect on a halted channel, and the previous value is
+/// restored.
+pub fn probe_split_support() -> SplitSupport {
+    let previous = unsafe { read(CHAN0_HCSPLT) };
+    unsafe { write(CHAN0_HCSPLT, 0xFFFF_FFFF) };
+    let hcsplt_readback = unsafe { read(CHAN0_HCSPLT) };
+    unsafe { write(CHAN0_HCSPLT, 0x1234_5678) };
+    let hcsplt_pattern_readback = unsafe { read(CHAN0_HCSPLT) };
+    unsafe { write(CHAN0_HCSPLT, previous) };
+
+    let hwcfg2 = unsafe { read(GHWCFG2) };
+    SplitSupport {
+        hwcfg1: unsafe { read(GHWCFG1) },
+        hwcfg2,
+        hwcfg3: unsafe { read(GHWCFG3) },
+        hwcfg4: unsafe { read(GHWCFG4) },
+        single_point: hwcfg2 & GHWCFG2_SINGPNT != 0,
+        hcsplt_readback,
+        hcsplt_pattern_readback,
+    }
 }
 
 fn dead_port(vbus_enable_acked: bool, core_alive: bool, core_id: u32) -> HostPort {
@@ -708,6 +845,55 @@ pub enum PacketOutcome {
 /// `is_in` lives here too even though a control transfer flips direction
 /// between its stages: `Endpoint` is `Copy`, so a stage can just say
 /// `Endpoint { is_in: true, ..pipe }`.
+/// The High-Speed hub whose Transaction Translator has to relay every
+/// transaction to a slower device behind it, identified the way `HCSPLT`
+/// wants it: the hub's own USB device address and the 1-based downstream
+/// port the device is on.
+#[derive(Clone, Copy)]
+pub struct SplitTarget {
+    pub hub_address: u8,
+    pub port_number: u8,
+}
+
+/// How the controller has to reach a device, as opposed to what is being
+/// sent to it. This is a property of where the device is plugged in, fixed
+/// for as long as it stays there, so it is carried around with the device
+/// (`protocol::ControlPipe`, `Endpoint`) rather than passed per transfer.
+///
+/// The three cases that matter, in the order the bus produces them:
+///
+/// - Plugged straight into USB-A: `Route::default()`. The whole bus runs at
+///   the device's own speed, so there is nothing special to do.
+/// - Behind a hub that runs at the same speed as the device: only
+///   `low_speed_via_hub` applies (a Low-Speed device on a Full-Speed bus
+///   needs PRE tokens).
+/// - Behind a *High-Speed* hub at Full or Low Speed: `split` is set, and
+///   every transaction becomes an SSPLIT/CSPLIT pair aimed at the hub's TT.
+#[derive(Clone, Copy, Default)]
+pub struct Route {
+    /// A Low-Speed device reached through a hub, which needs PRE tokens --
+    /// *not* just "the device is Low-Speed". See `HCCHAR_LSPDDEV`.
+    pub low_speed_via_hub: bool,
+    /// Set only for a Full/Low-Speed device behind a High-Speed hub.
+    pub split: Option<SplitTarget>,
+}
+
+impl Route {
+    /// The `HCSPLT` value for this route: a programmed split target, or 0
+    /// to leave splitting off for a device the host can address directly.
+    fn hcsplt(&self) -> u32 {
+        match self.split {
+            Some(target) => {
+                HCSPLT_SPLTENA
+                    | HCSPLT_XACTPOS_ALL
+                    | ((target.hub_address as u32 & 0x7F) << HCSPLT_HUBADDR_SHIFT)
+                    | (target.port_number as u32 & HCSPLT_PRTADDR_MASK)
+            }
+            None => 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Endpoint {
     pub device_address: u8,
@@ -716,9 +902,7 @@ pub struct Endpoint {
     pub endpoint_type: u32,
     pub mps: u16,
     pub is_in: bool,
-    /// A Low-Speed device behind a Full-Speed hub, which needs PRE tokens
-    /// -- *not* just "the device is Low-Speed". See `HCCHAR_LSPDDEV`.
-    pub low_speed_via_hub: bool,
+    pub route: Route,
 }
 
 /// Runs one packet (a single-entry, halt-on-complete QTD) on channel 0 to
@@ -742,15 +926,40 @@ pub struct Endpoint {
 /// re-enumerates -- logging every repeat of an already-diagnosed error
 /// adds nothing, so callers doing repeated polling pass `true` here once
 /// they have already logged the first one in a streak.
+///
+/// `max_split_rounds` bounds how many SSPLIT/CSPLIT round trips a split
+/// packet (`Endpoint::route`'s `split`) may take before giving up with
+/// `Timeout`; it is ignored for a device the host addresses directly. It
+/// exists because splitting moves NAK retrying out of the hardware and into
+/// this function: a device that has nothing to say NAKs the complete split,
+/// and whether that should be retried for a while (a control transfer,
+/// where a NAK means "busy, ask again") or abandoned immediately (interrupt
+/// polling, where it means "no new keystrokes" and the frame loop will be
+/// back in 16ms) is the caller's call, not something `timeout_iterations`
+/// -- a per-halt spin budget -- can express.
 pub fn run_packet(
     endpoint: &Endpoint,
     is_setup: bool,
     pid_data1: bool,
     timeout_iterations: u32,
+    max_split_rounds: u32,
     quiet_timeout: bool,
     quiet_errors: bool,
     buffer: &mut [u8],
 ) -> PacketOutcome {
+    if endpoint.route.split.is_some() {
+        return run_split_packet(
+            endpoint,
+            is_setup,
+            pid_data1,
+            timeout_iterations,
+            max_split_rounds,
+            quiet_timeout,
+            quiet_errors,
+            buffer,
+        );
+    }
+
     let xfer_len = buffer.len();
     let data_ptr = buffer.as_mut_ptr();
     if xfer_len > 0 {
@@ -774,33 +983,34 @@ pub fn run_packet(
     let hcchar = (endpoint.mps as u32 & 0x7FF) // bits[10:0]: MPS
         | ((endpoint.endpoint_number as u32 & 0xF) << 11)
         | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
-        | (if endpoint.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
+        | (if endpoint.route.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
         | endpoint.endpoint_type
         | ((endpoint.device_address as u32 & 0x7F) << 22);
     let hctsiz = HCTSIZ_SCHED_INFO_ALL | (if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 });
 
     unsafe {
         write(CHAN0_HCINT, 0xFFFF_FFFF); // clear stale status from a previous packet
+        write(CHAN0_HCSPLT, 0); // this path never splits; see `run_split_packet`
         write(CHAN0_HCCHAR, hcchar);
         write(CHAN0_HCTSIZ, hctsiz);
         write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
         modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
     }
 
-    if !poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, timeout_iterations) {
-        if !quiet_timeout {
-            uart::log(b"USB: control transfer timed out waiting for channel halt\r\n");
-            log_port_state();
+    let hcint = match await_packet(0, 0, timeout_iterations, max_split_rounds) {
+        Some(hcint) => hcint,
+        None => {
+            if !quiet_timeout {
+                uart::log(b"USB: control transfer timed out waiting for channel halt\r\n");
+                log_port_state();
+            }
+            // Leave the channel in a known-idle state regardless of why we
+            // gave up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is
+            // not racing whatever the core was still doing.
+            force_halt_channel();
+            return PacketOutcome::Timeout;
         }
-        // Leave the channel in a known-idle state regardless of why we gave
-        // up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is not
-        // racing whatever the core was still doing.
-        force_halt_channel();
-        return PacketOutcome::Timeout;
-    }
-
-    let hcint = unsafe { read(CHAN0_HCINT) };
-    unsafe { write(CHAN0_HCINT, hcint) }; // W1C
+    };
 
     cache_writeback_invalidate(qtd_address, 8); // see the QTD fields the core wrote back
     let control_after = unsafe { read(qtd_address) };
@@ -831,6 +1041,272 @@ pub fn run_packet(
         cache_writeback_invalidate(data_ptr as usize, transferred);
     }
     PacketOutcome::Ok(transferred)
+}
+
+/// Largest split packet `run_split_packet` will stage. A device reached
+/// through a hub's TT is Full or Low Speed by definition, so its endpoints
+/// cap out at a 64-byte max packet size (USB2.0 5.5.3/5.7.3/5.8.3), and
+/// every caller chunks by MPS before getting here.
+const SPLIT_STAGING_MAX: usize = 64;
+
+/// Absolute ceiling on the rounds one split packet may take, whatever the
+/// caller's soft budget. Only a TT that never stops answering NYET reaches
+/// it; see `await_packet` for why walking away before a safe boundary is a
+/// last resort rather than the normal path.
+const SPLIT_HARD_ROUND_CAP: u32 = 5_000;
+
+/// A word-aligned staging buffer for split packets. Buffer DMA hands
+/// `HCDMA` the data pointer itself (Scatter/Gather DMA pointed it at a
+/// descriptor instead), and the core requires that pointer to be word
+/// aligned -- which an arbitrary `&mut [u8]` sub-slice from a caller is
+/// not. Copying through a fixed aligned buffer is cheaper than propagating
+/// an alignment requirement up through every caller, at
+/// `SPLIT_STAGING_MAX` bytes a packet.
+#[repr(C, align(4))]
+struct SplitStaging {
+    bytes: [u8; SPLIT_STAGING_MAX],
+}
+
+/// Runs one packet to a device behind a High-Speed hub's Transaction
+/// Translator, using **buffer DMA** rather than the Scatter/Gather DMA the
+/// rest of this driver runs on.
+///
+/// That switch is the whole reason this function exists. The DWC_OTG core
+/// cannot do split transactions in Scatter/Gather DMA mode: with
+/// `HCFG.DescDMA` set and `HCSPLT.SpltEna` programmed, enabling the channel
+/// does nothing at all -- confirmed on real hardware, where the channel sat
+/// with `ChEna` still set and `HCINT` all zero until the timeout, having
+/// never attempted a transaction. (Linux's dwc2 driver reaches the same
+/// conclusion from the other direction: it turns descriptor DMA off when it
+/// needs splits.) In buffer DMA the core does the start split, halts, and
+/// leaves software to ask for the result -- which is what `await_packet`
+/// drives.
+///
+/// `HCFG.DescDMA` is a whole-controller setting, not a per-channel one, so
+/// it is cleared for the duration of this packet and restored afterwards.
+/// That is safe here only because `run_packet` is synchronous and channel 0
+/// is the only channel this driver ever uses: there is never another
+/// transfer in flight to be switched out from under.
+#[allow(clippy::too_many_arguments)]
+fn run_split_packet(
+    endpoint: &Endpoint,
+    is_setup: bool,
+    pid_data1: bool,
+    timeout_iterations: u32,
+    max_split_rounds: u32,
+    quiet_timeout: bool,
+    quiet_errors: bool,
+    buffer: &mut [u8],
+) -> PacketOutcome {
+    let xfer_len = buffer.len();
+    if xfer_len > SPLIT_STAGING_MAX {
+        // Unreachable via the current callers (all chunk by MPS, which is
+        // at most 64 on a Full/Low-Speed endpoint), but silently truncating
+        // a transfer would be far worse than refusing it.
+        uart::log_hex(b"USB: split packet larger than the staging buffer, len=", xfer_len as u32);
+        return PacketOutcome::Error;
+    }
+
+    let mut staging = SplitStaging { bytes: [0u8; SPLIT_STAGING_MAX] };
+    if !endpoint.is_in {
+        staging.bytes[..xfer_len].copy_from_slice(buffer);
+    }
+    let data_address = staging.bytes.as_mut_ptr() as usize;
+    cache_writeback_invalidate(data_address, SPLIT_STAGING_MAX);
+
+    let hcchar = (endpoint.mps as u32 & 0x7FF)
+        | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+        | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
+        | (if endpoint.route.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
+        | endpoint.endpoint_type
+        | HCCHAR_MC_ONE
+        | ((endpoint.device_address as u32 & 0x7F) << 22);
+    let pid = if is_setup {
+        HCTSIZ_PID_SETUP
+    } else if pid_data1 {
+        HCTSIZ_PID_DATA1
+    } else {
+        0
+    };
+    // One packet per call, as everywhere else in this driver -- including
+    // for a zero-length status stage, which is still one (empty) packet.
+    let hctsiz = (xfer_len as u32 & HCTSIZ_XFERSIZE_MASK) | (1 << HCTSIZ_PKTCNT_SHIFT) | pid;
+    let hcsplt = endpoint.route.hcsplt();
+
+    unsafe {
+        modify(HCFG, HCFG_DESCDMA, 0); // buffer DMA for this packet only
+        write(CHAN0_HCINT, 0xFFFF_FFFF);
+        write(CHAN0_HCSPLT, hcsplt);
+        write(CHAN0_HCCHAR, hcchar);
+        write(CHAN0_HCTSIZ, hctsiz);
+        write(CHAN0_HCDMA, data_address as u32);
+        modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+    }
+
+    let outcome = await_packet(hcsplt, hctsiz, timeout_iterations, max_split_rounds);
+
+    // Giving up leaves the channel enabled in the middle of a split, so it
+    // has to be stopped *before* the controller's DMA mode changes back
+    // underneath it. Switching `HCFG.DescDMA` with a transfer still in
+    // flight corrupts the core: confirmed on real hardware, where doing it
+    // in the other order made the *next*, unrelated, unsplit control
+    // transfer to the hub fail with `XCS_XACT_ERR` every time -- the hub
+    // looked like it had stopped answering, when in fact the abandoned
+    // split had been left mid-flight across the mode switch.
+    // Only tear anything down if the channel is genuinely still in flight.
+    // Giving up at a safe boundary (`await_packet`) leaves it already
+    // halted, and forcing `ChDis` onto a channel that is not enabled is not
+    // a harmless no-op on this core -- the halt it asks for never
+    // completes, because a disabled channel generates no halt. That path
+    // runs on *every* idle keyboard poll, so getting it wrong corrupts the
+    // core dozens of times a second rather than once in a rare timeout.
+    if outcome.is_none() && unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
+        force_halt_channel();
+        // An abandoned in-flight split can also leave residue in the
+        // FIFOs, which the next transfer -- on any endpoint, to any device
+        // -- would read as its own data.
+        flush_fifos();
+    }
+    // Restore Scatter/Gather DMA before anything can return: every other
+    // packet in this driver depends on it. Splitting is cleared with it, so
+    // no half-configured split outlives this call either.
+    unsafe {
+        write(CHAN0_HCSPLT, 0);
+        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+    }
+
+    let Some(hcint) = outcome else {
+        if !quiet_timeout {
+            uart::log(b"USB: split transfer timed out waiting for the hub's TT\r\n");
+            log_port_state();
+        }
+        return PacketOutcome::Timeout;
+    };
+
+    if hcint & HCINT_STALL != 0 {
+        if !quiet_errors {
+            uart::log(b"USB: split transfer STALL\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+    if hcint & HCINT_ERROR_MASK != 0 {
+        if !quiet_errors {
+            uart::log_hex(b"USB: split transfer transaction error, HCINT=", hcint);
+            log_port_state();
+        }
+        return PacketOutcome::Error;
+    }
+
+    // Buffer DMA reports progress by counting `HCTSIZ.XferSize` down as
+    // bytes move, where Scatter/Gather DMA wrote the remainder back into
+    // the QTD.
+    let remaining = (unsafe { read(CHAN0_HCTSIZ) } & HCTSIZ_XFERSIZE_MASK) as usize;
+    let transferred = xfer_len.saturating_sub(remaining.min(xfer_len));
+    if endpoint.is_in && transferred > 0 {
+        cache_writeback_invalidate(data_address, SPLIT_STAGING_MAX);
+        buffer[..transferred].copy_from_slice(&staging.bytes[..transferred]);
+    }
+    PacketOutcome::Ok(transferred)
+}
+
+/// Waits for the channel `run_packet` just enabled to halt, and returns the
+/// `HCINT` that ended it (already write-1-cleared). `None` on timeout.
+///
+/// For a device the host addresses directly this is a single wait: the core
+/// retries NAKs itself and halts once when the QTD is done.
+///
+/// A split packet takes more than one channel activation. The host asks the
+/// hub's Transaction Translator to run the transaction on its behalf (the
+/// *start split*), then asks for the result (the *complete split*), and the
+/// core halts the channel between the two:
+///
+/// - `NAK` means the TT has nothing for us -- either it would not take the
+///   job (its buffer is busy) or the device itself NAKed, e.g. an idle
+///   keyboard with no keystroke to report. Either way its buffer no longer
+///   holds this transaction, so the sequence restarts from a fresh start
+///   split.
+/// - a bare `ACK` (the TT accepted the start split) or `NYET` (it has not
+///   finished with the slow device yet) both mean "ask for the result",
+///   i.e. run the complete split.
+/// - anything else -- transfer complete, STALL, or a real error -- is the
+///   end of the packet either way, and is returned to `run_packet` to
+///   classify exactly as an unsplit one.
+///
+/// `hctsiz` is the value `run_split_packet` programmed, needed to re-arm the
+/// packet when a NAK sends the sequence back to a fresh start split; it is
+/// ignored when `hcsplt` says this is not a split packet.
+///
+/// `max_split_rounds` is a *soft* budget, and deliberately so: it stops the
+/// sequence at the first safe boundary at or after that many rounds, rather
+/// than the moment it is reached. A split may only be abandoned once the TT
+/// has let go of it -- USB2.0 11.17 requires the host to keep issuing
+/// complete splits until the TT answers something other than NYET, so a
+/// NAK (the TT discarding its buffer) or a conclusion is the only legal
+/// place to walk away.
+///
+/// Getting this wrong is not a subtle protocol nicety. When an idle
+/// keyboard poll gave up as soon as its budget ran out, it left the hub's
+/// TT holding a transaction nobody ever collected, and the *next* unrelated
+/// control transfer to that hub failed with `XCS_XACT_ERR` -- the hub
+/// looked like it had died. It went unnoticed at first only because the
+/// frame loop was resetting the whole bus every few seconds anyway, which
+/// cleared the wedged TT as a side effect.
+fn await_packet(
+    hcsplt: u32,
+    hctsiz: u32,
+    timeout_iterations: u32,
+    max_split_rounds: u32,
+) -> Option<u32> {
+    let mut rounds = 0u32;
+    loop {
+        if !poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, timeout_iterations) {
+            return None;
+        }
+        let hcint = unsafe { read(CHAN0_HCINT) };
+        unsafe { write(CHAN0_HCINT, hcint) }; // W1C
+
+        if hcsplt & HCSPLT_SPLTENA == 0 {
+            return Some(hcint);
+        }
+        // Only a bare handshake keeps a split packet going; anything that
+        // concludes it (data moved, STALL, error) is the caller's business.
+        if hcint & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_ERROR_MASK) != 0 {
+            return Some(hcint);
+        }
+        rounds += 1;
+
+        // A NAK invalidates the TT's buffer for this transaction, so the
+        // next step is a fresh start split rather than another complete
+        // split. Anything else (the ACK that accepts a start split, a NYET
+        // that says "not yet") continues into the complete-split half.
+        let in_complete_split = hcint & HCINT_NAK == 0;
+
+        if !in_complete_split && rounds >= max_split_rounds {
+            return None; // out of budget, and the TT has let go: safe to stop
+        }
+        if rounds >= SPLIT_HARD_ROUND_CAP {
+            // Last resort against a wedged TT that answers NYET forever.
+            // Leaving mid-sequence is exactly what the doc comment above
+            // warns about, so this is set high enough never to be the
+            // ordinary way out.
+            uart::log(b"USB: giving up mid-split; the hub's TT never answered\r\n");
+            return None;
+        }
+        unsafe {
+            if in_complete_split {
+                write(CHAN0_HCSPLT, hcsplt | HCSPLT_COMPSPLT);
+            } else {
+                // Starting over: put back the packet count and PID the core
+                // may have consumed on the attempt that just NAKed. HCDMA
+                // still points at the same staging buffer, and nothing was
+                // transferred, so this re-arms the identical packet.
+                write(CHAN0_HCSPLT, hcsplt);
+                write(CHAN0_HCTSIZ, hctsiz);
+            }
+            write(CHAN0_HCINT, 0xFFFF_FFFF);
+            modify(CHAN0_HCCHAR, HCCHAR_CHENA | HCCHAR_CHDIS, HCCHAR_CHENA);
+        }
+    }
 }
 
 /// Logs the raw root-port register alongside a failed transfer. A device

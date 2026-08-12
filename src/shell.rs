@@ -117,6 +117,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "usbhw",
+        usage: "usbhw",
+        lines: &[
+            "dump the DWC core's GHWCFG registers and probe HCSPLT to show",
+            "whether split transactions exist in hardware at all",
+        ],
+    },
+    HelpEntry {
         name: "usbmsc",
         usage: "usbmsc",
         lines: &[
@@ -153,7 +161,7 @@ pub enum Outcome {
 /// next.
 ///
 /// `usb_host` is the single registry `lcd.rs`'s frame loop owns
-/// (`USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
+/// (`docs/USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
 /// devices already in it instead of probing the bus independently, which
 /// is what used to let a diagnostic command reset a live keyboard/Mass
 /// Storage session out from under itself.
@@ -192,6 +200,7 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"usbrescan" => cmd_usbrescan(console, usb_host),
         b"usbvbus" => cmd_usbvbus(console, argument),
         b"usbhub" => cmd_usbhub(console, usb_host),
+        b"usbhw" => cmd_usbhw(console, usb_host),
         b"usbmsc" => cmd_usbmsc(console, usb_host),
         b"usbread" => cmd_usbread(console, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, usb_host),
@@ -553,7 +562,7 @@ fn cmd_sdzero(console: &mut Console, argument: &[u8]) {
 
 /// Reads LBA 0 from the SD card and hands it to `mbr::show` -- the
 /// device-specific half of the SD/USB split described in
-/// `USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
+/// `docs/USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
 /// knows nothing about SD.
 fn cmd_sdmbr(console: &mut Console) {
     console.write_output_line("activating SD card...");
@@ -646,7 +655,7 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
 ///
 /// This -- together with every other USB command reading or driving
 /// devices already in `usb_host` instead of calling `usb::probe_port`/
-/// `usb::enumerate_device` on its own -- is `USB_REFACTOR_PLAN.md` Stage
+/// `usb::enumerate_device` on its own -- is `docs/USB_REFACTOR_PLAN.md` Stage
 /// A: only `UsbHost::rescan` (via `usbrescan`, or `lcd.rs`'s frame loop)
 /// ever resets the bus, so no USB command can invalidate another device's
 /// live session anymore.
@@ -683,9 +692,9 @@ fn report_last_probe(console: &mut Console, usb_host: &usb::UsbHost) -> bool {
     // The speed line below only means what it says once it is clear
     // whether the host was allowed to negotiate High-Speed at all.
     console.write_output_line(if usb::FORCE_FS_LS_ONLY_HOST {
-        "host: FS/LS-only forced (HCFG.FSLSSupp, for hub support)"
+        "host: FS/LS-only forced (HCFG.FSLSSupp)"
     } else {
-        "host: High-Speed capable"
+        "host: High-Speed capable, split transactions on (see 'usbhw')"
     });
 
     if !port.connected {
@@ -796,7 +805,7 @@ fn device_kind_text(kind: &usb::DeviceKind) -> Line {
     line
 }
 
-/// `USB_MSC_PLAN.md` Stage 1-4, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/USB_MSC_PLAN.md` Stage 1-4, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
 /// runs SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10) against the Mass
 /// Storage device `UsbHost::rescan` already attached, wherever it is --
 /// USB-A directly or a hub port -- instead of enumerating one fresh. See
@@ -866,7 +875,7 @@ fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
     console.write_output_line(line.as_str());
 }
 
-/// `USB_MSC_PLAN.md` Stage 5, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/USB_MSC_PLAN.md` Stage 5, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
 /// read one 512-byte block via SCSI READ(10) from whichever Mass Storage
 /// device `UsbHost::rescan` already attached, and dump it, mirroring
 /// `cmd_sdread`'s shape (and reusing `sdmmc::dump_block` for the UART hex
@@ -917,7 +926,7 @@ fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHo
     console.write_output_line("full 512-byte hex dump: see UART log");
 }
 
-/// `USB_MSC_PLAN.md` Stage 6, extended by `USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/USB_MSC_PLAN.md` Stage 6, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
 /// reads LBA 0 from whichever Mass Storage device `UsbHost::rescan` already
 /// attached and hands it to the same `mbr::show` that `cmd_sdmbr` uses, so
 /// the two commands print partition tables in an identical format despite
@@ -941,12 +950,57 @@ fn cmd_usbmbr(console: &mut Console, usb_host: &mut usb::UsbHost) {
     mbr::show(console, &sector);
 }
 
-/// `USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `USB_REFACTOR_PLAN.md`
+/// `docs/USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `docs/USB_REFACTOR_PLAN.md`
 /// Stage C: reports the hub `UsbHost::rescan` already opened, and every
 /// port's live status alongside which class driver (if any) is attached to
 /// it. `Hub::status`/`Hub::port_status` are plain `GET_STATUS` reads, safe
 /// to run here without disturbing any attached device's address -- unlike
 /// `rescan`, nothing below this command resets the bus.
+/// Asks the DWC core itself whether it can do split transactions, so the
+/// "FS/LS behind a High-Speed hub is impossible on this chip" claim behind
+/// `usb::FORCE_FS_LS_ONLY_HOST` rests on measured silicon rather than only
+/// on Espressif's synthesis parameters and docs.
+fn cmd_usbhw(console: &mut Console, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, usb_host) {
+        return;
+    }
+    let hw = usb::probe_split_support();
+
+    let mut line = Line::new();
+    line.push_str("GHWCFG1=0x");
+    line.push_hex(hw.hwcfg1, 8);
+    line.push_str(" 2=0x");
+    line.push_hex(hw.hwcfg2, 8);
+    line.push_str(" 3=0x");
+    line.push_hex(hw.hwcfg3, 8);
+    line.push_str(" 4=0x");
+    line.push_hex(hw.hwcfg4, 8);
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("GHWCFG2.SingPnt (bit5): ");
+    line.push_u32(if hw.single_point { 1 } else { 0 });
+    line.push_str(if hw.single_point {
+        "  = single point: no hub/split in hardware"
+    } else {
+        "  = multi point: split transactions ARE supported"
+    });
+    console.write_output_line(line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("HCSPLT ch0: wrote 0xFFFFFFFF, read 0x");
+    line.push_hex(hw.hcsplt_readback, 8);
+    line.push_str("; wrote 0x12345678, read 0x");
+    line.push_hex(hw.hcsplt_pattern_readback, 8);
+    console.write_output_line(line.as_str());
+
+    console.write_output_line(if hw.hcsplt_readback == 0 {
+        "  -> register not implemented (SSPLIT/CSPLIT impossible)"
+    } else {
+        "  -> bits stuck; real HCSPLT would read 0x8001FFFF"
+    });
+}
+
 fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
     if !report_last_probe(console, usb_host) {
         return;

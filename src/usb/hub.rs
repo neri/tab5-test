@@ -2,14 +2,13 @@
 //! control transfers -- the hub-side counterpart to `hid_keyboard.rs`, and
 //! the only module that knows what a downstream port is.
 //!
-//! This is Stage 4 of `USB_HOST_PLAN.md`, generalized to every port by
-//! `USB_REFACTOR_PLAN.md` Stage C: `usb::registry::UsbHost` walks every
+//! This is Stage 4 of `docs/USB_HOST_PLAN.md`, generalized to every port by
+//! `docs/USB_REFACTOR_PLAN.md` Stage C: `usb::registry::UsbHost` walks every
 //! port with `debounce_connected_port`/`reset_port` rather than driving
-//! just one. The hub is reached at Full-Speed (`hcd::FORCE_FS_LS_ONLY_HOST`
-//! keeps the whole bus there) so that devices behind it need no split
-//! transactions; nothing in this file depends on that choice, since hub
-//! port management is identical at every speed. Hubs behind hubs are still
-//! out of scope.
+//! just one. Nothing in this file depends on the speed the hub or its
+//! devices came up at -- hub port management is identical at every speed,
+//! and combining a High-Speed hub with slower devices behind it is
+//! `hcd::Route`'s business. Hubs behind hubs are still out of scope.
 
 use super::hcd::Speed;
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
@@ -142,9 +141,11 @@ impl HubDescriptor {
     }
 
     /// Transaction-translator think time in Full-Speed bit times. Only
-    /// meaningful for a hub operating at High-Speed; with
-    /// `hcd::FORCE_FS_LS_ONLY_HOST` set, the hub has no active TT and this
-    /// is informational only.
+    /// meaningful for a hub operating at High-Speed, which is now the
+    /// normal case -- that TT is what carries every transaction to a
+    /// slower device behind it (`hcd::Route`). Still informational: this
+    /// driver waits for the TT by retrying the complete split rather than
+    /// by scheduling around a known think time.
     pub fn tt_think_time_bits(&self) -> u16 {
         (((self.characteristics >> 5) & 0x3) + 1) * 8
     }
@@ -217,11 +218,10 @@ impl PortStatus {
         self.status & PORT_STATUS_POWER != 0
     }
 
-    /// The attached device's speed. With `hcd::FORCE_FS_LS_ONLY_HOST` set
-    /// the whole bus is Full-Speed, so `Speed::High` here would mean the
-    /// hub negotiated High-Speed behind the host's back -- see
-    /// `Hub::reset_port`, which refuses such a port rather than trying to
-    /// talk to it without split transactions.
+    /// The attached device's speed, as the hub determined it during reset.
+    /// Compared against the hub's own speed by
+    /// `usb::registry::UsbHost::attach_hub` to decide whether the device
+    /// needs a split transaction to reach.
     pub fn speed(&self) -> Speed {
         if self.status & PORT_STATUS_HIGH_SPEED != 0 {
             Speed::High
@@ -270,6 +270,13 @@ impl Hub {
 
         let descriptor = read_descriptor(&pipe)?;
         Some(Self { pipe, descriptor })
+    }
+
+    /// The hub's own USB device address, which is what `HCSPLT.HubAddr`
+    /// needs to name it as the Transaction Translator for a slower device
+    /// behind one of its ports (`hcd::SplitTarget`).
+    pub fn device_address(&self) -> u8 {
+        self.pipe.device_address
     }
 
     /// The hub's own status and change bits (`GET_STATUS` addressed to the
@@ -375,7 +382,7 @@ impl Hub {
     /// Checks one port for a connected device and, if there is one, lets it
     /// settle before confirming it is still there -- the per-port building
     /// block `usb::registry::UsbHost` uses to attach every occupied port
-    /// instead of picking a single one (`USB_REFACTOR_PLAN.md` Stage C).
+    /// instead of picking a single one (`docs/USB_REFACTOR_PLAN.md` Stage C).
     ///
     /// Returns `Some(true)` if a device is connected and stayed connected
     /// through debounce, `Some(false)` if the port is simply empty (no
@@ -404,11 +411,12 @@ impl Hub {
     /// where the attached device's speed finally becomes known (the hub
     /// determines it during reset, exactly as the root port does).
     ///
-    /// Returns `None` if the reset never completed, or if the port came up
-    /// High-Speed: the host is deliberately held at Full-Speed
-    /// (`hcd::FORCE_FS_LS_ONLY_HOST`), so a High-Speed port would mean the
-    /// hub negotiated a speed nothing above this layer can talk to without
-    /// split transactions. Refusing it is the safe side.
+    /// Returns `None` only if the reset never completed or left the port
+    /// disabled. Every speed the port can report is now usable: one slower
+    /// than the hub's own is reached through its Transaction Translator
+    /// (`hcd::Route`'s `split`), which is why this no longer refuses a
+    /// High-Speed port the way it did while the bus was pinned to
+    /// Full-Speed.
     pub fn reset_port(&self, port: u8) -> Option<PortStatus> {
         if !self.set_port_feature(port, FEATURE_PORT_RESET) {
             uart::log(b"USB: hub SET_FEATURE(PORT_RESET) failed\r\n");
@@ -440,10 +448,6 @@ impl Hub {
         let status = self.port_status(port)?;
         if !status.enabled() {
             uart::log(b"USB: hub port reset completed but the port did not enable\r\n");
-            return None;
-        }
-        if status.speed() == Speed::High {
-            uart::log(b"USB: hub port came up High-Speed; split transactions are not implemented\r\n");
             return None;
         }
         Some(status)

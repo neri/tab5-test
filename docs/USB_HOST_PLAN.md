@@ -2,7 +2,7 @@
 
 ## 方針
 
-`DESIGN.md`の方針（ESP-IDF/RTOSをリンクせずレジスタ操作で実装、1機能=1モジュール=
+`../DESIGN.md`の方針（ESP-IDF/RTOSをリンクせずレジスタ操作で実装、1機能=1モジュール=
 実機確認可能な単位でコミット）を踏襲する。[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)と
 同様、USBホストも「コントローラ初期化」「デバイス接続検出」「コントロール転送
 （列挙）」「クラス固有プロトコル（HID Boot）」の層ごとに実機依存の罠が異なるため、
@@ -31,7 +31,7 @@ ESP32-P4は独立した2系統のUSB 2.0 OTGコントローラを持ち、それ
   `src/uart.rs`）: 既定でGPIO24(D-)/GPIO25(D+)。上記2つのOTGコントローラとは
   別ピン・別ハードウェアブロックであり、本機能追加による干渉はない。
 
-ECO2（chip revision v1.3、`DESIGN.md`記載の対象個体）ではHigh-Speed OTGのDPラインに
+ECO2（chip revision v1.3、`../DESIGN.md`記載の対象個体）ではHigh-Speed OTGのDPラインに
 過渡電流対策の1 MΩプルダウンが基板側で必要とされる（Espressifのスキーマチック
 チェックリストに記載、v3.0以降で内部修正済み）。本プロジェクトはTab5基板の設計には
 関与しないため、Tab5側で対応済みという前提で進める（実機で問題が出た場合のみ
@@ -86,7 +86,8 @@ FIFOサイズ設定、ホストポート電源ON）を移植する。RTOSのイ�
 ずつを`hcd_dwc.c`/`usb_dwc_hal.c`/`usb_dwc_ll.h`のレジスタ操作に1:1で
 対応させ、都度チャネルhalt待ちでポーリングする方式）。HIDキーボードは
 Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの範囲に限定し、
-複数チャネル同時発行やハブ経由のsplit transactionは範囲外とした。
+複数チャネル同時発行はこのStageの範囲外とした。ハブ経由のSplit Transactionも
+このStageでは範囲外とし、Stage 6で実装した。
 
 - `GET_DESCRIPTOR`(Device, 8byteのみ)でEP0の`bMaxPacketSize0`を取得
 - `SET_ADDRESS`でデバイスアドレスを1に設定（以後EP0はこのアドレス宛）
@@ -224,16 +225,27 @@ Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの
 - 物理的な抜去は`UsbKeyboard::is_connected`（`HPRT.PRTCONNSTS`を読むだけ）
   で検出し、`lcd.rs`側が`poll`のタイムアウトを待たずに毎フレーム判定する
 
-## Stage 4: USBハブ対応（FS限定、実機にFS-onlyハブが無いための制約）
+## Stage 4: USBハブ対応（FS強制 → Stage 6でSplit Transaction対応に置き換え）
 
 Stage 3までの前提（`protocol::DEVICE_ADDRESS`固定値・チャネル0のみ・単一デバイス）を
-崩し、複数デバイスを列挙・ポーリングできるようにする。ただし手元の検証機材は
-High-Speed対応ハブのみで、Full-Speed専用ハブを持っていない。HSハブ配下に
-FS/LSデバイスがぶら下がるケースを正しく扱うにはSplit Transaction
-（`HCSPLT`レジスタを使ったSSPLIT/CSPLITのハンドシェイク）が必要だが、これは
-現状のDWC OTGコアの使い方（周期スケジューラ/frame list未実装、都度
-アクティベート・poll方式）と相性が悪く単体でも大きな実装項目になるため、
-今回は範囲外とする。
+崩し、複数デバイスを列挙・ポーリングできるようにする。手元の検証機材は
+High-Speed対応ハブだが、HSハブをHSで動かした状態で配下のFS/LSデバイスを
+扱うにはSplit Transaction（SSPLIT/CSPLIT）が必須となる。
+
+当初これは**ハードウェア制限で対応不可能**と結論した。根拠はEspressifの
+資料が一致してそう述べていたことである（`usb_dwc_cfg.h`の
+`OTG20_SINGLE_POINT 1`、maintainer notesの"Split transfers not supported"、
+`components/usb/hub.c`が速度不一致ポートを"transaction translator (TT) is
+not supported"で切り離す実装）。
+
+**この結論は実機測定で誤りだと判明した**（Stage 6参照）。ESP32-P4 v1.3の
+シリコンは`GHWCFG2.SingPnt = 0`（multi-point）を報告し、`HCSPLT`は完全に
+機能するレジスタである。Stage 4のFS強制は「ハードウェア制限」ではなく
+「Split Transaction未実装の間の回避策」だった。Stage 6で実装したため、
+`FORCE_FS_LS_ONLY_HOST`は既定で`false`になっている。
+
+以下はStage 4当時の記録として残す。FS強制の仕組み自体はフォールバックとして
+有効なままである。
 
 代わりに、**ホスト自身をFS/LS専用動作に強制し、手元のHSハブをFSハブとして
 振る舞わせる**方針を採る。USB2.0のHS検出はリセット中のチャープ
@@ -251,13 +263,14 @@ setterが存在することを確認済み（`hw->hcfg_reg.fslssupp = 1`、
 デバイスは（チャープに応答しないことで）自然にフォールバックする経路
 しか使っていない。つまり「HS対応PHY・HS対応コアで、意図的にチャープ
 そのものを止める」という今回の使い方はESP-IDFの実績が無い組み合わせで、
-`DESIGN.md`の言う「実機でしか踏めない罠」に該当する可能性が高い。
+`../DESIGN.md`の言う「実機でしか踏めない罠」に該当する可能性が高い。
 
-### 将来の復帰を前提にした実装方針（今回のユーザー指示）
+### FS強制を切り替え可能に保つ方針
 
-このFS/LS強制は「FS-onlyハブが手に入るまでの暫定措置」であり、将来
-Split Transactionを実装してHSハブ本来の速度を使えるようにする際は
-外せる必要がある。そのため:
+（Stage 4当時は「両方を同時に満たすモードは存在しない」と考えていたが、
+Stage 6のSplit Transaction対応でHS動作とFS/LSデバイスの併用が可能になった。
+以下の切り替え可能性を保つ方針そのものは、そのままフォールバックとして
+役に立っている。）
 
 - `hcd.rs`に`FORCE_FS_LS_ONLY_HOST: bool`のような名前付き定数を1つ置き、
   `HCFG.FSLSSupp`の設定箇所はこの定数の分岐だけにする（コンパイル時に
@@ -267,12 +280,14 @@ Split Transactionを実装してHSハブ本来の速度を使えるようにす�
   （`GUSBCFG_FORCEHSTMODE`、UTMI PHYのHS選択、`Speed::High`列挙子、
   `HPRT_PRTSPD_MASK`の判定など）は一切削除・変更しない
 - Stage 5以降で新設するハブ・複数デバイス関連のコードも、`FSLSSupp`の
-  ON/OFFに依存する分岐は作らない（ハブのポート管理自体はホストの
-  動作速度に関係なく同じプロトコルなので、Split Transaction実装時に
-  Stage 5〜8の成果を作り直す必要はない想定。追加が必要になるのは
-  `hcd::run_packet`層のSplit対応だけのはず）
+  ON/OFFに依存する分岐は作らない（Stage 6でHSハブ配下のFS/LSデバイスを
+  実際に扱えるようになったため、この方針は結果的に正しかった。速度差の
+  扱いは`hcd::Route`に閉じている）
 
-### Stage 4-1: FS/LS専用動作への切り替え ✅ 完了（実機確認済み）
+### Stage 4-1: FS/LS専用動作への切り替え ✅ 完了（実機確認済み、現在は既定オフ）
+
+（`FORCE_FS_LS_ONLY_HOST`はStage 6で既定`false`になった。この節の内容は
+機構の記録であり、フォールバックとして今も有効に動く。）
 
 - `hcd.rs`の`set_core_defaults()`（またはその近辺）に`HCFG_FSLSSUPP`
   （`1 << 2`）を条件付きで設定する処理を追加
@@ -465,9 +480,10 @@ Split Transactionを実装してHSハブ本来の速度を使えるようにす�
     HSハブ配下に速度の異なるデバイスが繋がった場合、
     "transaction translator (TT) is not supported"として明示的に
     拒否する
-  - P4のチャネルレジスタには`HCSPLT`自体が無い
-    （`usb_dwc_struct.h`の`usb_dwc_host_chan_regs_t`はオフセット
-    0x04が`reserved_0x04`）
+  - （当時の記述「P4のチャネルレジスタには`HCSPLT`自体が無い」は誤り。
+    `reserved_0x04`になっているのはESP32-S2/S3のヘッダとP4の
+    デバイスモード用構造体で、P4の`usb_dwc_host_chan_regs_t`は
+    `hcsplt_reg`を持っている。実機にも実在する → Stage 6）
 - **原因と解決**: UTMI PHYの`fc_06.pre_hphy_lsie`（bit 2、ESP-IDFの
   `usb_utmi_struct.h`に "**Dis_preamble enable**" と記載、リセット値0）
   を1にすると動作した。実機で `usbexp 1` → `usbhub` の一発で、SETUPの
@@ -524,7 +540,7 @@ Split Transactionを実装してHSハブ本来の速度を使えるようにす�
 
 ## 想定される罠（実装前メモ、実機で要検証）
 
-`DESIGN.md`・`SD_CARD_PLAN.md`同様、以下は「シミュレーションではなく実機でしか
+`../DESIGN.md`・`SD_CARD_PLAN.md`同様、以下は「シミュレーションではなく実機でしか
 踏めない」可能性が高い項目として、着手前に注意しておく。
 
 - **VBUS ON順序**: 5Vを先に入れてからポートリセットする必要があるか、
@@ -533,6 +549,10 @@ Split Transactionを実装してHSハブ本来の速度を使えるようにす�
 - **チャネル停止**: SDMMCのDW-GDMA同様、DWC OTGのホストチャネルも
   `CHENA`クリアだけでは止まらず、Disable要求→完了待ちの手順が必要な
   可能性がある（`usb_dwc_ll.h`のチャネルdisable手順を要確認）
+  → **当たっていたが、実際に刺さったのは逆方向だった。** Disable要求→完了待ち
+  （`force_halt_channel`）は必要である一方、**既に停止しているチャネルに
+  それをやってはいけない**（停止済みチャネルはhalt割り込みを出さないため
+  待ちが空振りし、コアの状態が壊れる）。Stage 6の罠4を参照
 - **キャッシュ同期**: 転送バッファがPSRAM/内蔵SRAMいずれの場合も、
   DMAを使うなら`psram.rs`/`sdmmc.rs`と同じ`Cache_WriteBack_Invalidate_Addr`
   呼び出しが必要になる可能性がある（DWC OTGがDMAモードかFIFOのCPU
@@ -587,7 +607,7 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
 
 ## Stage 5（将来）: Interrupt転送の割り込み駆動化
 
-Stage 1〜4は一貫してポーリング方式で通してきたが（`DESIGN.md`の「まず
+Stage 1〜4は一貫してポーリング方式で通してきたが（`../DESIGN.md`の「まず
 ポーリングで動作確認し、必要になった時点でのみ割り込み化を検討する」に
 従ったもの）、Interrupt転送についてはコアが本来持っている自動スケジューリング
 機能を使っていない。着手するとしたらStage 4のコミット後、独立したStageとして
@@ -644,29 +664,188 @@ Scatter/Gather DMAモードにはperiodic frame listがあり、xHCIと同じく
 - LS＋PRE＋periodicという組み合わせはESP-IDFに前例が無い（Stage 4-4で
   踏んだPHYビットと同種の未知が残っている可能性がある）
 
+## Stage 6: Split Transaction対応（HSハブ配下のFS/LSデバイス）✅ 実機確認済み
+
+Stage 4で「ハードウェア制限により対応不可能」と結論した項目である。この結論は
+誤りだった。
+
+### 調査: Espressifの資料は全て誤り、シリコンが正しい
+
+`usbhw`シェルコマンド（`hcd::probe_split_support`）でESP32-P4 v1.3の実機を
+測定した結果:
+
+```text
+GHWCFG2=0x215FFFD0   SingPnt(bit5)=0
+HCSPLT ch0: wrote 0xFFFFFFFF -> 0x8001FFFF; wrote 0x12345678 -> 0x00005678
+```
+
+- `GHWCFG2.SingPnt`はコア自身が`OTG_SINGLE_POINT`合成パラメータを報告する
+  読み出し専用ビットで、**0（multi-point = hubとsplit対応）**を返す。同じ
+  レジスタの他10フィールド（architecture 2、host channel 16、dynamic FIFO、
+  multi-processor interruptなど）は全て資料通りにデコードできるので、ビット
+  位置のずれではない。食い違うのは`SingPnt`と`FSPhyType`の2つだけである。
+- `HCSPLT`は実在する読み書き可能なレジスタである。全1書き込みで
+  データブックの実装フィールドマスク（`SpltEna`|`CompSplt`|`XactPos`|
+  `HubAddr`|`PrtAddr` = `0x8001FFFF`）がそのまま返り、予約ビット[30:17]は
+  0に落ちる。任意パターンも同じマスクを通して保持される
+  （`0x12345678 & 0x8001FFFF = 0x00005678`）。
+
+つまり`soc/esp32p4/register/hw_ver{1,3}/soc/usb_dwc_cfg.h`の
+`OTG20_SINGLE_POINT 1`は、実際に出荷されているシリコンを正しく記述していない。
+`usb_dwc_cfg.h`をこのチップの仕様書として信用してはならない。
+
+### 実機で踏んだ罠 1・2（split実装時）
+
+罠は全部で4つあった。どれも実機でしか分からず、Espressifの資料にもESP-IDFの
+コードにも手がかりが無かった（ESP-IDFは`hcsplt_reg`に一度も書き込まないため）。
+3と4は後述する（Stage 7で定期rescanを廃止して初めて露出した）。
+
+1. **Scatter/Gather DMAではSplit Transactionが動作しない。**
+   `HCFG.DescDMA=1`のまま`HCSPLT.SpltEna`を立ててチャネルを有効化すると、
+   コアはトランザクションを一切試行しない（`ChEna=1`のまま`HCINT=0`で
+   タイムアウト）。DWC_OTGの既知の制約で、Linuxのdwc2もsplitが必要な場面では
+   descriptor DMAを無効化する。
+   → splitパケットだけbuffer DMAで走らせる`hcd::run_split_packet`を追加。
+   `HCFG.DescDMA`はコア全体の設定なので、パケット単位でクリアして復帰させる
+   （`run_packet`は同期実行でチャネル0しか使わないため安全）。buffer DMAでは
+   QTDではなく`HCTSIZ`にXferSize/PktCnt/PIDを直接書き、SETUPはQTDのビット
+   ではなくPID=2'b11で示す。転送量も`HCTSIZ.XferSize`の減算で読む。
+2. **`HCCHAR.MC/EC`が0だとTTが永久に完了しない。**
+   SSPLITはACKされるのに、CSPLITが延々`NYET`を返し続ける。データブックは
+   `SpltEna=1`のときこのフィールドを1以上にすることを要求しており、dwc2も
+   全チャネルで1に初期化している。1にした瞬間に完走した。
+
+### 実装
+
+- `hcd::Route`: デバイスへの到達方法（PRE要否 + split対象ハブ/ポート）を
+  デバイスと一緒に持ち回る型。従来の`low_speed_via_hub: bool`を置き換える。
+  LSかつsplitは同時に成立するため独立した2フィールドにしてある
+- `hcd::await_packet`: SSPLIT → ACK/NYETならCSPLIT → NAKならSSPLITから
+  やり直し、という状態機械。ラウンド数の上限は用途別に呼び出し側が渡す
+  （`CONTROL_SPLIT_ROUNDS`=512 / `INTERRUPT_POLL_SPLIT_ROUNDS`=1 /
+  `BULK_SPLIT_ROUNDS`=20000）。splitではNAKリトライがハードウェアから
+  ソフトウェア側に移るため、フレーム予算との兼ね合いを呼び出し側が決める。
+  この上限は**ソフト予算**であり、到達した瞬間ではなく「到達以降で最初に
+  訪れた安全な境界」で離脱する（罠3を参照）。したがって
+  `INTERRUPT_POLL_SPLIT_ROUNDS = 1`は「1回だけ聞いてNAKなら諦める」を意味する
+- `registry::route_behind_hub`: ハブの動作速度とポートが報告したデバイス速度を
+  比較して`Route`を決める
+- `hub::Hub::reset_port`: HSポートの拒否を撤去（速度差はsplitで扱えるため）
+- `FORCE_FS_LS_ONLY_HOST`は`false`が既定。定数自体は特定のハブのTTが
+  怪しいときのフォールバックとして残す
+
+### 実測した1回のsplitの流れ
+
+```text
+SPLIT: round hcint=0x00000022   ← SSPLIT: ACK
+SPLIT: round hcint=0x00000042   ← CSPLIT: NYET（TTがLSデバイスと通信中）
+SPLIT: done  hcint=0x00000023   ← CSPLIT: XferCompl
+```
+
+最低3ラウンドかかる。キーボードのポーリング予算を4ラウンドにしていた当初は
+TTが終わる前に諦めており、キーが1つも通らなかった。最終的にはこの予算を
+ソフト予算（安全境界まで離脱しない）に変えたため、`1`＝1回分の問い合わせで
+足りるようになっている。
+
+### 実機で踏んだ罠 3・4（Stage 7で定期rescanを廃止して露出）
+
+Stage 7で定期`rescan()`をやめるまで、**この2つはどちらも隠れていた**。
+5秒ごとのバスリセットが副作用で壊れた状態を復旧させていたためである。
+
+3. **Splitを中途で放棄してはいけない。** アイドルのキーボードのポーリングが
+   ラウンド予算切れで即座に離脱すると、ハブのTTが誰も回収しないトランザクションを
+   抱えたままになる（USB2.0 11.17はNYET以外の応答が返るまでcomplete splitを
+   続けることを要求している）。`max_split_rounds`は**ソフト予算**とし、安全な
+   境界（NAK = TTがバッファを解放した時点）以降でしか離脱しないようにした。
+4. **停止済みチャネルに`HCCHAR.ChDis`を書いてはいけない。** これが実際の
+   原因だった。安全境界で離脱した時点でチャネルは既にhalt済みなので
+   `force_halt_channel()`は無害なno-opのつもりだったが、**停止済みチャネルは
+   halt割り込みを出さない**ため待ちが空振りし、コアの状態が壊れる。しかも
+   毎フレーム（約57回/秒）走っていた。症状は「次に行うハブへの無関係な
+   コントロール転送が`XCS_XACT_ERR`でIN dataステージ失敗し、ハブが死んだように
+   見える」。現在は`HCCHAR.CHENA`を確認し、本当に転送中のときだけhalt +
+   FIFOフラッシュする。
+
+### 試したが誤りだった仮説
+
+- **`HCCHAR.LSpdDev`はHSバス上では立てるべきでない。** `low_speed_via_hub`は
+  この実装では「FSバス上のLSデバイス」＝PREトークンを意味しており、PREはFSバスに
+  しか存在しないので、split時は落とすのが筋だと考えた。実機では**最初のSETUPが
+  即STALL**した。splitでも`LSpdDev`は必要である。
+- **`HCFG.DescDMA`の復帰順序**。転送中にDMAモードを戻しているのが原因かと考えて
+  halt後に移したが、症状は変わらなかった（安全境界で離脱した時点でチャネルは
+  既にhalt済みなので、そもそも転送中ではなかった）。順序自体は現在も正しい方に
+  してある。
+
+### 確認済みの範囲
+
+- HS動作のまま、HSハブ配下のLSキーボードの列挙一式（`GET_DESCRIPTOR`、
+  `SET_ADDRESS`、コンフィグ記述子、`SET_CONFIGURATION`、HIDの
+  `SET_PROTOCOL`/`SET_IDLE`）がsplit経由で成功する。記述子の内容が正しく
+  読めているため、split INが実データを運んでいることの証明になっている
+- 同デバイスのInterrupt INも通り、8バイトのHIDレポートを受信できる
+- **実際のキー入力がコンソールに届く。** `SET_IDLE(0)`のため変化時のみ
+  レポートが来る経路（=マイルストーン本来の動作）まで通っている
+- 同じハブの別ポートのHS Mass Storageは、splitを使わず直結のまま
+  High-Speedで動作する（両者の併用ができている）
+- 90秒の連続動作でエラー・再列挙が一度も発生しない
+
+つまりStage 3のHIDキーボードのマイルストーンが、**HSハブ配下のLSデバイスでも**
+成立している。
+
+### 未確認
+
+- **split経由のBulk転送（許容済みの未検証項目）。** HSハブ配下にFS/LSの
+  Mass Storageを繋いだ場合の経路。手元のUSBメモリはHSなので直結で扱われ、
+  この経路を通らない。FSのMSCは入手困難なため未検証のままとする。
+  他のsplit経路と異なる点があるのでリスクとして記録しておく:
+  - splitでペイロードを**OUT方向**に運ぶ唯一の経路である
+    （`msc::bulk_transfer_out`）
+  - `hcd::await_packet`は素の`ACK`を「complete splitを実行せよ」と解釈する。
+    split OUTでは`ACK`が完了を意味するため、コアが`XferCompl`を上げることに
+    依存している。上げない場合はcomplete splitを繰り返して予算切れになる
+  - ここが動かなくてもリグレッションではなく「未実装が露出した」と扱う
+- ハブ配下のハブ（多段）は従来どおり範囲外
+
+## Stage 7: 定期rescanの廃止（増分ハブポートスキャン）✅ 実機確認済み
+
+フレームループはハブに空きポートがあるかぎり5秒ごとに`UsbHost::rescan()`を
+呼んでいた。`rescan()`はバスをリセットして全デバイスのアドレスを無効化するため、
+**動作中のデバイスを数秒ごとに破棄して再列挙していた**。表示のカクつきと、
+キー入力を落とすのに十分な長さの空白が発生する。
+
+ハブは自分のポート状態を答えられるので、バスに触らずに新規デバイスを検出できる。
+`UsbHost::scan_empty_hub_ports()`を追加し、空きスロットのポートについてのみ
+`GET_STATUS`を1回投げる方式にした（空きポートなら
+`Hub::debounce_connected_port`は遅延ゼロで即`false`を返す）。実際にデバイスが
+増えたポートだけリセット・列挙し、既存デバイスには一切触らない。
+
+| 状態 | 変更前 | 変更後 |
+|---|---|---|
+| ハブあり・空きポートあり | 5秒ごとに全バスリセット | 1秒ごとに空きポート数回の`GET_STATUS` |
+| ハブあり・全ポート使用中 | 5秒ごとに全バスリセット | 何もしない |
+| ハブなし・未列挙 | 5秒ごとに全リセット | 同じ（ルートポートしか聞ける相手がいない） |
+
+`rescan()`自体は残す。ルートポートの再接続と`needs_reinit`（セッションが
+実際に壊れた場合）では依然として必要である。
+
+さらに減らす場合はハブのStatus Change Interruptエンドポイントを使う手があるが、
+全ポート使用中は完全に無音になったため優先度は低い。
+
 ## 将来検討（範囲外）
 
+かつてここに挙げていた「USB Mass Storage」「ハブの複数ポート同時使用」
+「HSハブ配下のFS/LSデバイス」は、それぞれ`USB_MSC_PLAN.md`、
+`USB_REFACTOR_PLAN.md` Stage C、上記Stage 6で実装済みのため外した。
+
 - HIDマウス、複合デバイス（キーボード+ホイール等）の非Bootレポート解析
-- USB Mass Storage（MSC）。将来的にSDカード同様「USBメモリの生ブロック
-  読み書き」まで実機確認できれば、`sdmmc.rs`のブロックI/O層と同じ抽象で
-  上位（ファイルシステム）を共有できる可能性がある
-- **ハブ配下でのHigh-Speed動作**。Stage 4は`HCFG.FSLSSupp`でバス全体を
-  Full-Speedに固定しているため、ハブ配下のデバイスは最大12Mbpsに制限
-  される。HSで動かすにはSplit Transactionが必要だが、**このコアには
-  `HCSPLT`レジスタ自体が存在しない**（`usb_dwc_struct.h`の
-  `usb_dwc_host_chan_regs_t`はオフセット0x04が`reserved_0x04`）ため、
-  ソフトウェアで解決できる項目ではない。ESP-IDF自身もsplitを実装しておらず、
-  HSハブ配下に速度の異なるデバイスが繋がると`usb/hub.c`で拒否している。
-  したがって`FORCE_FS_LS_ONLY_HOST`は当面`true`のまま。HS対応が必要に
-  なった場合、選択肢は「ハブ配下はHSデバイスのみに限定して`false`に戻す」
-  （その場合FS/LSデバイスはハブ経由で使えなくなる）しかない
-  ※ Stage 4着手時点では「FS-onlyハブを入手すれば済む」と想定していたが、
-  これは誤り。LSデバイスがハブ配下にある限りハブの種類に関係なくPREが
-  必要で、PREを回避できるのはsplitだけだった（Stage 4-4の記録を参照）
-- ハブの複数ポート同時使用（Stage 4は1ポートのみを対象とする）
 - ハブのカスケード接続（ハブの下にハブ）
 - ハブ自身のInterrupt INステータス変更エンドポイントを使った割り込み駆動の
-  ポート変化検出（Stage 4は`GET_PORT_STATUS`の直接ポーリングのみ）
+  ポート変化検出。Stage 7でポーリングは空きポートへの`GET_STATUS`だけになり、
+  全ポート使用中は完全に無音になったため、優先度は下がった
+- 真の並列転送（複数チャネル・frame list・割り込み駆動）はStage 5のまま未着手。
+  Stage 6/7がStage 5より先に完了しているのは、そちらが実害のある不具合を
+  抱えていたためで、Stage 5が不要になったわけではない
 - Full-Speed OTGコントローラ（USB-C側）を使った同時ホスト動作
   （ESP32-P4は2系統同時ホスト動作が可能とされるが、本計画のマイルストーンでは
   USB-A/High-Speedコントローラのみを対象とする）

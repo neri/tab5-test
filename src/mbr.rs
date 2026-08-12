@@ -1,11 +1,11 @@
 //! MBR partition table display, shared between `shell.rs`'s `sdmbr` and
-//! `usbmbr` commands (`USB_MSC_PLAN.md` Stage 6, the goal of that plan:
+//! `usbmbr` commands (`docs/USB_MSC_PLAN.md` Stage 6, the goal of that plan:
 //! reaching MBR parsing shared between the SD card and USB Mass Storage
 //! block-I/O layers). Operates on an already-read 512-byte LBA 0 sector
 //! only -- it does not know how that sector was read, i.e. nothing about
 //! `sdmmc.rs` or `usb::UsbMassStorage`, which is what lets both commands
 //! call the same function. No GPT, no filesystem parsing (both explicitly
-//! out of scope, same as `SD_CARD_PLAN.md`'s Stage 4a originally was).
+//! out of scope, same as `docs/SD_CARD_PLAN.md`'s Stage 4a originally was).
 
 use crate::console::Console;
 use crate::shell::Line;

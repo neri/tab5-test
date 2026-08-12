@@ -42,6 +42,13 @@ const HEIGHT: u32 = 1280;
 // frames is close to the conventional ~500 ms terminal cursor blink phase.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
 
+// How often the frame loop looks for newly plugged-in USB devices. Both are
+// in ~57 Hz frames; see the two branches in `run_console` for why they
+// differ by so much -- one is a few control transfers to a hub that is
+// already talking, the other resets the whole bus.
+const HUB_PORT_SCAN_FRAMES: u32 = 60;
+const ROOT_RESCAN_FRAMES: u32 = 300;
+
 #[derive(Clone, Copy)]
 pub(super) struct InitCommand {
     command: u8,
@@ -209,14 +216,32 @@ pub fn run_console(psram: Psram) {
         }
         if usb_host.has_room() {
             usb_reconnect_frames += 1;
-            // Much coarser than CardKB's 60-frame retry: a full USB
-            // rescan is a few hundred ms of blocking work per device
-            // (VBUS settle, connect wait, debounce, reset), not a cheap
-            // I2C probe, and re-running it every second would make the
-            // whole console visibly stutter while a port sits empty.
-            // (The immediate `needs_reinit` retry above bypasses this for
-            // the "still plugged in, just needs re-enumerating" case.)
-            if usb_reconnect_frames == 300 {
+            if usb_host.hub().is_some() {
+                // With a hub attached, a newly plugged-in device can be
+                // found by asking the hub about its own ports -- one
+                // `GET_STATUS` control transfer per empty port, no bus
+                // reset, and nothing already attached is disturbed. That is
+                // cheap enough to run about once a second.
+                //
+                // This used to be the `rescan` below instead, which was
+                // wrong rather than merely slow: resetting the bus
+                // invalidates every device address on it, so a timer-driven
+                // rescan tore down and re-enumerated *working* devices
+                // every few seconds, long enough to drop a keystroke.
+                if usb_reconnect_frames >= HUB_PORT_SCAN_FRAMES {
+                    usb_reconnect_frames = 0;
+                    usb_host.scan_empty_hub_ports();
+                }
+            } else if usb_reconnect_frames >= ROOT_RESCAN_FRAMES {
+                // Nothing but the root port to ask, and the only way to
+                // enumerate what is on it is the full sequence. Much
+                // coarser than CardKB's 60-frame retry: this is a few
+                // hundred ms of blocking work (VBUS settle, connect wait,
+                // debounce, reset), not a cheap I2C probe. Nothing is
+                // attached in this state, so there is nothing to disturb.
+                // (The immediate `needs_reinit` retry above bypasses this
+                // for the "still plugged in, just needs re-enumerating"
+                // case.)
                 usb_reconnect_frames = 0;
                 usb_host.rescan();
             }

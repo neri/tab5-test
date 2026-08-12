@@ -346,7 +346,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR
 - `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
   経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
-  同じ構成。詳細・実機で踏んだ罠は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照
+  同じ構成。詳細・実機で踏んだ罠は[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)を参照
 - `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
   「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
   親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート
@@ -364,7 +364,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
     - `src/usb/hid_keyboard.rs`: HID Bootキーボードのクラスドライバー
       （Stage 3相当）。クラス固有リクエスト・キーコード変換・`UsbKeyboard`
       （`lcd.rs`のフレームループから`CardKb`と並列にポーリングされる）
-  段階分けと実装上の判断は[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照
+  段階分けと実装上の判断は[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
 
@@ -403,11 +403,11 @@ LCD: RGB565 framebuffer DMA active
 SDカード関連は起動シーケンスに含まれず、シェルコマンド（`sdinfo`/`sdread`/
 `sdreadn`/`sdwritetest`/`sdzero`）実行時にのみ`SDMMC: ...`という接頭辞で
 UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値が続きます。
-失敗パターンの詳細は[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
+失敗パターンの詳細は[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)を参照してください。
 
 USB-Aホスト関連も同様に起動シーケンスに含まれず、シェルコマンド（`usbinfo`/
 `usbvbus`）実行時にのみ`USB: ...`という接頭辞でUARTへ出ます。段階分けと
-未確定事項は[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照してください。
+未確定事項は[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照してください。
 
 主な失敗ログ:
 
@@ -443,7 +443,7 @@ USB-Aホスト関連も同様に起動シーケンスに含まれず、シェル
 
 SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一度も踏んでいないと
 思われる実機固有の制約が2つ見つかっています（詳細と切り分け過程は
-[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 2/3を参照）。
+[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)のStage 2/3を参照）。
 
 - `SDHOST_BUFFIFO_REG`へのCPU/APB直接読み出しはポップ動作をしない。
   `STATUS.FIFO_COUNT`はカードからの実データ到着どおりに増え続けるのに、
@@ -469,25 +469,33 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
   SWITCH_FUNC使用）でのactivation・ブロック読み書きまで実機確認済みです
   （複数枚のカードでHigh Speed対応・読み込み成功）。パーティション/
   ファイルシステム（FAT/exFAT）の解析は未実装です
-  （[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 4）。UHS-Iモード
+  （[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)のStage 4）。UHS-Iモード
   （SDR50/SDR104等、100MHz以上）は未実装です。
-- USB-Aホストは[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)のStage 3（HID Boot
+- USB-Aホストは[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)のStage 3（HID Boot
   Protocolキーボードからのキー入力）まで実機確認済みです。ただし
   Interrupt INエンドポイントのポーリングは`HCCHAR.eptype=INTR`ではなく
   `BULK`を使っています（periodic scheduler/frame list基盤が未実装のため、
   INTR型のままだとポーリングが一切完了しない不具合を実機で確認し、回避策
-  として変更、詳細はUSB_HOST_PLAN.md Stage 3参照）。`usbinfo`/`usbvbus`実行中に
+  として変更、詳細は`docs/USB_HOST_PLAN.md` Stage 3参照）。`usbinfo`/`usbvbus`実行中に
   `UsbKeyboard`が生きていると、`probe_port`のバスリセットでセッションが
   無効化されキーボードが一時的に反応しなくなる問題も実機で確認済みです。
   これに対しては、連続したUSBトランザクションエラーを検出すると自動的に
   再列挙して数秒で復帰する自己回復（`needs_reinit`）を実装済みですが、
   この自己回復自体の実機確認はまだです。文字列記述子（製品名）取得、
   periodic scheduler基盤の実装、HIDマウス・複数デバイスは未実装です
-  （`USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
-  [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)のStage 1〜6（Bulk-Only Transport
+  （`docs/USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
+  [`USB_MSC_PLAN.md`](docs/USB_MSC_PLAN.md)のStage 1〜6（Bulk-Only Transport
   でのSCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)、
   SDカードとのMBRパース共通化（`src/mbr.rs`）、`usbmsc`/`usbread`/
-  `usbmbr`コマンド）まで実機確認済みです。**USBハブ経由のMSC接続は
-  意図的に未実装のまま**（`usbmsc`/`usbread`/`usbmbr`はUSB-A直結
-  デバイスのみが対象）です。書き込み（WRITE(10)）、FAT/exFAT
-  ファイルシステムの解釈も未実装です。
+  `usbmbr`コマンド）まで実機確認済みです。USBハブ経由のMSC接続は
+  [`USB_REFACTOR_PLAN.md`](docs/USB_REFACTOR_PLAN.md) Stage Fで対応済みで、
+  ハブのポートに挿したUSBメモリがレジストリに乗るところまで実機確認
+  しています（`usbmsc`/`usbread`/`usbmbr`はいずれもレジストリを引くので
+  直結・ハブ経由を区別しません）。書き込み（WRITE(10)）、FAT/exFAT
+  ファイルシステムの解釈は未実装です。
+
+  High-Speedハブの配下にFull/Low-Speedデバイスを繋ぐ構成は
+  [`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md) Stage 6のSplit Transaction対応で
+  動作します。Espressifの資料はESP32-P4がSplit Transaction非対応
+  （`OTG_SINGLE_POINT=1`）としていますが、実機のシリコンは
+  `GHWCFG2.SingPnt=0`を報告し`HCSPLT`も実在するため、資料の側が誤りです。
