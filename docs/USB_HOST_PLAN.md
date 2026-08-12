@@ -566,20 +566,21 @@ Stage 6のSplit Transaction対応でHS動作とFS/LSデバイスの併用が可�
   `pre_hphy_lsie`が必要で、後者はESP-IDFに前例が無い。Stage 4-4の記録を
   参照**
 
-## モジュール構成（実際）
+## モジュール構成（現在）
 
 Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ理由（ホスト
 初期化・列挙・HID固有処理が同じチャネル0・同じレジスタ操作を共有しており、
 分ける明確な境界が無かった）で、すべて`src/usb.rs`にそのまま実装していた。
 その後1ファイルが肥大化した（1400行近く）ため、ユーザーの指摘で
-ホストコントローラー／USBプロトコル／クラスドライバの3層に分割した。
-`lcd.rs`・`lcd/st7121.rs`と同じ「親ファイルが`mod`宣言、実体はサブ
-ディレクトリ」という構成に合わせている。
+ホストコントローラー／USBプロトコル／クラスドライバに分割した。その後、
+[`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)でMSCクラスドライバ、
+[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md)でバスの単一所有者とデバイスレジストリを追加した。
+`lcd.rs`・`lcd/st7121.rs`と同じ「親ファイルが`mod`宣言、実体はサブディレクトリ」という
+構成に合わせている。
 
-- `src/usb.rs`: サブモジュール宣言と再エクスポート、および4層を組み合わせる
-  唯一の関数`connect_keyboard`（Stage 4-5。「USB-Aに何が挿さっているか」を
-  判断してキーボードのハンドルを返す。直結かハブ経由かはここだけが知って
-  いて、`lcd.rs`からは同じ1関数に見える）
+- `src/usb.rs`: サブモジュール宣言と、`lcd.rs`/`shell.rs`が使う型・関数の
+  最小限の再エクスポート。以前の`connect_keyboard`/
+  `connect_keyboard_through_hub`は削除済みで、`registry::UsbHost::rescan`に統合した
 - `src/usb/hcd.rs`: ESP32-P4 High-Speed USB-DWCホストコントローラー
   ドライバー（Stage 1）。VBUS、コア/ポート初期化、チャネル・パケット実行
   プリミティブ（`run_packet`、`PacketOutcome`）。USBデバイス・記述子の意味は
@@ -593,17 +594,18 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
   クラス固有リクエスト、キーコード→ASCII変換、`UsbKeyboard`。Interrupt IN
   ポーリング（`hcd::run_packet`を直接呼ぶ）は標準コントロール転送ではないため
   `protocol.rs`を経由しない
-- `src/shell.rs`: `usbinfo`（`hcd::probe_port`→`protocol::enumerate_device`→
-  `usb::find_hid_keyboard`の順で呼び、Stage 1/2の確認用）・`usbvbus`
-  （VBUS制御ビットの実機発見用）。Stage 4以降は`usbhub`（ハブディスクリプタ・
-  ポート状態の確認用）を追加する想定
-- `src/usb/hub.rs`（Stage 4で新規追加予定）: USBハブのクラスドライバー。
-  ハブディスクリプタ取得、ポート電源投入・接続検出・リセット・速度判定
-  （ハブ自身のクラス固有リクエストのみを扱う。`hcd.rs`/`protocol.rs`は
-  変更しない、または最小限の一般化に留める想定）
-- `src/lcd.rs`: フレームループに`UsbKeyboard`のポーリング・再接続ロジックを
-  `CardKb`と並列に追加。コンソールへの合流点（`Console::push`）は共通。
-  Stage 4-5でハブ経由`UsbKeyboard`のポーリングもここに追加する想定
+- `src/usb/hub.rs`: USBハブのクラスドライバー（Stage 4）。ハブディスクリプタ取得、
+  ポート電源投入・デバウンス・リセット・速度判定を担当
+- `src/usb/msc.rs`: USB Mass StorageのBulk-Only Transport、トグル管理、STALL回復、
+  SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)を担当
+- `src/usb/registry.rs`: `UsbHost`がバスを単一所有し、直結デバイスまたは
+  1段のハブの全ポートをスロット管理する。デバイスの列挙、クラスドライバへの振り分け、
+  複数キーボードのラウンドロビンポーリング、MSCハンドルの共有を担当
+- `src/lcd.rs`: フレームループが`UsbHost`を所有し、CardKBとUSBキーボードの入力を
+  `Console::push`で合流させる。切断、トランザクションエラー、空いているハブポートの再スキャンも担当
+- `src/shell.rs`: `usbinfo`/`usbhub`/`usbmsc`/`usbread`/`usbmbr`は共有レジストリを
+  参照し、`usbrescan`だけが明示的にバスを再列挙する。`usbvbus`はI/O expanderの
+  VBUSビットを直接操作する診断用コマンド
 
 ## Stage 5（将来）: Interrupt転送の割り込み駆動化
 

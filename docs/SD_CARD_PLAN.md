@@ -174,7 +174,7 @@ ESP-IDF自身の`SDMMC_FREQ_DEFAULT`もこの20MHzという分周値を採用し
 扱っている。実機で`sdreadn 0 4`が20MHz・4bitでも以前と同じ正しい内容
 （MBR署名、exFAT OEM名）を読めることを確認した。
 
-### 追加: High Speed（50MHz、CMD6 SWITCH_FUNC） ✅ 完了（実機確認済み）
+### 追加: High Speedモード（CMD6 SWITCH_FUNC、規格上限50MHz、実クロック40MHz） ✅ 完了（実機確認済み）
 
 CMD6(SWITCH_FUNC)はこれまでのコマンドと異なり、48bitの単純な応答ではなく
 **64byteのステータスブロックをDATライン経由で読み返す**特殊なコマンドである
@@ -261,7 +261,7 @@ Linux、GPT保護MBRの0xEEなど）だけ短い名前に変換し、その他�
 - ゴール: `shell.rs`に`ls`/`cat`相当のコマンドを追加し、実際にPCで書き込んだ
   ファイルが読める。書き込みは最後にテストカードで検証
 
-## モジュール構成（実際）
+## モジュール構成（現在）
 
 当初`src/sdcard.rs`（ブロックデバイス層）・`src/fat.rs`（ファイルシステム層）を
 別モジュールにする想定だったが、実際にはStage 2/3のブロックI/Oも
@@ -271,9 +271,11 @@ Linux、GPT保護MBRの0xEEなど）だけ短い名前に変換し、その他�
 - `src/sdmmc.rs`: ホスト初期化・カード活性化（4bit/High Speed含む）・
   DMA経由のブロック読み書き。すべてこのファイルに実装
   （`gpio.rs`/`i2c.rs`と同じ階層で、ペリフェラル固有の独立モジュールとする）
-- `src/shell.rs`: 各`sdXXX`コマンド。MBRパース（`sdmbr`）もここに直接実装
-  （Stage 4bでFAT対応する際は、`sdmmc.rs`とは別に`src/fat.rs`を切り出す
-  想定を維持する）
+- `src/mbr.rs`: `sdmbr`と`usbmbr`で共用するMBR署名・パーティションエントリの
+  パースと表示。読み込み済みの512 byteセクタだけを受け取り、SD/USBの違いは知らない
+- `src/shell.rs`: 各`sdXXX`コマンド。`sdmbr`は`sdmmc::read_block`でLBA 0を読み、
+  `mbr::show`を呼ぶ。Stage 4bでFAT対応する際は、`sdmmc.rs`とは別に
+  `src/fat.rs`を切り出す想定を維持する
 
 ## 各段階の完了条件（実機確認）
 

@@ -336,6 +336,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 - `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: CardKB入力エコーとコマンドライン切り出し用コンソール
 - `src/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
+- `src/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
@@ -350,8 +351,8 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 - `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
   「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
   親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート
-  だけを持つ薄いファイル。ホストコントローラー・USBプロトコル・クラスドライバの
-  3層に分離している（元は1ファイルだったが、肥大化したため分割した）
+  だけを持つ薄いファイル。ホストコントローラー、USBプロトコル、クラスドライバ、
+  それらを所有するデバイスレジストリに分離している
     - `src/usb/hcd.rs`: ESP32-P4 High-Speed USB-DWCホストコントローラー
       ドライバー（Stage 1相当）。VBUS電源（`i2c.rs`のI2Cバス経由で
       PI4IOE5V6408、2個目、0x44を叩く）、コア初期化・ホストポート電源投入・
@@ -364,6 +365,12 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
     - `src/usb/hid_keyboard.rs`: HID Bootキーボードのクラスドライバー
       （Stage 3相当）。クラス固有リクエスト・キーコード変換・`UsbKeyboard`
       （`lcd.rs`のフレームループから`CardKb`と並列にポーリングされる）
+    - `src/usb/hub.rs`: USBハブのクラスドライバー。ディスクリプタ取得、ポート電源、
+      接続検出、リセット、速度判定を担当
+    - `src/usb/msc.rs`: USB Mass StorageのBulk-Only TransportとSCSI読み込みコマンドを
+      実装するクラスドライバー
+    - `src/usb/registry.rs`: USBバスの単一オーナーである`UsbHost`とデバイスレジストリ。
+      直結デバイス、または1段のハブの全ポートを列挙し、キーボードとMSCのハンドルを保持
   段階分けと実装上の判断は[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
@@ -405,9 +412,13 @@ SDカード関連は起動シーケンスに含まれず、シェルコマンド
 UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値が続きます。
 失敗パターンの詳細は[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)を参照してください。
 
-USB-Aホスト関連も同様に起動シーケンスに含まれず、シェルコマンド（`usbinfo`/
-`usbvbus`）実行時にのみ`USB: ...`という接頭辞でUARTへ出ます。段階分けと
-未確定事項は[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照してください。
+USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::rescan`を実行します。
+そのため、起動時にも列挙結果や`USB: initial scan complete`がUARTへ出ます。その後も、
+ルートポートの切断・再接続、空いているハブポートの増分スキャン、トランザクションエラーからの
+復帰時に`USB: ...`ログが出ます。`usbinfo`/`usbhub`/`usbmsc`等は共有レジストリを使い、
+`usbrescan`だけがユーザー操作でバスの再列挙を行います。`usbvbus`はI/O expanderの出力ビットを
+直接変更する診断用コマンドです。段階分けと未確定事項は
+[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照してください。
 
 主な失敗ログ:
 
@@ -465,25 +476,23 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
   （約28.48 MiB）は`linked_list_allocator`によるグローバルアロケータのヒープです。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
 - 日本語フォント、省電力制御は未実装です。
-- SDカードは4bitモード・カード対応時はHigh Speed（50MHz、CMD6
-  SWITCH_FUNC使用）でのactivation・ブロック読み書きまで実機確認済みです
+- SDカードは4bitモード・カード対応時はHigh Speedモード（CMD6
+  SWITCH_FUNC使用、規格上限50 MHz、ホスト実クロック40 MHz）でのactivation・
+  ブロック読み書きまで実機確認済みです
   （複数枚のカードでHigh Speed対応・読み込み成功）。パーティション/
   ファイルシステム（FAT/exFAT）の解析は未実装です
   （[`SD_CARD_PLAN.md`](docs/SD_CARD_PLAN.md)のStage 4）。UHS-Iモード
   （SDR50/SDR104等、100MHz以上）は未実装です。
-- USB-Aホストは[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)のStage 3（HID Boot
-  Protocolキーボードからのキー入力）まで実機確認済みです。ただし
+- USB-AホストはHID Boot Protocolキーボードからのキー入力と、1段の
+  USBハブ配下の複数デバイス列挙・逐次ポーリングまで実機確認済みです。
   Interrupt INエンドポイントのポーリングは`HCCHAR.eptype=INTR`ではなく
   `BULK`を使っています（periodic scheduler/frame list基盤が未実装のため、
   INTR型のままだとポーリングが一切完了しない不具合を実機で確認し、回避策
-  として変更、詳細は`docs/USB_HOST_PLAN.md` Stage 3参照）。`usbinfo`/`usbvbus`実行中に
-  `UsbKeyboard`が生きていると、`probe_port`のバスリセットでセッションが
-  無効化されキーボードが一時的に反応しなくなる問題も実機で確認済みです。
-  これに対しては、連続したUSBトランザクションエラーを検出すると自動的に
-  再列挙して数秒で復帰する自己回復（`needs_reinit`）を実装済みですが、
-  この自己回復自体の実機確認はまだです。文字列記述子（製品名）取得、
-  periodic scheduler基盤の実装、HIDマウス・複数デバイスは未実装です
-  （`docs/USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
+  として変更、詳細は`docs/USB_HOST_PLAN.md` Stage 3参照）。チャネル0を使った逐次
+  ポーリングであり、真の並列転送は行いません。`UsbHost`がUSBバスを単一所有し、
+  `usbinfo`/`usbhub`等のシェルコマンドも同じレジストリを参照します。
+  文字列記述子（製品名）取得、periodic scheduler基盤、HIDマウス、多段ハブは
+  未実装です（`docs/USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
   [`USB_MSC_PLAN.md`](docs/USB_MSC_PLAN.md)のStage 1〜6（Bulk-Only Transport
   でのSCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)、
   SDカードとのMBRパース共通化（`src/mbr.rs`）、`usbmsc`/`usbread`/
