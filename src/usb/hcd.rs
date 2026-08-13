@@ -30,6 +30,27 @@ use crate::delay::{delay_ms, delay_us};
 use crate::gpio;
 use crate::i2c::SoftI2c;
 use crate::uart;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the current continuously-disconnected root-port state has
+/// already produced its timeout log.  `probe_port` is intentionally
+/// stateless otherwise, but it is called periodically while the port is
+/// empty, so this small bit prevents that normal polling from flooding the
+/// UART.
+static NO_DEVICE_TIMEOUT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn note_root_device_connected() {
+    // A later disconnect is a new state transition and deserves one timeout
+    // message. This flag only controls logging, so no memory synchronization
+    // with USB state is needed.
+    NO_DEVICE_TIMEOUT_REPORTED.store(false, Ordering::Relaxed);
+}
+
+fn log_no_device_timeout_once() {
+    if !NO_DEVICE_TIMEOUT_REPORTED.swap(true, Ordering::Relaxed) {
+        uart::log(b"USB: no device detected on USB-A within timeout\r\n");
+    }
+}
 
 // ------------------------------------------------------------------------
 // USB-A VBUS power switch (PI4IOE5V6408 "E2", I2C 0x44)
@@ -567,7 +588,10 @@ pub fn probe_port() -> HostPort {
     hprt_modify(HPRT_PRTPWR, HPRT_PRTPWR); // port power on
 
     if !wait_for_connect() {
-        uart::log(b"USB: no device detected on USB-A within timeout\r\n");
+        // The foreground periodically probes an empty root port. Emit this
+        // once for that disconnected interval, then wait until a connection
+        // has actually been observed before allowing it again.
+        log_no_device_timeout_once();
         return HostPort {
             vbus_enable_acked,
             core_alive,
@@ -579,6 +603,8 @@ pub fn probe_port() -> HostPort {
             speed: Speed::Unknown,
         };
     }
+
+    note_root_device_connected();
 
     delay_ms(DEBOUNCE_DELAY_MS);
     if unsafe { read(HPRT) } & HPRT_PRTCONNSTS == 0 {
@@ -626,7 +652,13 @@ pub fn probe_port() -> HostPort {
 /// Cheap liveness check (one HPRT read, no transaction) used by
 /// `hid_keyboard::UsbKeyboard::is_connected`.
 pub fn port_connected() -> bool {
-    unsafe { read(HPRT) & HPRT_PRTCONNSTS != 0 }
+    let connected = unsafe { read(HPRT) & HPRT_PRTCONNSTS != 0 };
+    if connected {
+        // This cheap per-frame check lets an insertion re-arm the timeout
+        // message even before the next full (and comparatively slow) probe.
+        note_root_device_connected();
+    }
+    connected
 }
 
 fn enable_utmi_clocks() {

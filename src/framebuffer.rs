@@ -52,36 +52,6 @@ impl DoubleBuffer {
         }
     }
 
-    /// Clears the landscape console and paints its top band in one forward,
-    /// panel-native PSRAM pass.
-    ///
-    /// A logical horizontal band becomes the first `band_height` pixels of
-    /// every native scanline after the CW rotation.
-    pub fn fill_console_background(
-        &mut self,
-        index: usize,
-        band_height: usize,
-        band_color: u16,
-        body_color: u16,
-    ) {
-        let Some(pointer) = self.memory.framebuffer(index) else {
-            return;
-        };
-        let band_height = band_height.min(NATIVE_WIDTH);
-        let mut offset = 0;
-        for _native_y in 0..NATIVE_HEIGHT {
-            for native_x in 0..NATIVE_WIDTH {
-                let color = if native_x < band_height {
-                    band_color
-                } else {
-                    body_color
-                };
-                unsafe { pointer.add(offset).write_volatile(color) };
-                offset += 1;
-            }
-        }
-    }
-
     pub fn draw_pixel(&mut self, index: usize, x: usize, y: usize, color: u16) {
         if x >= WIDTH || y >= HEIGHT {
             return;

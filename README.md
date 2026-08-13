@@ -67,6 +67,9 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 よっては、初期スキャン中の`USB: ...`ログも先に表示されます。
 
 シェルで`help`を実行するとコマンド一覧、`help <command>`で個別の使用法を表示します。
+`cpuinfo`は、実行中hartのRISC-V機械識別CSR（`mvendorid`、`marchid`、`mimpid`、
+`mhartid`、`misa`）を16進数で表示します。`misa`には、値から分かる単一文字ISA拡張を
+正規順で連結した表記（例: `RV32IMAFDC`）も併記します。
 `sdzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`も復元失敗時は
 データを壊す可能性があるため、テスト用カードの無害なLBAでのみ実行してください。
 

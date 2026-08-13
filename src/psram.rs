@@ -21,6 +21,7 @@ const PAGE_BYTES: usize = 64 * 1024;
 const CACHE_LINE_BYTES: usize = 64;
 
 const HP_SYS_CLKRST: usize = 0x500E_6000;
+const HP_RST_EN0: usize = HP_SYS_CLKRST + 0xC0;
 const MSPI2: usize = 0x5008_E000;
 const MSPI3: usize = 0x5008_F000;
 const MSPI_IOMUX: usize = 0x500E_1200;
@@ -30,6 +31,7 @@ const LP_CLKRST: usize = 0x5011_1000;
 const ROM_SPI_CMD_CONFIG: usize = 0x4FC0_0108;
 const ROM_SPI_SET_OP_MODE: usize = 0x4FC0_0110;
 const ROM_CACHE_PSRAM_MMU_SET: usize = 0x4FC0_0520;
+const ROM_CACHE_INVALIDATE_ADDR: usize = 0x4FC0_03E4;
 const ROM_CACHE_WRITEBACK_INVALIDATE_ADDR: usize = 0x4FC0_03FC;
 
 const SYNC_READ: u32 = 0x0000;
@@ -193,6 +195,11 @@ pub fn init() -> Option<Psram> {
         return None;
     }
 
+    // A CPU-only reset leaves L1/L2 cache lines for the former PSRAM mapping
+    // intact even though the MSPI controller was reset. Drop them before the
+    // first access through the newly programmed MMU window.
+    invalidate_mapped_cache();
+
     if !mapped_memory_test() {
         uart::log(b"PSRAM: mapped memory test failed\r\n");
         return None;
@@ -221,9 +228,19 @@ fn enable_power_and_clock() {
     delay();
 
     unsafe {
+        // Enable the PSRAM system clock before releasing its controller reset.
+        modify(HP_SYS_CLKRST + 0x14, 1 << 31, 1 << 31);
+    }
+
+    // `startup::reboot` resets only the HP CPU core, so a prior direct MSPI
+    // command can otherwise leave MSPI3 busy across a reboot. The ROM command
+    // configuration helper waits for that busy bit without a timeout. Reset
+    // both sides of the dual-MSPI block before programming it again.
+    reset_mspi();
+
+    unsafe {
         // Select the already-running 480 MHz SPLL, divide its core by one, then
         // divide both PSRAM buses by six for an 80 MHz DDR clock.
-        modify(HP_SYS_CLKRST + 0x14, 1 << 31, 1 << 31);
         modify(
             HP_SYS_CLKRST + 0x30,
             (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
@@ -236,6 +253,36 @@ fn enable_power_and_clock() {
         modify(MSPI2 + 0x190, 1 << 5, 1 << 5);
         modify(MSPI2 + 0x180, 1 << 5, 1 << 5);
         modify(MSPI3 + 0x200, 1, 1);
+    }
+}
+
+/// Resets the shared AXI and APB portions of the dual-MSPI controller.
+///
+/// The ordering matches ESP-IDF's PSRAM controller reset: assert AXI, assert
+/// APB, then release APB before AXI.
+fn reset_mspi() {
+    const RST_EN_MSPI_AXI: u32 = 1 << 22;
+    const RST_EN_MSPI_APB: u32 = 1 << 24;
+
+    unsafe {
+        modify(HP_RST_EN0, RST_EN_MSPI_AXI, RST_EN_MSPI_AXI);
+        modify(HP_RST_EN0, RST_EN_MSPI_APB, RST_EN_MSPI_APB);
+        modify(HP_RST_EN0, RST_EN_MSPI_APB, 0);
+        modify(HP_RST_EN0, RST_EN_MSPI_AXI, 0);
+    }
+}
+
+fn invalidate_mapped_cache() {
+    let invalidate: unsafe extern "C" fn(u32, u32, u32) =
+        unsafe { transmute(ROM_CACHE_INVALIDATE_ADDR) };
+    unsafe {
+        // The PSRAM mapping is external to the CPU, so both cache levels must
+        // be invalidated together. This matches ESP-IDF's cache_invalidate_addr.
+        invalidate(
+            CACHE_MAP_L1_DCACHE | CACHE_MAP_L2_CACHE,
+            PSRAM_VADDR as u32,
+            MAPPED_BYTES as u32,
+        );
     }
 }
 
@@ -280,14 +327,17 @@ fn configure_cache_access() {
         write(MSPI2 + 0x40, cache_sctrl);
         modify(
             MSPI2 + 0x44,
-            (0xF << 18) | (3 << 22) | (3 << 26),
-            (0xF << 18) | (3 << 22) | (3 << 26),
+            (0x3F << 18) | (3 << 26),
+            // OPI command/address, HEX data and write-dummy output. Bit 22
+            // (`sdummy_rin`) must remain clear for the DDR PSRAM path.
+            0b1100_1011_1100 << 16,
         );
         write(MSPI2 + 0x48, (15 << 28) | SYNC_READ);
         write(MSPI2 + 0x4C, (15 << 28) | SYNC_WRITE);
         modify(MSPI2 + 0xD8, 0xF, 3);
+        // MEM_CTRL1: keep AXI read/write bursts spliced across PSRAM pages.
+        modify(MSPI2 + 0x70, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
         modify(MSPI2 + 0x3C, (1 << 31) | 1, 1);
-        modify(MSPI2 + 0x0C, (1 << 25) | (1 << 26), (1 << 25) | (1 << 26));
         // Cache and command engines both use fixed-latency mode after tuning.
         modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
     }
@@ -527,6 +577,16 @@ fn transaction(
         unsafe { transmute(ROM_SPI_CMD_CONFIG) };
 
     unsafe {
+        // `esp_rom_spi_cmd_config` has its own unbounded `while (CMD != 0)`
+        // loop. Check the identical condition first so a residual command
+        // after a CPU-only restart degrades to the PSRAM fallback instead of
+        // permanently wedging the boot.
+        if !wait_for_mspi3_idle() {
+            uart::log(b"PSRAM: MSPI3 busy before command configuration\r\n");
+            log_mspi3_state();
+            return false;
+        }
+
         // ESP_ROM_SPIFLASH_OPI_DTR_MODE = 7; PSRAM is on CS1.
         set_mode(3, 7);
         configure(3, &mut config);
@@ -539,14 +599,7 @@ fn transaction(
         while read(MSPI3) & (1 << 18) != 0 {
             if timeout == 0 {
                 uart::log(b"PSRAM: MSPI3 command timeout\r\n");
-                uart::log_hex(b"PSRAM: MSPI3 CMD=", read(MSPI3));
-                uart::log_hex(b"PSRAM: MSPI3 CLOCK=", read(MSPI3 + 0x14));
-                uart::log_hex(b"PSRAM: MSPI3 USER=", read(MSPI3 + 0x18));
-                uart::log_hex(b"PSRAM: MSPI3 MISC=", read(MSPI3 + 0x34));
-                uart::log_hex(b"PSRAM: HP CLK=", read(HP_SYS_CLKRST + 0x30));
-                uart::log_hex(b"PSRAM: LDO2=", read(PMU + 0x1D0));
-                uart::log_hex(b"PSRAM: LDO2 ANA=", read(PMU + 0x1D4));
-                uart::log_hex(b"PSRAM: RF PWC=", read(PMU + 0x15C));
+                log_mspi3_state();
                 return false;
             }
             timeout -= 1;
@@ -560,6 +613,38 @@ fn transaction(
         }
     }
     true
+}
+
+/// Checks the exact idle condition that `esp_rom_spi_cmd_config` waits for,
+/// but with a finite timeout.
+///
+/// # Safety
+/// MSPI3 must be a valid MMIO block clocked for CPU access.
+unsafe fn wait_for_mspi3_idle() -> bool {
+    let mut timeout = 5_000_000u32;
+    while unsafe { read(MSPI3) } != 0 {
+        if timeout == 0 {
+            return false;
+        }
+        timeout -= 1;
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// # Safety
+/// MSPI3, the clock-control block and PMU must be valid MMIO blocks.
+unsafe fn log_mspi3_state() {
+    unsafe {
+        uart::log_hex(b"PSRAM: MSPI3 CMD=", read(MSPI3));
+        uart::log_hex(b"PSRAM: MSPI3 CLOCK=", read(MSPI3 + 0x14));
+        uart::log_hex(b"PSRAM: MSPI3 USER=", read(MSPI3 + 0x18));
+        uart::log_hex(b"PSRAM: MSPI3 MISC=", read(MSPI3 + 0x34));
+        uart::log_hex(b"PSRAM: HP CLK=", read(HP_SYS_CLKRST + 0x30));
+        uart::log_hex(b"PSRAM: LDO2=", read(PMU + 0x1D0));
+        uart::log_hex(b"PSRAM: LDO2 ANA=", read(PMU + 0x1D4));
+        uart::log_hex(b"PSRAM: RF PWC=", read(PMU + 0x15C));
+    }
 }
 
 fn set_bus_divider(register: usize, divider: u32) {

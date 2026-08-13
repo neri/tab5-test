@@ -2,16 +2,14 @@
 
 use core::cell::UnsafeCell;
 
-use crate::framebuffer::{BLACK, DoubleBuffer, GREEN, HEIGHT, WHITE, WIDTH};
+use crate::framebuffer::{BLACK, DoubleBuffer, HEIGHT, WHITE, WIDTH};
 use crate::uart;
-
-const DEFAULT_HEADER_COLOR: u16 = GREEN;
 
 const SCALE: usize = 2;
 const CELL_WIDTH: usize = 6 * SCALE;
 const CELL_HEIGHT: usize = 8 * SCALE;
 const LEFT: usize = 16;
-const TOP: usize = 40;
+const TOP: usize = 8;
 const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
 const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 
@@ -35,8 +33,6 @@ pub struct Console {
     /// the cursor block and that cell's normal (blank) contents without
     /// tracking the glyph underneath.
     cursor_visible: bool,
-    /// Header band color, changeable by the shell's `color` command.
-    header_color: u16,
     /// Set by `submit` when Enter completes a command line; drained by
     /// `take_submission`. Kept separate from `Update` since dispatching a
     /// command is an application-level reaction, not a rendering hint.
@@ -105,7 +101,6 @@ impl Console {
             row: 0,
             previous_was_carriage_return: false,
             cursor_visible: true,
-            header_color: DEFAULT_HEADER_COLOR,
             pending_submission: None,
         }
     }
@@ -113,11 +108,6 @@ impl Console {
     /// Takes the command line captured by the most recent `submit`, if any.
     pub fn take_submission(&mut self) -> Option<Submission> {
         self.pending_submission.take()
-    }
-
-    /// Changes the header band color, e.g. from the shell's `color` command.
-    pub fn set_header_color(&mut self, color: u16) {
-        self.header_color = color;
     }
 
     /// Clears every cell and returns to a fresh, empty first row (no
@@ -207,7 +197,7 @@ impl Console {
     pub fn render(&self, framebuffers: &mut DoubleBuffer, index: usize) {
         let cursor_row = self.row;
         let cursor_column = self.column;
-        framebuffers.fill_console_background(index, 32, self.header_color, BLACK);
+        framebuffers.fill(index, BLACK);
 
         // Only rows up to the cursor can contain input. Drawing each occupied
         // cell directly also avoids the former empty-run scanner, which could
@@ -238,16 +228,6 @@ impl Console {
         // cursor cell (always blank) still needs its own pass here.
         self.render_cell(framebuffers, index, cursor_column, cursor_row);
 
-        draw_ascii_text(
-            framebuffers,
-            index,
-            LEFT,
-            8,
-            "Tab5 Console",
-            2,
-            BLACK,
-            false,
-        );
     }
 
     /// Repaints one text cell without touching the rest of the framebuffer.
@@ -444,29 +424,6 @@ impl Console {
             }
         }
         self.advance_row();
-    }
-}
-
-fn draw_ascii_text(
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
-    x: usize,
-    y: usize,
-    text: &str,
-    scale: usize,
-    color: u16,
-    trace_first: bool,
-) {
-    for (column, ch) in text.chars().enumerate() {
-        framebuffers.draw_ascii_char(
-            index,
-            x + column * 6 * scale,
-            y,
-            ch,
-            scale,
-            color,
-            trace_first && column == 0,
-        );
     }
 }
 

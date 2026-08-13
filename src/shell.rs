@@ -12,7 +12,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::console::Console;
-use crate::framebuffer::{BLUE, CYAN, GREEN, MAGENTA, RED, WHITE, YELLOW};
 use crate::{interrupts, lcd, mbr, psram, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -32,6 +31,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { name: "clear", usage: "clear", lines: &["clear the screen"] },
     HelpEntry { name: "echo", usage: "echo <text>", lines: &["print text back"] },
     HelpEntry { name: "about", usage: "about", lines: &["firmware banner"] },
+    HelpEntry {
+        name: "cpuinfo",
+        usage: "cpuinfo",
+        lines: &["show RISC-V machine identification CSRs"],
+    },
     HelpEntry { name: "mem", usage: "mem", lines: &["PSRAM/RAM usage"] },
     HelpEntry {
         name: "alloctest",
@@ -40,14 +44,6 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry { name: "uptime", usage: "uptime", lines: &["time since boot"] },
     HelpEntry { name: "backlight", usage: "backlight on|off", lines: &["LCD backlight"] },
-    HelpEntry {
-        name: "color",
-        usage: "color <name>",
-        lines: &[
-            "change header color",
-            "green/red/blue/cyan/magenta/yellow/white",
-        ],
-    },
     HelpEntry { name: "paint", usage: "paint", lines: &["touch drawing screen"] },
     HelpEntry {
         name: "touchtest",
@@ -191,11 +187,11 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"clear" => console.clear(),
         b"echo" => console.write_output_line(as_str(argument)),
         b"about" | b"version" => console.write_output_line("Tab5 CardKB Shell 0.1"),
+        b"cpuinfo" => cmd_cpuinfo(console),
         b"mem" => cmd_mem(console),
         b"alloctest" => cmd_alloctest(console, argument),
         b"uptime" => cmd_uptime(console),
         b"backlight" => cmd_backlight(console, argument),
-        b"color" => cmd_color(console, argument),
         b"sdinfo" => cmd_sdinfo(console),
         b"sdread" => cmd_sdread(console, argument),
         b"sdreadn" => cmd_sdreadn(console, argument),
@@ -276,6 +272,93 @@ fn cmd_mem(console: &mut Console) {
     line.push_u32((heap_bytes() / (1024 * 1024)) as u32);
     line.push_str(" MiB");
     console.write_output_line(line.as_str());
+}
+
+/// Shows the standard RISC-V machine identification registers verbatim.
+///
+/// The architecture permits implementation-defined ID values (including
+/// zero), so this intentionally does not attempt to map them to a vendor or
+/// core name. `mhartid` identifies the hart executing this shell command.
+/// The `misa` line additionally renders its known single-letter ISA
+/// extensions in the RISC-V canonical order.
+fn cmd_cpuinfo(console: &mut Console) {
+    let mvendorid: u32;
+    let marchid: u32;
+    let mimpid: u32;
+    let mhartid: u32;
+    let misa: u32;
+    unsafe {
+        core::arch::asm!("csrr {value}, mvendorid", value = out(reg) mvendorid, options(nomem, nostack));
+        core::arch::asm!("csrr {value}, marchid", value = out(reg) marchid, options(nomem, nostack));
+        core::arch::asm!("csrr {value}, mimpid", value = out(reg) mimpid, options(nomem, nostack));
+        core::arch::asm!("csrr {value}, mhartid", value = out(reg) mhartid, options(nomem, nostack));
+        core::arch::asm!("csrr {value}, misa", value = out(reg) misa, options(nomem, nostack));
+    }
+
+    console.write_output_line("RISC-V machine CSRs:");
+    for (name, value) in [
+        ("mvendorid", mvendorid),
+        ("marchid", marchid),
+        ("mimpid", mimpid),
+        ("mhartid", mhartid),
+    ] {
+        let mut line = Line::new();
+        line.push_str(name);
+        line.push_str(": 0x");
+        line.push_hex(value, 8);
+        console.write_output_line(line.as_str());
+    }
+
+    let mut line = Line::new();
+    line.push_str("misa: 0x");
+    line.push_hex(misa, 8);
+    line.push_str(" (");
+    push_misa_isa(&mut line, misa);
+    line.push_str(")");
+    console.write_output_line(line.as_str());
+}
+
+/// Appends the ISA name derivable from `misa`.
+///
+/// `misa` reports only single-letter extensions. In particular, it cannot
+/// identify individual `Z*` extensions or name non-standard extensions, even
+/// when its `X` bit is set. The single-letter extensions follow the canonical
+/// order specified by the RISC-V ISA naming convention.
+fn push_misa_isa(line: &mut Line, misa: u32) {
+    if misa == 0 {
+        line.push_str("unavailable");
+        return;
+    }
+
+    line.push_str(match misa >> 30 {
+        1 => "RV32",
+        2 => "RV64",
+        3 => "RV128",
+        _ => "RV?",
+    });
+
+    // I and E are alternate base ISAs. The specification requires I to be
+    // selected when both are supported at reset, so prefer it defensively.
+    if misa_has_extension(misa, b'I') {
+        line.push_str("I");
+    } else if misa_has_extension(misa, b'E') {
+        line.push_str("E");
+    } else {
+        line.push_str("?");
+    }
+
+    // Canonical order for standard single-letter extensions after I/E:
+    // M, A, F, D, Q, C, B, P, V, H. `G` is an abbreviation, not a bit to
+    // render; privilege-mode and custom-extension bits are not ISA names.
+    for extension in b"MAFDQCBPVH" {
+        if misa_has_extension(misa, *extension) {
+            line.push_ascii(&[*extension]);
+        }
+    }
+}
+
+fn misa_has_extension(misa: u32, extension: u8) -> bool {
+    misa & (1 << (extension - b'A')) != 0
 }
 
 /// Bytes of PSRAM past the two framebuffers, matching `Psram::heap`'s split
@@ -1179,26 +1262,6 @@ fn cmd_backlight(console: &mut Console, argument: &[u8]) {
             console.write_output_line("backlight off");
         }
         _ => console.write_output_line("usage: backlight on|off"),
-    }
-}
-
-fn cmd_color(console: &mut Console, argument: &[u8]) {
-    let color = match argument {
-        b"green" => Some(GREEN),
-        b"red" => Some(RED),
-        b"blue" => Some(BLUE),
-        b"cyan" => Some(CYAN),
-        b"magenta" => Some(MAGENTA),
-        b"yellow" => Some(YELLOW),
-        b"white" => Some(WHITE),
-        _ => None,
-    };
-    match color {
-        Some(color) => {
-            console.set_header_color(color);
-            console.write_output_line("header color changed");
-        }
-        None => console.write_output_line("usage: color <name>, see 'help'"),
     }
 }
 

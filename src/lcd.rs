@@ -42,6 +42,10 @@ const HEIGHT: u32 = 1280;
 // frames is close to the conventional ~500 ms terminal cursor blink phase.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
 
+// Deliberately a display-only, provisional version label.  The firmware
+// version has not been formally defined yet.
+const BOOT_VERSION: &str = "Tab5 Shell 0.1";
+
 // How often the frame loop looks for newly plugged-in USB devices. Both are
 // in ~57 Hz frames; see the two branches in `run_console` for why they
 // differ by so much -- one is a few control transfers to a hub that is
@@ -87,6 +91,9 @@ pub fn run_console(psram: Psram) {
     };
     // One foreground hart owns the singleton for the lifetime of the app.
     let console = unsafe { crate::console::singleton() };
+    console.clear();
+    console.write_output_line(BOOT_VERSION);
+    console.write_prompt();
     console.render(&mut framebuffers, 0);
     console.render(&mut framebuffers, 1);
     if !framebuffers.flush(0) || !framebuffers.flush(1) {
