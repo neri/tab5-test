@@ -23,6 +23,13 @@ pub enum Touch {
     St7123(St7123),
 }
 
+/// One active contact in framebuffer logical (landscape) coordinates.
+#[derive(Clone, Copy)]
+pub struct TouchPoint {
+    pub x: usize,
+    pub y: usize,
+}
+
 impl Touch {
     /// Probes the older standalone GT911 first, then the newer integrated
     /// ST7121/ST7123 display-touch controller. Returns `None` if neither
@@ -34,12 +41,41 @@ impl Touch {
         St7123::init().map(Touch::St7123)
     }
 
-    /// Returns the first active touch point in `framebuffer.rs`'s logical
-    /// (landscape) coordinates, or `None` if the panel is idle.
-    pub fn poll(&self) -> Option<(usize, usize)> {
+    /// Fills `points` with every active contact in `framebuffer.rs`'s logical
+    /// (landscape) coordinates and returns how many fit.  A caller can pass
+    /// a shorter slice when it only needs the first few contacts.
+    pub fn poll_points(&self, points: &mut [TouchPoint]) -> usize {
         match self {
-            Touch::Gt911(panel) => panel.poll(),
-            Touch::St7123(panel) => panel.poll(),
+            Touch::Gt911(panel) => panel.poll_points(points),
+            Touch::St7123(panel) => panel.poll_points(points),
+        }
+    }
+
+    /// Returns the first active touch point, or `None` if the panel is idle.
+    /// This keeps the paint screen's single-stroke interface while the
+    /// `touchtest` command can inspect every contact through `poll_points`.
+    pub fn poll(&self) -> Option<(usize, usize)> {
+        let mut point = [TouchPoint { x: 0, y: 0 }; 1];
+        if self.poll_points(&mut point) == 0 {
+            None
+        } else {
+            Some((point[0].x, point[0].y))
+        }
+    }
+
+    /// A short controller name for the interactive diagnostic.
+    pub fn controller_name(&self) -> &'static str {
+        match self {
+            Touch::Gt911(_) => "GT911",
+            Touch::St7123(_) => "ST7121/ST7123",
+        }
+    }
+
+    /// Number of contacts the controller is configured to report.
+    pub fn max_touches(&self) -> usize {
+        match self {
+            Touch::Gt911(_) => GT911_MAX_TOUCH_POINTS,
+            Touch::St7123(panel) => panel.max_touches,
         }
     }
 }
@@ -56,6 +92,8 @@ const GT911_PRODUCT_ID: u16 = 0x8140;
 const GT911_X_RESOLUTION: u16 = 0x8146;
 const GT911_STATUS: u16 = 0x814E;
 const GT911_POINT_1: u16 = 0x8150;
+const GT911_TOUCH_STRIDE: usize = 8;
+const GT911_MAX_TOUCH_POINTS: usize = 5;
 
 pub struct Gt911 {
     bus: SoftI2c,
@@ -97,32 +135,39 @@ impl Gt911 {
         None
     }
 
-    fn poll(&self) -> Option<(usize, usize)> {
+    fn poll_points(&self, points: &mut [TouchPoint]) -> usize {
         let mut status = [0u8; 1];
         if !read(&self.bus, self.address, GT911_STATUS, &mut status) {
-            return None;
+            return 0;
         }
         let ready = status[0] & 0x80 != 0;
-        let point_count = status[0] & 0x0F;
-        let result = if ready && point_count > 0 {
-            let mut point = [0u8; 4];
-            read(&self.bus, self.address, GT911_POINT_1, &mut point).then(|| {
-                let raw_x = u16::from_le_bytes([point[0], point[1]]) as u32;
-                let raw_y = u16::from_le_bytes([point[2], point[3]]) as u32;
-                native_to_logical(
-                    scale(raw_x, self.x_max, NATIVE_WIDTH),
-                    scale(raw_y, self.y_max, NATIVE_HEIGHT),
-                )
-            })
-        } else {
-            None
-        };
+        let point_count = (status[0] as usize & 0x0F).min(GT911_MAX_TOUCH_POINTS);
+        let mut found = 0;
+        if ready && point_count > 0 {
+            let mut data = [0u8; GT911_MAX_TOUCH_POINTS * GT911_TOUCH_STRIDE];
+            let len = point_count * GT911_TOUCH_STRIDE;
+            if read(&self.bus, self.address, GT911_POINT_1, &mut data[..len]) {
+                for point in data[..len].chunks_exact(GT911_TOUCH_STRIDE) {
+                    if found == points.len() {
+                        break;
+                    }
+                    let raw_x = u16::from_le_bytes([point[1], point[2]]) as u32;
+                    let raw_y = u16::from_le_bytes([point[3], point[4]]) as u32;
+                    let (x, y) = native_to_logical(
+                        scale(raw_x, self.x_max, NATIVE_WIDTH),
+                        scale(raw_y, self.y_max, NATIVE_HEIGHT),
+                    );
+                    points[found] = TouchPoint { x, y };
+                    found += 1;
+                }
+            }
+        }
         if ready {
             // Clears the buffer-ready flag so the next read waits for a
             // fresh sample instead of repeating this one.
             let _ = write(&self.bus, self.address, GT911_STATUS, 0);
         }
-        result
+        found
     }
 }
 
@@ -135,8 +180,9 @@ const ST7123_ADDRESS: u8 = 0x55;
 const ST7123_STATUS: u16 = 0x0001; // [7:4] error code, [3:0] device status
 const ST7123_MAX_X: u16 = 0x0005; // X res @ +0/+1, Y res @ +2/+3
 const ST7123_MAX_TOUCHES_REGISTER: u16 = 0x0009;
-const ST7123_ADV_TOUCH_INFO: u16 = 0x0010; // reporting-table header; first
-// touch point starts 4 bytes later, at register 0x0014.
+const ST7123_ADV_TOUCH_INFO: u16 = 0x0010; // reporting-table header
+
+// The first touch point starts 4 bytes later, at register 0x0014.
 const ST7123_STATUS_INIT: u8 = 0x1;
 const ST7123_TOUCH_VALID: u8 = 0x80;
 const ST7123_COORD_HIGH_MASK: u8 = 0x3F;
@@ -151,9 +197,9 @@ pub struct St7123 {
     y_max: u16,
     /// How many touch slots the controller is configured to report. It only
     /// latches a fresh sample once the host has read its *entire* reporting
-    /// table, so `poll` must read this many slots even though only the
-    /// first one is ever used -- reading just one slot left every poll after
-    /// the first touch reporting that same first touch again.
+    /// table, so every poll must read this many slots. Reading only the first
+    /// one left every poll after the first touch reporting that same first
+    /// touch again.
     max_touches: usize,
 }
 
@@ -204,25 +250,38 @@ impl St7123 {
         })
     }
 
-    fn poll(&self) -> Option<(usize, usize)> {
+    fn poll_points(&self, points: &mut [TouchPoint]) -> usize {
         // Must read the controller's *complete* configured reporting table
-        // (see `max_touches` above), even though only the first slot below
-        // is ever used.
+        // (see `max_touches` above), otherwise the controller does not latch
+        // a fresh sample for the next poll.
         let mut data = [0u8; ST7123_HEADER_BYTES + ST7123_MAX_TOUCH_POINTS * ST7123_TOUCH_STRIDE];
         let len = ST7123_HEADER_BYTES + self.max_touches * ST7123_TOUCH_STRIDE;
-        if !read(&self.bus, ST7123_ADDRESS, ST7123_ADV_TOUCH_INFO, &mut data[..len]) {
-            return None;
+        if !read(
+            &self.bus,
+            ST7123_ADDRESS,
+            ST7123_ADV_TOUCH_INFO,
+            &mut data[..len],
+        ) {
+            return 0;
         }
-        let point = &data[ST7123_HEADER_BYTES..ST7123_HEADER_BYTES + ST7123_TOUCH_STRIDE];
-        if point[0] & ST7123_TOUCH_VALID == 0 {
-            return None;
+        let mut found = 0;
+        for point in data[ST7123_HEADER_BYTES..len].chunks_exact(ST7123_TOUCH_STRIDE) {
+            if point[0] & ST7123_TOUCH_VALID == 0 {
+                continue;
+            }
+            if found == points.len() {
+                break;
+            }
+            let raw_x = (((point[0] & ST7123_COORD_HIGH_MASK) as u32) << 8) | point[1] as u32;
+            let raw_y = (((point[2] & ST7123_COORD_HIGH_MASK) as u32) << 8) | point[3] as u32;
+            let (x, y) = native_to_logical(
+                scale(raw_x, self.x_max, NATIVE_WIDTH),
+                scale(raw_y, self.y_max, NATIVE_HEIGHT),
+            );
+            points[found] = TouchPoint { x, y };
+            found += 1;
         }
-        let raw_x = (((point[0] & ST7123_COORD_HIGH_MASK) as u32) << 8) | point[1] as u32;
-        let raw_y = (((point[2] & ST7123_COORD_HIGH_MASK) as u32) << 8) | point[3] as u32;
-        Some(native_to_logical(
-            scale(raw_x, self.x_max, NATIVE_WIDTH),
-            scale(raw_y, self.y_max, NATIVE_HEIGHT),
-        ))
+        found
     }
 }
 

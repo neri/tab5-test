@@ -11,7 +11,7 @@ use crate::{
     cardkb::CardKb,
     console::{Console, Update},
     framebuffer::DoubleBuffer,
-    gpio, interrupts, paint,
+    gpio, interrupts, paint, touch_test,
     psram::Psram,
     shell,
     usb,
@@ -279,6 +279,10 @@ pub fn run_console(psram: Psram) {
                     // framebuffers holding the finished drawing; clear them
                     // back to a fresh console before the redraw below.
                     paint::run(&mut framebuffers, &mut keyboard);
+                    console.clear();
+                }
+                if outcome == shell::Outcome::TouchTest {
+                    touch_test::run(&mut framebuffers, &mut keyboard);
                     console.clear();
                 }
                 if outcome != shell::Outcome::Reboot {

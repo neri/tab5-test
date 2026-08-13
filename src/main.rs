@@ -24,6 +24,7 @@ mod sdmmc;
 mod shell;
 mod startup;
 mod touch;
+mod touch_test;
 mod uart;
 mod usb;
 

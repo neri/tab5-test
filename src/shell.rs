@@ -50,6 +50,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry { name: "paint", usage: "paint", lines: &["touch drawing screen"] },
     HelpEntry {
+        name: "touchtest",
+        usage: "touchtest",
+        lines: &["live multi-touch test; use two fingers, any key exits"],
+    },
+    HelpEntry {
         name: "sdinfo",
         usage: "sdinfo",
         lines: &["activate SD card, show CID/CSD summary"],
@@ -155,6 +160,8 @@ pub enum Outcome {
     Reboot,
     /// Hand the display over to the touch paint screen.
     Paint,
+    /// Hand the display over to the multi-touch diagnostic screen.
+    TouchTest,
 }
 
 /// Parses and runs one command line, returning what the caller should do
@@ -205,6 +212,7 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"usbread" => cmd_usbread(console, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, usb_host),
         b"paint" => return Outcome::Paint,
+        b"touchtest" => return Outcome::TouchTest,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
             return Outcome::Reboot;
