@@ -30,6 +30,10 @@ use crate::uart;
 pub const MAX_HUB_PORTS: u8 = 8;
 
 const SLOT_COUNT: usize = MAX_HUB_PORTS as usize + 1; // index 0 = Direct, N = HubPort(N)
+/// A background port scan runs roughly once a second. Do not stop discovery
+/// for a one-off hub/host hiccup; pause only after this many consecutive
+/// full scan failures, then emit the existing one-shot diagnostic.
+const HUB_PORT_SCAN_FAILURE_GIVE_UP_THRESHOLD: u8 = 3;
 
 /// Where an attached device is plugged in, for logging and shell display.
 /// Class drivers do not need this -- it never leaves the registry.
@@ -117,6 +121,14 @@ pub struct UsbHost {
     /// separately from `slots`, since it is not itself something a class
     /// driver drives.
     hub_summary: Option<DeviceSummary>,
+    /// An empty-port scan reached a hub that did not answer even after the
+    /// control-transfer retry budget.  This affects only discovery of *new*
+    /// devices; resetting the whole bus here would tear down working
+    /// keyboards/storage every second.  `clear`/`rescan` re-arm scanning.
+    hub_port_scan_paused: bool,
+    /// Consecutive background scans that could not read an empty hub port.
+    /// A successful full scan resets it, so transient recovery stays silent.
+    hub_port_scan_failures: u8,
     slots: [Option<Slot>; SLOT_COUNT],
 }
 
@@ -128,6 +140,8 @@ impl UsbHost {
             hub: None,
             hub_speed: Speed::Unknown,
             hub_summary: None,
+            hub_port_scan_paused: false,
+            hub_port_scan_failures: 0,
             slots: [NONE_SLOT; SLOT_COUNT],
         }
     }
@@ -185,6 +199,8 @@ impl UsbHost {
         self.hub = None;
         self.hub_speed = Speed::Unknown;
         self.hub_summary = None;
+        self.hub_port_scan_paused = false;
+        self.hub_port_scan_failures = 0;
         for slot in self.slots.iter_mut() {
             *slot = None;
         }
@@ -225,6 +241,9 @@ impl UsbHost {
         match &self.hub {
             None => self.slots[0].is_none(),
             Some(hub) => {
+                if self.hub_port_scan_paused {
+                    return false;
+                }
                 let port_count = hub.port_count().min(MAX_HUB_PORTS);
                 (1..=port_count).any(|port| self.slots[port as usize].is_none())
             }
@@ -345,22 +364,32 @@ impl UsbHost {
     /// reads as unoccupied), and only a port that has actually gained a
     /// device gets reset and enumerated.
     pub fn scan_empty_hub_ports(&mut self) {
+        if self.hub_port_scan_paused {
+            return;
+        }
         // Taken out of `self` for the duration so the loop can borrow the
         // hub while filling in `self.slots`; nothing else can run in
         // between (this is all synchronous, single-threaded polling).
         let Some(hub) = self.hub.take() else { return };
         let hub_speed = self.hub_speed;
+        let mut pause_hub_scan = false;
 
         let port_count = hub.port_count().min(MAX_HUB_PORTS);
         for port in 1..=port_count {
             if self.slots[port as usize].is_some() {
                 continue; // already driving something here
             }
-            match hub.debounce_connected_port(port) {
+            match hub.debounce_connected_port_quiet(port) {
                 Some(true) => {}
                 Some(false) => continue,
                 None => {
-                    uart::log(b"USB: hub stopped answering while scanning ports\r\n");
+                    // This scan is only an opportunistic way to notice new
+                    // devices.  A root reset here would discard every
+                    // working keyboard/storage session, then produce a
+                    // misleading stream of "attached" logs. Keep the live
+                    // registry and wait for an explicit or genuine-device
+                    // error rescan instead.
+                    pause_hub_scan = true;
                     break;
                 }
             }
@@ -368,6 +397,19 @@ impl UsbHost {
         }
 
         self.hub = Some(hub);
+        if pause_hub_scan {
+            self.hub_port_scan_failures = self.hub_port_scan_failures.saturating_add(1);
+            if self.hub_port_scan_failures < HUB_PORT_SCAN_FAILURE_GIVE_UP_THRESHOLD {
+                // Keep the live registry and try again on the next coarse
+                // scan. The control failure is commonly transient and a
+                // later request succeeds without a root-port reset.
+                return;
+            }
+            self.hub_port_scan_paused = true;
+            uart::log(b"USB: hub port scan paused after repeated recovery failures; run usbrescan to retry\r\n");
+        } else {
+            self.hub_port_scan_failures = 0;
+        }
     }
 
     /// Resets one already-known-occupied hub port, enumerates whatever is

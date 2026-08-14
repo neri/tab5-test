@@ -61,6 +61,25 @@ const CONFIG_BUFFER_MAX: usize = 128;
 // command timeouts, not a retry budget of our own.
 const CONTROL_TIMEOUT_ITERATIONS: u32 = 2_000_000;
 
+/// A control-transfer transaction error can be transient: a hub may need
+/// another frame after waking its downstream logic, and the DWC core can
+/// report a one-off transaction error even though the root link is still
+/// enabled.  Retrying the *whole* control transfer is important here: a
+/// fresh SETUP packet resets EP0's control-transfer state (USB2.0 8.5.3.1),
+/// whereas retrying only the failed DATA or STATUS packet could use the
+/// wrong data toggle.
+///
+/// Earlier attempts run quietly.  That keeps a recovered hiccup invisible
+/// to the UART; callers that need diagnostics retain the detailed HCD and
+/// stage report when every attempt fails.
+const CONTROL_TRANSFER_ATTEMPTS: u8 = 3;
+const CONTROL_RETRY_DELAY_US: u32 = 1_000;
+
+const STAGE_SETUP: &[u8] = b"SETUP";
+const STAGE_IN_DATA: &[u8] = b"IN data";
+const STAGE_OUT_STATUS: &[u8] = b"OUT status";
+const STAGE_IN_STATUS: &[u8] = b"IN status";
+
 /// One USB frame, waited between the packets of a control transfer to a
 /// Low-Speed device behind a Full-Speed hub.
 ///
@@ -153,7 +172,11 @@ pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
     // Before SET_ADDRESS the device answers on address 0, and EP0's real
     // packet size is not known yet -- 8 bytes is the one size every
     // device supports (USB2.0 5.5.3).
-    let mut pipe = ControlPipe { device_address: 0, mps: 8, route };
+    let mut pipe = ControlPipe {
+        device_address: 0,
+        mps: 8,
+        route,
+    };
 
     let mut peek = [0u8; 8];
     let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_DEVICE, 0, 8);
@@ -263,44 +286,83 @@ pub fn build_standard_out_setup(request: u8, value: u16, index: u16) -> [u8; 8] 
 /// issue their own class-specific IN requests (`hub.rs`'s hub descriptor
 /// and status reads) through the same staging as standard ones.
 pub fn control_transfer_in(pipe: &ControlPipe, setup: &[u8; 8], buffer: &mut [u8]) -> Option<usize> {
-    let mut setup_buf = *setup;
-    if run_control_packet(pipe, false, true, false, &mut setup_buf).is_none() {
-        log_failed_stage(b"SETUP");
-        return None;
-    }
+    control_transfer_in_with_diagnostics(pipe, setup, buffer, true)
+}
 
-    let received = if buffer.is_empty() {
-        0
-    } else {
-        match data_stage_in(pipe, buffer) {
-            Some(received) => received,
-            None => {
-                log_failed_stage(b"IN data");
-                return None;
-            }
-        }
-    };
+/// The same complete-transfer recovery as [`control_transfer_in`], but with
+/// no UART diagnostics if its retry budget is exhausted.  The hub registry
+/// uses this while doing its opportunistic empty-port scan, where a failure
+/// must not disturb already-attached devices.  That scan reports one concise
+/// summary and pauses until an explicit or genuine-device-error rescan.
+pub fn control_transfer_in_quiet(
+    pipe: &ControlPipe,
+    setup: &[u8; 8],
+    buffer: &mut [u8],
+) -> Option<usize> {
+    control_transfer_in_with_diagnostics(pipe, setup, buffer, false)
+}
 
-    if run_control_packet(pipe, false, false, true, &mut []).is_none() {
-        log_failed_stage(b"OUT status");
-        return None;
-    }
-    Some(received)
+fn control_transfer_in_with_diagnostics(
+    pipe: &ControlPipe,
+    setup: &[u8; 8],
+    buffer: &mut [u8],
+    log_failure: bool,
+) -> Option<usize> {
+    retry_control_transfer(log_failure, |quiet_errors| {
+        let mut setup_buf = *setup;
+        run_control_packet(pipe, false, true, false, quiet_errors, &mut setup_buf)
+            .ok_or(STAGE_SETUP)?;
+
+        let received = if buffer.is_empty() {
+            0
+        } else {
+            data_stage_in(pipe, buffer, quiet_errors).ok_or(STAGE_IN_DATA)?
+        };
+
+        run_control_packet(pipe, false, false, true, quiet_errors, &mut [])
+            .ok_or(STAGE_OUT_STATUS)?;
+        Ok(received)
+    })
 }
 
 /// Runs a control transfer with no data stage (SETUP, IN status stage),
 /// e.g. `SET_ADDRESS`, `SET_CONFIGURATION`, or a class request.
 pub fn control_transfer_out_no_data(pipe: &ControlPipe, setup: &[u8; 8]) -> bool {
-    let mut setup_buf = *setup;
-    if run_control_packet(pipe, false, true, false, &mut setup_buf).is_none() {
-        log_failed_stage(b"SETUP");
-        return false;
+    retry_control_transfer(true, |quiet_errors| {
+        let mut setup_buf = *setup;
+        run_control_packet(pipe, false, true, false, quiet_errors, &mut setup_buf)
+            .ok_or(STAGE_SETUP)?;
+        run_control_packet(pipe, true, false, true, quiet_errors, &mut [])
+            .ok_or(STAGE_IN_STATUS)?;
+        Ok(())
+    })
+    .is_some()
+}
+
+/// Re-runs a complete EP0 transaction after a transient packet failure.
+///
+/// The HCD's first two attempts are deliberately quiet.  When diagnostics
+/// are requested, the final attempt retains its raw HCINT/HPRT diagnostic
+/// and is followed by one stage name, so a persistent failure remains
+/// actionable without flooding normal recovered errors into the UART log.
+fn retry_control_transfer<T>(
+    log_failure: bool,
+    mut transfer: impl FnMut(bool) -> Result<T, &'static [u8]>,
+) -> Option<T> {
+    for attempt in 0..CONTROL_TRANSFER_ATTEMPTS {
+        let final_attempt = attempt + 1 == CONTROL_TRANSFER_ATTEMPTS;
+        match transfer(!final_attempt || !log_failure) {
+            Ok(result) => return Some(result),
+            Err(stage) if final_attempt => {
+                if log_failure {
+                    log_failed_stage(stage);
+                }
+                return None;
+            }
+            Err(_) => delay_us(CONTROL_RETRY_DELAY_US),
+        }
     }
-    if run_control_packet(pipe, true, false, true, &mut []).is_none() {
-        log_failed_stage(b"IN status");
-        return false;
-    }
-    true
+    unreachable!("control-transfer retry loop always returns");
 }
 
 /// Names the control transfer stage that just failed.
@@ -319,7 +381,7 @@ fn log_failed_stage(stage: &[u8]) {
 /// Repeats MPS-sized IN packets (data stage PID always starts at DATA1,
 /// toggling per packet) until `buffer` is full or a short packet signals
 /// the end of the data, per USB2.0 8.5.3.
-fn data_stage_in(pipe: &ControlPipe, buffer: &mut [u8]) -> Option<usize> {
+fn data_stage_in(pipe: &ControlPipe, buffer: &mut [u8], quiet_errors: bool) -> Option<usize> {
     let mut received = 0usize;
     let mut pid_data1 = true;
     while received < buffer.len() {
@@ -329,6 +391,7 @@ fn data_stage_in(pipe: &ControlPipe, buffer: &mut [u8]) -> Option<usize> {
             true,
             false,
             pid_data1,
+            quiet_errors,
             &mut buffer[received..received + chunk_len],
         )?;
         received += got;
@@ -340,15 +403,17 @@ fn data_stage_in(pipe: &ControlPipe, buffer: &mut [u8]) -> Option<usize> {
     Some(received)
 }
 
-/// `hcd::run_packet` on EP0 (control transfers): errors are always worth
-/// logging (they are rare and something is actually wrong), and NAKs are
-/// expected to retry in hardware until success or a real error, so the
-/// timeout is long and never treated as routine.
+/// `hcd::run_packet` on EP0 (control transfers). NAKs are expected to retry
+/// in hardware until success or a real error, so the timeout is long and
+/// never treated as routine. `quiet_errors` is used by the whole-transfer
+/// recovery loop above; it suppresses diagnostics only until an attempt has
+/// actually exhausted the retry budget.
 fn run_control_packet(
     pipe: &ControlPipe,
     is_in: bool,
     is_setup: bool,
     pid_data1: bool,
+    quiet_errors: bool,
     buffer: &mut [u8],
 ) -> Option<usize> {
     // Only the preamble path needs the inter-packet gap. A split transfer
@@ -372,8 +437,8 @@ fn run_control_packet(
         pid_data1,
         CONTROL_TIMEOUT_ITERATIONS,
         CONTROL_SPLIT_ROUNDS,
-        false,
-        false,
+        quiet_errors,
+        quiet_errors,
         buffer,
     ) {
         PacketOutcome::Ok(n) => Some(n),

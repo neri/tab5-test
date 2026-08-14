@@ -10,7 +10,7 @@
 //! and combining a High-Speed hub with slower devices behind it is
 //! `hcd::Route`'s business. Hubs behind hubs are still out of scope.
 
-use super::hcd::Speed;
+use super::hcd::{self, Speed};
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::delay::delay_ms;
 use crate::uart;
@@ -309,6 +309,17 @@ impl Hub {
     /// One downstream port's status (`GET_STATUS` with the port number in
     /// wIndex).
     pub fn port_status(&self, port: u8) -> Option<PortStatus> {
+        self.port_status_with_diagnostics(port, true)
+    }
+
+    /// Quiet form of [`Self::port_status`] for the periodic empty-port scan.
+    /// A failed scan must not reset devices that are already working, so its
+    /// caller emits a single summary and pauses future background scans.
+    fn port_status_quiet(&self, port: u8) -> Option<PortStatus> {
+        self.port_status_with_diagnostics(port, false)
+    }
+
+    fn port_status_with_diagnostics(&self, port: u8, log_failure: bool) -> Option<PortStatus> {
         let mut buffer = [0u8; 4];
         let setup = build_class_in_setup(
             REQUEST_TYPE_DEVICE_TO_HOST_CLASS_OTHER,
@@ -317,16 +328,97 @@ impl Hub {
             port as u16,
             buffer.len() as u16,
         );
-        let received =
-            protocol::control_transfer_in(&self.pipe, &setup, &mut buffer)?;
+        let mut received = if log_failure {
+            protocol::control_transfer_in(&self.pipe, &setup, &mut buffer)
+        } else {
+            protocol::control_transfer_in_quiet(&self.pipe, &setup, &mut buffer)
+        };
+        if received.is_none() && !log_failure {
+            // A hub can be left with its EP0 state needing a fresh SETUP
+            // after delayed downstream/TT work. The post-failure probe
+            // showed that a harmless hub-recipient GET_STATUS, even when it
+            // itself reports an error, restores the following port request.
+            // Keep this recovery entirely quiet and retry the original
+            // request from a fresh control-transfer SETUP.
+            hcd::recover_channel_after_packet_failure();
+            self.reprime_control_pipe_quiet();
+            received = protocol::control_transfer_in_quiet(&self.pipe, &setup, &mut buffer);
+        }
+        let received = received?;
         if received < buffer.len() {
-            uart::log(b"USB: short hub GET_PORT_STATUS response\r\n");
+            if log_failure {
+                uart::log(b"USB: short hub GET_PORT_STATUS response\r\n");
+            }
             return None;
         }
         Some(PortStatus {
             status: u16::from_le_bytes([buffer[0], buffer[1]]),
             change: u16::from_le_bytes([buffer[2], buffer[3]]),
         })
+    }
+
+    fn reprime_control_pipe_quiet(&self) {
+        let mut buffer = [0u8; 4];
+        let setup = build_class_in_setup(
+            REQUEST_TYPE_DEVICE_TO_HOST_CLASS_DEVICE,
+            REQUEST_GET_STATUS,
+            0,
+            0,
+            buffer.len() as u16,
+        );
+        let _ = protocol::control_transfer_in_quiet(&self.pipe, &setup, &mut buffer);
+    }
+
+    /// Separates a failed hub-port request from a failed hub control endpoint.
+    ///
+    /// The registry calls this only after it has logged the original failure
+    /// and paused background scanning. Both reads use the quiet recovery
+    /// path, so this adds two result lines without turning a persistent
+    /// failure into a stream of packet diagnostics.
+    #[cfg(any())]
+    pub fn log_control_probe_after_failure(&self, port: u8) {
+        uart::log_hex(b"USB: post-failure hub EP0 probe, failed port=", port as u32);
+
+        let mut hub_buffer = [0u8; 4];
+        let hub_setup = build_class_in_setup(
+            REQUEST_TYPE_DEVICE_TO_HOST_CLASS_DEVICE,
+            REQUEST_GET_STATUS,
+            0,
+            0,
+            hub_buffer.len() as u16,
+        );
+        let hub_received =
+            protocol::control_transfer_in_quiet(&self.pipe, &hub_setup, &mut hub_buffer);
+        Self::log_control_probe_result(b"USB:   GET_STATUS(hub)=", hub_received, hub_buffer.len());
+
+        let mut port_buffer = [0u8; 4];
+        let port_setup = build_class_in_setup(
+            REQUEST_TYPE_DEVICE_TO_HOST_CLASS_OTHER,
+            REQUEST_GET_STATUS,
+            0,
+            port as u16,
+            port_buffer.len() as u16,
+        );
+        let port_received =
+            protocol::control_transfer_in_quiet(&self.pipe, &port_setup, &mut port_buffer);
+        Self::log_control_probe_result(
+            b"USB:   GET_PORT_STATUS(failed port)=",
+            port_received,
+            port_buffer.len(),
+        );
+    }
+
+    #[cfg(any())]
+    fn log_control_probe_result(label: &[u8], received: Option<usize>, expected: usize) {
+        uart::log(label);
+        match received {
+            Some(bytes) if bytes >= expected => uart::log(b"ok\r\n"),
+            Some(bytes) => {
+                uart::log(b"short response, bytes=");
+                uart::log_hex(b"", bytes as u32);
+            }
+            None => uart::log(b"failed\r\n"),
+        }
     }
 
     pub fn set_port_feature(&self, port: u8, feature: u16) -> bool {
@@ -393,14 +485,38 @@ impl Hub {
     ///
     /// Ports are assumed to be powered already (`power_on_all_ports`).
     pub fn debounce_connected_port(&self, port: u8) -> Option<bool> {
-        if !self.port_status(port)?.connected() {
+        self.debounce_connected_port_with_diagnostics(port, true)
+    }
+
+    /// Quiet form of [`Self::debounce_connected_port`] for background scans
+    /// that must leave already-attached devices alone on an error. The
+    /// registry defers a failed scan to its next coarse polling interval;
+    /// this method itself keeps `protocol.rs`'s normal whole-transfer retry.
+    pub fn debounce_connected_port_quiet(&self, port: u8) -> Option<bool> {
+        self.debounce_connected_port_with_diagnostics(port, false)
+    }
+
+    fn debounce_connected_port_with_diagnostics(&self, port: u8, log_failure: bool) -> Option<bool> {
+        let first_status = if log_failure {
+            self.port_status(port)
+        } else {
+            self.port_status_quiet(port)
+        };
+        if !first_status?.connected() {
             return Some(false);
         }
         // Mirrors `hcd::probe_port`'s debounce (including its "bounced
         // away" case) on the root port.
         delay_ms(PORT_DEBOUNCE_MS);
-        if !self.port_status(port)?.connected() {
-            uart::log_hex(b"USB: hub port connection bounced away during debounce, port ", port as u32);
+        let second_status = if log_failure {
+            self.port_status(port)
+        } else {
+            self.port_status_quiet(port)
+        };
+        if !second_status?.connected() {
+            if log_failure {
+                uart::log_hex(b"USB: hub port connection bounced away during debounce, port ", port as u32);
+            }
             return Some(false);
         }
         self.clear_port_feature(port, FEATURE_C_PORT_CONNECTION);

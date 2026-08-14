@@ -130,18 +130,18 @@ Stageで複数デバイスを保持するようになるほど「シェルコマ
   キーボードのセッションが壊れない（`needs_reinit`が発火しない）ことを
   実機で確認する
 
-**設計上の注意**: `shell.rs`のコマンドは`Console`経由で呼ばれ、`lcd.rs`の
+**設計上の注意**: `shell.rs`のコマンドは`Console`経由で呼ばれ、アプリケーションの
 フレームループとは別の実行タイミング（同じシングルスレッドの割り込み
 処理の合間ではあるが、呼び出し元が違う）で動く。`UsbHost`を単一の
 `static`や`Cell`越しに共有する必要があるか、あるいは`Console`/`shell`
-呼び出し自体が`lcd.rs`のループの中から行われる構造になっているかを
+呼び出し自体が`app.rs`のループの中から行われる構造になっているかを
 `console.rs`/`shell.rs`の呼び出し経路で確認してから実装方針を決める。
 
-**実装時の判明事項**: `shell::execute`は`lcd::run_console`のフレーム
+**実装時の判明事項**: `shell::execute`は`app::run`のフレーム
 ループから`console.take_submission()`直後に同期呼び出しされているだけで
-（`src/lcd.rs`の`let outcome = shell::execute(console, submission.as_bytes(), &mut usb_host);`）、
+（`src/app.rs`の`let outcome = shell::execute(console, submission.as_bytes(), &mut usb_host);`）、
 別スレッド/別割り込みコンテキストからの呼び出しは無い。つまり懸念していた
-「`static`や`RefCell`越しの共有」は不要で、`lcd.rs`が所有する
+「`static`や`RefCell`越しの共有」は不要で、`app.rs`が所有する
 `UsbHost`をそのまま`&mut`で`shell::execute`に渡すだけで済んだ。
 `shell::execute`のシグネチャに`usb_host: &mut usb::UsbHost`を追加し、
 `usbinfo`/`usbrescan`/`usbhub`/`usbmsc`/`usbread`/`usbmbr`の各コマンド
@@ -458,7 +458,10 @@ Stage A〜Fが実機で安定するまでは着手しない。
   （`Keyboard`/`MassStorage`）、`DeviceSummary`（VID/PID/class/
   インターフェース数/config bytesの表示用スナップショット）、
   `Location`（`Direct`/`HubPort(u8)`）、`rescan`/`attach_hub`/
-  `attach_class_driver`（デバイス種別ごとの振り分けロジック）
+  `attach_class_driver`（デバイス種別ごとの振り分けロジック）。空きポートの
+  背景走査は一時的な制御転送失敗を次周期へ無音で繰り延べ、3回連続の失敗時だけ
+  停止する。`hub.rs`がchannel/FIFO復旧とEP0再同期を行うため、通常は全バスの
+  `rescan`を必要としない
 - `src/usb/hub.rs`: `find_connected_port`（1ポート版）と`debounce_port`
   （private）を削除し、`Hub::debounce_connected_port(port) ->
   Option<bool>`（1ポート分の接続確認+デバウンス、状態を持たない）に
@@ -471,7 +474,7 @@ Stage A〜Fが実機で安定するまでは着手しない。
   `UsbHost::root_disconnected`に一本化されたため不要になった）と
   `HidKeyboardInterface::interval`（表示用途以外で未使用だったフィールド）
   を削除した。`msc.rs`の`MscInterface::interface_number`も同じ理由で削除
-- `src/lcd.rs`: `run_console`が`usb::UsbHost`を1つ所有し、
+- `src/app.rs`: `run`が`usb::UsbHost`を1つ所有し、
   `poll_keyboards`で全キーボードスロットをラウンドロビンポーリングする。
   `shell::execute`へ`&mut usb_host`を渡す
 - `src/shell.rs`: `usbinfo`/`usbhub`/`usbmsc`/`usbread`/`usbmbr`が

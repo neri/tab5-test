@@ -41,12 +41,12 @@
 use core::mem::size_of;
 
 use crate::delay::delay_us;
+use crate::gpio;
 use crate::uart;
 
 const SDHOST: usize = 0x5008_3000;
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const LP_CLKRST: usize = 0x5011_1000;
-const IO_MUX: usize = 0x500E_1000;
 
 const CTRL: usize = SDHOST + 0x00;
 const CLKDIV: usize = SDHOST + 0x08;
@@ -71,14 +71,6 @@ const SOC_CLK_CTRL1: usize = HP_SYS_CLKRST + 0x18;
 const PERI_CLK_CTRL01: usize = HP_SYS_CLKRST + 0x34;
 const PERI_CLK_CTRL02: usize = HP_SYS_CLKRST + 0x38;
 const HP_SDMMC_EMAC_RST_CTRL: usize = LP_CLKRST + 0x4C;
-
-const PIN_D0: u32 = 39;
-const PIN_D1: u32 = 40;
-const PIN_D2: u32 = 41;
-const PIN_D3: u32 = 42;
-const PIN_CLK: u32 = 43;
-const PIN_CMD: u32 = 44;
-const SDMMC_IOMUX_FUNC: u32 = 0;
 
 const CMD_RESPONSE_EXPECT: u32 = 1 << 6;
 const CMD_RESPONSE_LONG: u32 = 1 << 7;
@@ -198,7 +190,7 @@ pub struct SdCard {
 pub fn init() -> Option<SdCard> {
     enable_bus_clock();
     reset_peripheral();
-    configure_pins();
+    gpio::configure_sdmmc_4bit_pins();
     set_low_speed_clock_source(2);
     if !reset_controller() {
         uart::log(b"SDMMC: controller reset timed out\r\n");
@@ -845,25 +837,6 @@ fn reset_peripheral() {
         modify(HP_SDMMC_EMAC_RST_CTRL, 1 << 28, 1 << 28);
         modify(HP_SDMMC_EMAC_RST_CTRL, 1 << 28, 0);
     }
-}
-
-fn configure_pins() {
-    for pin in [PIN_CLK, PIN_CMD, PIN_D0, PIN_D1, PIN_D2, PIN_D3] {
-        unsafe { modify(iomux_register(pin), 0x7 << 12, SDMMC_IOMUX_FUNC << 12) };
-    }
-    // CMD/D0..D3 are bidirectional; the pad's input buffer (`fun_ie`) resets
-    // to disabled and, unlike output enable, is not implicitly switched on
-    // by selecting a non-GPIO `mcu_sel` function, so it needs setting
-    // explicitly or the controller's receiver only ever sees a stuck 0.
-    // Also match the ESP-IDF driver's `gpio_pullup_en` for these pins
-    // (CLK is host-driven output only, so it needs neither).
-    for pin in [PIN_CMD, PIN_D0, PIN_D1, PIN_D2, PIN_D3] {
-        unsafe { modify(iomux_register(pin), (1 << 8) | (1 << 9), (1 << 8) | (1 << 9)) };
-    }
-}
-
-fn iomux_register(pin: u32) -> usize {
-    IO_MUX + 0x04 + pin as usize * 4
 }
 
 /// Configures the SDIO low-speed clock generator (`HP_SYS_CLKRST`) that

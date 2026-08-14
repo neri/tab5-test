@@ -15,12 +15,38 @@
 const GPIO: usize = 0x500E_0000;
 const IO_MUX: usize = 0x500E_1000;
 
-fn matrix_out_register(pin: u32) -> usize {
-    GPIO + 0x558 + pin as usize * 4
+/// GPIOs wired to peripherals that this firmware controls directly.
+///
+/// Keeping the numeric GPIO assignment here prevents callers from passing an
+/// arbitrary number to the pin-level register API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Pin {
+    Backlight = 22,
+    BoardI2cSda = 31,
+    BoardI2cScl = 32,
+    SdmmcData0 = 39,
+    SdmmcData1 = 40,
+    SdmmcData2 = 41,
+    SdmmcData3 = 42,
+    SdmmcClock = 43,
+    SdmmcCommand = 44,
+    CardKbSda = 53,
+    CardKbScl = 54,
 }
 
-fn iomux_register(pin: u32) -> usize {
-    IO_MUX + 0x04 + pin as usize * 4
+impl Pin {
+    const fn number(self) -> u32 {
+        self as u32
+    }
+}
+
+fn matrix_out_register(pin: Pin) -> usize {
+    GPIO + 0x558 + pin.number() as usize * 4
+}
+
+fn iomux_register(pin: Pin) -> usize {
+    IO_MUX + 0x04 + pin.number() as usize * 4
 }
 
 /// Fixes the GPIO matrix output to this pin's GPIO function and configures
@@ -28,7 +54,7 @@ fn iomux_register(pin: u32) -> usize {
 /// the setup used for open-drain-style bit-level GPIO control such as
 /// software I2C; the pin ends up released (floating, left to the external
 /// pull-up) once configured.
-pub fn configure_open_drain(pin: u32) {
+pub fn configure_open_drain(pin: Pin) {
     unsafe {
         // GPIO matrix output, output-enable controlled by GPIO_ENABLE.
         write(matrix_out_register(pin), 256 | (1 << 10));
@@ -43,19 +69,56 @@ pub fn configure_open_drain(pin: u32) {
     release(pin);
 }
 
+/// Routes the Tab5 microSD socket's GPIO39..44 pads to the SDMMC peripheral.
+///
+/// CMD and D0..D3 need their input buffers and pull-ups enabled because they
+/// are bidirectional; CLK is controller-driven only and needs neither.
+pub fn configure_sdmmc_4bit_pins() {
+    const FUNCTION_MASK: u32 = 0x7 << 12;
+    const SDMMC_FUNCTION: u32 = 0 << 12;
+    const INPUT_ENABLE_AND_PULLUP: u32 = (1 << 8) | (1 << 9);
+
+    unsafe {
+        for pin in [
+            Pin::SdmmcClock,
+            Pin::SdmmcCommand,
+            Pin::SdmmcData0,
+            Pin::SdmmcData1,
+            Pin::SdmmcData2,
+            Pin::SdmmcData3,
+        ] {
+            modify(iomux_register(pin), FUNCTION_MASK, SDMMC_FUNCTION);
+        }
+        for pin in [
+            Pin::SdmmcCommand,
+            Pin::SdmmcData0,
+            Pin::SdmmcData1,
+            Pin::SdmmcData2,
+            Pin::SdmmcData3,
+        ] {
+            modify(
+                iomux_register(pin),
+                INPUT_ENABLE_AND_PULLUP,
+                INPUT_ENABLE_AND_PULLUP,
+            );
+        }
+    }
+}
+
 /// Drives the pin low (sets the output value low and enables the output).
-pub fn drive_low(pin: u32) {
+pub fn drive_low(pin: Pin) {
     set_low(pin);
     enable_output(pin);
 }
 
 /// Disables the pin's output (the open-drain "release"; it will not go high
 /// unless an external pull-up pulls it there).
-pub fn release(pin: u32) {
+pub fn release(pin: Pin) {
     disable_output(pin);
 }
 
-pub fn set_low(pin: u32) {
+pub fn set_low(pin: Pin) {
+    let pin = pin.number();
     unsafe {
         if pin < 32 {
             write(GPIO + 0x0C, 1u32 << pin); // GPIO_OUT_W1TC
@@ -69,13 +132,15 @@ pub fn set_low(pin: u32) {
 /// (including pin>=32) always go high through a release instead, so this is
 /// for plain outputs like the backlight only; the pin>=32 register is not
 /// implemented.
-pub fn set_high(pin: u32) {
+pub fn set_high(pin: Pin) {
+    let pin = pin.number();
     unsafe {
         write(GPIO + 0x08, 1u32 << pin); // GPIO_OUT_W1TS
     }
 }
 
-pub fn enable_output(pin: u32) {
+pub fn enable_output(pin: Pin) {
+    let pin = pin.number();
     unsafe {
         if pin < 32 {
             write(GPIO + 0x24, 1u32 << pin); // GPIO_ENABLE_W1TS
@@ -85,7 +150,8 @@ pub fn enable_output(pin: u32) {
     }
 }
 
-pub fn disable_output(pin: u32) {
+pub fn disable_output(pin: Pin) {
+    let pin = pin.number();
     unsafe {
         if pin < 32 {
             write(GPIO + 0x28, 1u32 << pin); // GPIO_ENABLE_W1TC
@@ -95,7 +161,8 @@ pub fn disable_output(pin: u32) {
     }
 }
 
-pub fn level(pin: u32) -> bool {
+pub fn level(pin: Pin) -> bool {
+    let pin = pin.number();
     unsafe {
         if pin < 32 {
             read(GPIO + 0x3C) & (1u32 << pin) != 0 // GPIO_IN

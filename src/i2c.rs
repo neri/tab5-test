@@ -5,7 +5,7 @@
 //! reads) each implemented the same state machine, differing only in their
 //! SDA/SCL pin numbers and bit timing, so it is consolidated here.
 
-use crate::gpio;
+use crate::gpio::{self, Pin};
 
 /// One software I2C bus and its bit timing.
 ///
@@ -13,14 +13,14 @@ use crate::gpio;
 /// each caller has measured and tuned on its own; there is no shared
 /// default.
 pub struct SoftI2c {
-    sda: u32,
-    scl: u32,
+    sda: Pin,
+    scl: Pin,
     delay_us: u32,
     scl_wait_iterations: u32,
 }
 
 impl SoftI2c {
-    pub const fn new(sda: u32, scl: u32, delay_us: u32, scl_wait_iterations: u32) -> Self {
+    pub const fn new(sda: Pin, scl: Pin, delay_us: u32, scl_wait_iterations: u32) -> Self {
         Self {
             sda,
             scl,

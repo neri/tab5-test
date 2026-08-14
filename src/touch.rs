@@ -10,12 +10,12 @@
 //! native_offset` applies, so callers can use touch points directly as
 //! `framebuffer.rs` drawing coordinates.
 
-use crate::gpio;
+use crate::gpio::{self, Pin};
 use crate::i2c::SoftI2c;
 use crate::psram::{HEIGHT as NATIVE_HEIGHT, WIDTH as NATIVE_WIDTH};
 
-const SDA: u32 = 31;
-const SCL: u32 = 32;
+const SDA: Pin = Pin::BoardI2cSda;
+const SCL: Pin = Pin::BoardI2cScl;
 
 /// Either touch controller Tab5 has shipped with, behind one `poll` API.
 pub enum Touch {

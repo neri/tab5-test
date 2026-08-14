@@ -10,6 +10,7 @@ use linked_list_allocator::LockedHeap;
 use riscv_rt::entry;
 
 mod cardkb;
+mod app;
 mod console;
 mod delay;
 mod framebuffer;
@@ -115,7 +116,7 @@ fn main() -> ! {
         unsafe {
             ALLOCATOR.lock().init(heap_start, heap_size);
         }
-        lcd::run_console(psram);
+        app::run(psram);
     } else {
         // PSRAM failed, so keep the independent DSI VPG useful as a visible
         // diagnostic rather than attempting the framebuffer path.

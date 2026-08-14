@@ -27,7 +27,7 @@
 //! (`VBUS_ENABLE_BIT` below).
 
 use crate::delay::{delay_ms, delay_us};
-use crate::gpio;
+use crate::gpio::{self, Pin};
 use crate::i2c::SoftI2c;
 use crate::uart;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -52,12 +52,200 @@ fn log_no_device_timeout_once() {
     }
 }
 
+#[cfg(any())]
+fn clear_last_packet_failure() {
+    LAST_PACKET_FAILURE_KIND.store(PACKET_FAILURE_NONE, Ordering::Relaxed);
+}
+
+#[cfg(any())]
+fn record_packet_failure(kind: u32, hcint: u32, qtd_status: u32) {
+    LAST_PACKET_FAILURE_HCINT.store(hcint, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HPRT.store(unsafe { read(HPRT) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_QTD_STATUS.store(qtd_status, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HCCHAR.store(unsafe { read(CHAN0_HCCHAR) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HCSPLT.store(unsafe { read(CHAN0_HCSPLT) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HCTSIZ.store(unsafe { read(CHAN0_HCTSIZ) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HFNUM.store(unsafe { read(HFNUM) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_GINTSTS.store(unsafe { read(GINTSTS) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_GINTMSK.store(unsafe { read(GINTMSK) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_HCFG.store(unsafe { read(HCFG) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_UTMI_FC06.store(unsafe { read(USB_UTMI_FC06) }, Ordering::Relaxed);
+    LAST_PACKET_FAILURE_USBOTG20_CTRL.store(
+        unsafe { read(HP_SYSTEM_USBOTG20_CTRL) },
+        Ordering::Relaxed,
+    );
+    LAST_PACKET_FAILURE_SOC_CLK_CTRL1.store(
+        unsafe { read(HP_SYS_CLKRST_SOC_CLK_CTRL1) },
+        Ordering::Relaxed,
+    );
+    LAST_PACKET_FAILURE_HP_USB_CTRL1.store(
+        unsafe { read(LP_CLKRST_HP_USB_CTRL1) },
+        Ordering::Relaxed,
+    );
+    // Publish last so a reader never observes a new kind with stale fields.
+    LAST_PACKET_FAILURE_KIND.store(kind, Ordering::Release);
+}
+
+/// Emits the diagnostic snapshot for the immediately preceding failed
+/// packet. Intended for a one-shot, higher-level recovery report -- callers
+/// must provide their own de-duplication policy.
+#[cfg(any())]
+pub fn log_last_packet_failure(context: &[u8]) {
+    let kind = LAST_PACKET_FAILURE_KIND.load(Ordering::Acquire);
+    uart::log(context);
+    uart::log(b": ");
+    uart::log(match kind {
+        PACKET_FAILURE_TIMEOUT => b"channel/TT timeout\r\n" as &[u8],
+        PACKET_FAILURE_STALL => b"USB STALL\r\n",
+        PACKET_FAILURE_TRANSACTION => b"transaction error\r\n",
+        PACKET_FAILURE_QTD => b"DMA QTD status error\r\n",
+        PACKET_FAILURE_INVALID_SPLIT_LENGTH => b"invalid split packet length\r\n",
+        PACKET_FAILURE_SHORT_RESPONSE => b"short control response\r\n",
+        _ => b"failure state unavailable\r\n",
+    });
+    if kind != PACKET_FAILURE_NONE {
+        uart::log_hex(
+            b"USB:   HCINT=",
+            LAST_PACKET_FAILURE_HCINT.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HPRT=",
+            LAST_PACKET_FAILURE_HPRT.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HCCHAR=",
+            LAST_PACKET_FAILURE_HCCHAR.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HCSPLT=",
+            LAST_PACKET_FAILURE_HCSPLT.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HCTSIZ=",
+            LAST_PACKET_FAILURE_HCTSIZ.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HFNUM at failure=",
+            LAST_PACKET_FAILURE_HFNUM.load(Ordering::Relaxed),
+        );
+        // A live sample separated by a millisecond tells us whether SOF/frame
+        // generation is still progressing after the failed transfer.
+        let hfnum_now = unsafe { read(HFNUM) };
+        delay_us(1_000);
+        uart::log_hex(b"USB:   HFNUM before +1ms=", hfnum_now);
+        uart::log_hex(b"USB:   HFNUM +1ms=", unsafe { read(HFNUM) });
+        uart::log_hex(
+            b"USB:   GINTSTS=",
+            LAST_PACKET_FAILURE_GINTSTS.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   GINTMSK=",
+            LAST_PACKET_FAILURE_GINTMSK.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   HCFG=",
+            LAST_PACKET_FAILURE_HCFG.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   UTMI_FC06=",
+            LAST_PACKET_FAILURE_UTMI_FC06.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   USBOTG20_CTRL=",
+            LAST_PACKET_FAILURE_USBOTG20_CTRL.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   USB SYS CLK CTRL1=",
+            LAST_PACKET_FAILURE_SOC_CLK_CTRL1.load(Ordering::Relaxed),
+        );
+        uart::log_hex(
+            b"USB:   USB PHY/CORE CTRL1=",
+            LAST_PACKET_FAILURE_HP_USB_CTRL1.load(Ordering::Relaxed),
+        );
+        if kind == PACKET_FAILURE_QTD {
+            uart::log_hex(
+                b"USB:   QTD status=",
+                LAST_PACKET_FAILURE_QTD_STATUS.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+#[cfg(any())]
+fn clear_split_trace() {
+    SPLIT_TRACE_NEXT.store(0, Ordering::Relaxed);
+    SPLIT_TRACE_COUNT.store(0, Ordering::Relaxed);
+    LAST_SPLIT_OUTCOME.store(SPLIT_OUTCOME_NONE, Ordering::Relaxed);
+    LAST_SPLIT_CHANNEL_ACTIVE.store(false, Ordering::Relaxed);
+}
+
+#[cfg(any())]
+fn record_split_round(phase: u32, hcint: u32) {
+    let next = SPLIT_TRACE_NEXT.fetch_add(1, Ordering::Relaxed);
+    let slot = (next as usize) % SPLIT_TRACE_CAPACITY;
+    SPLIT_TRACE_PHASE[slot].store(phase, Ordering::Relaxed);
+    SPLIT_TRACE_HCINT[slot].store(hcint, Ordering::Relaxed);
+    let count = SPLIT_TRACE_COUNT.load(Ordering::Relaxed);
+    if count < SPLIT_TRACE_CAPACITY as u32 {
+        SPLIT_TRACE_COUNT.store(count + 1, Ordering::Release);
+    }
+}
+
+/// Emits the last split packet's handshake history. Called only when a later
+/// hub control transfer has exhausted its retry budget.
+#[cfg(any())]
+pub fn log_recent_split_trace() {
+    let count = SPLIT_TRACE_COUNT.load(Ordering::Acquire) as usize;
+    if count == 0 {
+        uart::log(b"USB: no preceding split transaction recorded\r\n");
+        return;
+    }
+    uart::log(b"USB: preceding split transaction (oldest first)\r\n");
+    let next = SPLIT_TRACE_NEXT.load(Ordering::Relaxed) as usize;
+    let start = if count == SPLIT_TRACE_CAPACITY {
+        next % SPLIT_TRACE_CAPACITY
+    } else {
+        0
+    };
+    for offset in 0..count {
+        let slot = (start + offset) % SPLIT_TRACE_CAPACITY;
+        let phase = SPLIT_TRACE_PHASE[slot].load(Ordering::Relaxed);
+        let label = if phase == SPLIT_PHASE_COMPLETE {
+            b"USB:   CSPLIT HCINT=" as &[u8]
+        } else {
+            b"USB:   SSPLIT HCINT="
+        };
+        uart::log_hex(label, SPLIT_TRACE_HCINT[slot].load(Ordering::Relaxed));
+    }
+    uart::log(b"USB:   split outcome=");
+    uart::log(match LAST_SPLIT_OUTCOME.load(Ordering::Relaxed) {
+        SPLIT_OUTCOME_COMPLETE => b"complete\r\n" as &[u8],
+        SPLIT_OUTCOME_SAFE_TIMEOUT => b"safe timeout/NAK boundary\r\n",
+        SPLIT_OUTCOME_ERROR => b"transfer error\r\n",
+        _ => b"not recorded\r\n",
+    });
+    uart::log_hex(
+        b"USB:   split HCFG after cleanup=",
+        LAST_SPLIT_HCFG_AFTER.load(Ordering::Relaxed),
+    );
+    if LAST_SPLIT_CHANNEL_ACTIVE.load(Ordering::Relaxed) {
+        uart::log(b"USB:   split channel was active during cleanup\r\n");
+    }
+}
+
+/// Records a completed but too-short class/control response. This is not an
+/// HCD error, but is still enough to make a hub-port scan unreliable.
+#[cfg(any())]
+pub fn note_short_control_response() {
+    record_packet_failure(PACKET_FAILURE_SHORT_RESPONSE, 0, 0);
+}
+
 // ------------------------------------------------------------------------
 // USB-A VBUS power switch (PI4IOE5V6408 "E2", I2C 0x44)
 // ------------------------------------------------------------------------
 
-const I2C_SDA: u32 = 31;
-const I2C_SCL: u32 = 32;
+const I2C_SDA: Pin = Pin::BoardI2cSda;
+const I2C_SCL: Pin = Pin::BoardI2cScl;
 // Same board I2C bus as `lcd.rs` (PI4IOE1) and `touch.rs`; timing copied
 // from `lcd.rs`'s tuned PI4IOE1_BUS since it is the same chip family on the
 // same bus.
@@ -802,6 +990,25 @@ fn flush_fifos() {
     }
 }
 
+/// Restores channel 0 to the baseline used by descriptor-DMA transfers after
+/// a packet failure.  The driver is synchronous and uses no other channel,
+/// so flushing the FIFOs here cannot discard another in-flight transfer.
+///
+/// This is intentionally lighter than a root-port reset: devices keep their
+/// address/configuration and a retry can resume without re-enumerating live
+/// keyboard or storage sessions.
+pub fn recover_channel_after_packet_failure() {
+    if unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
+        force_halt_channel();
+    }
+    unsafe {
+        write(CHAN0_HCINT, 0xFFFF_FFFF);
+        write(CHAN0_HCSPLT, 0);
+        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+    }
+    flush_fifos();
+}
+
 fn wait_for_connect() -> bool {
     const POLL_INTERVAL_US: u32 = 2_000;
     const MAX_POLLS: u32 = 250; // ~500ms; run `usbinfo` after plugging in the device
@@ -1192,7 +1399,8 @@ fn run_split_packet(
     // completes, because a disabled channel generates no halt. That path
     // runs on *every* idle keyboard poll, so getting it wrong corrupts the
     // core dozens of times a second rather than once in a rare timeout.
-    if outcome.is_none() && unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
+    let channel_active_during_cleanup = unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0;
+    if outcome.is_none() && channel_active_during_cleanup {
         force_halt_channel();
         // An abandoned in-flight split can also leave residue in the
         // FIFOs, which the next transfer -- on any endpoint, to any device

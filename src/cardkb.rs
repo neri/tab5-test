@@ -4,11 +4,11 @@
 //! key byte directly when addressed for reading at I2C address 0x5F.
 
 use crate::delay::delay_us;
-use crate::gpio;
+use crate::gpio::{self, Pin};
 use crate::i2c::SoftI2c;
 
-const SDA: u32 = 53;
-const SCL: u32 = 54;
+const SDA: Pin = Pin::CardKbSda;
+const SCL: Pin = Pin::CardKbScl;
 const CARDKB_ADDRESS: u8 = 0x5F;
 
 pub struct CardKb {

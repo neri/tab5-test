@@ -130,7 +130,7 @@ CPUが描画した内容をGDMAから参照できるよう、転送前にROMの
 `src/main.rs`は`extern crate alloc`を宣言し、`linked_list_allocator`crateの
 `LockedHeap`（spinロック付き）を`#[global_allocator]`として静的に配置します。
 初期化は`psram::init()`成功後、`psram.heap()`が返す`(*mut u8, usize)`で
-`ALLOCATOR.lock().init(...)`を呼ぶだけで、`lcd::run_console`を呼ぶ前に完了します。
+`ALLOCATOR.lock().init(...)`を呼ぶだけで、`app::run`を呼ぶ前に完了します。
 `psram::init()`が失敗した経路（VPGフォールバック）ではヒープは初期化されず、
 `alloc`を使うコードは実行されません。
 
@@ -253,8 +253,8 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 （`src/shell.rs`の`HELP_ENTRIES`）。
 
 `shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`）で、
-`reboot`と同様に`paint`もコンソール本体ではなく`lcd::run_console`側の分岐で
-処理します。`Paint`が返ると`lcd::run_console`は`paint::run`を呼んでキー入力を
+`reboot`と同様に`paint`もコンソール本体ではなく`app::run`側の分岐で
+処理します。`Paint`が返ると`app::run`は`paint::run`を呼んでキー入力を
 待ち、戻ってきたら`Console::clear`で画面をリセットしてから通常どおり
 プロンプトを再描画します。
 
@@ -318,7 +318,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 表示します。CardKBの任意のキーでシェルに戻ります。
 
 `src/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
-`lcd::run_console`のフレームループと同じ「非表示面→表示面の順に描画・書き戻し」
+`app::run`のフレームループと同じ「非表示面→表示面の順に描画・書き戻し」
 パターンを使い、直前のタッチ点から現在のタッチ点まで`fill_circle`をスタンプ
 しながら補間することで線を描きます（`framebuffer.rs`に太線用の新しい
 プリミティブは追加していません）。タッチが持ち上げられたら次のタッチを

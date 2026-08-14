@@ -5,17 +5,10 @@
 //! fallback diagnostic when framebuffer setup fails.
 
 use crate::delay::{delay_ms, delay_us};
+use crate::gpio::Pin;
 use crate::i2c::SoftI2c;
 use crate::uart;
-use crate::{
-    cardkb::CardKb,
-    console::{Console, Update},
-    framebuffer::DoubleBuffer,
-    gpio, interrupts, paint, touch_test,
-    psram::Psram,
-    shell,
-    usb,
-};
+use crate::{framebuffer::DoubleBuffer, gpio, interrupts, psram::Psram};
 
 mod st7121;
 
@@ -26,8 +19,8 @@ const DW_GDMA: usize = 0x5008_1000;
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const PMU: usize = 0x5011_5000;
 
-const I2C_SDA: u32 = 31;
-const I2C_SCL: u32 = 32;
+const I2C_SDA: Pin = Pin::BoardI2cSda;
+const I2C_SCL: Pin = Pin::BoardI2cScl;
 // The official ST7121 driver's I2C bus runs at whatever the original hand-
 // tuned bit-bang timing produced. Two of its per-bit delays were 2us rather
 // than the 3us used everywhere else on this bus; both are rounded up to 3us
@@ -37,21 +30,6 @@ const PI4IOE1_BUS: SoftI2c = SoftI2c::new(I2C_SDA, I2C_SCL, 3, 10_000);
 
 const WIDTH: u32 = 720;
 const HEIGHT: u32 = 1280;
-
-// The panel runs at roughly 57 Hz (80 MHz DPI clock / (917 * 1524)), so 30
-// frames is close to the conventional ~500 ms terminal cursor blink phase.
-const BLINK_INTERVAL_FRAMES: u32 = 30;
-
-// Deliberately a display-only, provisional version label.  The firmware
-// version has not been formally defined yet.
-const BOOT_VERSION: &str = "Tab5 Shell 0.1";
-
-// How often the frame loop looks for newly plugged-in USB devices. Both are
-// in ~57 Hz frames; see the two branches in `run_console` for why they
-// differ by so much -- one is a few control transfers to a hub that is
-// already talking, the other resets the whole bus.
-const HUB_PORT_SCAN_FRAMES: u32 = 60;
-const ROOT_RESCAN_FRAMES: u32 = 300;
 
 #[derive(Clone, Copy)]
 pub(super) struct InitCommand {
@@ -79,334 +57,107 @@ pub fn start_pattern() -> bool {
     true
 }
 
-/// Runs the CardKB input echo console over the double-buffered DMA display.
+/// A running DSI/DMA display and its double-buffered framebuffer storage.
 ///
-/// Each keystroke is rendered into the inactive buffer, cache-synchronised,
-/// then selected at the next full-frame DMA completion. This never modifies a
-/// buffer while the display engine can read from it.
-pub fn run_console(psram: Psram) {
-    let Some(mut framebuffers) = DoubleBuffer::new(psram) else {
-        uart::log(b"FB: two buffers do not fit in mapped PSRAM\r\n");
-        return;
-    };
-    // One foreground hart owns the singleton for the lifetime of the app.
-    let console = unsafe { crate::console::singleton() };
-    console.clear();
-    console.write_output_line(BOOT_VERSION);
-    console.write_prompt();
-    console.render(&mut framebuffers, 0);
-    console.render(&mut framebuffers, 1);
-    if !framebuffers.flush(0) || !framebuffers.flush(1) {
-        uart::log(b"FB: cache sync failed\r\n");
-        return;
-    }
-    let Some(fb0) = framebuffers.address(0) else {
-        return;
-    };
-    let Some(fb1) = framebuffers.address(1) else {
-        return;
-    };
-
-    if !init_panel() {
-        return;
-    }
-    configure_video_dma();
-    let mut dma = DmaDisplay::new(fb0, fb1);
-    if !dma.initialize() {
-        uart::log(b"LCD: DW-GDMA initialization failed\r\n");
-        return;
-    }
-    interrupts::install(fb0, fb1);
-    unsafe {
-        write(DSI_BRG + 0x50, 1); // clear a stale FIFO-underrun indication
-    }
-    if !dma.start(0) {
-        uart::log(b"LCD: DW-GDMA setup failed\r\n");
-        return;
-    }
-    if !wait_for_bridge_fifo(256) {
-        uart::log(b"LCD: Bridge FIFO prefill timeout\r\n");
-        dma.log_status();
-        return;
-    }
-    // Start video for the first time with the DMA source already armed. This
-    // has no VPG source-mux transition and mirrors dpi_panel_init(). No UART
-    // writes may be inserted in this sequence.
-    unsafe {
-        write(DSI_HOST + 0x38, 0x0000_FF02);
-        write(DSI_HOST + 0x34, 0);
-        write(DSI_HOST + 0x94, (1 << 0) | (1 << 1));
-        write(DSI_BRG + 0x40, 1 | (WIDTH << 4));
-        write(DSI_BRG + 0x44, 1);
-    }
-    sync_video_registers();
-
-    uart::log(b"LCD: DMA 3/3 full-frame interrupt installed\r\n");
-    set_backlight(true);
-    uart::log(b"LCD: RGB565 framebuffer DMA active\r\n");
-
-    let mut sequence = interrupts::frame_sequence();
-    let mut keyboard = CardKb::init();
-    if keyboard.is_some() {
-        uart::log(b"CardKB: ready\r\n");
-    } else {
-        uart::log(b"CardKB: absent\r\n");
-    }
-    let mut usb_host = usb::UsbHost::new();
-    usb_host.rescan();
-    uart::log(b"USB: initial scan complete\r\n");
-    let mut reconnect_frames = 0u32;
-    let mut usb_reconnect_frames = 0u32;
-    let mut blink_frames = 0u32;
-    loop {
-        // An error IRQ can arrive while a key update is running. Check before
-        // WFI as well as after it so a status already acknowledged by the ISR
-        // cannot leave the foreground asleep forever.
-        let error = interrupts::dma_error();
-        if error != 0 {
-            uart::log_hex(b"LCD: DMA interrupt error=", error);
-            dma.log_status();
-            return;
-        }
-        interrupts::wait_for_interrupt();
-        let error = interrupts::dma_error();
-        if error != 0 {
-            uart::log_hex(b"LCD: DMA interrupt error=", error);
-            dma.log_status();
-            return;
-        }
-        let next_sequence = interrupts::frame_sequence();
-        if next_sequence == sequence {
-            continue;
-        }
-        sequence = next_sequence;
-        // Keep the CPU's view of the displayed side in sync with the ISR.
-        // Rendering is always directed to the opposite side below.
-        let displayed = interrupts::active_framebuffer();
-
-        if keyboard.is_none() {
-            reconnect_frames += 1;
-            if reconnect_frames == 60 {
-                reconnect_frames = 0;
-                keyboard = CardKb::init();
-                if keyboard.is_some() {
-                    uart::log(b"CardKB: connected\r\n");
-                }
-            }
-        }
-
-        // The registry can go stale two different ways, and they call for
-        // different urgency:
-        // - The cable comes out (`root_disconnected`, a single cheap
-        //   register read). Nothing is plugged in at all, so there is no
-        //   rush; fall through to the throttled rescan below, same as
-        //   never having found anything. `is_empty` guards the log line so
-        //   it fires once on the transition, not every frame the cable
-        //   stays out.
-        // - A keyboard slot's session goes stale (`needs_reinit`, from
-        //   `UsbKeyboard::poll`'s error tracking). Now that `UsbHost` is
-        //   the only thing that ever resets the bus (`usbinfo`/`usbhub`/
-        //   `usbrescan` all read or drive the same registry instead of
-        //   probing independently), this should only fire on a genuine
-        //   hardware error -- but whatever is plugged in is almost
-        //   certainly still there, so this rescans immediately rather than
-        //   leaving everything dead for the throttle's full ~5s interval.
-        if usb_host.root_disconnected() {
-            if !usb_host.is_empty() {
-                usb_host.clear();
-                uart::log(b"USB: nothing connected to USB-A\r\n");
-            }
-        } else if usb_host.needs_reinit() {
-            uart::log(b"USB: a device session went stale, rescanning...\r\n");
-            usb_host.rescan();
-            usb_reconnect_frames = 0;
-        }
-        if usb_host.has_room() {
-            usb_reconnect_frames += 1;
-            if usb_host.hub().is_some() {
-                // With a hub attached, a newly plugged-in device can be
-                // found by asking the hub about its own ports -- one
-                // `GET_STATUS` control transfer per empty port, no bus
-                // reset, and nothing already attached is disturbed. That is
-                // cheap enough to run about once a second.
-                //
-                // This used to be the `rescan` below instead, which was
-                // wrong rather than merely slow: resetting the bus
-                // invalidates every device address on it, so a timer-driven
-                // rescan tore down and re-enumerated *working* devices
-                // every few seconds, long enough to drop a keystroke.
-                if usb_reconnect_frames >= HUB_PORT_SCAN_FRAMES {
-                    usb_reconnect_frames = 0;
-                    usb_host.scan_empty_hub_ports();
-                }
-            } else if usb_reconnect_frames >= ROOT_RESCAN_FRAMES {
-                // Nothing but the root port to ask, and the only way to
-                // enumerate what is on it is the full sequence. Much
-                // coarser than CardKB's 60-frame retry: this is a few
-                // hundred ms of blocking work (VBUS settle, connect wait,
-                // debounce, reset), not a cheap I2C probe. Nothing is
-                // attached in this state, so there is nothing to disturb.
-                // (The immediate `needs_reinit` retry above bypasses this
-                // for the "still plugged in, just needs re-enumerating"
-                // case.)
-                usb_reconnect_frames = 0;
-                usb_host.rescan();
-            }
-        }
-
-        let key = keyboard
-            .as_mut()
-            .and_then(CardKb::poll)
-            .or_else(|| usb_host.poll_keyboards());
-
-        if let Some(byte) = key {
-            blink_frames = 0;
-            // Capture the cursor's cell before this byte can move it, so it
-            // can be re-rendered below as plain (non-cursor) content: that
-            // is the only way its block is ever erased, since backspace,
-            // newline and scroll updates above only ever touch the *new*
-            // cursor cell, not the one just vacated.
-            let previous_cursor = console.cursor();
-            let update = console.push(char::from(byte));
-            // Typing always shows a solid cursor; only idle time blinks it.
-            console.show_cursor();
-
-            // Enter completing a command line is an application-level
-            // reaction, not a rendering hint, so it is handled independently
-            // of `update` (which is always `None` for the byte that
-            // triggered it -- `Console::push` leaves any actual redraw to
-            // this dispatch instead).
-            if let Some(submission) = console.take_submission() {
-                // A command's output can span an arbitrary number of rows,
-                // so (like a scroll) this redraws both sides from scratch
-                // rather than tracking an incremental region.
-                let outcome = shell::execute(console, submission.as_bytes(), &mut usb_host);
-                if outcome == shell::Outcome::Paint {
-                    // Blocks until a key is pressed, leaving both
-                    // framebuffers holding the finished drawing; clear them
-                    // back to a fresh console before the redraw below.
-                    paint::run(&mut framebuffers, &mut keyboard);
-                    console.clear();
-                }
-                if outcome == shell::Outcome::TouchTest {
-                    touch_test::run(&mut framebuffers, &mut keyboard);
-                    console.clear();
-                }
-                if outcome != shell::Outcome::Reboot {
-                    console.write_prompt();
-                }
-                for index in [displayed ^ 1, displayed] {
-                    console.render(&mut framebuffers, index);
-                    if !framebuffers.flush(index) {
-                        uart::log(b"Console: flush failed\r\n");
-                        break;
-                    }
-                }
-                if outcome == shell::Outcome::Reboot {
-                    // Let the panel actually scan out the frame just
-                    // flushed (the "rebooting..." line) before the
-                    // watchdog fires.
-                    delay_ms(300);
-                    shell::reboot();
-                }
-                continue;
-            }
-
-            match update {
-                Update::None => {}
-                Update::Cells { row, start, end } => {
-                    // Both sides start identical. Update the inactive side
-                    // first, then the displayed side. Only the native span
-                    // covering this range is written back, so GDMA retains
-                    // almost all PSRAM bandwidth and visible tearing is at
-                    // most one small run of glyphs.
-                    let back_buffer = displayed ^ 1;
-                    console.render_cells(&mut framebuffers, back_buffer, row, start, end);
-                    if !console.flush_cells(&framebuffers, back_buffer, row, start, end) {
-                        uart::log(b"Console: cell flush failed\r\n");
-                        continue;
-                    }
-                    console.render_cells(&mut framebuffers, displayed, row, start, end);
-                    if !console.flush_cells(&framebuffers, displayed, row, start, end) {
-                        uart::log(b"Console: cell flush failed\r\n");
-                    }
-                }
-                Update::Full => {
-                    // Only a bottom-row scroll reaches here; every visible
-                    // row moved, so both sides need a complete redraw to
-                    // stay coherent for subsequent incremental updates.
-                    //
-                    // A brief flash of a wrong solid color has been
-                    // observed here during scrolling. Buffer selection,
-                    // writeback chunking, and pausing/aborting GDMA for the
-                    // duration of the write have all been tried and none
-                    // change it, so it is not fixed by anything in this
-                    // function; see DESIGN.md's known-issues note.
-                    for index in [displayed ^ 1, displayed] {
-                        console.render(&mut framebuffers, index);
-                        if !framebuffers.flush(index) {
-                            uart::log(b"Console: flush failed\r\n");
-                            break;
-                        }
-                    }
-                }
-            }
-            // `Update::Full` already redrew every cell, cursor included, so
-            // only the incremental path needs this separate cursor pass.
-            if !matches!(update, Update::Full) {
-                let current_cursor = console.cursor();
-                let back_buffer = displayed ^ 1;
-                // `continue` must reach the outer frame loop on a back-buffer
-                // failure, as it does in the arms above, so a plain
-                // `continue` inside this `for` (which would only skip to the
-                // next cell) is tracked with a flag instead.
-                let mut back_buffer_failed = false;
-                for (column, row) in [previous_cursor, current_cursor] {
-                    if !redraw_cell(console, &mut framebuffers, back_buffer, column, row) {
-                        uart::log(b"Console: cursor flush failed\r\n");
-                        back_buffer_failed = true;
-                        break;
-                    }
-                    if !redraw_cell(console, &mut framebuffers, displayed, column, row) {
-                        uart::log(b"Console: cursor flush failed\r\n");
-                    }
-                }
-                if back_buffer_failed {
-                    continue;
-                }
-            }
-        } else {
-            // No key this frame: advance the idle blink timer and, on
-            // phase change, repaint only the cursor's own cell.
-            blink_frames += 1;
-            if blink_frames >= BLINK_INTERVAL_FRAMES {
-                blink_frames = 0;
-                console.toggle_cursor();
-                let (column, row) = console.cursor();
-                let back_buffer = displayed ^ 1;
-                if !redraw_cell(console, &mut framebuffers, back_buffer, column, row) {
-                    uart::log(b"Console: cursor flush failed\r\n");
-                    continue;
-                }
-                if !redraw_cell(console, &mut framebuffers, displayed, column, row) {
-                    uart::log(b"Console: cursor flush failed\r\n");
-                }
-            }
-        }
-    }
+/// The application owns its event loop and draws through `framebuffers_mut`;
+/// this type owns only panel initialization and frame-boundary synchronization.
+pub struct Display {
+    framebuffers: DoubleBuffer,
+    dma: DmaDisplay,
+    sequence: u32,
 }
 
-/// Repaints one console cell in one framebuffer and writes it back,
-/// reporting whether the writeback succeeded.
-fn redraw_cell(
-    console: &Console,
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
-    column: usize,
-    row: usize,
-) -> bool {
-    console.render_cell(framebuffers, index, column, row);
-    console.flush_cell(framebuffers, index, column, row)
+impl Display {
+    /// Allocates the framebuffer pair. Callers should prepare both buffers
+    /// before calling `start`, because that starts scanout immediately.
+    pub fn new(psram: Psram) -> Option<Self> {
+        let Some(framebuffers) = DoubleBuffer::new(psram) else {
+            uart::log(b"FB: two buffers do not fit in mapped PSRAM\r\n");
+            return None;
+        };
+        let fb0 = framebuffers.address(0)?;
+        let fb1 = framebuffers.address(1)?;
+        Some(Self {
+            framebuffers,
+            dma: DmaDisplay::new(fb0, fb1),
+            sequence: 0,
+        })
+    }
+
+    pub fn framebuffers_mut(&mut self) -> &mut DoubleBuffer {
+        &mut self.framebuffers
+    }
+
+    /// Initializes the panel and starts framebuffer scanout from buffer zero.
+    pub fn start(&mut self) -> bool {
+        if !init_panel() {
+            return false;
+        }
+        configure_video_dma();
+        if !self.dma.initialize() {
+            uart::log(b"LCD: DW-GDMA initialization failed\r\n");
+            return false;
+        }
+        let Some(fb0) = self.framebuffers.address(0) else {
+            return false;
+        };
+        let Some(fb1) = self.framebuffers.address(1) else {
+            return false;
+        };
+        interrupts::install(fb0, fb1);
+        unsafe {
+            write(DSI_BRG + 0x50, 1); // clear a stale FIFO-underrun indication
+        }
+        if !self.dma.start(0) {
+            uart::log(b"LCD: DW-GDMA setup failed\r\n");
+            return false;
+        }
+        if !wait_for_bridge_fifo(256) {
+            uart::log(b"LCD: Bridge FIFO prefill timeout\r\n");
+            self.dma.log_status();
+            return false;
+        }
+        // Start video with the DMA source already armed. No UART writes may
+        // be inserted in this register sequence.
+        unsafe {
+            write(DSI_HOST + 0x38, 0x0000_FF02);
+            write(DSI_HOST + 0x34, 0);
+            write(DSI_HOST + 0x94, (1 << 0) | (1 << 1));
+            write(DSI_BRG + 0x40, 1 | (WIDTH << 4));
+            write(DSI_BRG + 0x44, 1);
+        }
+        sync_video_registers();
+        uart::log(b"LCD: DMA 3/3 full-frame interrupt installed\r\n");
+        set_backlight(true);
+        uart::log(b"LCD: RGB565 framebuffer DMA active\r\n");
+        self.sequence = interrupts::frame_sequence();
+        true
+    }
+
+    /// Waits for the next frame boundary and returns the displayed buffer.
+    /// Returns `None` after a DMA error, which has already been logged.
+    pub fn wait_for_frame(&mut self) -> Option<usize> {
+        loop {
+            let error = interrupts::dma_error();
+            if error != 0 {
+                uart::log_hex(b"LCD: DMA interrupt error=", error);
+                self.dma.log_status();
+                return None;
+            }
+            interrupts::wait_for_interrupt();
+            let error = interrupts::dma_error();
+            if error != 0 {
+                uart::log_hex(b"LCD: DMA interrupt error=", error);
+                self.dma.log_status();
+                return None;
+            }
+            let next_sequence = interrupts::frame_sequence();
+            if next_sequence != self.sequence {
+                self.sequence = next_sequence;
+                return Some(interrupts::active_framebuffer());
+            }
+        }
+    }
 }
 
 fn init_panel() -> bool {
@@ -915,11 +666,11 @@ impl DmaDisplay {
 /// Exposed for the shell's `backlight` command as well as the two internal
 /// bring-up call sites below.
 pub fn set_backlight(on: bool) {
-    gpio::enable_output(22);
+    gpio::enable_output(Pin::Backlight);
     if on {
-        gpio::set_high(22);
+        gpio::set_high(Pin::Backlight);
     } else {
-        gpio::set_low(22);
+        gpio::set_low(Pin::Backlight);
     }
 }
 

@@ -146,7 +146,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry { name: "reboot", usage: "reboot", lines: &["restart the board"] },
 ];
 
-/// What the display loop in `lcd::run_console` should do once a command has
+/// What the foreground application loop should do once a command has
 /// been dispatched.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Outcome {
@@ -163,7 +163,7 @@ pub enum Outcome {
 /// Parses and runs one command line, returning what the caller should do
 /// next.
 ///
-/// `usb_host` is the single registry `lcd.rs`'s frame loop owns
+/// `usb_host` is the single registry the application's frame loop owns
 /// (`docs/USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
 /// devices already in it instead of probing the bus independently, which
 /// is what used to let a diagnostic command reset a live keyboard/Mass
