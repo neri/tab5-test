@@ -51,6 +51,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["live multi-touch test; use two fingers, any key exits"],
     },
     HelpEntry {
+        name: "axistest",
+        usage: "axistest",
+        lines: &["tilt-controlled BMI270 ball test; any key exits"],
+    },
+    HelpEntry {
         name: "sdinfo",
         usage: "sdinfo",
         lines: &["activate SD card, show CID/CSD summary"],
@@ -158,6 +163,8 @@ pub enum Outcome {
     Paint,
     /// Hand the display over to the multi-touch diagnostic screen.
     TouchTest,
+    /// Hand the display over to the BMI270 tilt diagnostic screen.
+    AxisTest,
 }
 
 /// Parses and runs one command line, returning what the caller should do
@@ -209,6 +216,7 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"usbmbr" => cmd_usbmbr(console, usb_host),
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
+        b"axistest" => return Outcome::AxisTest,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
             return Outcome::Reboot;

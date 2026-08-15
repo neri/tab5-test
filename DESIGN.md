@@ -257,11 +257,10 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 `help <name>`で個別コマンドの使用法と説明を表示する二段構成にしています
 （`src/shell.rs`の`HELP_ENTRIES`）。
 
-`shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`）で、
-`reboot`と同様に`paint`もコンソール本体ではなく`app::run`側の分岐で
-処理します。`Paint`が返ると`app::run`は`paint::run`を呼んでキー入力を
-待ち、戻ってきたら`Console::clear`で画面をリセットしてから通常どおり
-プロンプトを再描画します。
+`shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`／
+`TouchTest`／`AxisTest`）で、全画面サブアプリはコンソール本体ではなく
+`app::run`側の分岐で処理します。各サブアプリが戻った後は`Console::clear`で
+画面をリセットしてから通常どおりプロンプトを再描画します。
 
 `reboot`は`src/startup.rs`の`reboot()`が実装しており、HPCPU 0自身の
 ソフトウェアリセットビット（`LP_CLKRST_HPCPU_RESET_CTRL0_REG`のbit13、
@@ -332,6 +331,35 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 だけで抜けられる画面を表示します。キーボード未接続で入った場合も、後から接続した
 CardKBまたはUSBキーボードの任意のキーで抜けられます。
 
+## BMI270軸センサーテスト
+
+`axistest`コマンドは`src/axis_test.rs`の全画面診断を開く。画面・物理・入力は
+`axis_test.rs`が担当し、BMI270との直接I2C通信は`src/bmi270.rs`に分離している。
+Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に接続されている。初期化ではchip ID
+`0x24`を確認し、soft reset後にBosch BMI270 SensorAPIのmaximum-FIFO版に由来する
+328 byteの最小ファームウェアをロードする。BMI270はリセット後、直接データレジスタを
+使うだけの場合でもこのファームウェアのロードが必要である。
+
+加速度計は200 Hz・±4 g、ジャイロは200 Hz・±1000 °/sに設定して両方を有効化する。
+レジスタ`0x0C`から連続する12 byteを読み、加速度X/Y/ZとジャイロX/Y/Zを同じサンプル
+として扱う。画面上には加速度をg、ジャイロを°/sで表示する。加速度計の物理的な取付け
+向きとCW回転後のLandscape座標は異なるため、ボールの運動には`screen_x = -acc_y`、
+`screen_y = acc_x`の符号・軸変換を適用する。加速度計が報告する支持力は重力と逆向き
+なので、この符号で画面上の低い側へボールが転がる。
+
+ボールは固定小数点（1 pixel = 256単位）で位置・速度を持つ。加速度、軽い減衰、壁面で
+の60%反発を使い、画面端の枠内を転がる。ヘッダにはX/Y加速度から求める気泡水準器と
+`HORIZONTAL`／`TILTED`を表示し、`abs(acc_x) + abs(acc_y) <= 700 LSB`（±4 g設定で
+約0.085 g、約5度）を水平と判定する。任意のCardKBまたはUSBキーボード入力で終了する。
+
+画面のちらつきと入力維持処理による停止を防ぐため、診断中は`InputManager::service`を
+呼ばない。これにより、USB-A未接続時の定期的なroot-port再スキャン（リセット・
+デバウンスを伴う）を避けつつ、既存キーボードは`poll_key`でそのまま終了キーとして
+使える。ボールは前後位置を包含する矩形だけを描画・書き戻しする。数値HUDは約14 Hzで
+判定し、表示後の値から加速度が0.02 g以上、ジャイロが5 °/s以上、水平状態、または
+気泡が2 pixel以上変化した場合にだけ再描画する。I2C読出しが一時的に失敗した場合は
+診断を終了せず、ボールを惰性で継続させ、UARTへ最初の失敗だけを記録する。
+
 ## ファイル構成
 
 - `src/main.rs`: 起動順の定義、グローバルアロケータ（`linked_list_allocator`の
@@ -351,6 +379,9 @@ CardKBまたはUSBキーボードの任意のキーで抜けられます。
 - `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用）
 - `src/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
+- `src/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
+- `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
+- `src/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR

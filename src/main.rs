@@ -10,6 +10,8 @@ use linked_list_allocator::LockedHeap;
 use riscv_rt::entry;
 
 mod app;
+mod axis_test;
+mod bmi270;
 mod cardkb;
 mod console;
 mod delay;

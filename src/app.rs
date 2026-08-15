@@ -4,6 +4,7 @@
 //! command dispatch, and application-mode transitions.
 
 use crate::console::{Console, Update};
+use crate::axis_test;
 use crate::delay::delay_ms;
 use crate::framebuffer::DoubleBuffer;
 use crate::input::InputManager;
@@ -84,6 +85,10 @@ pub fn run(psram: Psram) {
                 }
                 if outcome == shell::Outcome::TouchTest {
                     touch_test::run(&mut framebuffers, &mut input);
+                    console.clear();
+                }
+                if outcome == shell::Outcome::AxisTest {
+                    axis_test::run(&mut framebuffers, &mut input);
                     console.clear();
                 }
                 if outcome != shell::Outcome::Reboot {
