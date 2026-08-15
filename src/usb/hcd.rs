@@ -27,8 +27,7 @@
 //! (`VBUS_ENABLE_BIT` below).
 
 use crate::delay::{delay_ms, delay_us};
-use crate::gpio::{self, Pin};
-use crate::i2c::SoftI2c;
+use crate::i2c;
 use crate::uart;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -244,12 +243,6 @@ pub fn note_short_control_response() {
 // USB-A VBUS power switch (PI4IOE5V6408 "E2", I2C 0x44)
 // ------------------------------------------------------------------------
 
-const I2C_SDA: Pin = Pin::BoardI2cSda;
-const I2C_SCL: Pin = Pin::BoardI2cScl;
-// Same board I2C bus as `lcd.rs` (PI4IOE1) and `touch.rs`; timing copied
-// from `lcd.rs`'s tuned PI4IOE1_BUS since it is the same chip family on the
-// same bus.
-const PI4IOE2_BUS: SoftI2c = SoftI2c::new(I2C_SDA, I2C_SCL, 3, 10_000);
 const PI4IOE2_ADDRESS: u8 = 0x44;
 
 // PI4IOE5V6408 register map, confirmed on this board's PI4IOE1 by
@@ -269,7 +262,7 @@ const VBUS_ENABLE_BIT: u8 = 3;
 /// touched here is read-modify-write of a single bit so the other pins'
 /// configuration is left exactly as found.
 pub fn set_vbus_bit(bit: u8, on: bool) -> bool {
-    if bit > 7 || !recover_bus() {
+    if bit > 7 {
         return false;
     }
     rmw_bit(PI4IOE2_REG_DIRECTION, bit, true)
@@ -290,54 +283,18 @@ fn rmw_bit(register: u8, bit: u8, set_bit: bool) -> bool {
     pi4ioe2_write(register, updated)
 }
 
-/// Configures the shared board I2C bus for open-drain operation and clocks
-/// out a bus-recovery sequence, matching `cardkb::CardKb::init`.
-fn recover_bus() -> bool {
-    gpio::configure_open_drain(I2C_SDA);
-    gpio::configure_open_drain(I2C_SCL);
-    gpio::release(I2C_SDA);
-    gpio::release(I2C_SCL);
-    delay_us(20);
-
-    for _ in 0..9 {
-        gpio::drive_low(I2C_SCL);
-        PI4IOE2_BUS.delay();
-        gpio::release(I2C_SCL);
-        if !PI4IOE2_BUS.wait_scl_high() {
-            return false;
-        }
-        PI4IOE2_BUS.delay();
-    }
-    PI4IOE2_BUS.stop();
-    true
-}
-
 fn pi4ioe2_write(register: u8, value: u8) -> bool {
-    if !PI4IOE2_BUS.start() {
-        return false;
-    }
-    let ok = PI4IOE2_BUS.write_byte(PI4IOE2_ADDRESS << 1)
-        && PI4IOE2_BUS.write_byte(register)
-        && PI4IOE2_BUS.write_byte(value);
-    PI4IOE2_BUS.stop();
-    ok
+    i2c::board_bus()
+        .write(PI4IOE2_ADDRESS, &[register, value])
+        .is_ok()
 }
 
 fn pi4ioe2_read(register: u8) -> Option<u8> {
-    if !PI4IOE2_BUS.start() {
-        return None;
-    }
-    let addressed = PI4IOE2_BUS.write_byte(PI4IOE2_ADDRESS << 1)
-        && PI4IOE2_BUS.write_byte(register)
-        && PI4IOE2_BUS.start() // repeated start, switching the transaction to a read
-        && PI4IOE2_BUS.write_byte((PI4IOE2_ADDRESS << 1) | 1);
-    if !addressed {
-        PI4IOE2_BUS.stop();
-        return None;
-    }
-    let value = PI4IOE2_BUS.read_byte(false);
-    PI4IOE2_BUS.stop();
-    value
+    let mut value = [0u8; 1];
+    i2c::board_bus()
+        .write_read(PI4IOE2_ADDRESS, &[register], &mut value)
+        .ok()?;
+    Some(value[0])
 }
 
 // ------------------------------------------------------------------------

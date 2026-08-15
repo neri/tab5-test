@@ -6,7 +6,7 @@
 
 use crate::delay::{delay_ms, delay_us};
 use crate::gpio::Pin;
-use crate::i2c::SoftI2c;
+use crate::i2c;
 use crate::uart;
 use crate::{framebuffer::DoubleBuffer, gpio, interrupts, psram::Psram};
 
@@ -18,15 +18,6 @@ const DSI_BRG_MEM: usize = 0x5010_5000;
 const DW_GDMA: usize = 0x5008_1000;
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const PMU: usize = 0x5011_5000;
-
-const I2C_SDA: Pin = Pin::BoardI2cSda;
-const I2C_SCL: Pin = Pin::BoardI2cScl;
-// The official ST7121 driver's I2C bus runs at whatever the original hand-
-// tuned bit-bang timing produced. Two of its per-bit delays were 2us rather
-// than the 3us used everywhere else on this bus; both are rounded up to 3us
-// here since a slower bit-banged clock only relaxes I2C timing, never
-// violates it.
-const PI4IOE1_BUS: SoftI2c = SoftI2c::new(I2C_SDA, I2C_SCL, 3, 10_000);
 
 const WIDTH: u32 = 720;
 const HEIGHT: u32 = 1280;
@@ -220,21 +211,6 @@ fn reset_lcd_panel() -> bool {
     // Tab5's LCD reset is PI4IOE1 P4, not an ESP32-P4 GPIO. Use a small
     // open-drain software-I2C master on the board bus (SDA31/SCL32), avoiding
     // any dependency on an ECO2-aware peripheral HAL.
-    gpio::configure_open_drain(I2C_SDA);
-    gpio::configure_open_drain(I2C_SCL);
-    gpio::release(I2C_SDA);
-    gpio::release(I2C_SCL);
-    delay_us(20);
-
-    // Recover a transaction that a reset may have interrupted.
-    for _ in 0..9 {
-        gpio::drive_low(I2C_SCL);
-        PI4IOE1_BUS.delay();
-        gpio::release(I2C_SCL);
-        PI4IOE1_BUS.delay();
-    }
-    PI4IOE1_BUS.stop();
-
     const SETUP: &[(u8, u8)] = &[
         (0x01, 0xFF), // chip reset
         (0x03, 0x7F), // P0..P6 outputs
@@ -263,14 +239,7 @@ fn reset_lcd_panel() -> bool {
 }
 
 fn pi4ioe1_write(register: u8, value: u8) -> bool {
-    if !PI4IOE1_BUS.start() {
-        return false;
-    }
-    let acknowledged = PI4IOE1_BUS.write_byte(0x43 << 1)
-        && PI4IOE1_BUS.write_byte(register)
-        && PI4IOE1_BUS.write_byte(value);
-    PI4IOE1_BUS.stop();
-    acknowledged
+    i2c::board_bus().write(0x43, &[register, value]).is_ok()
 }
 
 fn enable_dphy_ldo() {

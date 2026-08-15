@@ -10,12 +10,8 @@
 //! native_offset` applies, so callers can use touch points directly as
 //! `framebuffer.rs` drawing coordinates.
 
-use crate::gpio::{self, Pin};
-use crate::i2c::SoftI2c;
+use crate::i2c::{self, SoftI2c};
 use crate::psram::{HEIGHT as NATIVE_HEIGHT, WIDTH as NATIVE_WIDTH};
-
-const SDA: Pin = Pin::BoardI2cSda;
-const SCL: Pin = Pin::BoardI2cScl;
 
 /// Either touch controller Tab5 has shipped with, behind one `poll` API.
 pub enum Touch {
@@ -96,7 +92,7 @@ const GT911_TOUCH_STRIDE: usize = 8;
 const GT911_MAX_TOUCH_POINTS: usize = 5;
 
 pub struct Gt911 {
-    bus: SoftI2c,
+    bus: &'static SoftI2c,
     address: u8,
     x_max: u16,
     y_max: u16,
@@ -192,7 +188,7 @@ const ST7123_TOUCH_STRIDE: usize = 7;
 const ST7123_MAX_TOUCH_POINTS: usize = 10;
 
 pub struct St7123 {
-    bus: SoftI2c,
+    bus: &'static SoftI2c,
     x_max: u16,
     y_max: u16,
     /// How many touch slots the controller is configured to report. It only
@@ -289,13 +285,8 @@ impl St7123 {
 // Shared bus plumbing
 // ---------------------------------------------------------------------
 
-fn shared_bus() -> SoftI2c {
-    let bus = SoftI2c::new(SDA, SCL, 3, 10_000);
-    gpio::configure_open_drain(SDA);
-    gpio::configure_open_drain(SCL);
-    gpio::release(SDA);
-    gpio::release(SCL);
-    bus
+fn shared_bus() -> &'static SoftI2c {
+    i2c::board_bus()
 }
 
 /// A zeroed resolution register (unconfigured or unread) falls back to the
@@ -321,40 +312,11 @@ fn native_to_logical(native_x: u32, native_y: u32) -> (usize, usize) {
 }
 
 fn read(bus: &SoftI2c, address: u8, register: u16, buffer: &mut [u8]) -> bool {
-    if !bus.start() {
-        return false;
-    }
-    let addressed = bus.write_byte(address << 1)
-        && bus.write_byte((register >> 8) as u8)
-        && bus.write_byte(register as u8)
-        && bus.start() // repeated start, switching the transaction to a read
-        && bus.write_byte((address << 1) | 1);
-    if !addressed {
-        bus.stop();
-        return false;
-    }
-    let last = buffer.len().saturating_sub(1);
-    for (index, slot) in buffer.iter_mut().enumerate() {
-        match bus.read_byte(index != last) {
-            Some(byte) => *slot = byte,
-            None => {
-                bus.stop();
-                return false;
-            }
-        }
-    }
-    bus.stop();
-    true
+    bus.write_read(address, &[(register >> 8) as u8, register as u8], buffer)
+        .is_ok()
 }
 
 fn write(bus: &SoftI2c, address: u8, register: u16, value: u8) -> bool {
-    if !bus.start() {
-        return false;
-    }
-    let ok = bus.write_byte(address << 1)
-        && bus.write_byte((register >> 8) as u8)
-        && bus.write_byte(register as u8)
-        && bus.write_byte(value);
-    bus.stop();
-    ok
+    bus.write(address, &[(register >> 8) as u8, register as u8, value])
+        .is_ok()
 }

@@ -63,7 +63,11 @@ pub struct InputManager {
 impl InputManager {
     /// Initializes the directly connected CardKB and the USB-A host.
     pub fn new() -> Self {
-        let cardkb = CardKb::init();
+        let cardkb = if crate::i2c::initialize_cardkb_bus().is_ok() {
+            CardKb::init()
+        } else {
+            None
+        };
         if cardkb.is_some() {
             uart::log(b"CardKB: ready\r\n");
         } else {

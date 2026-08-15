@@ -5,11 +5,8 @@
 //! reset, register configuration, and raw sample decoding.
 
 use crate::delay::delay_ms;
-use crate::gpio::{self, Pin};
-use crate::i2c::SoftI2c;
+use crate::i2c::{self, SoftI2c};
 
-const SDA: Pin = Pin::BoardI2cSda;
-const SCL: Pin = Pin::BoardI2cScl;
 const ADDRESS: u8 = 0x68;
 const CHIP_ID: u8 = 0x24;
 
@@ -59,7 +56,7 @@ impl InitError {
 
 /// A configured BMI270 on Tab5's board I2C bus.
 pub struct Bmi270 {
-    bus: SoftI2c,
+    bus: &'static SoftI2c,
 }
 
 impl Bmi270 {
@@ -69,11 +66,7 @@ impl Bmi270 {
         if firmware.is_empty() || firmware.len() % 2 != 0 {
             return Err(InitError::Firmware);
         }
-        let bus = SoftI2c::new(SDA, SCL, 3, 10_000);
-        gpio::configure_open_drain(SDA);
-        gpio::configure_open_drain(SCL);
-        gpio::release(SDA);
-        gpio::release(SCL);
+        let bus = i2c::board_bus();
 
         let mut id = [0u8; 1];
         if !read_register(&bus, 0x00, &mut id) || id[0] != CHIP_ID {
@@ -142,27 +135,7 @@ fn upload_firmware(bus: &SoftI2c, firmware: &[u8]) -> bool {
 }
 
 fn read_register(bus: &SoftI2c, register: u8, buffer: &mut [u8]) -> bool {
-    if !bus.start() {
-        return false;
-    }
-    let addressed = bus.write_byte(ADDRESS << 1)
-        && bus.write_byte(register)
-        && bus.start()
-        && bus.write_byte((ADDRESS << 1) | 1);
-    if !addressed {
-        bus.stop();
-        return false;
-    }
-    let last = buffer.len().saturating_sub(1);
-    for (index, byte) in buffer.iter_mut().enumerate() {
-        let Some(value) = bus.read_byte(index != last) else {
-            bus.stop();
-            return false;
-        };
-        *byte = value;
-    }
-    bus.stop();
-    true
+    bus.write_read(ADDRESS, &[register], buffer).is_ok()
 }
 
 fn write_register(bus: &SoftI2c, register: u8, value: u8) -> bool {
@@ -170,13 +143,10 @@ fn write_register(bus: &SoftI2c, register: u8, value: u8) -> bool {
 }
 
 fn write_registers(bus: &SoftI2c, register: u8, values: &[u8]) -> bool {
-    if !bus.start() {
-        return false;
-    }
-    let mut ok = bus.write_byte(ADDRESS << 1) && bus.write_byte(register);
-    for &value in values {
-        ok = ok && bus.write_byte(value);
-    }
-    bus.stop();
-    ok
+    bus.transaction(|transaction| {
+        transaction.start_write(ADDRESS)?;
+        transaction.write_byte(register)?;
+        transaction.write_all(values)
+    })
+    .is_ok()
 }

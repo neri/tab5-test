@@ -114,6 +114,9 @@ fn main() -> ! {
     }
     uart::hello_world();
     startup::log_ram_limit();
+    if i2c::initialize_board_bus().is_err() {
+        uart::log(b"I2C: board-bus recovery failed\r\n");
+    }
     if let Some(psram) = psram::init() {
         let (heap_start, heap_size) = psram.heap();
         unsafe {

@@ -5,45 +5,22 @@
 //! four cursor keys return CardKB-specific non-ASCII bytes; `input.rs`
 //! normalizes them into its common key representation.
 
-use crate::delay::delay_us;
-use crate::gpio::{self, Pin};
-use crate::i2c::SoftI2c;
+use crate::i2c::{self, SoftI2c};
 
-const SDA: Pin = Pin::CardKbSda;
-const SCL: Pin = Pin::CardKbScl;
 const CARDKB_ADDRESS: u8 = 0x5F;
 
 pub struct CardKb {
-    bus: SoftI2c,
+    bus: &'static SoftI2c,
 }
 
 impl CardKb {
-    /// Configures PORT.A for open-drain, software-I2C operation.
-    ///
-    /// Initialization succeeds when both bus lines can be released high.  A
+    /// Opens the already-initialized PORT.A software-I2C bus.
+    /// Initialization succeeds when both bus lines are idle high. A
     /// disconnected keyboard is therefore harmless: `poll` simply returns no
     /// byte until a device acknowledges its address.
     pub fn init() -> Option<Self> {
-        let bus = SoftI2c::new(SDA, SCL, 5, 40_000);
-        gpio::configure_open_drain(SDA);
-        gpio::configure_open_drain(SCL);
-        gpio::release(SDA);
-        gpio::release(SCL);
-        delay_us(20);
-
-        // Recover a bus left in the middle of a transaction before starting
-        // normal polling.  This also makes hot-plugging the unit predictable.
-        for _ in 0..9 {
-            gpio::drive_low(SCL);
-            bus.delay();
-            gpio::release(SCL);
-            if !bus.wait_scl_high() {
-                return None;
-            }
-            bus.delay();
-        }
-        bus.stop();
-        if gpio::level(SDA) && gpio::level(SCL) {
+        let bus = i2c::cardkb_bus();
+        if bus.is_idle() {
             Some(Self { bus })
         } else {
             None
@@ -55,15 +32,8 @@ impl CardKb {
     /// idle.  Non-ASCII cursor values are deliberately left raw here and
     /// normalized by `input::InputManager`.
     pub fn poll(&mut self) -> Option<u8> {
-        if !self.bus.start() || !self.bus.write_byte((CARDKB_ADDRESS << 1) | 1) {
-            self.bus.stop();
-            return None;
-        }
-        let Some(byte) = self.bus.read_byte(false) else {
-            self.bus.stop();
-            return None;
-        };
-        self.bus.stop();
-        (byte != 0).then_some(byte)
+        let mut byte = [0u8; 1];
+        self.bus.read(CARDKB_ADDRESS, &mut byte).ok()?;
+        (byte[0] != 0).then_some(byte[0])
     }
 }

@@ -374,7 +374,7 @@ Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に�
 - `src/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
 - `src/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
-- `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
+- `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
 - `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用）
