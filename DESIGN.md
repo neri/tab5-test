@@ -88,7 +88,7 @@ riscv-rt
   → 2面のRGB565コンソール画面を描画してキャッシュを同期
   → LCDリセット・D-PHY・パネル初期化
   → DSI BridgeとDW-GDMAを準備してvideo modeを開始
-  → CardKB入力時に変更セルだけを両面へ描画・部分同期
+  → InputManagerが統合キーボード入力に応じて変更セルだけを両面へ描画・部分同期
 ```
 
 正常経路ではDSI HostのVideo Pattern Generatorを使用しません。ECO2では動作中の
@@ -218,9 +218,14 @@ native_y = 1279 - logical_x
 DSIの解像度やパネル初期化コマンドは変更せず、全描画プリミティブと画像転送に
 同じ座標変換を適用します。
 
-`src/console.rs` は 69 列 × 28 行の固定サイズ端末としてCardKBのASCII入力を保持します。
+`src/console.rs` は 69 列 × 28 行の固定サイズ端末としてキーボードからのASCII入力を保持します。
 各行の先頭には半角`"> "`プロンプトを自動で書き込み、Backspaceはプロンプトより前へは
 戻りません（5×7 ASCIIフォントのみのため、全角`＞`ではなく半角`>`を使用しています）。
+CardKB v1.1のEscとカーソル（`0xB5`=↑、`0xB6`=↓、`0xB4`=←、`0xB7`=→）、およびUSB HID
+BootキーボードのEsc、カーソル、Home/End、Page Up/Down、Insert/Delete、F1〜F12は`input::Key`へ
+正規化します。コンソールではEscで現在行を消去し、Left/Right/Home/EndとDeleteで
+現在のコマンド行を編集します。Up/Down、ページ、Insert、Fキーはイベントとして取得するだけで、
+コマンド履歴などの機能が未実装のため現時点では動作を割り当てません。
 通常キーでは変更された1セルだけを非表示面、表示面の順に描画し、回転後のセルを含む
 約26 KiBのPSRAM範囲だけを書き戻します。改行時も新しい行のプロンプト2セルだけを
 同様に描画・書き戻し、末尾スクロールが発生したときだけ全画面を再生成します。毎キーの
@@ -235,12 +240,12 @@ Line Feed、Backspace、Tabと末尾スクロールを処理します。
 残ります。`render_cell`は文字を描く前に必ずセルをBLACKで塗り潰してからグリフを
 描画し、この「カーソルの塗り残し」を防いでいます。キー入力のたびに移動前後の
 2セルを明示的に再描画するため、Backspace・改行・スクロールでもカーソルの描き残しは
-残りません。点滅は`src/lcd.rs`のフレームループがアイドル時に約30フレーム
+残りません。点滅は`src/app.rs`のフレームループがアイドル時に約30フレーム
 （パネルの約57 Hzから逆算した約500ms）ごとに切り替えます。
 
 Enterを押すと、プロンプトより後ろに入力された文字列（コマンドライン）を
 `Console::submit`が切り出し、`Console`内部の`pending_submission`に保持します。
-`src/lcd.rs`は`push()`の戻り値（描画hint、`Update::None/Cells/Full`）とは
+`src/app.rs`は`push()`の戻り値（描画hint、`Update::None/Cells/Full`）とは
 独立に、毎キー`Console::take_submission`でこれを取り出して有無を判定します
 （コマンド実行はアプリケーション層の反応であって描画hintではないため、
 あえて`Update`に混ぜていません）。取り出せた場合は`src/shell.rs`が解析・実行し、
@@ -275,7 +280,7 @@ ESP-IDFの`esp_restart_noos`（ESP32-P4版）が実際に使っている
 起動直後のコンソールには暫定バージョン表記の`"Tab5 Shell 0.1"`を通常の出力行として
 表示してからプロンプトを表示します。これはまだ正式なバージョン定義ではありません。
 
-`src/lcd.rs`のCardKB入力ループは、起動シーケンスのUARTログとは別に、キー入力の
+`src/app.rs`のInputManager経由のキー入力ループは、起動シーケンスのUARTログとは別に、キー入力の
 たびに発生する診断ログ（キーコード、セル更新完了など）を出力していません。USB
 Serial/JTAGへの書き込みはホスト側が読み出していないとFIFOが埋まりタイムアウトまで
 スピンするため、これを毎キー実行するとキー入力から描画までの体感遅延が生じます。
@@ -315,18 +320,17 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 
 `touchtest`コマンドは全画面のマルチタッチ診断を開きます。現在の同時接触数と観測した
 最大数を表示し、同一レポート内で2点以上を読み取れた時点で`PASS: MULTITOUCH DETECTED`を
-表示します。CardKBの任意のキーでシェルに戻ります。
+表示します。CardKBまたはUSBキーボードの任意のキーでシェルに戻ります。
 
 `src/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
 `app::run`のフレームループと同じ「非表示面→表示面の順に描画・書き戻し」
 パターンを使い、直前のタッチ点から現在のタッチ点まで`fill_circle`をスタンプ
 しながら補間することで線を描きます（`framebuffer.rs`に太線用の新しい
 プリミティブは追加していません）。タッチが持ち上げられたら次のタッチを
-新しい線の起点として扱います。CardKBの任意のキーを押すとシェルへ戻ります。
+新しい線の起点として扱います。CardKBまたはUSBキーボードの任意のキーを押すとシェルへ戻ります。
 タッチコントローラーが見つからない場合もUARTへログを出したうえで、キー入力
-だけで抜けられる画面を表示します（`paint::run`はキーボードが存在しなくても
-`Option<CardKb>`のまま動作するため、この場合だけ画面から抜ける手段が
-なくなる点に注意）。
+だけで抜けられる画面を表示します。キーボード未接続で入った場合も、後から接続した
+CardKBまたはUSBキーボードの任意のキーで抜けられます。
 
 ## ファイル構成
 
@@ -338,12 +342,13 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
   ヒープ用領域（`Psram::heap`）の両方を提供
 - `src/framebuffer.rs`: ダブルバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
-- `src/console.rs`: CardKB入力エコーとコマンドライン切り出し用コンソール
+- `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール
 - `src/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
 - `src/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
+- `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用）
 - `src/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
@@ -368,7 +373,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
       よる列挙。デバイスクラスについては何も知らない
     - `src/usb/hid_keyboard.rs`: HID Bootキーボードのクラスドライバー
       （Stage 3相当）。クラス固有リクエスト・キーコード変換・`UsbKeyboard`
-      （`lcd.rs`のフレームループから`CardKb`と並列にポーリングされる）
+      （`InputManager`から`CardKb`と並列にポーリングされる）
     - `src/usb/hub.rs`: USBハブのクラスドライバー。ディスクリプタ取得、ポート電源、
       接続検出、リセット、速度判定を担当
     - `src/usb/msc.rs`: USB Mass StorageのBulk-Only TransportとSCSI読み込みコマンドを

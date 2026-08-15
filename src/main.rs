@@ -1,4 +1,4 @@
-//! M5Stack Tab5 (ESP32-P4 ECO2) CardKB input echo console.
+//! M5Stack Tab5 (ESP32-P4 ECO2) multi-keyboard input echo console.
 //! Linker layout: two minimal XIP compatibility segments and an HP-SRAM body.
 
 #![no_std]
@@ -9,13 +9,14 @@ extern crate alloc;
 use linked_list_allocator::LockedHeap;
 use riscv_rt::entry;
 
-mod cardkb;
 mod app;
+mod cardkb;
 mod console;
 mod delay;
 mod framebuffer;
 mod gpio;
 mod i2c;
+mod input;
 mod interrupts;
 mod lcd;
 mod mbr;

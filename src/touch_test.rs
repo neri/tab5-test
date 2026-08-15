@@ -1,7 +1,7 @@
 //! Full-screen multi-touch diagnostic entered through `touchtest`.
 
-use crate::cardkb::CardKb;
 use crate::framebuffer::{DoubleBuffer, BLACK, CYAN, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
+use crate::input::InputManager;
 use crate::touch::{Touch, TouchPoint};
 use crate::{interrupts, uart};
 
@@ -25,8 +25,8 @@ const PEAK_TEXT: [&str; MAX_POINTS + 1] = [
 ];
 
 /// Shows the active contact count and succeeds once two contacts are read in
-/// the same controller report. Press any CardKB key to exit.
-pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
+/// the same controller report. Press any managed keyboard key to exit.
+pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
     let touch_panel = Touch::init();
     let displayed = interrupts::active_framebuffer();
     for index in [displayed ^ 1, displayed] {
@@ -54,7 +54,7 @@ pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
             index,
             16,
             104,
-            "Press any CardKB key to exit.",
+            "Press any key to exit.",
             2,
             YELLOW,
             None,
@@ -81,7 +81,7 @@ pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
     }
 
     let Some(panel) = touch_panel.as_ref() else {
-        wait_for_key(keyboard);
+        wait_for_key(input);
         return;
     };
     uart::log(b"Touch test: place two fingers on the panel\r\n");
@@ -102,10 +102,9 @@ pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
             continue;
         }
         sequence = next_sequence;
-        if let Some(kb) = keyboard.as_mut() {
-            if kb.poll().is_some() {
-                return;
-            }
+        input.service();
+        if input.poll_key().is_some() {
+            return;
         }
 
         let count = panel.poll_points(&mut points).min(MAX_POINTS);
@@ -167,7 +166,7 @@ fn draw_status(
     framebuffers.draw_text(index, 16, 288, message, 3, color, None);
 }
 
-fn wait_for_key(keyboard: &mut Option<CardKb>) {
+fn wait_for_key(input: &mut InputManager) {
     let mut sequence = interrupts::frame_sequence();
     loop {
         interrupts::wait_for_interrupt();
@@ -176,10 +175,9 @@ fn wait_for_key(keyboard: &mut Option<CardKb>) {
             continue;
         }
         sequence = next_sequence;
-        if let Some(kb) = keyboard.as_mut() {
-            if kb.poll().is_some() {
-                return;
-            }
+        input.service();
+        if input.poll_key().is_some() {
+            return;
         }
     }
 }

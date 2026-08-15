@@ -1,4 +1,4 @@
-//! Command dispatcher for the CardKB console.
+//! Command dispatcher for the keyboard-input console.
 //!
 //! Every command reads or writes only through `Console`'s output-line API,
 //! so results share the same wrapping/scrolling/rendering as the rest of
@@ -186,7 +186,7 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"help" => cmd_help(console, argument),
         b"clear" => console.clear(),
         b"echo" => console.write_output_line(as_str(argument)),
-        b"about" | b"version" => console.write_output_line("Tab5 CardKB Shell 0.1"),
+        b"about" | b"version" => console.write_output_line("Tab5 Shell 0.1"),
         b"cpuinfo" => cmd_cpuinfo(console),
         b"mem" => cmd_mem(console),
         b"alloctest" => cmd_alloctest(console, argument),
@@ -1265,7 +1265,7 @@ fn cmd_backlight(console: &mut Console, argument: &[u8]) {
     }
 }
 
-/// Trims leading and trailing spaces (the only whitespace CardKB input or
+/// Trims leading and trailing spaces (the only whitespace current keyboard input or
 /// command output ever contains).
 fn trim(bytes: &[u8]) -> &[u8] {
     let mut start = 0;

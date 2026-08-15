@@ -20,6 +20,7 @@ use super::hid_keyboard::UsbKeyboard;
 use super::hub::{self, Hub};
 use super::msc::UsbMassStorage;
 use super::protocol::{self, EnumeratedDevice};
+use crate::input::Key;
 use crate::uart;
 
 /// Hard cap on hub ports this registry tracks. Real hubs are almost always
@@ -102,8 +103,8 @@ pub struct AttachedDevice<'a> {
 /// `MAX_HUB_PORTS` devices behind that hub (or the one device plugged into
 /// USB-A directly, if it is not a hub).
 ///
-/// `lcd.rs` holds the only instance, across the lifetime of the frame
-/// loop, and is the only thing that calls `rescan`. Every USB shell command
+/// `input::InputManager` holds the only instance, across the lifetime of the
+/// frame loop, and is the only thing that calls `rescan`. Every USB shell command
 /// in `shell.rs` takes a `&UsbHost`/`&mut UsbHost` and reads or drives
 /// devices already in the registry instead of touching `hcd`/`hub`/
 /// `protocol` directly -- so nothing can reset the bus out from under a
@@ -129,6 +130,10 @@ pub struct UsbHost {
     /// Consecutive background scans that could not read an empty hub port.
     /// A successful full scan resets it, so transient recovery stays silent.
     hub_port_scan_failures: u8,
+    /// Slot index at which the next keyboard scan starts.  Advancing it after
+    /// each delivered key prevents a low-numbered USB keyboard from starving
+    /// another one that is also producing input.
+    next_keyboard_slot: usize,
     slots: [Option<Slot>; SLOT_COUNT],
 }
 
@@ -142,6 +147,7 @@ impl UsbHost {
             hub_summary: None,
             hub_port_scan_paused: false,
             hub_port_scan_failures: 0,
+            next_keyboard_slot: 0,
             slots: [NONE_SLOT; SLOT_COUNT],
         }
     }
@@ -185,7 +191,7 @@ impl UsbHost {
 
     /// Cheap liveness check (one HPRT read, no transaction): true once
     /// nothing is plugged into USB-A at all, in which case nothing behind
-    /// it (hub or no hub) can still be there either. `lcd.rs` calls this
+    /// it (hub or no hub) can still be there either. `InputManager` calls this
     /// every frame, the same spirit as `CardKb`'s bus-failure check, but
     /// for the whole registry at once rather than per device.
     pub fn root_disconnected(&self) -> bool {
@@ -193,7 +199,7 @@ impl UsbHost {
     }
 
     /// Drops every slot and the hub handle without touching the bus --
-    /// what `lcd.rs` calls once `root_disconnected` reports the cable
+    /// what `InputManager` calls once `root_disconnected` reports the cable
     /// itself came out.
     pub fn clear(&mut self) {
         self.hub = None;
@@ -201,13 +207,14 @@ impl UsbHost {
         self.hub_summary = None;
         self.hub_port_scan_paused = false;
         self.hub_port_scan_failures = 0;
+        self.next_keyboard_slot = 0;
         for slot in self.slots.iter_mut() {
             *slot = None;
         }
     }
 
     /// True if nothing is currently registered at all -- no hub, no
-    /// direct device, no hub-port device. Lets `lcd.rs` fire the
+    /// direct device, no hub-port device. Lets `InputManager` fire the
     /// "disconnected" log line once on the transition rather than every
     /// single frame the cable stays unplugged (`root_disconnected` alone
     /// is a raw per-frame register read with no memory of the last call).
@@ -235,7 +242,7 @@ impl UsbHost {
     /// True if there is room for another device to be picked up by the
     /// next `rescan`: an empty root slot with no hub attached, or (if a hub
     /// is attached) any hub port not currently holding a device. Drives
-    /// `lcd.rs`'s coarse reconnect throttle, generalizing its old "no
+    /// `InputManager`'s coarse reconnect throttle, generalizing its old "no
     /// keyboard yet" check to the whole registry.
     pub fn has_room(&self) -> bool {
         match &self.hub {
@@ -250,15 +257,20 @@ impl UsbHost {
         }
     }
 
-    /// Polls every attached keyboard slot in turn (root and hub ports
-    /// alike) and returns the first newly-available key, mirroring
-    /// `UsbKeyboard::poll`'s shape so `lcd.rs` can treat one keyboard or
-    /// several the same way.
-    pub fn poll_keyboards(&mut self) -> Option<u8> {
-        for slot in self.slots.iter_mut().flatten() {
+    /// Polls every attached keyboard slot in round-robin order (root and hub
+    /// ports alike) and returns the first newly-available key.  The next scan
+    /// begins after the slot that won this one, preventing a low-numbered
+    /// slot from monopolizing input when more than one keyboard is active.
+    pub fn poll_keyboards(&mut self) -> Option<Key> {
+        for offset in 0..SLOT_COUNT {
+            let index = (self.next_keyboard_slot + offset) % SLOT_COUNT;
+            let Some(slot) = self.slots[index].as_mut() else {
+                continue;
+            };
             if let DeviceKind::Keyboard(keyboard) = &mut slot.kind
                 && let Some(byte) = keyboard.poll()
             {
+                self.next_keyboard_slot = (index + 1) % SLOT_COUNT;
                 return Some(byte);
             }
         }

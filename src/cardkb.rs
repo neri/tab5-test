@@ -1,7 +1,9 @@
 //! CardKB v1.1 reader for the Tab5 PORT.A connector.
 //!
 //! The connector exposes GPIO53 as SDA and GPIO54 as SCL.  CardKB returns one
-//! key byte directly when addressed for reading at I2C address 0x5F.
+//! key byte directly when addressed for reading at I2C address 0x5F.  The
+//! four cursor keys return CardKB-specific non-ASCII bytes; `input.rs`
+//! normalizes them into its common key representation.
 
 use crate::delay::delay_us;
 use crate::gpio::{self, Pin};
@@ -48,8 +50,10 @@ impl CardKb {
         }
     }
 
-    /// Reads the current key value.  `None` means no key, no attached unit,
-    /// or a transient bus failure; CardKB itself returns zero when idle.
+    /// Reads the current raw key value.  `None` means no key, no attached
+    /// unit, or a transient bus failure; CardKB itself returns zero when
+    /// idle.  Non-ASCII cursor values are deliberately left raw here and
+    /// normalized by `input::InputManager`.
     pub fn poll(&mut self) -> Option<u8> {
         if !self.bus.start() || !self.bus.write_byte((CARDKB_ADDRESS << 1) | 1) {
             self.bus.stop();

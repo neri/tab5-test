@@ -1,17 +1,17 @@
 //! Full-screen touch drawing mode entered via the shell's `paint` command.
 
-use crate::cardkb::CardKb;
 use crate::framebuffer::{BLACK, CYAN, DoubleBuffer, HEIGHT, WHITE, WIDTH};
+use crate::input::InputManager;
 use crate::touch::Touch;
 use crate::{interrupts, uart};
 
 const BRUSH_RADIUS: usize = 5;
 const HINT: &str = "PAINT - TOUCH TO DRAW, ANY KEY TO EXIT";
 
-/// Runs the paint screen until a CardKB key is pressed. Both framebuffers
+/// Runs the paint screen until any managed keyboard key is pressed. Both framebuffers
 /// hold the same canvas on return, so the caller can render straight over
 /// it (e.g. a cleared console) without needing to know paint's internals.
-pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
+pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
     let touch_panel = Touch::init();
     if touch_panel.is_none() {
         uart::log(b"Paint: no touch controller found, no drawing input available\r\n");
@@ -42,10 +42,9 @@ pub fn run(framebuffers: &mut DoubleBuffer, keyboard: &mut Option<CardKb>) {
         }
         sequence = next_sequence;
 
-        if let Some(kb) = keyboard.as_mut() {
-            if kb.poll().is_some() {
-                return;
-            }
+        input.service();
+        if input.poll_key().is_some() {
+            return;
         }
 
         let Some(panel) = touch_panel.as_ref() else {

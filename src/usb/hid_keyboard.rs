@@ -6,10 +6,11 @@
 //!
 //! This is Stage 3 of `docs/USB_HOST_PLAN.md`, the actual milestone: `UsbKeyboard`
 //! feeds decoded keystrokes into the same `Console::push` path `cardkb.rs`
-//! uses, polled from `lcd.rs`'s frame loop alongside `CardKb`.
+//! uses, polled by `input::InputManager` alongside `CardKb`.
 
 use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome};
 use super::protocol::{self, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
+use crate::input::Key;
 use crate::uart;
 
 // HID class-specific requests (HID 1.11 section 7.2), used only during
@@ -139,7 +140,7 @@ pub struct UsbKeyboard {
     endpoint: Endpoint,
     next_pid_data1: bool,
     previous_keys: [u8; 6],
-    pending: [u8; 6],
+    pending: [Key; 6],
     pending_len: u8,
     pending_pos: u8,
     // Consecutive hard errors from `poll`; drives `needs_reinit` and also
@@ -201,7 +202,7 @@ impl UsbKeyboard {
             // SET_CONFIGURATION (USB2.0 9.4.5).
             next_pid_data1: false,
             previous_keys: [0; 6],
-            pending: [0; 6],
+            pending: [Key::Ascii(0); 6],
             pending_len: 0,
             pending_pos: 0,
             consecutive_hard_errors: 0,
@@ -223,24 +224,24 @@ impl UsbKeyboard {
     /// that now (`docs/USB_REFACTOR_PLAN.md` Stage A made it the sole owner of
     /// `hcd::probe_port`), so in practice this now means a genuine
     /// transaction error rather than another command resetting the bus
-    /// out from under an active session. `lcd.rs` checks this and calls
+    /// out from under an active session. `InputManager` checks this and calls
     /// `UsbHost::rescan` once it's true, which re-enumerates every still
     /// physically present device and recovers within a few frames.
     pub fn needs_reinit(&self) -> bool {
         self.consecutive_hard_errors >= POLL_FAILURE_GIVE_UP_THRESHOLD
     }
 
-    /// Returns the next newly-pressed key as ASCII, or `None` if nothing
-    /// new is available this frame. Mirrors `CardKb::poll`'s shape so
-    /// `lcd.rs` can poll both the same way.
+    /// Returns the next newly-pressed key, or `None` if nothing new is
+    /// available this frame. ASCII and HID-only keys (Esc, arrows, and so
+    /// on) use the same `input::Key` contract that `InputManager` exposes.
     ///
     /// A single Boot report can carry up to 6 simultaneously-pressed keys;
-    /// since this returns one byte at a time, newly-pressed keys from one
+    /// since this returns one key at a time, newly-pressed keys from one
     /// report are queued and drained a byte per call (at ~57 polls/sec,
     /// the queue is essentially never more than a key or two deep).
-    pub fn poll(&mut self) -> Option<u8> {
-        if let Some(byte) = self.next_pending() {
-            return Some(byte);
+    pub fn poll(&mut self) -> Option<Key> {
+        if let Some(key) = self.next_pending() {
+            return Some(key);
         }
 
         let mut report = [0u8; 8];
@@ -280,7 +281,7 @@ impl UsbKeyboard {
                 // means this handle's cached address/configuration went
                 // stale -- most commonly because something else ran
                 // `hcd::probe_port` and reset the bus out from under it.
-                // `needs_reinit` surfaces this so `lcd.rs` can drop and
+                // `needs_reinit` surfaces this so `InputManager` can drop and
                 // re-enumerate instead of erroring forever.
                 self.consecutive_hard_errors = self.consecutive_hard_errors.wrapping_add(1);
                 return None;
@@ -297,7 +298,7 @@ impl UsbKeyboard {
         self.next_pending()
     }
 
-    fn next_pending(&mut self) -> Option<u8> {
+    fn next_pending(&mut self) -> Option<Key> {
         if self.pending_pos < self.pending_len {
             let byte = self.pending[self.pending_pos as usize];
             self.pending_pos += 1;
@@ -308,8 +309,8 @@ impl UsbKeyboard {
     }
 
     /// Compares `report`'s keycodes against the last report to find newly
-    /// pressed keys (held-down keys are not repeated every poll) and
-    /// queues their ASCII translations.
+    /// pressed keys (held-down keys are not repeated every poll) and queues
+    /// their normalized translations.
     fn queue_new_keys(&mut self, report: &[u8; 8]) {
         let modifiers = report[0];
         let keys: [u8; 6] = report[2..8].try_into().unwrap();
@@ -329,10 +330,10 @@ impl UsbKeyboard {
             if keycode == 0 || self.previous_keys.contains(&keycode) {
                 continue; // empty slot, or already held from the last report
             }
-            if let Some(byte) = translate_keycode(keycode, shift)
+            if let Some(key) = translate_keycode(keycode, shift)
                 && (self.pending_len as usize) < self.pending.len()
             {
-                self.pending[self.pending_len as usize] = byte;
+                self.pending[self.pending_len as usize] = key;
                 self.pending_len += 1;
             }
         }
@@ -341,38 +342,48 @@ impl UsbKeyboard {
 }
 
 /// Translates one HID Keyboard/Keypad usage ID (HID Usage Tables 1.4,
-/// page 0x07) to ASCII. Covers letters, digits, the punctuation row, and
-/// the same control characters `console.rs` already recognizes
-/// (Backspace, Tab, Enter); function keys, arrows, and modifiers-as-keys
-/// have no ASCII form and translate to `None`, matching this project's
-/// current console scope (`docs/USB_HOST_PLAN.md` Stage 3).
-fn translate_keycode(keycode: u8, shift: bool) -> Option<u8> {
+/// page 0x07) into the application-wide key representation. Covers ASCII,
+/// editing/navigation keys, and F1 through F12. Modifier keys by themselves
+/// still have no event; their Shift state modifies printable ASCII only.
+fn translate_keycode(keycode: u8, shift: bool) -> Option<Key> {
     match keycode {
         0x04..=0x1D => {
             let letter = b'a' + (keycode - 0x04);
-            Some(if shift { letter.to_ascii_uppercase() } else { letter })
+            Some(Key::Ascii(if shift { letter.to_ascii_uppercase() } else { letter }))
         }
         0x1E..=0x27 => {
             const UNSHIFTED: &[u8; 10] = b"1234567890";
             const SHIFTED: &[u8; 10] = b"!@#$%^&*()";
             let index = (keycode - 0x1E) as usize;
-            Some(if shift { SHIFTED[index] } else { UNSHIFTED[index] })
+            Some(Key::Ascii(if shift { SHIFTED[index] } else { UNSHIFTED[index] }))
         }
-        0x28 => Some(b'\r'), // Enter
-        0x2A => Some(0x08),  // Backspace
-        0x2B => Some(b'\t'), // Tab
-        0x2C => Some(b' '),  // Space
-        0x2D => Some(if shift { b'_' } else { b'-' }),
-        0x2E => Some(if shift { b'+' } else { b'=' }),
-        0x2F => Some(if shift { b'{' } else { b'[' }),
-        0x30 => Some(if shift { b'}' } else { b']' }),
-        0x31 => Some(if shift { b'|' } else { b'\\' }),
-        0x33 => Some(if shift { b':' } else { b';' }),
-        0x34 => Some(if shift { b'"' } else { b'\'' }),
-        0x35 => Some(if shift { b'~' } else { b'`' }),
-        0x36 => Some(if shift { b'<' } else { b',' }),
-        0x37 => Some(if shift { b'>' } else { b'.' }),
-        0x38 => Some(if shift { b'?' } else { b'/' }),
+        0x28 => Some(Key::Ascii(b'\r')), // Enter
+        0x29 => Some(Key::Escape),
+        0x2A => Some(Key::Ascii(0x08)), // Backspace
+        0x2B => Some(Key::Ascii(b'\t')), // Tab
+        0x2C => Some(Key::Ascii(b' ')), // Space
+        0x2D => Some(Key::Ascii(if shift { b'_' } else { b'-' })),
+        0x2E => Some(Key::Ascii(if shift { b'+' } else { b'=' })),
+        0x2F => Some(Key::Ascii(if shift { b'{' } else { b'[' })),
+        0x30 => Some(Key::Ascii(if shift { b'}' } else { b']' })),
+        0x31 => Some(Key::Ascii(if shift { b'|' } else { b'\\' })),
+        0x33 => Some(Key::Ascii(if shift { b':' } else { b';' })),
+        0x34 => Some(Key::Ascii(if shift { b'"' } else { b'\'' })),
+        0x35 => Some(Key::Ascii(if shift { b'~' } else { b'`' })),
+        0x36 => Some(Key::Ascii(if shift { b'<' } else { b',' })),
+        0x37 => Some(Key::Ascii(if shift { b'>' } else { b'.' })),
+        0x38 => Some(Key::Ascii(if shift { b'?' } else { b'/' })),
+        0x3A..=0x45 => Some(Key::Function(keycode - 0x39)),
+        0x49 => Some(Key::Insert),
+        0x4A => Some(Key::Home),
+        0x4B => Some(Key::PageUp),
+        0x4C => Some(Key::Delete),
+        0x4D => Some(Key::End),
+        0x4E => Some(Key::PageDown),
+        0x4F => Some(Key::ArrowRight),
+        0x50 => Some(Key::ArrowLeft),
+        0x51 => Some(Key::ArrowDown),
+        0x52 => Some(Key::ArrowUp),
         _ => None,
     }
 }

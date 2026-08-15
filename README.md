@@ -7,7 +7,7 @@
 
 - USB Serial/JTAGへのUARTログ出力
 - 1280×720 Landscape（CW回転）のRGB565ダブルバッファ
-- CardKB v1.1（PORT.A、GPIO53/54、I2C 0x5F）とUSB HID Bootキーボードから入力できる
+- CardKB v1.1（PORT.A、GPIO53/54、I2C 0x5F）とUSB HID Bootキーボードから入力できる。CardKBとUSBはEsc・カーソルを認識し、USBはさらにHome/End、Delete、F1〜F12も認識する
   5×7 ASCIIコンソール
 - PSRAM・バックライト・SDカード・USB-Aを確認する簡易シェル
 - SDカードの4bit/High Speedモード（実クロック40 MHz）での生ブロック読み書きと
@@ -82,6 +82,7 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - `src/console.rs`: キー入力とシェル出力を表示するコンソール
 - `src/shell.rs`: 画面上の簡易シェル
 - `src/cardkb.rs`: PORT.AのソフトウェアI2C CardKBドライバ
+- `src/input.rs`: CardKBとUSBキーボードを統合する入力管理
 - `src/touch.rs`・`src/paint.rs`: タッチ入力とお絵描き画面
 - `src/sdmmc.rs`・`src/mbr.rs`: SDブロックI/OとMBR表示
 - `src/usb.rs`・`src/usb/`: USB-Aホスト、HIDキーボード、ハブ、MSC、デバイス管理

@@ -3,6 +3,7 @@
 use core::cell::UnsafeCell;
 
 use crate::framebuffer::{BLACK, DoubleBuffer, HEIGHT, WHITE, WIDTH};
+use crate::input::Key;
 use crate::uart;
 
 const SCALE: usize = 2;
@@ -20,11 +21,15 @@ const PROMPT: [char; 2] = ['>', ' '];
 /// Longest command line `submit` can capture: one row minus the prompt.
 const MAX_LINE: usize = COLUMNS - PROMPT.len();
 
-/// Terminal-like text storage for the CardKB input echo display.
+/// Terminal-like text storage for the keyboard input echo display.
 pub struct Console {
     cells: [[char; COLUMNS]; ROWS],
     column: usize,
     row: usize,
+    /// First unused cell on the current editable line.  It is distinct from
+    /// `column` while the cursor has moved left, so Enter still submits the
+    /// full line and Insert/Delete can shift its suffix correctly.
+    input_end: usize,
     previous_was_carriage_return: bool,
     /// Current blink phase of the pseudo cursor block drawn at `(column,
     /// row)`. The cursor cell itself never holds a printable character (it
@@ -99,6 +104,7 @@ impl Console {
             cells,
             column: PROMPT.len(),
             row: 0,
+            input_end: PROMPT.len(),
             previous_was_carriage_return: false,
             cursor_visible: true,
             pending_submission: None,
@@ -116,6 +122,7 @@ impl Console {
         self.cells = [['\0'; COLUMNS]; ROWS];
         self.column = 0;
         self.row = 0;
+        self.input_end = 0;
         self.previous_was_carriage_return = false;
         self.cursor_visible = true;
     }
@@ -136,7 +143,7 @@ impl Console {
         self.cursor_visible = !self.cursor_visible;
     }
 
-    /// Adds one CardKB character using familiar terminal control characters.
+    /// Adds one keyboard character using familiar terminal control characters.
     pub fn push(&mut self, ch: char) -> Update {
         let update = match ch {
             '\r' => {
@@ -177,6 +184,29 @@ impl Console {
         update
     }
 
+    /// Handles a normalized key event.  Printable ASCII retains the original
+    /// console behavior; navigation and editing keys operate on the current
+    /// command line. Esc clears that line. Up/Down, paging, Insert, and
+    /// function keys are accepted here but intentionally have no behavior
+    /// until command history or another consumer is added.
+    pub fn push_key(&mut self, key: Key) -> Update {
+        match key {
+            Key::Ascii(byte) => self.push(char::from(byte)),
+            Key::Escape => self.clear_input_line(),
+            Key::ArrowLeft => self.move_cursor(self.column.saturating_sub(1).max(PROMPT.len())),
+            Key::ArrowRight => self.move_cursor((self.column + 1).min(self.input_end)),
+            Key::Home => self.move_cursor(PROMPT.len()),
+            Key::End => self.move_cursor(self.input_end),
+            Key::Delete => self.delete(),
+            Key::ArrowUp
+            | Key::ArrowDown
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Insert
+            | Key::Function(_) => Update::None,
+        }
+    }
+
     /// Only a bottom-row scroll moves every visible row, so it is the only
     /// case that needs a full redraw; a plain new line just needs its own
     /// prompt cells drawn.
@@ -201,7 +231,7 @@ impl Console {
 
         // Only rows up to the cursor can contain input. Drawing each occupied
         // cell directly also avoids the former empty-run scanner, which could
-        // stall before the first CardKB byte was received on ECO2.
+        // stall before the first keyboard byte was received on ECO2.
         for row in 0..=cursor_row {
             let end = if row == cursor_row {
                 cursor_column
@@ -317,16 +347,23 @@ impl Console {
     fn put(&mut self, ch: char) -> Update {
         let column = self.column;
         let row = self.row;
+        if self.input_end == COLUMNS {
+            return Update::None;
+        }
+        for index in (column..self.input_end).rev() {
+            self.cells[row][index + 1] = self.cells[row][index];
+        }
         self.cells[self.row][self.column] = ch;
         self.column += 1;
-        if self.column == COLUMNS {
+        self.input_end += 1;
+        if self.input_end == COLUMNS {
             let scrolled = self.new_line();
             return self.line_update(scrolled);
         }
         Update::Cells {
             row,
             start: column,
-            end: column + 1,
+            end: self.input_end,
         }
     }
 
@@ -337,11 +374,64 @@ impl Console {
             return Update::None;
         }
         self.column -= 1;
-        self.cells[self.row][self.column] = '\0';
+        let old_end = self.input_end;
+        for index in self.column..old_end - 1 {
+            self.cells[self.row][index] = self.cells[self.row][index + 1];
+        }
+        self.input_end -= 1;
+        self.cells[self.row][self.input_end] = '\0';
         Update::Cells {
             row: self.row,
             start: self.column,
-            end: self.column + 1,
+            end: old_end,
+        }
+    }
+
+    fn delete(&mut self) -> Update {
+        if self.column >= self.input_end {
+            return Update::None;
+        }
+        let old_end = self.input_end;
+        for index in self.column..old_end - 1 {
+            self.cells[self.row][index] = self.cells[self.row][index + 1];
+        }
+        self.input_end -= 1;
+        self.cells[self.row][self.input_end] = '\0';
+        Update::Cells {
+            row: self.row,
+            start: self.column,
+            end: old_end,
+        }
+    }
+
+    fn clear_input_line(&mut self) -> Update {
+        if self.input_end == PROMPT.len() && self.column == PROMPT.len() {
+            return Update::None;
+        }
+        let old_end = self.input_end;
+        for column in PROMPT.len()..old_end {
+            self.cells[self.row][column] = '\0';
+        }
+        self.column = PROMPT.len();
+        self.input_end = PROMPT.len();
+        Update::Cells {
+            row: self.row,
+            start: PROMPT.len(),
+            end: old_end.max(PROMPT.len() + 1),
+        }
+    }
+
+    fn move_cursor(&mut self, column: usize) -> Update {
+        let column = column.clamp(PROMPT.len(), self.input_end);
+        if column == self.column {
+            return Update::None;
+        }
+        let previous = self.column;
+        self.column = column;
+        Update::Cells {
+            row: self.row,
+            start: previous.min(column),
+            end: previous.max(column) + 1,
         }
     }
 
@@ -359,6 +449,7 @@ impl Console {
             self.row = ROWS - 1;
         }
         self.column = 0;
+        self.input_end = 0;
         scrolled
     }
 
@@ -378,6 +469,7 @@ impl Console {
             self.cells[self.row][column] = ch;
         }
         self.column = PROMPT.len();
+        self.input_end = PROMPT.len();
     }
 
     /// Handles Enter: captures the just-typed line (the cells between the
@@ -388,7 +480,7 @@ impl Console {
     fn submit(&mut self) {
         let mut text = [0u8; MAX_LINE];
         let mut len = 0;
-        for column in PROMPT.len()..self.column {
+        for column in PROMPT.len()..self.input_end {
             // Only ASCII printable chars (or blanks) ever land in a cell via
             // `put`, so this narrowing cast never loses information.
             text[len] = self.cells[self.row][column] as u8;
