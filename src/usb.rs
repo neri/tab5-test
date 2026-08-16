@@ -33,6 +33,6 @@ mod msc;
 mod protocol;
 mod registry;
 
-pub use hcd::{FORCE_FS_LS_ONLY_HOST, Speed, probe_split_support, set_vbus_bit};
+pub use hcd::{FORCE_FS_LS_ONLY_HOST, Speed, probe_split_support, set_pi4ioe2_output_bit, set_vbus_bit};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
 pub use registry::{DeviceKind, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost};

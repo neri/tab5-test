@@ -23,6 +23,7 @@ mod interrupts;
 mod lcd;
 mod mbr;
 mod paint;
+mod power;
 mod psram;
 mod sdmmc;
 mod shell;

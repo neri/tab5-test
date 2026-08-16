@@ -254,20 +254,29 @@ const PI4IOE2_REG_HIZ: u8 = 0x07; // 1 = output stage high-impedance (must be 0 
 /// Confirmed on real hardware (see the module doc comment).
 const VBUS_ENABLE_BIT: u8 = 3;
 
-/// Enables or disables the USB-A 5V rail through a specific E2 output bit.
+/// Drives a specific PI4IOE2 output bit.
 ///
 /// Unlike `lcd.rs`'s PI4IOE1 writes (which own every pin on that expander
 /// and can overwrite the whole output byte), E2 also carries WiFi chip,
 /// speaker amp, and expansion-port 5V power on other pins. Every register
 /// touched here is read-modify-write of a single bit so the other pins'
 /// configuration is left exactly as found.
-pub fn set_vbus_bit(bit: u8, on: bool) -> bool {
+pub fn set_pi4ioe2_output_bit(bit: u8, on: bool) -> bool {
     if bit > 7 {
         return false;
     }
     rmw_bit(PI4IOE2_REG_DIRECTION, bit, true)
         && rmw_bit(PI4IOE2_REG_HIZ, bit, false)
         && rmw_bit(PI4IOE2_REG_OUTPUT, bit, on)
+}
+
+/// Enables or disables the USB-A 5V rail through a specific E2 output bit.
+///
+/// This remains the USB-facing spelling used by the shell's `usbvbus`
+/// diagnostic. Other board functions should use [`set_pi4ioe2_output_bit`]
+/// so they do not imply that an arbitrary E2 pin is a VBUS control.
+pub fn set_vbus_bit(bit: u8, on: bool) -> bool {
+    set_pi4ioe2_output_bit(bit, on)
 }
 
 fn set_vbus(on: bool) -> bool {

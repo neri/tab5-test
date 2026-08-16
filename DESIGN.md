@@ -257,7 +257,7 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 `help <name>`で個別コマンドの使用法と説明を表示する二段構成にしています
 （`src/shell.rs`の`HELP_ENTRIES`）。
 
-`shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Paint`／
+`shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Shutdown`／`Paint`／
 `TouchTest`／`AxisTest`）で、全画面サブアプリはコンソール本体ではなく
 `app::run`側の分岐で処理します。各サブアプリが戻った後は`Console::clear`で
 画面をリセットしてから通常どおりプロンプトを再描画します。
@@ -275,6 +275,25 @@ ESP-IDFの`esp_restart_noos`（ESP32-P4版）が実際に使っている
 (2) そもそもESP-IDF自身もこのウォッチドッグ経路は`esp_cpu_reset()`の背後の
 数秒がかりの保険としてのみ使っており、主経路ではありません。現在の実装は
 この主経路（HPCORE0_SW_RESET）だけを使っています。
+
+### 全体電源断
+
+`shutdown`（別名`poweroff`）はTab5全体の電源断を要求する引数なしのシェルコマンドです。
+メディアへの書き込みなど、アプリケーション側で必要な保存処理を完了してから実行する必要が
+あります。コマンドは`src/shell.rs`で`Outcome::Shutdown`を返し、`src/app.rs`は
+`"shutting down..."`を両フレームバッファへ描画・同期してから300 ms待機します。このため、
+電源断が即時に行われてもユーザーは操作受付を画面で確認できます。
+
+実際の電源断要求は`src/power.rs`が担当します。ボードI2C（SDA31/SCL32）上の2個目の
+PI4IOE5V6408（E2、アドレス`0x44`）のP4は、電源制御回路の`PWROFF_PULSE`へ接続されて
+います。P4を出力・非ハイインピーダンスに設定した上で、high 100 ms／low 100 msのパルスを
+3回送ります。これはTab5公式ファームウェアの電源断シーケンスと同じ回数・幅です。
+
+E2はUSB-A VBUS、Wi-Fi、充電などの別制御線も共用するため、`src/usb/hcd.rs`の
+`set_pi4ioe2_output_bit`は、方向・ハイインピーダンス・出力値の各レジスタを対象ビットだけ
+read-modify-writeします。電源断シーケンス中にI2C書込みが一つでも失敗した場合、
+`power::shutdown()`は`false`を返し、`app::run`は電源断失敗を表示してシェルを継続します。
+正常時は最初のパルス途中で電源が落ちることがあるため、関数が戻ることは保証しません。
 
 起動直後のコンソールには暫定バージョン表記の`"Tab5 Shell 0.1"`を通常の出力行として
 表示してからプロンプトを表示します。これはまだ正式なバージョン定義ではありません。
@@ -379,6 +398,7 @@ Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に�
 - `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用）
 - `src/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
+- `src/power.rs`: E2 P4（`PWROFF_PULSE`）を用いたTab5全体の電源断要求
 - `src/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
 - `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
 - `src/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
@@ -395,7 +415,8 @@ Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に�
   それらを所有するデバイスレジストリに分離している
     - `src/usb/hcd.rs`: ESP32-P4 High-Speed USB-DWCホストコントローラー
       ドライバー（Stage 1相当）。VBUS電源（`i2c.rs`のI2Cバス経由で
-      PI4IOE5V6408、2個目、0x44を叩く）、コア初期化・ホストポート電源投入・
+      PI4IOE5V6408、2個目、0x44を叩く）、および同expanderのビット単位
+      read-modify-write、コア初期化・ホストポート電源投入・
       接続検出・リセット・速度判定、チャネル/パケット実行のプリミティブ
       （`run_packet`）。レジスタ・チャネル・パケットのことだけを知っており、
       USBデバイスや記述子の意味は一切知らない

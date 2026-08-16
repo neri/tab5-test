@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::console::Console;
-use crate::{interrupts, lcd, mbr, psram, sdmmc, startup, uart, usb};
+use crate::{interrupts, lcd, mbr, power, psram, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 const FRAMES_PER_SECOND: u32 = 57;
@@ -115,6 +115,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "shutdown",
+        usage: "shutdown",
+        lines: &[
+            "turn off the whole Tab5 through the board power controller",
+            "(save data first; press the physical power key to start again)",
+        ],
+    },
+    HelpEntry {
         name: "usbhub",
         usage: "usbhub",
         lines: &[
@@ -159,6 +167,8 @@ pub enum Outcome {
     Continue,
     /// Reboot once this frame's output has reached the panel.
     Reboot,
+    /// Shut down once this frame's output has reached the panel.
+    Shutdown,
     /// Hand the display over to the touch paint screen.
     Paint,
     /// Hand the display over to the multi-touch diagnostic screen.
@@ -221,6 +231,13 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
             console.write_output_line("rebooting...");
             return Outcome::Reboot;
         }
+        b"shutdown" | b"poweroff" => {
+            if argument.is_empty() {
+                console.write_output_line("shutting down...");
+                return Outcome::Shutdown;
+            }
+            console.write_output_line("usage: shutdown");
+        }
         _ => console.write_output_line("unknown command (try 'help')"),
     }
     Outcome::Continue
@@ -230,6 +247,14 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
 /// output to the panel; this never returns.
 pub fn reboot() -> ! {
     startup::reboot()
+}
+
+/// Sends the board power controller's hardware shutdown request.
+///
+/// The caller has already flushed the status line, so an otherwise immediate
+/// power cut still gives the user feedback on the display.
+pub fn shutdown() -> bool {
+    power::shutdown()
 }
 
 /// With no argument, lists command names only; with a command name, shows

@@ -91,7 +91,7 @@ pub fn run(psram: Psram) {
                     axis_test::run(&mut framebuffers, &mut input);
                     console.clear();
                 }
-                if outcome != shell::Outcome::Reboot {
+                if outcome != shell::Outcome::Reboot && outcome != shell::Outcome::Shutdown {
                     console.write_prompt();
                 }
                 for index in [displayed ^ 1, displayed] {
@@ -107,6 +107,23 @@ pub fn run(psram: Psram) {
                     // watchdog fires.
                     delay_ms(300);
                     shell::reboot();
+                }
+                if outcome == shell::Outcome::Shutdown {
+                    // As with reboot, give the panel one scan-out interval to
+                    // show the acknowledgement before the power controller
+                    // is asked to remove the device rail.
+                    delay_ms(300);
+                    if !shell::shutdown() {
+                        console.write_output_line("shutdown request failed; device is still running");
+                        console.write_prompt();
+                        for index in [displayed ^ 1, displayed] {
+                            console.render(&mut framebuffers, index);
+                            if !framebuffers.flush(index) {
+                                uart::log(b"Console: flush failed\r\n");
+                                break;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
