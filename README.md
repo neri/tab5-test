@@ -15,6 +15,7 @@
 - USBハブ配下を含むHID BootキーボードとUSB Mass Storageの読み込み
 - GT911またはST7121/ST7123タッチコントローラを使う`paint`コマンドと、二本指同時入力を確認する`touchtest`コマンド
 - BMI270加速度センサーで本体の傾きに合わせてボールを転がす`axistest`コマンド
+- INA226電力モニターでバッテリーパックの電圧・電流・電力をライブ表示する`battery`コマンド
 - 通常キー入力時の1セル部分描画・部分キャッシュ同期
 - PSRAM初期化失敗時のカラーバー表示
 
@@ -86,6 +87,7 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - `src/input.rs`: CardKBとUSBキーボードを統合する入力管理
 - `src/touch.rs`・`src/paint.rs`: タッチ入力とお絵描き画面
 - `src/bmi270.rs`・`src/axis_test.rs`: BMI270の6軸ドライバと傾きボール診断画面
+- `src/ina226.rs`・`src/battery.rs`: INA226バッテリー電力モニタードライバとライブ表示画面
 - `src/sdmmc.rs`・`src/mbr.rs`: SDブロックI/OとMBR表示
 - `src/usb.rs`・`src/usb/`: USB-Aホスト、HIDキーボード、ハブ、MSC、デバイス管理
 - `src/lcd.rs`: LCD、MIPI-DSI、GDMA

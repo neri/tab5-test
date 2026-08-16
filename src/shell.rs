@@ -56,6 +56,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["tilt-controlled BMI270 ball test; any key exits"],
     },
     HelpEntry {
+        name: "battery",
+        usage: "battery",
+        lines: &[
+            "live INA226 battery monitor: pack voltage, current, power, and",
+            "a voltage-based estimate; any key exits",
+        ],
+    },
+    HelpEntry {
         name: "sdinfo",
         usage: "sdinfo",
         lines: &["activate SD card, show CID/CSD summary"],
@@ -175,6 +183,8 @@ pub enum Outcome {
     TouchTest,
     /// Hand the display over to the BMI270 tilt diagnostic screen.
     AxisTest,
+    /// Hand the display over to the INA226 battery monitor.
+    Battery,
 }
 
 /// Parses and runs one command line, returning what the caller should do
@@ -227,6 +237,7 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
         b"axistest" => return Outcome::AxisTest,
+        b"battery" | b"batinfo" => return Outcome::Battery,
         b"reboot" | b"reset" => {
             console.write_output_line("rebooting...");
             return Outcome::Reboot;

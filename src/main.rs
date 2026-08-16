@@ -11,6 +11,7 @@ use riscv_rt::entry;
 
 mod app;
 mod axis_test;
+mod battery;
 mod bmi270;
 mod cardkb;
 mod console;
@@ -19,6 +20,7 @@ mod framebuffer;
 mod gpio;
 mod i2c;
 mod input;
+mod ina226;
 mod interrupts;
 mod lcd;
 mod mbr;
