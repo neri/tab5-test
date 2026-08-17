@@ -11,9 +11,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
-use crate::{icm, interrupts, lcd, mbr, membench, power, psram, rtc, sdmmc, startup, uart, usb};
+use crate::{icm, interrupts, lcd, power, psram, rtc, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 /// Fixed, because the panel only tolerates the one set of vertical timings
@@ -128,6 +129,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "touchtest",
         usage: "touchtest",
         lines: &["live multi-touch test; use two fingers, any key exits"],
+    },
+    HelpEntry {
+        name: "coordtest",
+        usage: "coordtest",
+        lines: &[
+            "full-screen coordinate chart: a 100-pixel grid, the logical centre",
+            "axes, labelled corners, and four one-pixel inset borders (red is",
+            "the exact edge, then green, blue, white). hold a ruler against it",
+            "to check the CW rotation and that nothing is clipped or offset.",
+            "any key exits.",
+        ],
     },
     HelpEntry {
         name: "axistest",
@@ -278,6 +290,8 @@ pub enum Outcome {
     Paint,
     /// Hand the display over to the multi-touch diagnostic screen.
     TouchTest,
+    /// Hand the display over to the coordinate calibration chart.
+    CoordTest,
     /// Hand the display over to the BMI270 tilt diagnostic screen.
     AxisTest,
     /// Hand the display over to the INA226 battery monitor.
@@ -343,6 +357,7 @@ pub fn execute(
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
+        b"coordtest" => return Outcome::CoordTest,
         b"axistest" => return Outcome::AxisTest,
         b"battery" | b"batinfo" => return Outcome::Battery,
         b"reboot" | b"reset" => {

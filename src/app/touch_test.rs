@@ -60,7 +60,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     }
 
     let Some(panel) = touch_panel.as_ref() else {
-        wait_for_key(input);
+        input.wait_for_key();
         return;
     };
     uart::log(b"Touch test: place two fingers on the panel\r\n");
@@ -134,20 +134,4 @@ fn draw_status(framebuffer: &mut Framebuffer, current: usize, peak: usize, passe
         ("WAITING FOR 2+ SIMULTANEOUS TOUCHES", YELLOW)
     };
     framebuffer.draw_text(16, 288, message, 3, color, None);
-}
-
-fn wait_for_key(input: &mut InputManager) {
-    let mut sequence = interrupts::frame_sequence();
-    loop {
-        interrupts::wait_for_interrupt();
-        let next_sequence = interrupts::frame_sequence();
-        if next_sequence == sequence {
-            continue;
-        }
-        sequence = next_sequence;
-        input.service();
-        if input.poll_key().is_some() {
-            return;
-        }
-    }
 }

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "ask": [
+      "Edit(./README.md)",
+      "Write(./README.md)"
+    ]
+  }
+}

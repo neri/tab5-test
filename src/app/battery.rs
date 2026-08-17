@@ -15,7 +15,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         Ok(monitor) => monitor,
         Err(error) => {
             show_unavailable(framebuffer, error);
-            wait_for_key(input);
+            input.wait_for_key();
             return;
         }
     };
@@ -219,22 +219,6 @@ fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
         return;
     }
     uart::log(error.log_message());
-}
-
-fn wait_for_key(input: &mut InputManager) {
-    let mut sequence = interrupts::frame_sequence();
-    loop {
-        interrupts::wait_for_interrupt();
-        let next_sequence = interrupts::frame_sequence();
-        if next_sequence == sequence {
-            continue;
-        }
-        sequence = next_sequence;
-        input.service();
-        if input.poll_key().is_some() {
-            return;
-        }
-    }
 }
 
 struct Text {

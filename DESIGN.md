@@ -91,11 +91,16 @@ riscv-rt
   → InputManagerが統合キーボード入力に応じて変更セルだけを描画・部分同期
 ```
 
-正常経路ではDSI HostのVideo Pattern Generatorを使用しません。ECO2では動作中の
-VPGからBridge入力へ切り替えると、設定値、FIFO量、underrun状態が同一でも稀に黒画面に
-なることを実機で確認したためです。最初のDMAデータをFIFOへ充填してからHostのvideo
-modeとBridge出力を初めて有効化します。VPGのカラーバーはPSRAMまたはDMA経路が失敗
-した場合の独立した診断表示としてだけ使用します。
+DSI HostのVideo Pattern Generatorは使用しません。ECO2では動作中のVPGからBridge
+入力へ切り替えると、設定値、FIFO量、underrun状態が同一でも稀に黒画面になることを
+実機で確認したためです。最初のDMAデータをFIFOへ充填してからHostのvideo modeと
+Bridge出力を初めて有効化します。
+
+以前はPSRAMやDMA経路が失敗した場合にVPGのカラーバーを診断表示として出していま
+したが、削除しました。VPGへ入るにもDMA経路と同じパネル初期化とBridge設定を通る
+ため独立した診断にならず、実際の失敗の多くは初期化がそこへ到達する前に止まるか、
+逆にPSRAMの検査を通過してしまい発火しませんでした。失敗の切り分けはUSBシリアルの
+ログで行います。
 
 ## PSRAM
 
@@ -131,13 +136,14 @@ CPUが描画した内容をGDMAから参照できるよう、転送前にROMの
 `LockedHeap`（spinロック付き）を`#[global_allocator]`として静的に配置します。
 初期化は`psram::init()`成功後、`psram.heap()`が返す`(*mut u8, usize)`で
 `ALLOCATOR.lock().init(...)`を呼ぶだけで、`app::run`を呼ぶ前に完了します。
-`psram::init()`が失敗した経路（VPGフォールバック）ではヒープは初期化されず、
-`alloc`を使うコードは実行されません。
+`psram::init()`が失敗した場合はヒープが初期化されないまま`app::run`を呼ばずに
+待機ループへ入るので、`alloc`を使うコードは実行されません。
 
 シェルの`alloctest <MiB>`コマンドは、この確保済みヒープから実際に
 `Vec<u8>`を`try_reserve_exact`で確保し、インデックス由来のパターンを書き込んで
-読み直すことで、PSRAM全域の読み書きを実機検証します（`src/shell.rs`）。
-`mem`コマンドはヒープ容量（約28 MiB）も表示します。
+読み直すことで、PSRAM全域の読み書きを実機検証します（`src/app/shell.rs`）。
+`mem`コマンドはヒープ容量も表示します。`MAPPED_BYTES - FRAMEBUFFER_BYTES`を
+MiBへ切り捨てた値なので30 MiBと出ます（実際は31,711,232 byte＝約30.24 MiB）。
 
 ## LCDとパネル初期化
 
@@ -211,7 +217,7 @@ GDMAの読み出しが間に合わなくなります。1セル更新で再現し
 
 ### CPUから見たPSRAMの実測値
 
-`membench`コマンド（`src/membench.rs`、`mcycle`を時間基準にした実測）の結果。
+`membench`コマンド（`src/app/membench.rs`、`mcycle`を時間基準にした実測）の結果。
 **走査を動かしたまま**、かつ後述のICM優先度設定（表示15／CPU・キャッシュ0）が
 効いた状態、つまり描画コードが実際に置かれている条件での値。
 
@@ -628,14 +634,14 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 `Console::submit`が切り出し、`Console`内部の`pending_submission`に保持します。
 `src/app.rs`は毎キー`Console::take_submission`でこれを取り出して有無を判定します
 （コマンド実行はアプリケーション層の反応であって描画の一部ではないため、
-コンソール側では扱いません）。取り出せた場合は`src/shell.rs`が解析・実行し、
+コンソール側では扱いません）。取り出せた場合は`src/app/shell.rs`が解析・実行し、
 結果は`Console::write_output_line`でプロンプトなしの出力行として書き込まれ、
 最後に`Console::write_prompt`で次のプロンプトを出します。どちらも書き込みと
 同時に描画・書き戻しまで済ませるため、`shell::execute`にはコンソールと一緒に
 フレームバッファを渡します。対応コマンドは`help`で一覧できます。コマンド数が
 増えて全文表示が長くなったため、引数なしの`help`はコマンド名だけを列挙し、
 `help <name>`で個別コマンドの使用法と説明を表示する二段構成にしています
-（`src/shell.rs`の`HELP_ENTRIES`）。
+（`src/app/shell.rs`の`HELP_ENTRIES`）。
 
 `shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Shutdown`／`Paint`／
 `TouchTest`／`AxisTest`／`Battery`）で、全画面サブアプリはコンソール本体ではなく
@@ -677,7 +683,7 @@ PSRAMが壊れた状態で起動してヒープ確保時にPANICする、とい�
 
 `shutdown`（別名`poweroff`）はTab5全体の電源断を要求する引数なしのシェルコマンドです。
 メディアへの書き込みなど、アプリケーション側で必要な保存処理を完了してから実行する必要が
-あります。コマンドは`src/shell.rs`で`Outcome::Shutdown`を返し、`src/app.rs`は
+あります。コマンドは`src/app/shell.rs`で`Outcome::Shutdown`を返し、`src/app.rs`は
 `"shutting down..."`を両フレームバッファへ描画・同期してから300 ms待機します。このため、
 電源断が即時に行われてもユーザーは操作受付を画面で確認できます。
 
@@ -737,7 +743,7 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 最大数を表示し、同一レポート内で2点以上を読み取れた時点で`PASS: MULTITOUCH DETECTED`を
 表示します。CardKBまたはUSBキーボードの任意のキーでシェルに戻ります。
 
-`src/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
+`src/app/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
 `app::run`のフレームループと同じ「描画してから部分書き戻し」パターンを使い、
 直前のタッチ点から現在のタッチ点まで`fill_circle`をスタンプ
 しながら補間することで線を描きます（`framebuffer.rs`に太線用の新しい
@@ -747,9 +753,22 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 だけで抜けられる画面を表示します。キーボード未接続で入った場合も、後から接続した
 CardKBまたはUSBキーボードの任意のキーで抜けられます。
 
+## 座標キャリブレーションチャート
+
+`coordtest`コマンドは`src/app/coord_test.rs`の全画面チャートを開きます。描画自体は
+ブリングアップ当初からある`Framebuffer::draw_coordinate_chart`で、100ピクセル
+グリッド、論理中心の2ピクセル軸、四隅の座標ラベル、そして1ピクセルずつ内側へ
+入った4本の枠（外から赤・緑・青・白）を描きます。表示される数値はすべて論理座標
+なので、パネルに定規を当てて突き合わせればCW回転、各辺のクリッピング、
+論理→ネイティブ変換をまとめて確認できます。
+
+チャートの上には終了方法などの案内を描きません。画面上の全ピクセルが測定対象
+なので、案内はUARTログへ出します。CardKBまたはUSBキーボードの任意のキーで
+シェルへ戻ります。
+
 ## BMI270軸センサーテスト
 
-`axistest`コマンドは`src/axis_test.rs`の全画面診断を開く。画面・物理・入力は
+`axistest`コマンドは`src/app/axis_test.rs`の全画面診断を開く。画面・物理・入力は
 `axis_test.rs`が担当し、BMI270との直接I2C通信は`src/bmi270.rs`に分離している。
 Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に接続されている。初期化ではchip ID
 `0x24`を確認し、soft reset後にBosch BMI270 SensorAPIのmaximum-FIFO版に由来する
@@ -778,7 +797,7 @@ Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に�
 
 ## バッテリー電力モニター
 
-`battery`（別名`batinfo`）コマンドは、`src/battery.rs`の全画面モニターを開く。
+`battery`（別名`batinfo`）コマンドは、`src/app/battery.rs`の全画面モニターを開く。
 任意のCardKBまたはUSBキーボード入力でシェルへ戻る。表示中は空のUSB-Aルートポートを
 再スキャンしないため、USBホストのデバウンス／リセット処理がI2C測定の更新を止めない。
 
@@ -875,30 +894,35 @@ bit-bangバスでは7バイトの途中で桁上がりが起こり得る（23:59
   `LockedHeap`）の宣言とPSRAMヒープでの初期化
 - `src/startup.rs`: watchdog停止、CPUクロック引き上げ、L2キャッシュ分割とRAM上限の確認
 - `src/uart.rs`: USB Serial/JTAG出力
+- `src/delay.rs`: `rdcycle`を基準にしたビジーウェイト（`delay_ms`・`delay_us`）
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。フレームバッファと
   ヒープ用領域（`Psram::heap`）の両方を提供
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール
-- `src/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
-- `src/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
+- `src/app.rs`: コンソールのフレームループ。入力、コマンド実行、全画面モードへの
+  出入りだけを持つ。以下は`app`配下の、シェルコマンドを実行するためだけに存在する
+  モジュール群で、クレート直下のハードウェア寄りモジュールからは参照されない
+    - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
+    - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
+    - `src/app/membench.rs`: 内蔵SRAMとPSRAMのCPUアクセスコスト測定。`mcycle`を時間基準に、逐次スループットと1キャッシュラインあたりのレイテンシを実測する（`membench`コマンド）
+    - `src/app/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
+    - `src/app/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
+    - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
+    - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
+    - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
-- `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント
+- `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント、全画面モードが共通で使うキー待ち（`wait_for_key`）
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用）
-- `src/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
 - `src/power.rs`: E2 P4（`PWROFF_PULSE`）を用いたTab5全体の電源断要求
-- `src/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
 - `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
-- `src/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
 - `src/ina226.rs`: INA226の識別、連続測定設定、5 mΩシャント向け較正、電圧・電流の読出しと換算
-- `src/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
 - `src/rtc.rs`: RX8130CE（`0x32`）のカレンダー読み書き、BCDと週ビットフィールドの検証、フラグ・制御レジスタの読出し（`rtc`コマンド）
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: CLICトラップ入口とGDMA ISR
-- `src/membench.rs`: 内蔵SRAMとPSRAMのCPUアクセスコスト測定。`mcycle`を時間基準に、逐次スループットと1キャッシュラインあたりのレイテンシを実測する（`membench`コマンド）
 - `src/icm.rs`: システムAXIインターコネクトの調停優先度。表示DMAのPSRAM読み出しを最優先にしてDSI BridgeのFIFOアンダーラン（水色フラッシュ）を防ぐ。2D-DMAマスターは逆に最低優先度へ明示的に固定する
 - `src/dma2d.rs`: 2D-DMA。矩形ブロックを単位に転送するエンジンで、ディスクリプタが
   「画像の中のブロック」を表すためCW回転した配置をそのまま扱える。クロック投入、
@@ -952,6 +976,9 @@ MMIOプリミティブ）は`unsafe fn`として定義します。呼び出し�
 関数単位でまとめるのが方針です）。
 
 `README.md`は人間がメンテします。AIは指示された場合を除き編集しないでください。
+このルールは[`CLAUDE.md`](CLAUDE.md)にも書いてあります（DESIGN.mdは自動では
+読み込まれないため）。`.claude/settings.json`の`permissions.ask`でも、README.mdへの
+`Edit`/`Write`に確認を挟むようにしてあります。
 
 ## 診断ログ
 
@@ -1063,7 +1090,7 @@ SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一�
   未実装です（`docs/USB_HOST_PLAN.md`の「将来検討」）。USB Mass Storageは
   [`USB_MSC_PLAN.md`](docs/USB_MSC_PLAN.md)のStage 1〜6（Bulk-Only Transport
   でのSCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)、
-  SDカードとのMBRパース共通化（`src/mbr.rs`）、`usbmsc`/`usbread`/
+  SDカードとのMBRパース共通化（`src/app/mbr.rs`）、`usbmsc`/`usbread`/
   `usbmbr`コマンド）まで実機確認済みです。USBハブ経由のMSC接続は
   [`USB_REFACTOR_PLAN.md`](docs/USB_REFACTOR_PLAN.md) Stage Fで対応済みで、
   ハブのポートに挿したUSBメモリがレジストリに乗るところまで実機確認

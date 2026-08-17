@@ -527,9 +527,9 @@ impl Framebuffer {
 
     /// Paints the bring-up quadrant pattern and confirms it reached PSRAM.
     ///
-    /// `draw_coordinate_chart` is the other bring-up screen; it is kept
-    /// alongside this one so either can be dropped in while checking rotation
-    /// or clipping.
+    /// `draw_coordinate_chart` is the other bring-up screen; this one is kept
+    /// alongside it so either can be dropped in while checking rotation or
+    /// clipping.
     pub fn draw_test_images(&mut self) -> bool {
         self.draw_quadrants();
         if !self.flush() {
@@ -538,7 +538,7 @@ impl Framebuffer {
 
         // Cache invalidation above makes this read come back from external
         // PSRAM. The same first word is consumed by DW-GDMA, so this detects
-        // a failed cache-to-memory synchronization before VPG is disabled.
+        // a failed cache-to-memory synchronization before scanout starts.
         let Some(framebuffer) = self.memory.framebuffer() else {
             return false;
         };
@@ -589,7 +589,14 @@ impl Framebuffer {
         self.draw_line(80, 660, 1200, 400, MAGENTA);
     }
 
-    fn draw_coordinate_chart(&mut self) {
+    /// Paints the coordinate calibration chart: a 100-pixel grid, the exact
+    /// logical centre axes, labelled corners, and four one-pixel inset borders.
+    ///
+    /// Every number on it is a logical coordinate, so comparing the chart
+    /// against a ruler on the panel is what verifies the CW rotation, the
+    /// clipping at each edge, and the logical-to-native mapping. The caller
+    /// flushes; nothing here writes back the cache.
+    pub fn draw_coordinate_chart(&mut self) {
         const DARK_A: u16 = 0x0841;
         const GRID: u16 = 0x7BEF;
 

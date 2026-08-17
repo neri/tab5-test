@@ -7,9 +7,9 @@
 //! call the same function. No GPT, no filesystem parsing (both explicitly
 //! out of scope, same as `docs/SD_CARD_PLAN.md`'s Stage 4a originally was).
 
+use super::shell::Line;
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
-use crate::shell::Line;
 
 /// Classic MBR layout: 4 fixed 16-byte partition entries at offset 446,
 /// each `[boot flag, 3 CHS bytes, type, 3 CHS bytes, start LBA (u32 LE),

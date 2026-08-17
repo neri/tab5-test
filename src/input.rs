@@ -6,7 +6,7 @@
 //! USB devices such as Mass Storage.
 
 use crate::cardkb::CardKb;
-use crate::{uart, usb};
+use crate::{interrupts, uart, usb};
 
 const CARDKB_RECONNECT_FRAMES: u32 = 60;
 const HUB_PORT_SCAN_FRAMES: u32 = 60;
@@ -149,6 +149,30 @@ impl InputManager {
             }
         }
         None
+    }
+
+    /// Blocks until any key arrives, servicing input sources once per frame.
+    ///
+    /// The full-screen modes end this way, so the pairing of `service` and
+    /// `poll_key` with the frame boundary lives here rather than being
+    /// rewritten by each of them. Waiting on the frame interrupt is what keeps
+    /// a mode that has nothing left to draw from polling I2C and USB flat out;
+    /// it also means a keyboard connected *after* the mode was entered is still
+    /// discovered, because `service` keeps running while the mode waits.
+    pub fn wait_for_key(&mut self) {
+        let mut sequence = interrupts::frame_sequence();
+        loop {
+            interrupts::wait_for_interrupt();
+            let next_sequence = interrupts::frame_sequence();
+            if next_sequence == sequence {
+                continue;
+            }
+            sequence = next_sequence;
+            self.service();
+            if self.poll_key().is_some() {
+                return;
+            }
+        }
     }
 
     /// Mutable USB bus registry for commands such as `usbrescan` and MSC I/O.

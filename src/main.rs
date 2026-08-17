@@ -10,8 +10,6 @@ use linked_list_allocator::LockedHeap;
 use riscv_rt::entry;
 
 mod app;
-mod axis_test;
-mod battery;
 mod bmi270;
 mod cardkb;
 mod console;
@@ -25,18 +23,13 @@ mod ina226;
 mod input;
 mod interrupts;
 mod lcd;
-mod mbr;
-mod membench;
-mod paint;
 mod power;
 mod ppa;
 mod psram;
 mod rtc;
 mod sdmmc;
-mod shell;
 mod startup;
 mod touch;
-mod touch_test;
 mod uart;
 mod usb;
 
@@ -141,10 +134,6 @@ fn main() -> ! {
             ALLOCATOR.lock().init(heap_start, heap_size);
         }
         app::run(psram);
-    } else {
-        // PSRAM failed, so keep the independent DSI VPG useful as a visible
-        // diagnostic rather than attempting the framebuffer path.
-        let _ = lcd::start_pattern();
     }
 
     loop {

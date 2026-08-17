@@ -2,16 +2,27 @@
 //!
 //! The display supplies frame boundaries; this module owns input sources,
 //! command dispatch, and application-mode transitions.
+//!
+//! Everything below it exists only to serve a shell command: `shell` itself
+//! dispatches them, `membench` and `mbr` are the two whose output is long
+//! enough to deserve their own file, and the rest are the full-screen modes
+//! `run` hands the framebuffer to. None of them is reachable from the
+//! hardware-facing modules at the crate root, which is what keeps that
+//! dependency pointing one way.
 
-use crate::axis_test;
-use crate::battery;
+mod axis_test;
+mod battery;
+mod coord_test;
+mod mbr;
+mod membench;
+mod paint;
+mod shell;
+mod touch_test;
+
 use crate::delay::delay_ms;
 use crate::input::InputManager;
 use crate::lcd::Display;
-use crate::paint;
 use crate::psram::Psram;
-use crate::shell;
-use crate::touch_test;
 
 /// Roughly half a second of cursor blink at the panel's fixed 57.3 Hz.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
@@ -92,6 +103,10 @@ pub fn run(psram: Psram) {
             }
             shell::Outcome::TouchTest => {
                 touch_test::run(framebuffer, &mut input);
+                console.clear(framebuffer);
+            }
+            shell::Outcome::CoordTest => {
+                coord_test::run(framebuffer, &mut input);
                 console.clear(framebuffer);
             }
             shell::Outcome::AxisTest => {

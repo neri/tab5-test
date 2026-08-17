@@ -1,8 +1,6 @@
 //! Tab5 ST7121-compatible MIPI-DSI output for ESP32-P4 ECO2.
 //!
-//! The normal path streams an RGB565 double framebuffer from PSRAM through
-//! DW-GDMA. The DSI Host's Video Pattern Generator remains available as a
-//! fallback diagnostic when framebuffer setup fails.
+//! Scanout streams an RGB565 double framebuffer from PSRAM through DW-GDMA.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -64,25 +62,6 @@ pub(super) struct InitCommand {
     command: u8,
     data: &'static [u8],
     delay_ms: u32,
-}
-
-/// Starts the DSI Host's vertical colour-bar generator.
-///
-/// A failure returns to the caller after writing a diagnostic to USB; it never
-/// spins forever waiting for a PHY that did not lock.
-pub fn start_pattern() -> bool {
-    uart::log(b"LCD: enabling DSI test pattern...\r\n");
-    if !init_panel() {
-        return false;
-    }
-    // Match ESP-IDF's lifecycle: create/configure the normal DPI bridge first,
-    // then temporarily replace its output with the Host VPG. The later DMA
-    // transition only disables VPG and re-enables this already-clean bridge.
-    configure_video_dma();
-    start_video_pattern();
-    set_backlight(true);
-    uart::log(b"LCD: ST7121 VPG vertical colour bars active\r\n");
-    true
 }
 
 /// A running DSI/DMA display and its double-buffered framebuffer storage.
@@ -582,60 +561,12 @@ fn read_display_id() -> Option<[u8; 3]> {
     }
 }
 
-fn start_video_pattern() {
-    unsafe {
-        // The BSP requests 70 MHz from PLL_F240M. Its integer divider is 3, so the
-        // real DPI clock is 80 MHz; host timing is nevertheless calculated from
-        // the requested 70 MHz and the bridge front porch compensates the delta.
-        modify(
-            HP_SYS_CLKRST + 0x3C,
-            (0x3 << 5) | (1 << 7) | (0xFF << 8),
-            (1 << 5) | (1 << 7) | (2 << 8),
-        );
-
-        write(DSI_HOST + 0x0C, 0);
-        write(DSI_HOST + 0x10, 0); // RGB565 configuration 1
-        write(DSI_HOST + 0x14, 0);
-        write(DSI_HOST + 0x3C, WIDTH);
-        write(DSI_HOST + 0x40, 0);
-        write(DSI_HOST + 0x44, 0);
-        write(DSI_HOST + 0x48, 3);
-        write(DSI_HOST + 0x4C, 69);
-        write(DSI_HOST + 0x50, HLINE_LANE_BYTE_CLOCKS);
-        write(DSI_HOST + 0x54, VSYNC_LINES);
-        write(DSI_HOST + 0x58, VBP_LINES);
-        write(DSI_HOST + 0x5C, VFP_LINES);
-        write(DSI_HOST + 0x60, HEIGHT);
-
-        // Start from a complete normal DPI-bridge configuration. ESP-IDF's VPG
-        // helper does this first, then disables only the bridge's pixel output;
-        // omitting these bridge timing registers leaves the Host VPG black.
-        write(DSI_BRG + 0x00, 1);
-        write(DSI_BRG + 0x18, 2); // RGB565 raw input type
-        write(DSI_BRG + 0x30, VTOTAL_LINES | (HEIGHT << 16)); // vtotal, vdisplay
-        write(DSI_BRG + 0x34, VBP_LINES | (VSYNC_LINES << 16)); // vback porch, vsync
-        write(DSI_BRG + 0x38, 917 | (WIDTH << 16)); // compensated htotal, hdisplay
-        write(DSI_BRG + 0x3C, 40 | (2 << 16)); // hback porch, hsync
-        write(DSI_BRG + 0x40, 1 | (WIDTH << 4)); // DPI on, underrun discard
-        write(DSI_BRG + 0x04, 1);
-        write(DSI_BRG + 0x44, 1);
-
-        // Mirror esp_lcd_dpi_panel_set_pattern(): stop bridge pixels, commit,
-        // then let the Host's VPG generate vertical bars instead of DMA input.
-        write(DSI_BRG + 0x40, WIDTH << 4);
-        write(DSI_BRG + 0x44, 1);
-        // Burst-with-sync-pulses, LP porches, frame ACK, and VPG vertical bars.
-        write(DSI_HOST + 0x38, 0x0001_FF02);
-
-        write(DSI_HOST + 0x34, 0);
-        write(DSI_HOST + 0x94, (1 << 0) | (1 << 1));
-    }
-}
-
 fn configure_video_dma() {
     unsafe {
-        // Same 80 MHz real DPI clock and compensated timings as the known-good
-        // VPG path, but leave the Host pattern generator disabled.
+        // The BSP requests 70 MHz from PLL_F240M. Its integer divider is 3, so
+        // the real DPI clock is 80 MHz; host timing is nevertheless calculated
+        // from the requested 70 MHz and the bridge front porch compensates the
+        // delta.
         modify(
             HP_SYS_CLKRST + 0x3C,
             (0x3 << 5) | (1 << 7) | (0xFF << 8),
