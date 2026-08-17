@@ -31,6 +31,7 @@ mod paint;
 mod power;
 mod ppa;
 mod psram;
+mod rtc;
 mod sdmmc;
 mod shell;
 mod startup;

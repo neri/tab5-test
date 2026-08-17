@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
-use crate::{icm, interrupts, lcd, mbr, membench, power, psram, sdmmc, startup, uart, usb};
+use crate::{icm, interrupts, lcd, mbr, membench, power, psram, rtc, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 /// Fixed, because the panel only tolerates the one set of vertical timings
@@ -140,6 +140,20 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &[
             "live INA226 battery monitor: pack voltage, current, power, and",
             "a voltage-based estimate; any key exits",
+        ],
+    },
+    HelpEntry {
+        name: "rtc",
+        usage: "rtc | rtc set <YYYY-MM-DD> <HH:MM:SS> | rtc regs | rtc test",
+        lines: &[
+            "RX8130CE real-time clock (board I2C 0x32). with no argument,",
+            "show the calendar and the flag/control registers. 'set' writes",
+            "the calendar (day of the week is computed from the date) and",
+            "clears the voltage-low flag. 'regs' dumps registers 0x10-0x1F.",
+            "'test' checks that the device answers, that the calendar is a",
+            "valid date, and that the counters actually advance -- it waits",
+            "for two second-carries, so it takes about 3 seconds and the",
+            "whole report appears at once when it finishes.",
         ],
     },
     HelpEntry {
@@ -311,6 +325,7 @@ pub fn execute(
         b"backlight" => cmd_backlight(console, framebuffer, argument),
         b"icm" => cmd_icm(console, framebuffer, argument),
         b"ppafill" => cmd_ppafill(console, framebuffer, argument),
+        b"rtc" => cmd_rtc(console, framebuffer, argument),
         b"sdinfo" => cmd_sdinfo(console, framebuffer),
         b"sdread" => cmd_sdread(console, framebuffer, argument),
         b"sdreadn" => cmd_sdreadn(console, framebuffer, argument),
@@ -789,6 +804,442 @@ fn cmd_uptime(console: &mut Console, framebuffer: &mut Framebuffer) {
     line.push_u32(seconds);
     line.push_str(" s (frame-counted)");
     console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Reads, writes and tests the RX8130CE real-time clock.
+///
+/// The clock is the one board device whose whole purpose is to keep counting
+/// while the firmware is not running, so "does it answer on I2C" says very
+/// little about it: `rtc test` also measures a carry of the second counter,
+/// which is the only check here that observes the 32.768 kHz oscillator
+/// rather than the register file.
+fn cmd_rtc(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    let (subcommand, rest) = split_first_word(argument);
+    match subcommand {
+        b"" => cmd_rtc_show(console, framebuffer),
+        b"regs" => cmd_rtc_regs(console, framebuffer),
+        b"set" => cmd_rtc_set(console, framebuffer, trim(rest)),
+        b"test" => cmd_rtc_test(console, framebuffer),
+        _ => console.write_output_line(
+            framebuffer,
+            "usage: rtc [set <YYYY-MM-DD> <HH:MM:SS> | regs | test]",
+        ),
+    }
+}
+
+fn cmd_rtc_show(console: &mut Console, framebuffer: &mut Framebuffer) {
+    match rtc::read_datetime() {
+        Ok(datetime) => {
+            let mut line = Line::new();
+            push_datetime(&mut line, &datetime);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => console.write_output_line(framebuffer, error.message()),
+    }
+    match rtc::read_status() {
+        Ok(status) => report_rtc_status(console, framebuffer, status),
+        Err(error) => console.write_output_line(framebuffer, error.message()),
+    }
+}
+
+/// Dumps registers 0x10-0x1F as they were read, eight per line.
+fn cmd_rtc_regs(console: &mut Console, framebuffer: &mut Framebuffer) {
+    let mut registers = [0u8; rtc::REGISTER_COUNT];
+    if let Err(error) = rtc::read_all_registers(&mut registers) {
+        console.write_output_line(framebuffer, error.message());
+        return;
+    }
+    for (index, chunk) in registers.chunks(8).enumerate() {
+        let mut line = Line::new();
+        line.push_str("0x");
+        line.push_hex(rtc::FIRST_REGISTER as u32 + (index * 8) as u32, 2);
+        line.push_str(":");
+        for &byte in chunk {
+            line.push_str(" ");
+            line.push_hex(byte as u32, 2);
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+fn cmd_rtc_set(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    let (date_text, rest) = split_first_word(argument);
+    let time_text = trim(rest);
+    let mut date = [0u32; 3];
+    let mut time = [0u32; 3];
+    if !parse_fields(date_text, b'-', &mut date) || !parse_fields(time_text, b':', &mut time) {
+        console.write_output_line(framebuffer, "usage: rtc set <YYYY-MM-DD> <HH:MM:SS>");
+        return;
+    }
+    // Narrowing through `try_from` so that a field too large for the calendar
+    // is rejected rather than truncated into a plausible-looking one; the
+    // calendar ranges themselves are `DateTime::is_valid`'s business.
+    let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(minute), Ok(second)) = (
+        u16::try_from(date[0]),
+        u8::try_from(date[1]),
+        u8::try_from(date[2]),
+        u8::try_from(time[0]),
+        u8::try_from(time[1]),
+        u8::try_from(time[2]),
+    ) else {
+        console.write_output_line(
+            framebuffer,
+            "out of range: year 2000-2099, a real calendar day, 24-hour time",
+        );
+        return;
+    };
+
+    // The device's week register is written from the date, so `weekday` here
+    // only has to be a value `is_valid` accepts.
+    let datetime = rtc::DateTime {
+        year,
+        month,
+        day,
+        weekday: None,
+        hour,
+        minute,
+        second,
+    };
+    if !datetime.is_valid() {
+        console.write_output_line(
+            framebuffer,
+            "out of range: year 2000-2099, a real calendar day, 24-hour time",
+        );
+        return;
+    }
+
+    if let Err(error) = rtc::write_datetime(&datetime) {
+        console.write_output_line(framebuffer, error.message());
+        return;
+    }
+    // Reading the calendar back is what turns "the writes were acknowledged"
+    // into "the device kept them".
+    match rtc::read_datetime() {
+        Ok(readback) => {
+            let mut line = Line::new();
+            line.push_str("set; reads back as ");
+            push_datetime(&mut line, &readback);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => console.write_output_line(framebuffer, error.message()),
+    }
+}
+
+/// Runs the checks in increasing order of what they prove: that something
+/// answers, that its control registers are in a usable state, that the
+/// calendar holds a real date, that the second counter carries once per
+/// second, and that the per-second update logic still raises its flag.
+///
+/// Only the flag register is written (to clear the update flag), so a clock
+/// already keeping correct time still is afterwards.
+fn cmd_rtc_test(console: &mut Console, framebuffer: &mut Framebuffer) {
+    /// A carry must arrive within this long, or the counters are not running.
+    const CARRY_TIMEOUT_MS: u32 = 1_500;
+    /// How far a measured carry interval may sit from one second. The clock
+    /// itself is a crystal part; this only has to absorb the I2C read that
+    /// observes the carry and the cycle-counter conversion.
+    const CARRY_TOLERANCE_MS: u32 = 50;
+
+    if !rtc::probe() {
+        console.write_output_line(framebuffer, "FAIL probe: nothing acknowledged I2C 0x32");
+        return;
+    }
+    console.write_output_line(framebuffer, "PASS probe: 0x32 acknowledged");
+
+    let status = match rtc::read_status() {
+        Ok(status) => status,
+        Err(error) => {
+            console.write_output_line(framebuffer, error.message());
+            return;
+        }
+    };
+    report_rtc_status(console, framebuffer, status);
+
+    let mut failures = 0u32;
+    if status.stopped() {
+        failures += 1;
+    }
+
+    match rtc::read_datetime() {
+        Ok(datetime) => {
+            let mut line = Line::new();
+            line.push_str("PASS calendar: ");
+            push_datetime(&mut line, &datetime);
+            console.write_output_line(framebuffer, line.as_str());
+
+            // The week register is an independent counter, not derived from
+            // the date, so the two can legitimately be read and still
+            // disagree -- which is worth naming rather than hiding.
+            let expected = rtc::weekday_from_date(datetime.year, datetime.month, datetime.day);
+            if datetime.weekday.is_some_and(|weekday| weekday != expected) {
+                let mut line = Line::new();
+                line.push_str("WARN week register disagrees with the date (expected ");
+                line.push_str(rtc::weekday_name(expected));
+                line.push_str(")");
+                console.write_output_line(framebuffer, line.as_str());
+            }
+        }
+        Err(error) => {
+            failures += 1;
+            let mut line = Line::new();
+            line.push_str("FAIL calendar: ");
+            line.push_str(error.message());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+
+    // The first carry only synchronises to a second boundary; the interval
+    // between it and the next one is the measurement.
+    let interval = match wait_for_second_change(CARRY_TIMEOUT_MS) {
+        Ok(Some(_)) => wait_for_second_change(CARRY_TIMEOUT_MS),
+        timeout_or_error => timeout_or_error,
+    };
+    match interval {
+        Ok(Some(interval_ms)) => {
+            let within_tolerance = interval_ms.abs_diff(1_000) <= CARRY_TOLERANCE_MS;
+            if !within_tolerance {
+                failures += 1;
+            }
+            let mut line = Line::new();
+            line.push_str(if within_tolerance { "PASS" } else { "FAIL" });
+            line.push_str(" tick: second counter carried after ");
+            line.push_u32(interval_ms);
+            line.push_str(" ms (expected 1000)");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Ok(None) => {
+            failures += 1;
+            console.write_output_line(
+                framebuffer,
+                "FAIL tick: no carry within 1500 ms; the counters are not running",
+            );
+        }
+        Err(error) => {
+            failures += 1;
+            console.write_output_line(framebuffer, error.message());
+        }
+    }
+
+    if status.extension & rtc::EXTENSION_UPDATE_MINUTE == 0 {
+        match test_update_flag(CARRY_TIMEOUT_MS) {
+            Ok(Some(elapsed_ms)) => {
+                let mut line = Line::new();
+                line.push_str("PASS update flag: cleared, then set again after ");
+                line.push_u32(elapsed_ms);
+                line.push_str(" ms");
+                console.write_output_line(framebuffer, line.as_str());
+            }
+            Ok(None) => {
+                failures += 1;
+                console.write_output_line(
+                    framebuffer,
+                    "FAIL update flag: did not clear, or was not set again within 1500 ms",
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                console.write_output_line(framebuffer, error.message());
+            }
+        }
+    } else {
+        console.write_output_line(
+            framebuffer,
+            "SKIP update flag: the extension register selects per-minute updates",
+        );
+    }
+
+    let mut line = Line::new();
+    if failures == 0 {
+        line.push_str("rtc test: all checks passed");
+    } else {
+        line.push_str("rtc test: ");
+        line.push_u32(failures);
+        line.push_str(" check(s) failed");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Clears the update flag and waits for the device to set it again, which the
+/// RX8130CE does once per second while its extension register selects
+/// per-second updates. Returns how long that took, or `None` if the flag did
+/// not clear or never came back.
+fn test_update_flag(timeout_ms: u32) -> Result<Option<u32>, rtc::Error> {
+    rtc::clear_flag(rtc::FLAG_UPDATE)?;
+    if rtc::read_status()?.flags & rtc::FLAG_UPDATE != 0 {
+        return Ok(None);
+    }
+    let start = membench::cycles();
+    loop {
+        let flags = rtc::read_status()?.flags;
+        let elapsed_ms = elapsed_ms_since(start);
+        if flags & rtc::FLAG_UPDATE != 0 {
+            return Ok(Some(elapsed_ms));
+        }
+        if elapsed_ms > timeout_ms {
+            return Ok(None);
+        }
+    }
+}
+
+/// Polls the second counter until it changes, returning how long that took.
+/// `None` means it had not changed within `timeout_ms`.
+fn wait_for_second_change(timeout_ms: u32) -> Result<Option<u32>, rtc::Error> {
+    let start = membench::cycles();
+    let first = rtc::read_second()?;
+    loop {
+        let second = rtc::read_second()?;
+        // Taken after the read that observed the change, so the reported
+        // interval includes one I2C read rather than excluding it.
+        let elapsed_ms = elapsed_ms_since(start);
+        if second != first {
+            return Ok(Some(elapsed_ms));
+        }
+        if elapsed_ms > timeout_ms {
+            return Ok(None);
+        }
+    }
+}
+
+/// Milliseconds since a `membench::cycles()` reading. The counter is 32-bit
+/// and wraps every 11.9 seconds at 360 MHz, which is far longer than any wait
+/// this command performs.
+fn elapsed_ms_since(start: u32) -> u32 {
+    let cycles = membench::cycles().wrapping_sub(start) as u64;
+    (cycles * 1_000 / startup::cpu_hz() as u64) as u32
+}
+
+fn report_rtc_status(console: &mut Console, framebuffer: &mut Framebuffer, status: rtc::Status) {
+    let mut line = Line::new();
+    line.push_str("ext=0x");
+    line.push_hex(status.extension as u32, 2);
+    line.push_str(" flags=0x");
+    line.push_hex(status.flags as u32, 2);
+    line.push_str(" ctrl0=0x");
+    line.push_hex(status.control0 as u32, 2);
+    line.push_str(" ctrl1=0x");
+    line.push_hex(status.control1 as u32, 2);
+    console.write_output_line(framebuffer, line.as_str());
+
+    // The hex above is the device's answer verbatim; this names the bits in
+    // it that a test cares about, so neither has to be taken on trust.
+    let mut line = Line::new();
+    line.push_str("flags set:");
+    if !push_bit_names(
+        &mut line,
+        status.flags,
+        &[
+            (rtc::FLAG_VOLTAGE_LOW, "VLF"),
+            (rtc::FLAG_ALARM, "AF"),
+            (rtc::FLAG_TIMER, "TF"),
+            (rtc::FLAG_UPDATE, "UF"),
+        ],
+    ) {
+        line.push_str(" none");
+    }
+    line.push_str("   ctrl0 set:");
+    if !push_bit_names(
+        &mut line,
+        status.control0,
+        &[
+            (rtc::CONTROL0_ALARM_INTERRUPT, "AIE"),
+            (rtc::CONTROL0_TIMER_INTERRUPT, "TIE"),
+            (rtc::CONTROL0_UPDATE_INTERRUPT, "UIE"),
+            (rtc::CONTROL0_STOP, "STOP"),
+            (rtc::CONTROL0_TEST, "TEST"),
+        ],
+    ) {
+        line.push_str(" none");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    if status.voltage_low() {
+        console.write_output_line(
+            framebuffer,
+            "WARN voltage-low flag: the oscillator stopped, so the calendar is",
+        );
+        console.write_output_line(
+            framebuffer,
+            "     stale; 'rtc set' writes a new time and clears the flag",
+        );
+    }
+    if status.stopped() {
+        console.write_output_line(
+            framebuffer,
+            "FAIL STOP is set in ctrl0: the calendar counters are halted",
+        );
+    }
+}
+
+/// Formats a calendar as `YYYY-MM-DD (Day) HH:MM:SS`, naming an
+/// uninterpretable week register instead of inventing a day for it.
+fn push_datetime(line: &mut Line, datetime: &rtc::DateTime) {
+    line.push_u32(datetime.year as u32);
+    line.push_str("-");
+    push_two_digits(line, datetime.month);
+    line.push_str("-");
+    push_two_digits(line, datetime.day);
+    match datetime.weekday {
+        Some(weekday) => {
+            line.push_str(" (");
+            line.push_str(rtc::weekday_name(weekday));
+            line.push_str(") ");
+        }
+        None => line.push_str(" (week reg invalid) "),
+    }
+    push_two_digits(line, datetime.hour);
+    line.push_str(":");
+    push_two_digits(line, datetime.minute);
+    line.push_str(":");
+    push_two_digits(line, datetime.second);
+}
+
+/// Appends the names of whichever `names` bits are set in `value`, each
+/// preceded by a space. Returns whether any was appended, so the caller can
+/// say "none" rather than leaving a bare label.
+fn push_bit_names(line: &mut Line, value: u8, names: &[(u8, &str)]) -> bool {
+    let mut any = false;
+    for &(bit, name) in names {
+        if value & bit != 0 {
+            line.push_str(" ");
+            line.push_str(name);
+            any = true;
+        }
+    }
+    any
+}
+
+fn push_two_digits(line: &mut Line, value: u8) {
+    if value < 10 {
+        line.push_str("0");
+    }
+    line.push_u32(value as u32);
+}
+
+/// Splits `text` into exactly `values.len()` decimal fields separated by
+/// `separator`, as `2026-08-17` and `12:34:56` are. Returns false unless
+/// every field is present and is a plain decimal number.
+fn parse_fields(text: &[u8], separator: u8, values: &mut [u32]) -> bool {
+    let mut remaining = text;
+    let last = values.len() - 1;
+    for (index, value) in values.iter_mut().enumerate() {
+        let field = if index == last {
+            core::mem::take(&mut remaining)
+        } else {
+            match remaining.iter().position(|&byte| byte == separator) {
+                Some(at) => {
+                    let (head, tail) = remaining.split_at(at);
+                    remaining = &tail[1..];
+                    head
+                }
+                None => return false,
+            }
+        };
+        match parse_u32(field) {
+            Some(parsed) => *value = parsed,
+            None => return false,
+        }
+    }
+    true
 }
 
 fn cmd_sdinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
