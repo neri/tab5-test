@@ -1,5 +1,7 @@
 //! ESP32-P4 ECO2 startup operations which must happen before application code.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::uart;
 
 const HP_SYS_CLKRST: usize = 0x500E_6000;
@@ -8,6 +10,16 @@ const ROOT_CLK_CTRL1: usize = HP_SYS_CLKRST + 0x08;
 const ROOT_CLK_CTRL2: usize = HP_SYS_CLKRST + 0x0C;
 const LP_CLKRST: usize = 0x5011_1000;
 const HP_CLK_CTRL: usize = LP_CLKRST + 0x40;
+
+/// Clock the CPU is actually running at. The bootloader hands over at 90 MHz
+/// and `raise_cpu_clock` moves to 360 MHz only if it recognises that state, so
+/// anything converting cycles to time has to ask rather than assume.
+static CPU_HZ: AtomicU32 = AtomicU32::new(90_000_000);
+
+/// Current CPU clock in hertz.
+pub fn cpu_hz() -> u32 {
+    CPU_HZ.load(Ordering::Relaxed)
+}
 
 /// Stops the RTC watchdog inherited from the ESP-IDF bootloader.
 pub fn init() {
@@ -101,6 +113,7 @@ pub fn raise_cpu_clock() -> bool {
         latch_dividers();
     }
 
+    CPU_HZ.store(360_000_000, Ordering::Relaxed);
     true
 }
 

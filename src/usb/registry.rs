@@ -183,10 +183,13 @@ impl UsbHost {
     /// every call; they share whatever `rescan` already attached, wherever
     /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
-        self.slots.iter_mut().flatten().find_map(|slot| match &mut slot.kind {
-            DeviceKind::MassStorage(storage) => Some(storage),
-            DeviceKind::Keyboard(_) => None,
-        })
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find_map(|slot| match &mut slot.kind {
+                DeviceKind::MassStorage(storage) => Some(storage),
+                DeviceKind::Keyboard(_) => None,
+            })
     }
 
     /// Cheap liveness check (one HPRT read, no transaction): true once
@@ -306,7 +309,11 @@ impl UsbHost {
         if device.device_class == hub::DEVICE_CLASS_HUB {
             self.attach_hub(&device, port.speed);
         } else if let Some(kind) = attach_class_driver(&device) {
-            self.slots[0] = Some(Slot { location: Location::Direct, summary: DeviceSummary::from(&device), kind });
+            self.slots[0] = Some(Slot {
+                location: Location::Direct,
+                summary: DeviceSummary::from(&device),
+                kind,
+            });
         } else {
             uart::log(b"USB: no class driver for the device on USB-A\r\n");
         }
@@ -430,7 +437,9 @@ impl UsbHost {
     /// that a device found later is set up identically to one that was
     /// present at rescan time -- routing included.
     fn attach_hub_port(&mut self, hub: &Hub, port: u8, hub_speed: Speed) {
-        let Some(status) = hub.reset_port(port) else { return };
+        let Some(status) = hub.reset_port(port) else {
+            return;
+        };
         let address = protocol::downstream_address(port);
         let route = route_behind_hub(hub.device_address(), port, hub_speed, status.speed());
         if route.split.is_some() {
@@ -445,7 +454,10 @@ impl UsbHost {
             uart::log_hex(b", reached with split transactions; hub port ", port as u32);
         }
         let Some(downstream) = protocol::enumerate_device(address, route) else {
-            uart::log_hex(b"USB: enumeration failed for device on hub port ", port as u32);
+            uart::log_hex(
+                b"USB: enumeration failed for device on hub port ",
+                port as u32,
+            );
             return;
         };
 
@@ -486,16 +498,14 @@ impl UsbHost {
 /// clearing it for split routes was tried on real hardware and the very
 /// first SETUP came back STALL, so the core does need `HCCHAR.LSpdDev` to
 /// describe the device at the far end of the TT.
-fn route_behind_hub(
-    hub_address: u8,
-    port: u8,
-    hub_speed: Speed,
-    device_speed: Speed,
-) -> Route {
+fn route_behind_hub(hub_address: u8, port: u8, hub_speed: Speed, device_speed: Speed) -> Route {
     Route {
         low_speed_via_hub: device_speed == Speed::Low,
         split: if hub_speed == Speed::High && device_speed != Speed::High {
-            Some(SplitTarget { hub_address, port_number: port })
+            Some(SplitTarget {
+                hub_address,
+                port_number: port,
+            })
         } else {
             None
         },

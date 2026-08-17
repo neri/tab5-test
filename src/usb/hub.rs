@@ -290,8 +290,7 @@ impl Hub {
             0,
             buffer.len() as u16,
         );
-        let received =
-            protocol::control_transfer_in(&self.pipe, &setup, &mut buffer)?;
+        let received = protocol::control_transfer_in(&self.pipe, &setup, &mut buffer)?;
         if received < buffer.len() {
             uart::log(b"USB: short hub GET_STATUS response\r\n");
             return None;
@@ -377,7 +376,10 @@ impl Hub {
     /// failure into a stream of packet diagnostics.
     #[cfg(any())]
     pub fn log_control_probe_after_failure(&self, port: u8) {
-        uart::log_hex(b"USB: post-failure hub EP0 probe, failed port=", port as u32);
+        uart::log_hex(
+            b"USB: post-failure hub EP0 probe, failed port=",
+            port as u32,
+        );
 
         let mut hub_buffer = [0u8; 4];
         let hub_setup = build_class_in_setup(
@@ -459,7 +461,10 @@ impl Hub {
                 // itself, so one failing means the hub is no longer
                 // answering and the remaining ports would each burn
                 // another full control-transfer timeout to say so.
-                uart::log_hex(b"USB: hub SET_FEATURE(PORT_POWER) failed on port ", port as u32);
+                uart::log_hex(
+                    b"USB: hub SET_FEATURE(PORT_POWER) failed on port ",
+                    port as u32,
+                );
                 return false;
             }
             // Let each port's power switch settle before hitting the next
@@ -496,7 +501,11 @@ impl Hub {
         self.debounce_connected_port_with_diagnostics(port, false)
     }
 
-    fn debounce_connected_port_with_diagnostics(&self, port: u8, log_failure: bool) -> Option<bool> {
+    fn debounce_connected_port_with_diagnostics(
+        &self,
+        port: u8,
+        log_failure: bool,
+    ) -> Option<bool> {
         let first_status = if log_failure {
             self.port_status(port)
         } else {
@@ -515,7 +524,10 @@ impl Hub {
         };
         if !second_status?.connected() {
             if log_failure {
-                uart::log_hex(b"USB: hub port connection bounced away during debounce, port ", port as u32);
+                uart::log_hex(
+                    b"USB: hub port connection bounced away during debounce, port ",
+                    port as u32,
+                );
             }
             return Some(false);
         }
@@ -601,8 +613,7 @@ fn read_descriptor(pipe: &ControlPipe) -> Option<HubDescriptor> {
         0,
         total_length as u16,
     );
-    let received =
-        protocol::control_transfer_in(pipe, &setup, &mut bytes[..total_length])?;
+    let received = protocol::control_transfer_in(pipe, &setup, &mut bytes[..total_length])?;
     if received < DESCRIPTOR_FIXED_LEN {
         uart::log(b"USB: short hub descriptor\r\n");
         return None;
@@ -610,7 +621,10 @@ fn read_descriptor(pipe: &ControlPipe) -> Option<HubDescriptor> {
 
     let mut port_count = bytes[2];
     if port_count > MAX_PORTS {
-        uart::log_hex(b"USB: hub reports more ports than supported, capping: ", port_count as u32);
+        uart::log_hex(
+            b"USB: hub reports more ports than supported, capping: ",
+            port_count as u32,
+        );
         port_count = MAX_PORTS;
     }
 
@@ -620,7 +634,11 @@ fn read_descriptor(pipe: &ControlPipe) -> Option<HubDescriptor> {
     // driver has no use for) starts right after it.
     let removable_end = received.min(DESCRIPTOR_FIXED_LEN + port_count as usize / 8 + 1);
     let mut device_removable = 0u32;
-    for (index, &byte) in bytes[DESCRIPTOR_FIXED_LEN..removable_end].iter().enumerate().take(4) {
+    for (index, &byte) in bytes[DESCRIPTOR_FIXED_LEN..removable_end]
+        .iter()
+        .enumerate()
+        .take(4)
+    {
         device_removable |= (byte as u32) << (8 * index);
     }
 
@@ -638,7 +656,13 @@ fn read_descriptor(pipe: &ControlPipe) -> Option<HubDescriptor> {
 /// counterpart to `protocol::build_standard_out_setup`. `request_type`
 /// selects the recipient: the hub itself (0xA0) or one of its ports
 /// (0xA3, port number in `index`).
-fn build_class_in_setup(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> [u8; 8] {
+fn build_class_in_setup(
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+) -> [u8; 8] {
     [
         request_type,
         request,

@@ -1,6 +1,6 @@
 //! Full-screen live battery monitor entered through the `battery` command.
 
-use crate::framebuffer::{DoubleBuffer, BLACK, CYAN, GREEN, RED, WHITE, WIDTH, YELLOW};
+use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, RED, WHITE, WIDTH, YELLOW};
 use crate::ina226::{BatterySample, Ina226, InitError};
 use crate::input::InputManager;
 use crate::{interrupts, uart};
@@ -10,11 +10,11 @@ const PACK_EMPTY_MV: u32 = 6_000;
 const PACK_FULL_MV: u32 = 8_230;
 
 /// Opens the battery monitor.  Any managed keyboard key returns to the shell.
-pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
+pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let monitor = match Ina226::init() {
         Ok(monitor) => monitor,
         Err(error) => {
-            show_unavailable(framebuffers, error);
+            show_unavailable(framebuffer, error);
             wait_for_key(input);
             return;
         }
@@ -22,7 +22,7 @@ pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
     uart::log(b"Battery: INA226 monitor ready\r\n");
 
     let mut sample = monitor.read_sample();
-    draw_all(framebuffers, sample, monitor.address());
+    draw_all(framebuffer, sample, monitor.address());
     let mut sequence = interrupts::frame_sequence();
     let mut last_update = sequence;
     let mut read_failure_reported = false;
@@ -58,45 +58,36 @@ pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
             }
             None => {}
         }
-        draw_all(framebuffers, sample, monitor.address());
+        draw_all(framebuffer, sample, monitor.address());
     }
 }
 
-fn draw_all(framebuffers: &mut DoubleBuffer, sample: Option<BatterySample>, address: u8) {
-    let displayed = interrupts::active_framebuffer();
-    for index in [displayed ^ 1, displayed] {
-        draw_scene(framebuffers, index, sample, address);
-        if !framebuffers.flush(index) {
-            uart::log(b"Battery: framebuffer flush failed\r\n");
-            return;
-        }
+fn draw_all(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, address: u8) {
+    draw_scene(framebuffer, sample, address);
+    if !framebuffer.flush() {
+        uart::log(b"Battery: framebuffer flush failed\r\n");
+        return;
     }
 }
 
-fn draw_scene(
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
-    sample: Option<BatterySample>,
-    address: u8,
-) {
-    framebuffers.fill(index, BLACK);
-    framebuffers.draw_text(index, 32, 26, "BATTERY MONITOR", 4, CYAN, None);
+fn draw_scene(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, address: u8) {
+    framebuffer.fill(BLACK);
+    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 4, CYAN, None);
     let mut device_text = Text::new();
     device_text.push_str("TAB5 / INA226 / I2C 0X");
     device_text.push_hex_byte(address);
     device_text.push_str(" / 5 MOHM");
-    framebuffers.draw_text(index, 34, 70, device_text.as_str(), 2, WHITE, None);
-    framebuffers.draw_line(index, 32, 100, WIDTH - 32, 100, CYAN);
+    framebuffer.draw_text(34, 70, device_text.as_str(), 2, WHITE, None);
+    framebuffer.draw_line(32, 100, WIDTH - 32, 100, CYAN);
 
     match sample {
-        Some(sample) => draw_reading(framebuffers, index, sample),
+        Some(sample) => draw_reading(framebuffer, sample),
         None => {
-            framebuffers.draw_text(index, 380, 300, "WAITING FOR INA226 DATA", 3, YELLOW, None);
-            draw_battery(framebuffers, index, 0, RED);
+            framebuffer.draw_text(380, 300, "WAITING FOR INA226 DATA", 3, YELLOW, None);
+            draw_battery(framebuffer, 0, RED);
         }
     }
-    framebuffers.draw_text(
-        index,
+    framebuffer.draw_text(
         32,
         674,
         "LIVE UPDATE: 1 S       PRESS ANY KEY TO EXIT",
@@ -106,21 +97,20 @@ fn draw_scene(
     );
 }
 
-fn draw_reading(framebuffers: &mut DoubleBuffer, index: usize, sample: BatterySample) {
+fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     let percent = voltage_percent(sample.bus_voltage_mv);
     let level_color = level_color(percent);
-    draw_battery(framebuffers, index, percent, level_color);
+    draw_battery(framebuffer, percent, level_color);
 
     let mut text = Text::new();
     text.push_str("VOLTAGE ESTIMATE  ");
     text.push_u32(percent);
     text.push_str("%");
-    framebuffers.draw_text(index, 68, 530, text.as_str(), 2, level_color, None);
-    framebuffers.draw_text(index, 68, 562, "6.00V EMPTY  /  8.23V FULL", 2, WHITE, None);
+    framebuffer.draw_text(68, 530, text.as_str(), 2, level_color, None);
+    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 2, WHITE, None);
 
     draw_value(
-        framebuffers,
-        index,
+        framebuffer,
         510,
         148,
         "PACK VOLTAGE",
@@ -128,8 +118,7 @@ fn draw_reading(framebuffers: &mut DoubleBuffer, index: usize, sample: BatterySa
         CYAN,
     );
     draw_value(
-        framebuffers,
-        index,
+        framebuffer,
         510,
         270,
         "CURRENT (IN+ TO IN-)",
@@ -137,8 +126,7 @@ fn draw_reading(framebuffers: &mut DoubleBuffer, index: usize, sample: BatterySa
         level_color,
     );
     draw_value(
-        framebuffers,
-        index,
+        framebuffer,
         510,
         392,
         "POWER (V X I)",
@@ -146,8 +134,7 @@ fn draw_reading(framebuffers: &mut DoubleBuffer, index: usize, sample: BatterySa
         level_color,
     );
     draw_value(
-        framebuffers,
-        index,
+        framebuffer,
         510,
         514,
         "SHUNT VOLTAGE",
@@ -156,7 +143,7 @@ fn draw_reading(framebuffers: &mut DoubleBuffer, index: usize, sample: BatterySa
     );
 }
 
-fn draw_battery(framebuffers: &mut DoubleBuffer, index: usize, percent: u32, color: u16) {
+fn draw_battery(framebuffer: &mut Framebuffer, percent: u32, color: u16) {
     const LEFT: usize = 74;
     const TOP: usize = 148;
     const BODY_WIDTH: usize = 310;
@@ -165,9 +152,8 @@ fn draw_battery(framebuffers: &mut DoubleBuffer, index: usize, percent: u32, col
     const CAP_HEIGHT: usize = 100;
     const INNER: usize = 16;
 
-    framebuffers.stroke_rect(index, LEFT, TOP, BODY_WIDTH, BODY_HEIGHT, WHITE);
-    framebuffers.stroke_rect(
-        index,
+    framebuffer.stroke_rect(LEFT, TOP, BODY_WIDTH, BODY_HEIGHT, WHITE);
+    framebuffer.stroke_rect(
         LEFT + BODY_WIDTH,
         TOP + (BODY_HEIGHT - CAP_HEIGHT) / 2,
         CAP_WIDTH,
@@ -177,8 +163,7 @@ fn draw_battery(framebuffers: &mut DoubleBuffer, index: usize, percent: u32, col
     let available_height = BODY_HEIGHT - INNER * 2;
     let filled = available_height * percent as usize / 100;
     if filled > 0 {
-        framebuffers.fill_rect(
-            index,
+        framebuffer.fill_rect(
             LEFT + INNER,
             TOP + INNER + available_height - filled,
             BODY_WIDTH - INNER * 2,
@@ -189,29 +174,20 @@ fn draw_battery(framebuffers: &mut DoubleBuffer, index: usize, percent: u32, col
     let mut text = Text::new();
     text.push_u32(percent);
     text.push_str("%");
-    framebuffers.draw_text(
-        index,
-        LEFT + 92,
-        TOP + 136,
-        text.as_str(),
-        5,
-        WHITE,
-        Some(BLACK),
-    );
+    framebuffer.draw_text(LEFT + 92, TOP + 136, text.as_str(), 5, WHITE, Some(BLACK));
 }
 
 fn draw_value(
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
+    framebuffer: &mut Framebuffer,
     x: usize,
     y: usize,
     label: &str,
     value: &str,
     value_color: u16,
 ) {
-    framebuffers.draw_text(index, x, y, label, 2, WHITE, None);
-    framebuffers.draw_text(index, x, y + 34, value, 5, value_color, None);
-    framebuffers.draw_line(index, x, y + 102, WIDTH - 54, y + 102, 0x39E7);
+    framebuffer.draw_text(x, y, label, 2, WHITE, None);
+    framebuffer.draw_text(x, y + 34, value, 5, value_color, None);
+    framebuffer.draw_line(x, y + 102, WIDTH - 54, y + 102, 0x39E7);
 }
 
 fn voltage_percent(voltage_mv: u32) -> u32 {
@@ -233,17 +209,14 @@ fn level_color(percent: u32) -> u16 {
     }
 }
 
-fn show_unavailable(framebuffers: &mut DoubleBuffer, error: InitError) {
-    let displayed = interrupts::active_framebuffer();
-    for index in [displayed ^ 1, displayed] {
-        framebuffers.fill(index, BLACK);
-        framebuffers.draw_text(index, 32, 26, "BATTERY MONITOR", 4, CYAN, None);
-        framebuffers.draw_text(index, 32, 160, error.message(), 3, RED, None);
-        framebuffers.draw_text(index, 32, 220, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
-        if !framebuffers.flush(index) {
-            uart::log(b"Battery: unavailable-screen flush failed\r\n");
-            return;
-        }
+fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
+    framebuffer.fill(BLACK);
+    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 4, CYAN, None);
+    framebuffer.draw_text(32, 160, error.message(), 3, RED, None);
+    framebuffer.draw_text(32, 220, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
+    if !framebuffer.flush() {
+        uart::log(b"Battery: unavailable-screen flush failed\r\n");
+        return;
     }
     uart::log(error.log_message());
 }

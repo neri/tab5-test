@@ -107,7 +107,9 @@ pub fn find_hid_keyboard(config: &[u8]) -> Option<HidKeyboardInterface> {
                     if endpoint_descriptor_type == protocol::DESCRIPTOR_TYPE_INTERFACE {
                         break; // next interface started; this one had no usable endpoint
                     }
-                    if endpoint_descriptor_type == protocol::DESCRIPTOR_TYPE_ENDPOINT && endpoint_length >= 7 {
+                    if endpoint_descriptor_type == protocol::DESCRIPTOR_TYPE_ENDPOINT
+                        && endpoint_length >= 7
+                    {
                         let endpoint_address = config[endpoint_offset + 2];
                         let attributes = config[endpoint_offset + 3];
                         let is_interrupt = attributes & 0x03 == 3;
@@ -164,8 +166,11 @@ impl UsbKeyboard {
         let hid = find_hid_keyboard(device.config_bytes())?;
         let pipe = device.control_pipe();
 
-        let setup =
-            protocol::build_standard_out_setup(REQUEST_SET_CONFIGURATION, device.configuration_value as u16, 0);
+        let setup = protocol::build_standard_out_setup(
+            REQUEST_SET_CONFIGURATION,
+            device.configuration_value as u16,
+            0,
+        );
         if !protocol::control_transfer_out_no_data(&pipe, &setup) {
             uart::log(b"USB: SET_CONFIGURATION failed\r\n");
             return None;
@@ -349,19 +354,27 @@ fn translate_keycode(keycode: u8, shift: bool) -> Option<Key> {
     match keycode {
         0x04..=0x1D => {
             let letter = b'a' + (keycode - 0x04);
-            Some(Key::Ascii(if shift { letter.to_ascii_uppercase() } else { letter }))
+            Some(Key::Ascii(if shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter
+            }))
         }
         0x1E..=0x27 => {
             const UNSHIFTED: &[u8; 10] = b"1234567890";
             const SHIFTED: &[u8; 10] = b"!@#$%^&*()";
             let index = (keycode - 0x1E) as usize;
-            Some(Key::Ascii(if shift { SHIFTED[index] } else { UNSHIFTED[index] }))
+            Some(Key::Ascii(if shift {
+                SHIFTED[index]
+            } else {
+                UNSHIFTED[index]
+            }))
         }
         0x28 => Some(Key::Ascii(b'\r')), // Enter
         0x29 => Some(Key::Escape),
-        0x2A => Some(Key::Ascii(0x08)), // Backspace
+        0x2A => Some(Key::Ascii(0x08)),  // Backspace
         0x2B => Some(Key::Ascii(b'\t')), // Tab
-        0x2C => Some(Key::Ascii(b' ')), // Space
+        0x2C => Some(Key::Ascii(b' ')),  // Space
         0x2D => Some(Key::Ascii(if shift { b'_' } else { b'-' })),
         0x2E => Some(Key::Ascii(if shift { b'+' } else { b'=' })),
         0x2F => Some(Key::Ascii(if shift { b'{' } else { b'[' })),

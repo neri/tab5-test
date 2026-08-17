@@ -2,8 +2,8 @@
 //!
 //! Maps the Tab5's full 32 MiB PSRAM at `0x4800_0000` (well within the chip's
 //! 64 MiB PSRAM MMU window) and verifies the mapping before returning it to
-//! the caller. The first two framebuffer-sized slots back the LCD module;
-//! [`Psram::heap`] exposes everything after them for a global allocator.
+//! the caller. The first framebuffer-sized slot backs the LCD module;
+//! [`Psram::heap`] exposes everything after it for a global allocator.
 
 use core::mem::transmute;
 
@@ -13,7 +13,6 @@ pub const WIDTH: usize = 720;
 pub const HEIGHT: usize = 1280;
 pub const BYTES_PER_PIXEL: usize = 2;
 pub const FRAMEBUFFER_BYTES: usize = WIDTH * HEIGHT * BYTES_PER_PIXEL;
-pub const FRAMEBUFFER_COUNT: usize = 2;
 
 const PSRAM_VADDR: usize = 0x4800_0000;
 pub const MAPPED_BYTES: usize = 32 * 1024 * 1024;
@@ -68,26 +67,24 @@ pub struct Psram {
 }
 
 impl Psram {
-    pub fn framebuffer(&self, index: usize) -> Option<*mut u16> {
-        if index >= FRAMEBUFFER_COUNT {
+    pub fn framebuffer(&self) -> Option<*mut u16> {
+        if FRAMEBUFFER_BYTES > self.bytes {
             return None;
         }
-        let offset = index * FRAMEBUFFER_BYTES;
-        if offset + FRAMEBUFFER_BYTES > self.bytes {
-            return None;
-        }
-        Some((self.base + offset) as *mut u16)
+        Some(self.base as *mut u16)
     }
 
-    /// Returns the PSRAM span after the two framebuffers, for use as a heap.
+    /// Returns the PSRAM span after the framebuffer, for use as a heap.
     pub fn heap(&self) -> (*mut u8, usize) {
-        let offset = FRAMEBUFFER_COUNT * FRAMEBUFFER_BYTES;
-        ((self.base + offset) as *mut u8, self.bytes - offset)
+        (
+            (self.base + FRAMEBUFFER_BYTES) as *mut u8,
+            self.bytes - FRAMEBUFFER_BYTES,
+        )
     }
 
-    /// Writes back a bounded byte range within one framebuffer.
-    pub fn writeback_range(&self, index: usize, offset: usize, bytes: usize) -> bool {
-        let Some(framebuffer) = self.framebuffer(index) else {
+    /// Writes back a bounded byte range within the framebuffer.
+    pub fn writeback_range(&self, offset: usize, bytes: usize) -> bool {
+        let Some(framebuffer) = self.framebuffer() else {
             return false;
         };
         let Some(end) = offset.checked_add(bytes) else {
@@ -119,6 +116,21 @@ impl Psram {
             let l2 = writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
             l1 == 0 && l2 == 0
         }
+    }
+}
+
+/// Writes back and invalidates an arbitrary span of the mapped PSRAM window.
+///
+/// Unlike `Psram::writeback_range`, which is bounded to the framebuffer, this
+/// takes a raw address so a caller staging its own buffer -- `membench`
+/// wanting a cold cache before each pass -- can drop it out of both levels.
+/// The caller is responsible for the span lying inside the mapping.
+pub fn writeback_invalidate(address: usize, bytes: usize) {
+    let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
+        unsafe { transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
+    unsafe {
+        writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, bytes as u32);
+        writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, bytes as u32);
     }
 }
 
@@ -209,7 +221,7 @@ pub fn init() -> Option<Psram> {
         base: PSRAM_VADDR,
         bytes: MAPPED_BYTES,
     };
-    uart::log(b"PSRAM: ready (2 framebuffers + heap)\r\n");
+    uart::log(b"PSRAM: ready (framebuffer + heap)\r\n");
     Some(psram)
 }
 

@@ -409,7 +409,14 @@ impl UsbMassStorage {
     /// Sense Key (byte 2, low nibble) out of it.
     pub fn request_sense(&mut self) -> Option<[u8; REQUEST_SENSE_RESPONSE_LEN]> {
         let mut data = [0u8; REQUEST_SENSE_RESPONSE_LEN];
-        let cdb: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, REQUEST_SENSE_RESPONSE_LEN as u8, 0];
+        let cdb: [u8; 6] = [
+            SCSI_REQUEST_SENSE,
+            0,
+            0,
+            0,
+            REQUEST_SENSE_RESPONSE_LEN as u8,
+            0,
+        ];
         let (transferred, status) = self.execute_command(&cdb, true, &mut data)?;
         if status != CSW_STATUS_PASSED {
             uart::log_hex(b"USB MSC: REQUEST SENSE failed, CSW status=", status as u32);
@@ -433,7 +440,10 @@ impl UsbMassStorage {
         let cdb: [u8; 10] = [SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let (transferred, status) = self.execute_command(&cdb, true, &mut data)?;
         if status != CSW_STATUS_PASSED {
-            uart::log_hex(b"USB MSC: READ CAPACITY(10) failed, CSW status=", status as u32);
+            uart::log_hex(
+                b"USB MSC: READ CAPACITY(10) failed, CSW status=",
+                status as u32,
+            );
             return None;
         }
         if transferred < data.len() {
@@ -446,7 +456,10 @@ impl UsbMassStorage {
             return None;
         }
         let block_length = u32::from_be_bytes(data[4..8].try_into().unwrap());
-        Some(ReadCapacity { last_lba, block_length })
+        Some(ReadCapacity {
+            last_lba,
+            block_length,
+        })
     }
 
     /// SCSI READ(10) (SBC, opcode 0x28): reads consecutive 512-byte blocks
@@ -457,7 +470,9 @@ impl UsbMassStorage {
     /// either with the same call shape.
     pub fn read_blocks(&mut self, lba: u32, buffer: &mut [u8]) -> bool {
         if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
-            uart::log(b"USB MSC: block transfer length must be a nonzero multiple of 512 bytes\r\n");
+            uart::log(
+                b"USB MSC: block transfer length must be a nonzero multiple of 512 bytes\r\n",
+            );
             return false;
         }
         let block_count = buffer.len() / BLOCK_BYTES;
@@ -502,10 +517,19 @@ impl UsbMassStorage {
     /// number of bytes actually moved in the data phase and the CSW status
     /// byte (0 = Passed) -- callers decide what a nonzero status means for
     /// their specific command.
-    fn execute_command(&mut self, cdb: &[u8], direction_in: bool, data: &mut [u8]) -> Option<(usize, u8)> {
+    fn execute_command(
+        &mut self,
+        cdb: &[u8],
+        direction_in: bool,
+        data: &mut [u8],
+    ) -> Option<(usize, u8)> {
         self.next_tag = self.next_tag.wrapping_add(1);
         let tag = self.next_tag;
-        let flags = if direction_in { CBW_FLAGS_DATA_IN } else { CBW_FLAGS_DATA_OUT };
+        let flags = if direction_in {
+            CBW_FLAGS_DATA_IN
+        } else {
+            CBW_FLAGS_DATA_OUT
+        };
         let mut cbw = build_cbw(tag, data.len() as u32, flags, cdb);
         if !self.bulk_transfer_out(&mut cbw) {
             uart::log(b"USB MSC: CBW send failed\r\n");

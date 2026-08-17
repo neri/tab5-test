@@ -1,6 +1,6 @@
 //! Full-screen multi-touch diagnostic entered through `touchtest`.
 
-use crate::framebuffer::{DoubleBuffer, BLACK, CYAN, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
+use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
 use crate::input::InputManager;
 use crate::touch::{Touch, TouchPoint};
 use crate::{interrupts, uart};
@@ -26,58 +26,37 @@ const PEAK_TEXT: [&str; MAX_POINTS + 1] = [
 
 /// Shows the active contact count and succeeds once two contacts are read in
 /// the same controller report. Press any managed keyboard key to exit.
-pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
+pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let touch_panel = Touch::init();
-    let displayed = interrupts::active_framebuffer();
-    for index in [displayed ^ 1, displayed] {
-        framebuffers.fill(index, BLACK);
-        framebuffers.draw_text(index, 16, 8, "MULTITOUCH TEST", 3, CYAN, None);
-        framebuffers.draw_text(
-            index,
-            16,
-            48,
-            "Place two or more fingers on the screen.",
-            2,
-            WHITE,
-            None,
-        );
-        framebuffers.draw_text(
-            index,
-            16,
-            72,
-            "A simultaneous count of 2 or more is a PASS.",
-            2,
-            WHITE,
-            None,
-        );
-        framebuffers.draw_text(
-            index,
-            16,
-            104,
-            "Press any key to exit.",
-            2,
-            YELLOW,
-            None,
-        );
-        if let Some(panel) = touch_panel.as_ref() {
-            framebuffers.draw_text(index, 16, 128, panel.controller_name(), 2, CYAN, None);
-            framebuffers.draw_text(
-                index,
-                16,
-                152,
-                configured_text(panel.max_touches()),
-                2,
-                CYAN,
-                None,
-            );
-        } else {
-            framebuffers.draw_text(index, 16, 128, "NO TOUCH CONTROLLER FOUND", 2, RED, None);
-        }
-        draw_status(framebuffers, index, 0, 0, false);
-        if !framebuffers.flush(index) {
-            uart::log(b"Touch test: initial flush failed\r\n");
-            return;
-        }
+    framebuffer.fill(BLACK);
+    framebuffer.draw_text(16, 8, "MULTITOUCH TEST", 3, CYAN, None);
+    framebuffer.draw_text(
+        16,
+        48,
+        "Place two or more fingers on the screen.",
+        2,
+        WHITE,
+        None,
+    );
+    framebuffer.draw_text(
+        16,
+        72,
+        "A simultaneous count of 2 or more is a PASS.",
+        2,
+        WHITE,
+        None,
+    );
+    framebuffer.draw_text(16, 104, "Press any key to exit.", 2, YELLOW, None);
+    if let Some(panel) = touch_panel.as_ref() {
+        framebuffer.draw_text(16, 128, panel.controller_name(), 2, CYAN, None);
+        framebuffer.draw_text(16, 152, configured_text(panel.max_touches()), 2, CYAN, None);
+    } else {
+        framebuffer.draw_text(16, 128, "NO TOUCH CONTROLLER FOUND", 2, RED, None);
+    }
+    draw_status(framebuffer, 0, 0, false);
+    if !framebuffer.flush() {
+        uart::log(b"Touch test: initial flush failed\r\n");
+        return;
     }
 
     let Some(panel) = touch_panel.as_ref() else {
@@ -121,13 +100,10 @@ pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
         if newly_passed {
             uart::log(b"Touch test: PASS (multi-touch observed)\r\n");
         }
-        let displayed = interrupts::active_framebuffer();
-        for index in [displayed ^ 1, displayed] {
-            draw_status(framebuffers, index, current, peak, passed);
-            if !framebuffers.flush_rect(index, 0, 176, WIDTH, HEIGHT - 176) {
-                uart::log(b"Touch test: flush failed\r\n");
-                return;
-            }
+        draw_status(framebuffer, current, peak, passed);
+        if !framebuffer.flush_rect(0, 176, WIDTH, HEIGHT - 176) {
+            uart::log(b"Touch test: flush failed\r\n");
+            return;
         }
     }
 }
@@ -148,22 +124,16 @@ fn configured_text(max_touches: usize) -> &'static str {
     }
 }
 
-fn draw_status(
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
-    current: usize,
-    peak: usize,
-    passed: bool,
-) {
-    framebuffers.fill_rect(index, 0, 176, WIDTH, HEIGHT - 176, BLACK);
-    framebuffers.draw_text(index, 16, 192, COUNT_TEXT[current], 4, WHITE, None);
-    framebuffers.draw_text(index, 16, 240, PEAK_TEXT[peak], 3, WHITE, None);
+fn draw_status(framebuffer: &mut Framebuffer, current: usize, peak: usize, passed: bool) {
+    framebuffer.fill_rect(0, 176, WIDTH, HEIGHT - 176, BLACK);
+    framebuffer.draw_text(16, 192, COUNT_TEXT[current], 4, WHITE, None);
+    framebuffer.draw_text(16, 240, PEAK_TEXT[peak], 3, WHITE, None);
     let (message, color) = if passed {
         ("PASS: MULTITOUCH DETECTED", GREEN)
     } else {
         ("WAITING FOR 2+ SIMULTANEOUS TOUCHES", YELLOW)
     };
-    framebuffers.draw_text(index, 16, 288, message, 3, color, None);
+    framebuffer.draw_text(16, 288, message, 3, color, None);
 }
 
 fn wait_for_key(input: &mut InputManager) {

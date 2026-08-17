@@ -220,8 +220,7 @@ pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
 
     let mut config_descriptor = [0u8; CONFIG_BUFFER_MAX];
     let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_CONFIGURATION, 0, total_length as u16);
-    let Some(received) =
-        control_transfer_in(&pipe, &setup, &mut config_descriptor[..total_length])
+    let Some(received) = control_transfer_in(&pipe, &setup, &mut config_descriptor[..total_length])
     else {
         uart::log(b"USB: full configuration descriptor read failed\r\n");
         return None;
@@ -285,7 +284,11 @@ pub fn build_standard_out_setup(request: u8, value: u16, index: u16) -> [u8; 8] 
 /// `setup` is passed in whole rather than built here, so class drivers can
 /// issue their own class-specific IN requests (`hub.rs`'s hub descriptor
 /// and status reads) through the same staging as standard ones.
-pub fn control_transfer_in(pipe: &ControlPipe, setup: &[u8; 8], buffer: &mut [u8]) -> Option<usize> {
+pub fn control_transfer_in(
+    pipe: &ControlPipe,
+    setup: &[u8; 8],
+    buffer: &mut [u8],
+) -> Option<usize> {
     control_transfer_in_with_diagnostics(pipe, setup, buffer, true)
 }
 

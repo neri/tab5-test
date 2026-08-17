@@ -12,9 +12,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::console::Console;
-use crate::{interrupts, lcd, mbr, power, psram, sdmmc, startup, uart, usb};
+use crate::framebuffer::Framebuffer;
+use crate::{icm, interrupts, lcd, mbr, membench, power, psram, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
+/// Fixed, because the panel only tolerates the one set of vertical timings
+/// (see `lcd`'s `VFP_LINES`).
 const FRAMES_PER_SECOND: u32 = 57;
 
 /// One `help` entry: the bare command name (used both to look commands up
@@ -27,24 +30,88 @@ struct HelpEntry {
 }
 
 const HELP_ENTRIES: &[HelpEntry] = &[
-    HelpEntry { name: "help", usage: "help [command]", lines: &["list commands, or describe one"] },
-    HelpEntry { name: "clear", usage: "clear", lines: &["clear the screen"] },
-    HelpEntry { name: "echo", usage: "echo <text>", lines: &["print text back"] },
-    HelpEntry { name: "about", usage: "about", lines: &["firmware banner"] },
+    HelpEntry {
+        name: "help",
+        usage: "help [command]",
+        lines: &["list commands, or describe one"],
+    },
+    HelpEntry {
+        name: "clear",
+        usage: "clear",
+        lines: &["clear the screen"],
+    },
+    HelpEntry {
+        name: "echo",
+        usage: "echo <text>",
+        lines: &["print text back"],
+    },
+    HelpEntry {
+        name: "about",
+        usage: "about",
+        lines: &["firmware banner"],
+    },
     HelpEntry {
         name: "cpuinfo",
         usage: "cpuinfo",
         lines: &["show RISC-V machine identification CSRs"],
     },
-    HelpEntry { name: "mem", usage: "mem", lines: &["PSRAM/RAM usage"] },
+    HelpEntry {
+        name: "mem",
+        usage: "mem",
+        lines: &["PSRAM/RAM usage"],
+    },
     HelpEntry {
         name: "alloctest",
         usage: "alloctest <MiB>",
         lines: &["allocate N MiB on the PSRAM heap, verify read/write"],
     },
-    HelpEntry { name: "uptime", usage: "uptime", lines: &["time since boot"] },
-    HelpEntry { name: "backlight", usage: "backlight on|off", lines: &["LCD backlight"] },
-    HelpEntry { name: "paint", usage: "paint", lines: &["touch drawing screen"] },
+    HelpEntry {
+        name: "stress",
+        usage: "stress [count]",
+        lines: &[
+            "repeat a full-screen fill and report how long it took and how",
+            "many DPI FIFO underruns it caused. a fixed, countable workload,",
+            "so settings can be compared: run it, change one thing (say the",
+            "'icm' priority), run it again with the same count.",
+        ],
+    },
+    HelpEntry {
+        name: "membench",
+        usage: "membench",
+        lines: &[
+            "measure CPU access to SRAM, cached PSRAM, and the direct alias.",
+            "the 'line' rows are the ones that matter: one access per 64-byte",
+            "cache line, which is what a per-pixel drawing loop produces and",
+            "so the real price of write-allocate. scanout keeps running, so",
+            "the PSRAM figures include the bandwidth the display is taking.",
+        ],
+    },
+    HelpEntry {
+        name: "uptime",
+        usage: "uptime",
+        lines: &["time since boot"],
+    },
+    HelpEntry {
+        name: "backlight",
+        usage: "backlight on|off",
+        lines: &["LCD backlight"],
+    },
+    HelpEntry {
+        name: "icm",
+        usage: "icm [priority arqos]",
+        lines: &[
+            "display DMA arbitration and DPI FIFO underruns. with no",
+            "argument, report the interconnect registers and the underrun",
+            "count. with two values (0-15), set the DW-GDMA read priority",
+            "and AXI QoS; 15 15 measurably lowers the underrun rate, 0 0",
+            "is the power-on state. compare with 'stress'.",
+        ],
+    },
+    HelpEntry {
+        name: "paint",
+        usage: "paint",
+        lines: &["touch drawing screen"],
+    },
     HelpEntry {
         name: "touchtest",
         usage: "touchtest",
@@ -164,7 +231,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "usbmbr",
         lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
     },
-    HelpEntry { name: "reboot", usage: "reboot", lines: &["restart the board"] },
+    HelpEntry {
+        name: "reboot",
+        usage: "reboot",
+        lines: &["restart the board"],
+    },
 ];
 
 /// What the foreground application loop should do once a command has
@@ -195,7 +266,12 @@ pub enum Outcome {
 /// devices already in it instead of probing the bus independently, which
 /// is what used to let a diagnostic command reset a live keyboard/Mass
 /// Storage session out from under itself.
-pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) -> Outcome {
+pub fn execute(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    line: &[u8],
+    usb_host: &mut usb::UsbHost,
+) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
         return Outcome::Continue;
@@ -210,46 +286,49 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
     let (command, rest) = split_first_word(line);
     let argument = trim(rest);
     match command {
-        b"help" => cmd_help(console, argument),
-        b"clear" => console.clear(),
-        b"echo" => console.write_output_line(as_str(argument)),
-        b"about" | b"version" => console.write_output_line("Tab5 Shell 0.1"),
-        b"cpuinfo" => cmd_cpuinfo(console),
-        b"mem" => cmd_mem(console),
-        b"alloctest" => cmd_alloctest(console, argument),
-        b"uptime" => cmd_uptime(console),
-        b"backlight" => cmd_backlight(console, argument),
-        b"sdinfo" => cmd_sdinfo(console),
-        b"sdread" => cmd_sdread(console, argument),
-        b"sdreadn" => cmd_sdreadn(console, argument),
-        b"sdwritetest" => cmd_sdwritetest(console, argument),
-        b"sdzero" => cmd_sdzero(console, argument),
-        b"sdmbr" => cmd_sdmbr(console),
-        b"sdreadpsram" => cmd_sdreadpsram(console, argument),
-        b"usbinfo" => cmd_usbinfo(console, usb_host),
-        b"usbrescan" => cmd_usbrescan(console, usb_host),
-        b"usbvbus" => cmd_usbvbus(console, argument),
-        b"usbhub" => cmd_usbhub(console, usb_host),
-        b"usbhw" => cmd_usbhw(console, usb_host),
-        b"usbmsc" => cmd_usbmsc(console, usb_host),
-        b"usbread" => cmd_usbread(console, argument, usb_host),
-        b"usbmbr" => cmd_usbmbr(console, usb_host),
+        b"help" => cmd_help(console, framebuffer, argument),
+        b"clear" => console.clear(framebuffer),
+        b"echo" => console.write_output_line(framebuffer, as_str(argument)),
+        b"about" | b"version" => console.write_output_line(framebuffer, "Tab5 Shell 0.1"),
+        b"cpuinfo" => cmd_cpuinfo(console, framebuffer),
+        b"mem" => cmd_mem(console, framebuffer),
+        b"alloctest" => cmd_alloctest(console, framebuffer, argument),
+        b"uptime" => cmd_uptime(console, framebuffer),
+        b"membench" => cmd_membench(console, framebuffer),
+        b"stress" => cmd_stress(console, framebuffer, argument),
+        b"backlight" => cmd_backlight(console, framebuffer, argument),
+        b"icm" => cmd_icm(console, framebuffer, argument),
+        b"sdinfo" => cmd_sdinfo(console, framebuffer),
+        b"sdread" => cmd_sdread(console, framebuffer, argument),
+        b"sdreadn" => cmd_sdreadn(console, framebuffer, argument),
+        b"sdwritetest" => cmd_sdwritetest(console, framebuffer, argument),
+        b"sdzero" => cmd_sdzero(console, framebuffer, argument),
+        b"sdmbr" => cmd_sdmbr(console, framebuffer),
+        b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
+        b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
+        b"usbrescan" => cmd_usbrescan(console, framebuffer, usb_host),
+        b"usbvbus" => cmd_usbvbus(console, framebuffer, argument),
+        b"usbhub" => cmd_usbhub(console, framebuffer, usb_host),
+        b"usbhw" => cmd_usbhw(console, framebuffer, usb_host),
+        b"usbmsc" => cmd_usbmsc(console, framebuffer, usb_host),
+        b"usbread" => cmd_usbread(console, framebuffer, argument, usb_host),
+        b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
         b"axistest" => return Outcome::AxisTest,
         b"battery" | b"batinfo" => return Outcome::Battery,
         b"reboot" | b"reset" => {
-            console.write_output_line("rebooting...");
+            console.write_output_line(framebuffer, "rebooting...");
             return Outcome::Reboot;
         }
         b"shutdown" | b"poweroff" => {
             if argument.is_empty() {
-                console.write_output_line("shutting down...");
+                console.write_output_line(framebuffer, "shutting down...");
                 return Outcome::Shutdown;
             }
-            console.write_output_line("usage: shutdown");
+            console.write_output_line(framebuffer, "usage: shutdown");
         }
-        _ => console.write_output_line("unknown command (try 'help')"),
+        _ => console.write_output_line(framebuffer, "unknown command (try 'help')"),
     }
     Outcome::Continue
 }
@@ -257,6 +336,12 @@ pub fn execute(console: &mut Console, line: &[u8], usb_host: &mut usb::UsbHost) 
 /// Reboots the board. The caller must have already flushed the "rebooting..."
 /// output to the panel; this never returns.
 pub fn reboot() -> ! {
+    // Only the HP CPU core is reset, so scanout would otherwise keep reading
+    // PSRAM -- at the raised interconnect priority this firmware gave it --
+    // right through the bootloader's flash reads and the next boot's PSRAM
+    // bring-up. The boot path quiesces it too, for resets that never reach
+    // here, but that is too late to help the bootloader.
+    lcd::quiesce_dma();
     startup::reboot()
 }
 
@@ -271,9 +356,9 @@ pub fn shutdown() -> bool {
 /// With no argument, lists command names only; with a command name, shows
 /// its usage and description. `write_output_line` wraps at the console's
 /// column width on its own, so the name list can just be one long line.
-fn cmd_help(console: &mut Console, argument: &[u8]) {
+fn cmd_help(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     if argument.is_empty() {
-        console.write_output_line("commands (help <name> for details):");
+        console.write_output_line(framebuffer, "commands (help <name> for details):");
         let mut names = String::new();
         for (index, entry) in HELP_ENTRIES.iter().enumerate() {
             if index > 0 {
@@ -281,41 +366,40 @@ fn cmd_help(console: &mut Console, argument: &[u8]) {
             }
             names.push_str(entry.name);
         }
-        console.write_output_line(&names);
+        console.write_output_line(framebuffer, &names);
         return;
     }
 
     let name = as_str(argument);
     match HELP_ENTRIES.iter().find(|entry| entry.name == name) {
         Some(entry) => {
-            console.write_output_line(entry.usage);
+            console.write_output_line(framebuffer, entry.usage);
             for line in entry.lines {
-                console.write_output_line(line);
+                console.write_output_line(framebuffer, line);
             }
         }
-        None => console.write_output_line("unknown command (try 'help')"),
+        None => console.write_output_line(framebuffer, "unknown command (try 'help')"),
     }
 }
 
-fn cmd_mem(console: &mut Console) {
+fn cmd_mem(console: &mut Console, framebuffer: &mut Framebuffer) {
     let mut line = Line::new();
     line.push_str("PSRAM window: ");
     line.push_u32(psram::MAPPED_BYTES as u32);
     line.push_str(" bytes");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("framebuffer: ");
     line.push_u32(psram::FRAMEBUFFER_BYTES as u32);
-    line.push_str(" bytes x");
-    line.push_u32(psram::FRAMEBUFFER_COUNT as u32);
-    console.write_output_line(line.as_str());
+    line.push_str(" bytes");
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("heap: ");
     line.push_u32((heap_bytes() / (1024 * 1024)) as u32);
     line.push_str(" MiB");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// Shows the standard RISC-V machine identification registers verbatim.
@@ -325,7 +409,7 @@ fn cmd_mem(console: &mut Console) {
 /// core name. `mhartid` identifies the hart executing this shell command.
 /// The `misa` line additionally renders its known single-letter ISA
 /// extensions in the RISC-V canonical order.
-fn cmd_cpuinfo(console: &mut Console) {
+fn cmd_cpuinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
     let mvendorid: u32;
     let marchid: u32;
     let mimpid: u32;
@@ -339,7 +423,7 @@ fn cmd_cpuinfo(console: &mut Console) {
         core::arch::asm!("csrr {value}, misa", value = out(reg) misa, options(nomem, nostack));
     }
 
-    console.write_output_line("RISC-V machine CSRs:");
+    console.write_output_line(framebuffer, "RISC-V machine CSRs:");
     for (name, value) in [
         ("mvendorid", mvendorid),
         ("marchid", marchid),
@@ -350,7 +434,7 @@ fn cmd_cpuinfo(console: &mut Console) {
         line.push_str(name);
         line.push_str(": 0x");
         line.push_hex(value, 8);
-        console.write_output_line(line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
     }
 
     let mut line = Line::new();
@@ -359,7 +443,7 @@ fn cmd_cpuinfo(console: &mut Console) {
     line.push_str(" (");
     push_misa_isa(&mut line, misa);
     line.push_str(")");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// Appends the ISA name derivable from `misa`.
@@ -408,20 +492,20 @@ fn misa_has_extension(misa: u32, extension: u8) -> bool {
 /// Bytes of PSRAM past the two framebuffers, matching `Psram::heap`'s split
 /// and backing the global allocator installed in `main`.
 fn heap_bytes() -> usize {
-    psram::MAPPED_BYTES - psram::FRAMEBUFFER_COUNT * psram::FRAMEBUFFER_BYTES
+    psram::MAPPED_BYTES - psram::FRAMEBUFFER_BYTES
 }
 
 /// Allocates `mib` MiB from the PSRAM-backed global allocator, fills it with
 /// a per-byte pattern derived from its index, reads it back and reports any
 /// mismatch. Uses `try_reserve_exact` so a too-large request reports failure
 /// instead of aborting the firmware.
-fn cmd_alloctest(console: &mut Console, argument: &[u8]) {
+fn cmd_alloctest(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let Some(mib) = parse_u32(argument) else {
-        console.write_output_line("usage: alloctest <MiB>");
+        console.write_output_line(framebuffer, "usage: alloctest <MiB>");
         return;
     };
     if mib == 0 {
-        console.write_output_line("MiB must be at least 1");
+        console.write_output_line(framebuffer, "MiB must be at least 1");
         return;
     }
     let bytes = mib as usize * 1024 * 1024;
@@ -432,21 +516,24 @@ fn cmd_alloctest(console: &mut Console, argument: &[u8]) {
     line.push_str(" MiB (heap has ");
     line.push_u32((heap_bytes() / (1024 * 1024)) as u32);
     line.push_str(" MiB)...");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut buffer: Vec<u8> = Vec::new();
     if buffer.try_reserve_exact(bytes).is_err() {
-        console.write_output_line("allocation failed (not enough contiguous heap)");
+        console.write_output_line(
+            framebuffer,
+            "allocation failed (not enough contiguous heap)",
+        );
         return;
     }
     buffer.resize(bytes, 0);
 
-    console.write_output_line("writing pattern...");
+    console.write_output_line(framebuffer, "writing pattern...");
     for (index, byte) in buffer.iter_mut().enumerate() {
         *byte = pattern_byte(index);
     }
 
-    console.write_output_line("verifying...");
+    console.write_output_line(framebuffer, "verifying...");
     let mut mismatches: u32 = 0;
     let mut first_mismatch = None;
     for (index, &byte) in buffer.iter().enumerate() {
@@ -470,7 +557,7 @@ fn cmd_alloctest(console: &mut Console, argument: &[u8]) {
         line.push_str(" mismatch(es), first at offset 0x");
         line.push_hex(first_mismatch.unwrap_or(0) as u32, 8);
     }
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// A well-mixed byte per index so nearby or aliased addresses are unlikely
@@ -479,19 +566,222 @@ fn pattern_byte(index: usize) -> u8 {
     ((index as u32).wrapping_mul(2_654_435_761) >> 24) as u8
 }
 
-fn cmd_uptime(console: &mut Console) {
+/// Repeats a full-screen fill and reports its cost.
+///
+/// A full-screen fill is the redraw that starves the DSI bridge, so this is
+/// both the workload that provokes underruns and the baseline any replacement
+/// for it has to beat. Fixed and countable, so two settings can be compared by
+/// running the same count under each.
+fn cmd_stress(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    let count = if argument.is_empty() {
+        10
+    } else {
+        match parse_u32(argument) {
+            Some(value) if value > 0 && value <= 1000 => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: stress [count] (1-1000)");
+                return;
+            }
+        }
+    };
+
+    // The underrun indication is one sticky bit and the frame loop is what
+    // normally consumes it. This loop never yields to the frame loop, so it
+    // has to consume the bit itself -- and between fills rather than once at
+    // the end, or every underrun in the whole run collapses into one.
+    lcd::take_underrun();
+    let start = membench::cycles();
+    let mut underruns = 0u32;
+    for _ in 0..count {
+        framebuffer.fill(crate::framebuffer::BLACK);
+        framebuffer.flush();
+        if lcd::take_underrun() {
+            underruns += 1;
+        }
+    }
+    let elapsed = membench::cycles().wrapping_sub(start);
+
+    // The screen is now blank; put the console back over it.
+    console.clear(framebuffer);
+    console.write_prompt(framebuffer);
+
+    let cpu_hz = startup::cpu_hz();
+    let microseconds = ((elapsed as u64) * 1_000_000 / cpu_hz as u64) as u32;
+
+    let mut line = Line::new();
+    line.push_str("stress: ");
+    line.push_u32(count);
+    line.push_str(" full-screen fills in ");
+    line.push_u32(microseconds / 1000);
+    line.push_str(" ms");
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("per fill: ");
+    line.push_u32(microseconds / count.max(1) / 1000);
+    line.push_str(" ms   fills that underran: ");
+    line.push_u32(underruns);
+    line.push_str("/");
+    line.push_u32(count);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Measures CPU-side memory cost and prints it.
+///
+/// The estimates this replaces were built from the MSPI timing registers with
+/// a guessed command-phase length; these are the cycle counter's answer.
+fn cmd_membench(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "measuring (scanout keeps running)...");
+
+    // A 64-byte aligned span of the PSRAM heap, big enough that a pass over it
+    // cannot sit in L2.
+    let words = membench::psram_bytes() / 4 + 16;
+    let mut buffer: Vec<u32> = Vec::new();
+    let psram = if buffer.try_reserve_exact(words).is_ok() {
+        buffer.resize(words, 0);
+        let raw = buffer.as_mut_ptr() as usize;
+        let aligned = (raw + 63) & !63;
+        Some((aligned as *mut u32, membench::psram_bytes()))
+    } else {
+        console.write_output_line(framebuffer, "PSRAM buffer allocation failed; SRAM only");
+        None
+    };
+
+    let report = membench::run(psram);
+
+    let mut line = Line::new();
+    line.push_str("CPU ");
+    line.push_u32(report.cpu_hz / 1_000_000);
+    line.push_str(" MHz, SRAM ");
+    line.push_u32((membench::sram_bytes() / 1024) as u32);
+    line.push_str(" KiB, PSRAM ");
+    line.push_u32((membench::psram_bytes() / 1024) as u32);
+    line.push_str(" KiB, L1D ");
+    line.push_u32(report.l1_data_cache_bytes / 1024);
+    line.push_str(" KiB");
+    console.write_output_line(framebuffer, line.as_str());
+
+    throughput_line(
+        console,
+        framebuffer,
+        "seq write u32",
+        |m| m.sequential_write_u32,
+        &report,
+    );
+    throughput_line(
+        console,
+        framebuffer,
+        "seq write u16",
+        |m| m.sequential_write_u16,
+        &report,
+    );
+    throughput_line(
+        console,
+        framebuffer,
+        "seq read  u32",
+        |m| m.sequential_read_u32,
+        &report,
+    );
+    latency_line(
+        console,
+        framebuffer,
+        "line write   ",
+        |m| m.line_write_ns,
+        &report,
+    );
+    latency_line(
+        console,
+        framebuffer,
+        "line read    ",
+        |m| m.line_read_ns,
+        &report,
+    );
+    latency_line(
+        console,
+        framebuffer,
+        "scatter read ",
+        |m| m.scatter_read_ns,
+        &report,
+    );
+
+    // A buffer that fits in L1 measures L1, not the memory behind it. That is
+    // not a footnote: it changes what the SRAM column means entirely.
+    if (membench::sram_bytes() as u32) <= report.l1_data_cache_bytes {
+        console.write_output_line(
+            framebuffer,
+            "WARNING: SRAM buffer fits in L1D; SRAM column is L1, not SRAM",
+        );
+    }
+    console.write_output_line(framebuffer, "(line = 1 access per 64B line, in order)");
+    console.write_output_line(
+        framebuffer,
+        "(scatter = same, but 4 KiB apart: no prefetch)",
+    );
+}
+
+fn throughput_line(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    label: &str,
+    field: fn(&membench::Measurements) -> u32,
+    report: &membench::Report,
+) {
+    let mut line = Line::new();
+    line.push_str(label);
+    line.push_str(": SRAM ");
+    line.push_u32(field(&report.sram));
+    line.push_str(" MB/s");
+    if let Some(psram) = &report.psram {
+        line.push_str("  CACHED ");
+        line.push_u32(field(psram));
+        line.push_str(" MB/s");
+    }
+    if let Some(psram) = &report.psram_direct {
+        line.push_str("  DIRECT ");
+        line.push_u32(field(psram));
+        line.push_str(" MB/s");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn latency_line(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    label: &str,
+    field: fn(&membench::Measurements) -> u32,
+    report: &membench::Report,
+) {
+    let mut line = Line::new();
+    line.push_str(label);
+    line.push_str(": SRAM ");
+    line.push_u32(field(&report.sram));
+    line.push_str(" ns");
+    if let Some(psram) = &report.psram {
+        line.push_str("  CACHED ");
+        line.push_u32(field(psram));
+        line.push_str(" ns");
+    }
+    if let Some(psram) = &report.psram_direct {
+        line.push_str("  DIRECT ");
+        line.push_u32(field(psram));
+        line.push_str(" ns");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn cmd_uptime(console: &mut Console, framebuffer: &mut Framebuffer) {
     let seconds = interrupts::frame_sequence() / FRAMES_PER_SECOND;
     let mut line = Line::new();
     line.push_str("uptime: ~");
     line.push_u32(seconds);
     line.push_str(" s (frame-counted)");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
-fn cmd_sdinfo(console: &mut Console) {
-    console.write_output_line("activating SD card...");
+fn cmd_sdinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
@@ -500,7 +790,7 @@ fn cmd_sdinfo(console: &mut Console) {
     line.push_hex(card.rca as u32, 4);
     line.push_str("  manufacturer ID: 0x");
     line.push_hex(card.cid[3] >> 24, 2);
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("type: ");
@@ -509,7 +799,7 @@ fn cmd_sdinfo(console: &mut Console) {
     } else {
         "SDSC"
     });
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     match card.capacity_bytes {
@@ -520,21 +810,27 @@ fn cmd_sdinfo(console: &mut Console) {
         }
         None => line.push_str("capacity: unknown (CSD v1, not decoded)"),
     }
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     // CSD PERM_WRITE_PROTECT (bit 13) / TMP_WRITE_PROTECT (bit 12), common to
     // both CSD structure versions.
     let write_protected = card.csd[0] & (0b11 << 12) != 0;
-    console.write_output_line(if write_protected {
-        "write-protected: yes"
-    } else {
-        "write-protected: no"
-    });
-    console.write_output_line(if card.bus_width_4bit {
-        "bus width: 4-bit"
-    } else {
-        "bus width: 1-bit (ACMD6 failed or skipped)"
-    });
+    console.write_output_line(
+        framebuffer,
+        if write_protected {
+            "write-protected: yes"
+        } else {
+            "write-protected: no"
+        },
+    );
+    console.write_output_line(
+        framebuffer,
+        if card.bus_width_4bit {
+            "bus width: 4-bit"
+        } else {
+            "bus width: 1-bit (ACMD6 failed or skipped)"
+        },
+    );
     let mut line = Line::new();
     line.push_str("clock: ");
     line.push_u32(card.clock_khz);
@@ -545,25 +841,25 @@ fn cmd_sdinfo(console: &mut Console) {
         "Default Speed"
     });
     line.push_str(")");
-    console.write_output_line(line.as_str());
-    console.write_output_line("full CID/CSD dump: see UART log");
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(framebuffer, "full CID/CSD dump: see UART log");
 }
 
-fn cmd_sdread(console: &mut Console, argument: &[u8]) {
+fn cmd_sdread(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let Some(lba) = parse_u32(argument) else {
-        console.write_output_line("usage: sdread <lba>");
+        console.write_output_line(framebuffer, "usage: sdread <lba>");
         return;
     };
 
-    console.write_output_line("activating SD card...");
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut buffer = [0u8; 512];
     if !sdmmc::read_block(&card, lba, &mut buffer) {
-        console.write_output_line("block read failed, see UART log");
+        console.write_output_line(framebuffer, "block read failed, see UART log");
         return;
     }
     sdmmc::dump_block(&buffer);
@@ -577,40 +873,43 @@ fn cmd_sdread(console: &mut Console, argument: &[u8]) {
         line.push_str(" ");
     }
     line.push_str("...");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let boot_signature = buffer[510] == 0x55 && buffer[511] == 0xAA;
-    console.write_output_line(if boot_signature {
-        "bytes 510-511 = 55 AA (MBR/boot-sector signature)"
-    } else {
-        "no 55 AA signature at bytes 510-511"
-    });
-    console.write_output_line("full 512-byte hex dump: see UART log");
+    console.write_output_line(
+        framebuffer,
+        if boot_signature {
+            "bytes 510-511 = 55 AA (MBR/boot-sector signature)"
+        } else {
+            "no 55 AA signature at bytes 510-511"
+        },
+    );
+    console.write_output_line(framebuffer, "full 512-byte hex dump: see UART log");
 }
 
 const MAX_MULTI_BLOCKS: u32 = 8;
 
-fn cmd_sdreadn(console: &mut Console, argument: &[u8]) {
+fn cmd_sdreadn(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let (lba_text, count_text) = split_first_word(argument);
     let (Some(lba), Some(count)) = (parse_u32(lba_text), parse_u32(trim(count_text))) else {
-        console.write_output_line("usage: sdreadn <lba> <count>");
+        console.write_output_line(framebuffer, "usage: sdreadn <lba> <count>");
         return;
     };
     if count == 0 || count > MAX_MULTI_BLOCKS {
-        console.write_output_line("count must be 1..=8");
+        console.write_output_line(framebuffer, "count must be 1..=8");
         return;
     }
 
-    console.write_output_line("activating SD card...");
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut buffer = [0u8; 512 * MAX_MULTI_BLOCKS as usize];
     let region = &mut buffer[..512 * count as usize];
     if !sdmmc::read_blocks(&card, lba, region) {
-        console.write_output_line("multi-block read failed, see UART log");
+        console.write_output_line(framebuffer, "multi-block read failed, see UART log");
         return;
     }
     for (index, block) in region.chunks_exact(512).enumerate() {
@@ -623,26 +922,32 @@ fn cmd_sdreadn(console: &mut Console, argument: &[u8]) {
     line.push_str(" block(s) from LBA ");
     line.push_u32(lba);
     line.push_str(" via DMA, OK");
-    console.write_output_line(line.as_str());
-    console.write_output_line("full hex dump: see UART log");
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(framebuffer, "full hex dump: see UART log");
 }
 
-fn cmd_sdwritetest(console: &mut Console, argument: &[u8]) {
+fn cmd_sdwritetest(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let Some(lba) = parse_u32(argument) else {
-        console.write_output_line("usage: sdwritetest <lba>");
+        console.write_output_line(framebuffer, "usage: sdwritetest <lba>");
         return;
     };
 
-    console.write_output_line("WARNING: temporarily overwrites 1 block, then restores it");
-    console.write_output_line("activating SD card...");
+    console.write_output_line(
+        framebuffer,
+        "WARNING: temporarily overwrites 1 block, then restores it",
+    );
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut original = [0u8; 512];
     if !sdmmc::read_blocks(&card, lba, &mut original) {
-        console.write_output_line("could not read original block, aborting (nothing written)");
+        console.write_output_line(
+            framebuffer,
+            "could not read original block, aborting (nothing written)",
+        );
         return;
     }
 
@@ -652,66 +957,71 @@ fn cmd_sdwritetest(console: &mut Console, argument: &[u8]) {
     }
 
     if !sdmmc::write_blocks(&card, lba, &mut pattern) {
-        console.write_output_line("pattern write failed, see UART log");
+        console.write_output_line(framebuffer, "pattern write failed, see UART log");
         return;
     }
     let mut verify = [0u8; 512];
-    let pattern_ok =
-        sdmmc::read_blocks(&card, lba, &mut verify) && verify == pattern;
-    console.write_output_line(if pattern_ok {
-        "pattern write+read-back: match"
-    } else {
-        "pattern write+read-back: MISMATCH, see UART log"
-    });
+    let pattern_ok = sdmmc::read_blocks(&card, lba, &mut verify) && verify == pattern;
+    console.write_output_line(
+        framebuffer,
+        if pattern_ok {
+            "pattern write+read-back: match"
+        } else {
+            "pattern write+read-back: MISMATCH, see UART log"
+        },
+    );
 
     let mut restore = original;
     let restored = sdmmc::write_blocks(&card, lba, &mut restore);
     let mut check = [0u8; 512];
     let restore_ok = restored && sdmmc::read_blocks(&card, lba, &mut check) && check == original;
-    console.write_output_line(if restore_ok {
-        "original data restored: yes"
-    } else {
-        "original data restored: NO -- see UART log, LBA may be corrupted"
-    });
+    console.write_output_line(
+        framebuffer,
+        if restore_ok {
+            "original data restored: yes"
+        } else {
+            "original data restored: NO -- see UART log, LBA may be corrupted"
+        },
+    );
 }
 
-fn cmd_sdzero(console: &mut Console, argument: &[u8]) {
+fn cmd_sdzero(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let Some(lba) = parse_u32(argument) else {
-        console.write_output_line("usage: sdzero <lba>");
+        console.write_output_line(framebuffer, "usage: sdzero <lba>");
         return;
     };
 
-    console.write_output_line("activating SD card...");
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut zero = [0u8; 512];
     if !sdmmc::write_blocks(&card, lba, &mut zero) {
-        console.write_output_line("zero write failed, see UART log");
+        console.write_output_line(framebuffer, "zero write failed, see UART log");
         return;
     }
-    console.write_output_line("block zeroed");
+    console.write_output_line(framebuffer, "block zeroed");
 }
 
 /// Reads LBA 0 from the SD card and hands it to `mbr::show` -- the
 /// device-specific half of the SD/USB split described in
 /// `docs/USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
 /// knows nothing about SD.
-fn cmd_sdmbr(console: &mut Console) {
-    console.write_output_line("activating SD card...");
+fn cmd_sdmbr(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut sector = [0u8; 512];
     if !sdmmc::read_block(&card, 0, &mut sector) {
-        console.write_output_line("MBR read failed, see UART log");
+        console.write_output_line(framebuffer, "MBR read failed, see UART log");
         return;
     }
-    mbr::show(console, &sector);
+    mbr::show(console, framebuffer, &sector);
 }
 
 /// Reads the same blocks twice -- once into a stack (internal SRAM) buffer,
@@ -723,46 +1033,55 @@ fn cmd_sdmbr(console: &mut Console) {
 /// cache writeback/invalidate isn't sufficient for PSRAM, this either times
 /// out/fails outright or comes back with silently wrong bytes -- which the
 /// comparison catches without having to eyeball a hex dump.
-fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
+fn cmd_sdreadpsram(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let (lba_text, count_text) = split_first_word(argument);
     let (Some(lba), Some(count)) = (parse_u32(lba_text), parse_u32(trim(count_text))) else {
-        console.write_output_line("usage: sdreadpsram <lba> <count>");
+        console.write_output_line(framebuffer, "usage: sdreadpsram <lba> <count>");
         return;
     };
     if count == 0 || count > MAX_MULTI_BLOCKS {
-        console.write_output_line("count must be 1..=8");
+        console.write_output_line(framebuffer, "count must be 1..=8");
         return;
     }
     let bytes = 512 * count as usize;
 
-    console.write_output_line("activating SD card...");
+    console.write_output_line(framebuffer, "activating SD card...");
     let Some(card) = sdmmc::init() else {
-        console.write_output_line("SD card activation failed, see UART log");
+        console.write_output_line(framebuffer, "SD card activation failed, see UART log");
         return;
     };
 
     let mut sram_reference = [0u8; 512 * MAX_MULTI_BLOCKS as usize];
     let sram_region = &mut sram_reference[..bytes];
     if !sdmmc::read_blocks(&card, lba, sram_region) {
-        console.write_output_line("SRAM reference read failed, see UART log");
+        console.write_output_line(framebuffer, "SRAM reference read failed, see UART log");
         return;
     }
 
     let mut psram_buffer: Vec<u8> = Vec::new();
     if psram_buffer.try_reserve_exact(bytes).is_err() {
-        console.write_output_line("PSRAM allocation failed (not enough contiguous heap)");
+        console.write_output_line(
+            framebuffer,
+            "PSRAM allocation failed (not enough contiguous heap)",
+        );
         return;
     }
     psram_buffer.resize(bytes, 0);
 
-    console.write_output_line("DMA-ing the same blocks directly into PSRAM...");
+    console.write_output_line(
+        framebuffer,
+        "DMA-ing the same blocks directly into PSRAM...",
+    );
     if !sdmmc::read_blocks(&card, lba, &mut psram_buffer) {
-        console.write_output_line("PSRAM DMA read failed, see UART log");
+        console.write_output_line(framebuffer, "PSRAM DMA read failed, see UART log");
         return;
     }
 
     if psram_buffer.as_slice() == sram_region {
-        console.write_output_line("match: SD -> PSRAM DMA works, same bytes as SD -> SRAM");
+        console.write_output_line(
+            framebuffer,
+            "match: SD -> PSRAM DMA works, same bytes as SD -> SRAM",
+        );
     } else {
         let mismatches = psram_buffer
             .iter()
@@ -775,10 +1094,13 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
         line.push_str(" of ");
         line.push_u32(bytes as u32);
         line.push_str(" bytes differ");
-        console.write_output_line(line.as_str());
-        console.write_output_line("SD -> PSRAM DMA does not work as-is");
+        console.write_output_line(framebuffer, line.as_str());
+        console.write_output_line(framebuffer, "SD -> PSRAM DMA does not work as-is");
     }
-    console.write_output_line("first block of the SRAM reference, for reference:");
+    console.write_output_line(
+        framebuffer,
+        "first block of the SRAM reference, for reference:",
+    );
     sdmmc::dump_block_at((&sram_region[..512]).try_into().unwrap(), 0);
 }
 
@@ -794,23 +1116,30 @@ fn cmd_sdreadpsram(console: &mut Console, argument: &[u8]) {
 /// A: only `UsbHost::rescan` (via `usbrescan`, or `lcd.rs`'s frame loop)
 /// ever resets the bus, so no USB command can invalidate another device's
 /// live session anymore.
-fn report_last_probe(console: &mut Console, usb_host: &usb::UsbHost) -> bool {
+fn report_last_probe(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &usb::UsbHost,
+) -> bool {
     let Some(port) = usb_host.last_probe() else {
-        console.write_output_line("USB-A not probed yet; try 'usbrescan'");
+        console.write_output_line(framebuffer, "USB-A not probed yet; try 'usbrescan'");
         return false;
     };
 
-    console.write_output_line(if port.vbus_enable_acked {
-        "VBUS enable: I2C ok"
-    } else {
-        "VBUS enable: I2C not acked (PI4IOE2 @ 0x44 not responding)"
-    });
+    console.write_output_line(
+        framebuffer,
+        if port.vbus_enable_acked {
+            "VBUS enable: I2C ok"
+        } else {
+            "VBUS enable: I2C not acked (PI4IOE2 @ 0x44 not responding)"
+        },
+    );
 
     if !port.core_alive {
         let mut line = Line::new();
         line.push_str("DWC core not responding, GSNPSID=0x");
         line.push_hex(port.core_id, 8);
-        console.write_output_line(line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
         return false;
     }
 
@@ -822,32 +1151,41 @@ fn report_last_probe(console: &mut Console, usb_host: &usb::UsbHost) -> bool {
     line.push_str("  fifo: ");
     line.push_u32(port.fifo_depth_words);
     line.push_str("w");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     // The speed line below only means what it says once it is clear
     // whether the host was allowed to negotiate High-Speed at all.
-    console.write_output_line(if usb::FORCE_FS_LS_ONLY_HOST {
-        "host: FS/LS-only forced (HCFG.FSLSSupp)"
-    } else {
-        "host: High-Speed capable, split transactions on (see 'usbhw')"
-    });
+    console.write_output_line(
+        framebuffer,
+        if usb::FORCE_FS_LS_ONLY_HOST {
+            "host: FS/LS-only forced (HCFG.FSLSSupp)"
+        } else {
+            "host: High-Speed capable, split transactions on (see 'usbhw')"
+        },
+    );
 
     if !port.connected {
-        console.write_output_line("no device detected (plug in USB-A and try 'usbrescan')");
+        console.write_output_line(
+            framebuffer,
+            "no device detected (plug in USB-A and try 'usbrescan')",
+        );
         return false;
     }
-    console.write_output_line(if port.enabled {
-        "device connected, port reset and enabled"
-    } else {
-        "device connected, but port did not enable after reset"
-    });
+    console.write_output_line(
+        framebuffer,
+        if port.enabled {
+            "device connected, port reset and enabled"
+        } else {
+            "device connected, but port did not enable after reset"
+        },
+    );
     if !port.enabled {
         return false;
     }
     let mut line = Line::new();
     line.push_str("speed: ");
     line.push_str(speed_text(port.speed));
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
     true
 }
 
@@ -862,8 +1200,8 @@ fn speed_text(speed: usb::Speed) -> &'static str {
 
 /// Read-only: shows every device the last scan attached, root or hub port
 /// alike. Run `usbrescan` first if something was just plugged in.
-fn cmd_usbinfo(console: &mut Console, usb_host: &usb::UsbHost) {
-    report_usb_state(console, usb_host);
+fn cmd_usbinfo(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {
+    report_usb_state(console, framebuffer, usb_host);
 }
 
 /// Forces a fresh probe (`UsbHost::rescan`: port reset, every address
@@ -871,30 +1209,40 @@ fn cmd_usbinfo(console: &mut Console, usb_host: &usb::UsbHost) {
 /// only USB shell command that resets the bus -- run it after plugging
 /// something in, not routinely, since it briefly drops whatever else was
 /// already attached and working.
-fn cmd_usbrescan(console: &mut Console, usb_host: &mut usb::UsbHost) {
-    console.write_output_line("probing USB-A host port (USB-DWC HS)...");
+fn cmd_usbrescan(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) {
+    console.write_output_line(framebuffer, "probing USB-A host port (USB-DWC HS)...");
     usb_host.rescan();
-    report_usb_state(console, usb_host);
+    report_usb_state(console, framebuffer, usb_host);
 }
 
 /// Shared by `usbinfo` and `usbrescan`.
-fn report_usb_state(console: &mut Console, usb_host: &usb::UsbHost) {
-    if !report_last_probe(console, usb_host) {
+fn report_usb_state(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, framebuffer, usb_host) {
         return;
     }
     if usb_host.hub().is_some() {
-        console.write_output_line("hub attached; see 'usbhub' for per-port detail");
+        console.write_output_line(
+            framebuffer,
+            "hub attached; see 'usbhub' for per-port detail",
+        );
     }
 
     let mut any = false;
     for device in usb_host.attached_devices() {
         any = true;
-        console.write_output_line(location_text(device.location).as_str());
-        console.write_output_line(device_summary_text(device.summary).as_str());
-        console.write_output_line(device_kind_text(device.kind).as_str());
+        console.write_output_line(framebuffer, location_text(device.location).as_str());
+        console.write_output_line(framebuffer, device_summary_text(device.summary).as_str());
+        console.write_output_line(framebuffer, device_kind_text(device.kind).as_str());
     }
     if !any {
-        console.write_output_line("no supported device attached (unsupported device, or nothing plugged in)");
+        console.write_output_line(
+            framebuffer,
+            "no supported device attached (unsupported device, or nothing plugged in)",
+        );
     }
 }
 
@@ -946,15 +1294,18 @@ fn device_kind_text(kind: &usb::DeviceKind) -> Line {
 /// USB-A directly or a hub port -- instead of enumerating one fresh. See
 /// `usbinfo` for VID/PID and interface identity; if nothing shows up here,
 /// plug a device in and run `usbrescan` first.
-fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
+fn cmd_usbmsc(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &mut usb::UsbHost) {
     let Some(mass_storage) = usb_host.mass_storage_mut() else {
-        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
         return;
     };
 
-    console.write_output_line("sending SCSI INQUIRY (bulk transfers)...");
+    console.write_output_line(framebuffer, "sending SCSI INQUIRY (bulk transfers)...");
     let Some(inquiry) = mass_storage.inquiry() else {
-        console.write_output_line("INQUIRY failed, see UART log");
+        console.write_output_line(framebuffer, "INQUIRY failed, see UART log");
         return;
     };
 
@@ -969,31 +1320,31 @@ fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
     line.push_ascii(&inquiry[16..32]);
     line.push_str("  Rev: ");
     line.push_ascii(&inquiry[32..36]);
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
-    console.write_output_line("checking media (TEST UNIT READY)...");
+    console.write_output_line(framebuffer, "checking media (TEST UNIT READY)...");
     match mass_storage.test_unit_ready() {
-        Some(true) => console.write_output_line("media ready"),
+        Some(true) => console.write_output_line(framebuffer, "media ready"),
         Some(false) => {
-            console.write_output_line("media not ready");
+            console.write_output_line(framebuffer, "media not ready");
             if let Some(sense) = mass_storage.request_sense() {
                 let mut line = Line::new();
                 line.push_str("sense key: 0x");
                 line.push_hex((sense[2] & 0x0F) as u32, 1);
-                console.write_output_line(line.as_str());
+                console.write_output_line(framebuffer, line.as_str());
             } else {
-                console.write_output_line("REQUEST SENSE failed, see UART log");
+                console.write_output_line(framebuffer, "REQUEST SENSE failed, see UART log");
             }
         }
         None => {
-            console.write_output_line("TEST UNIT READY command failed, see UART log");
+            console.write_output_line(framebuffer, "TEST UNIT READY command failed, see UART log");
             return;
         }
     }
 
-    console.write_output_line("reading capacity (READ CAPACITY(10))...");
+    console.write_output_line(framebuffer, "reading capacity (READ CAPACITY(10))...");
     let Some(capacity) = mass_storage.read_capacity() else {
-        console.write_output_line("READ CAPACITY(10) failed, see UART log");
+        console.write_output_line(framebuffer, "READ CAPACITY(10) failed, see UART log");
         return;
     };
     let block_count = capacity.last_lba as u64 + 1;
@@ -1007,7 +1358,7 @@ fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
     line.push_str(" bytes = ");
     line.push_u32(total_mib as u32);
     line.push_str(" MiB");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// `docs/USB_MSC_PLAN.md` Stage 5, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
@@ -1015,13 +1366,21 @@ fn cmd_usbmsc(console: &mut Console, usb_host: &mut usb::UsbHost) {
 /// device `UsbHost::rescan` already attached, and dump it, mirroring
 /// `cmd_sdread`'s shape (and reusing `sdmmc::dump_block` for the UART hex
 /// dump -- the dump format itself has nothing SD-specific about it).
-fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHost) {
+fn cmd_usbread(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
     let Some(lba) = parse_u32(argument) else {
-        console.write_output_line("usage: usbread <lba>");
+        console.write_output_line(framebuffer, "usage: usbread <lba>");
         return;
     };
     let Some(mass_storage) = usb_host.mass_storage_mut() else {
-        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
         return;
     };
 
@@ -1029,14 +1388,17 @@ fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHo
     // command right after SET_CONFIGURATION; skipping this made an
     // immediate `usbread` unreliable on real hardware (see
     // `UsbMassStorage::wait_until_ready`'s doc comment).
-    console.write_output_line("waiting for media ready (TEST UNIT READY)...");
+    console.write_output_line(framebuffer, "waiting for media ready (TEST UNIT READY)...");
     if !mass_storage.wait_until_ready(10) {
-        console.write_output_line("media not ready after retries, attempting read anyway");
+        console.write_output_line(
+            framebuffer,
+            "media not ready after retries, attempting read anyway",
+        );
     }
 
     let mut buffer = [0u8; 512];
     if !mass_storage.read_blocks(lba, &mut buffer) {
-        console.write_output_line("block read failed, see UART log");
+        console.write_output_line(framebuffer, "block read failed, see UART log");
         return;
     }
     sdmmc::dump_block(&buffer);
@@ -1050,15 +1412,18 @@ fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHo
         line.push_str(" ");
     }
     line.push_str("...");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let boot_signature = buffer[510] == 0x55 && buffer[511] == 0xAA;
-    console.write_output_line(if boot_signature {
-        "bytes 510-511 = 55 AA (MBR/boot-sector signature)"
-    } else {
-        "no 55 AA signature at bytes 510-511"
-    });
-    console.write_output_line("full 512-byte hex dump: see UART log");
+    console.write_output_line(
+        framebuffer,
+        if boot_signature {
+            "bytes 510-511 = 55 AA (MBR/boot-sector signature)"
+        } else {
+            "no 55 AA signature at bytes 510-511"
+        },
+    );
+    console.write_output_line(framebuffer, "full 512-byte hex dump: see UART log");
 }
 
 /// `docs/USB_MSC_PLAN.md` Stage 6, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
@@ -1066,23 +1431,29 @@ fn cmd_usbread(console: &mut Console, argument: &[u8], usb_host: &mut usb::UsbHo
 /// attached and hands it to the same `mbr::show` that `cmd_sdmbr` uses, so
 /// the two commands print partition tables in an identical format despite
 /// reading them through entirely different block-I/O stacks.
-fn cmd_usbmbr(console: &mut Console, usb_host: &mut usb::UsbHost) {
+fn cmd_usbmbr(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &mut usb::UsbHost) {
     let Some(mass_storage) = usb_host.mass_storage_mut() else {
-        console.write_output_line("no Mass Storage device attached; plug one in and run 'usbrescan'");
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
         return;
     };
 
-    console.write_output_line("waiting for media ready (TEST UNIT READY)...");
+    console.write_output_line(framebuffer, "waiting for media ready (TEST UNIT READY)...");
     if !mass_storage.wait_until_ready(10) {
-        console.write_output_line("media not ready after retries, attempting read anyway");
+        console.write_output_line(
+            framebuffer,
+            "media not ready after retries, attempting read anyway",
+        );
     }
 
     let mut sector = [0u8; 512];
     if !mass_storage.read_blocks(0, &mut sector) {
-        console.write_output_line("MBR read failed, see UART log");
+        console.write_output_line(framebuffer, "MBR read failed, see UART log");
         return;
     }
-    mbr::show(console, &sector);
+    mbr::show(console, framebuffer, &sector);
 }
 
 /// `docs/USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `docs/USB_REFACTOR_PLAN.md`
@@ -1095,8 +1466,8 @@ fn cmd_usbmbr(console: &mut Console, usb_host: &mut usb::UsbHost) {
 /// "FS/LS behind a High-Speed hub is impossible on this chip" claim behind
 /// `usb::FORCE_FS_LS_ONLY_HOST` rests on measured silicon rather than only
 /// on Espressif's synthesis parameters and docs.
-fn cmd_usbhw(console: &mut Console, usb_host: &usb::UsbHost) {
-    if !report_last_probe(console, usb_host) {
+fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, framebuffer, usb_host) {
         return;
     }
     let hw = usb::probe_split_support();
@@ -1110,7 +1481,7 @@ fn cmd_usbhw(console: &mut Console, usb_host: &usb::UsbHost) {
     line.push_hex(hw.hwcfg3, 8);
     line.push_str(" 4=0x");
     line.push_hex(hw.hwcfg4, 8);
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("GHWCFG2.SingPnt (bit5): ");
@@ -1120,32 +1491,38 @@ fn cmd_usbhw(console: &mut Console, usb_host: &usb::UsbHost) {
     } else {
         "  = multi point: split transactions ARE supported"
     });
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("HCSPLT ch0: wrote 0xFFFFFFFF, read 0x");
     line.push_hex(hw.hcsplt_readback, 8);
     line.push_str("; wrote 0x12345678, read 0x");
     line.push_hex(hw.hcsplt_pattern_readback, 8);
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
-    console.write_output_line(if hw.hcsplt_readback == 0 {
-        "  -> register not implemented (SSPLIT/CSPLIT impossible)"
-    } else {
-        "  -> bits stuck; real HCSPLT would read 0x8001FFFF"
-    });
+    console.write_output_line(
+        framebuffer,
+        if hw.hcsplt_readback == 0 {
+            "  -> register not implemented (SSPLIT/CSPLIT impossible)"
+        } else {
+            "  -> bits stuck; real HCSPLT would read 0x8001FFFF"
+        },
+    );
 }
 
-fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
-    if !report_last_probe(console, usb_host) {
+fn cmd_usbhub(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {
+    if !report_last_probe(console, framebuffer, usb_host) {
         return;
     }
     let Some(hub) = usb_host.hub() else {
-        console.write_output_line("no hub attached; plug one into USB-A and run 'usbrescan'");
+        console.write_output_line(
+            framebuffer,
+            "no hub attached; plug one into USB-A and run 'usbrescan'",
+        );
         return;
     };
     if let Some(summary) = usb_host.hub_summary() {
-        console.write_output_line(device_summary_text(summary).as_str());
+        console.write_output_line(framebuffer, device_summary_text(summary).as_str());
     }
     let descriptor = &hub.descriptor;
 
@@ -1157,7 +1534,7 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
     line.push_str("ms  hub current: ");
     line.push_u32(descriptor.control_current_ma as u32);
     line.push_str("mA");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("power switching: ");
@@ -1172,19 +1549,27 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
         usb::OverCurrentProtection::PerPort => "per-port",
         usb::OverCurrentProtection::Unsupported => "none",
     });
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("compound: ");
-    line.push_str(if descriptor.is_compound_device() { "yes" } else { "no" });
+    line.push_str(if descriptor.is_compound_device() {
+        "yes"
+    } else {
+        "no"
+    });
     line.push_str("  indicators: ");
-    line.push_str(if descriptor.has_port_indicators() { "yes" } else { "no" });
+    line.push_str(if descriptor.has_port_indicators() {
+        "yes"
+    } else {
+        "no"
+    });
     line.push_str("  TT think time: ");
     line.push_u32(descriptor.tt_think_time_bits() as u32);
     line.push_str(" FS bits  hubdesc: ");
     line.push_u32(descriptor.descriptor_len as u32);
     line.push_str("b");
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("removable ports:");
@@ -1199,15 +1584,19 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
     if !any_removable {
         line.push_str(" none (all permanently attached)");
     }
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     let Some(status) = hub.status() else {
-        console.write_output_line("hub GET_STATUS failed, see UART log");
+        console.write_output_line(framebuffer, "hub GET_STATUS failed, see UART log");
         return;
     };
     let mut line = Line::new();
     line.push_str("hub status: local power ");
-    line.push_str(if status.local_power_lost() { "lost" } else { "good" });
+    line.push_str(if status.local_power_lost() {
+        "lost"
+    } else {
+        "good"
+    });
     line.push_str(", over-current ");
     line.push_str(if status.over_current() { "YES" } else { "no" });
     if status.local_power_changed() || status.over_current_changed() {
@@ -1215,7 +1604,7 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
         line.push_hex(status.change as u32, 4);
         line.push_str(")");
     }
-    console.write_output_line(line.as_str());
+    console.write_output_line(framebuffer, line.as_str());
 
     // Live per-port status (safe: a plain GET_STATUS, not a reset) next to
     // whichever slot `rescan` attached there, if any.
@@ -1225,7 +1614,7 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
             line.push_str("port ");
             line.push_u32(port as u32);
             line.push_str(": GET_PORT_STATUS failed, see UART log");
-            console.write_output_line(line.as_str());
+            console.write_output_line(framebuffer, line.as_str());
             break;
         };
         let mut line = port_status_text(port, &status);
@@ -1240,10 +1629,13 @@ fn cmd_usbhub(console: &mut Console, usb_host: &usb::UsbHost) {
             });
             line.push_str("]");
         }
-        console.write_output_line(line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
     }
     if descriptor.port_count > usb::MAX_HUB_PORTS {
-        console.write_output_line("(ports beyond the tracked limit are not shown; see UART log)");
+        console.write_output_line(
+            framebuffer,
+            "(ports beyond the tracked limit are not shown; see UART log)",
+        );
     }
 }
 
@@ -1257,7 +1649,11 @@ fn port_status_text(port: u8, status: &usb::PortStatus) -> Line {
     line.push_str(if status.enabled() { "ena " } else { "--- " });
     line.push_str(if status.suspended() { "susp " } else { "" });
     line.push_str(if status.in_reset() { "rst " } else { "" });
-    line.push_str(if status.over_current() { "OVERCURRENT " } else { "" });
+    line.push_str(if status.over_current() {
+        "OVERCURRENT "
+    } else {
+        ""
+    });
     if status.connected() {
         line.push_str(speed_text(status.speed()));
         line.push_str(" ");
@@ -1269,44 +1665,93 @@ fn port_status_text(port: u8, status: &usb::PortStatus) -> Line {
     line
 }
 
-fn cmd_usbvbus(console: &mut Console, argument: &[u8]) {
+fn cmd_usbvbus(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     let (bit_text, rest) = split_first_word(argument);
     let state = trim(rest);
     let Some(bit) = parse_u32(bit_text) else {
-        console.write_output_line("usage: usbvbus <0-7> on|off");
+        console.write_output_line(framebuffer, "usage: usbvbus <0-7> on|off");
         return;
     };
     if bit > 7 {
-        console.write_output_line("bit must be 0-7");
+        console.write_output_line(framebuffer, "bit must be 0-7");
         return;
     }
     let on = match state {
         b"on" => true,
         b"off" => false,
         _ => {
-            console.write_output_line("usage: usbvbus <0-7> on|off");
+            console.write_output_line(framebuffer, "usage: usbvbus <0-7> on|off");
             return;
         }
     };
     if usb::set_vbus_bit(bit as u8, on) {
-        console.write_output_line("ok; check USB-A 5V with a meter/current tester");
+        console.write_output_line(
+            framebuffer,
+            "ok; check USB-A 5V with a meter/current tester",
+        );
     } else {
-        console.write_output_line("I2C write failed (PI4IOE2 @ 0x44 not acked)");
+        console.write_output_line(framebuffer, "I2C write failed (PI4IOE2 @ 0x44 not acked)");
     }
 }
 
-fn cmd_backlight(console: &mut Console, argument: &[u8]) {
+fn cmd_backlight(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     match argument {
         b"on" => {
             lcd::set_backlight(true);
-            console.write_output_line("backlight on");
+            console.write_output_line(framebuffer, "backlight on");
         }
         b"off" => {
             lcd::set_backlight(false);
-            console.write_output_line("backlight off");
+            console.write_output_line(framebuffer, "backlight off");
         }
-        _ => console.write_output_line("usage: backlight on|off"),
+        _ => console.write_output_line(framebuffer, "usage: backlight on|off"),
     }
+}
+
+/// Reports, and optionally retunes, the interconnect arbitration that decides
+/// whether DSI scanout reads beat CPU and cache traffic to PSRAM.
+///
+/// Losing that race empties the DSI bridge FIFO and paints the rest of the
+/// frame light blue, so the underrun count reported here is the direct
+/// pass/fail measure for any value tried. Setting the fields at runtime avoids
+/// a reflash per experiment, which matters because the arbitration priority
+/// field's polarity is not documented in the register description.
+fn cmd_icm(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    if !argument.is_empty() {
+        let (head, rest) = split_first_word(argument);
+        let (Some(priority), Some(arqos)) = (parse_u32(head), parse_u32(trim(rest))) else {
+            console.write_output_line(framebuffer, "usage: icm [priority arqos]");
+            return;
+        };
+        if priority > 15 || arqos > 15 {
+            console.write_output_line(framebuffer, "priority and arqos must be 0-15");
+            return;
+        }
+        icm::set_display_priority(priority, arqos);
+    }
+
+    let status = icm::status();
+    let mut line = Line::new();
+    line.push_str("clk_en: 0x");
+    line.push_hex(status.clock_enable, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("mst_arb_priority: 0x");
+    line.push_hex(status.master_priority, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("mst_arqos: 0x");
+    line.push_hex(status.master_arqos, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    console.write_output_line(framebuffer, "(DW-GDMA occupies bits 12-19 of both)");
+
+    let mut line = Line::new();
+    line.push_str("DPI FIFO underruns: ");
+    line.push_u32(lcd::underrun_count());
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// Trims leading and trailing spaces (the only whitespace current keyboard input or
@@ -1409,7 +1854,11 @@ impl Line {
     /// are device-supplied and not guaranteed clean.
     pub(crate) fn push_ascii(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            let ch = if byte.is_ascii_graphic() || byte == b' ' { byte } else { b'.' };
+            let ch = if byte.is_ascii_graphic() || byte == b' ' {
+                byte
+            } else {
+                b'.'
+            };
             if self.len < self.buffer.len() {
                 self.buffer[self.len] = ch;
                 self.len += 1;

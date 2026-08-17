@@ -8,15 +8,19 @@
 //! out of scope, same as `docs/SD_CARD_PLAN.md`'s Stage 4a originally was).
 
 use crate::console::Console;
+use crate::framebuffer::Framebuffer;
 use crate::shell::Line;
 
 /// Classic MBR layout: 4 fixed 16-byte partition entries at offset 446,
 /// each `[boot flag, 3 CHS bytes, type, 3 CHS bytes, start LBA (u32 LE),
 /// sector count (u32 LE)]`, followed by the `55 AA` signature at 510-511.
 /// Does not look past the MBR itself -- no GPT, no filesystem parsing.
-pub fn show(console: &mut Console, sector: &[u8; 512]) {
+pub fn show(console: &mut Console, framebuffer: &mut Framebuffer, sector: &[u8; 512]) {
     if sector[510] != 0x55 || sector[511] != 0xAA {
-        console.write_output_line("no 55 AA boot signature at LBA 0; not a valid MBR");
+        console.write_output_line(
+            framebuffer,
+            "no 55 AA boot signature at LBA 0; not a valid MBR",
+        );
         return;
     }
 
@@ -36,11 +40,15 @@ pub fn show(console: &mut Console, sector: &[u8; 512]) {
         let mut line = Line::new();
         line.push_str("#");
         line.push_u32((entry + 1) as u32);
-        line.push_str(if boot == 0x80 { " * type 0x" } else { "   type 0x" });
+        line.push_str(if boot == 0x80 {
+            " * type 0x"
+        } else {
+            "   type 0x"
+        });
         line.push_hex(partition_type as u32, 2);
         line.push_str(" ");
         line.push_str(partition_type_name(partition_type));
-        console.write_output_line(line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
 
         let mut line = Line::new();
         line.push_str("   start LBA ");
@@ -48,15 +56,18 @@ pub fn show(console: &mut Console, sector: &[u8; 512]) {
         line.push_str(", ");
         line.push_u32(size_mib as u32);
         line.push_str(" MiB");
-        console.write_output_line(line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
 
         if partition_type == 0xEE {
-            console.write_output_line("   (GPT protective MBR; GPT itself not parsed)");
+            console.write_output_line(
+                framebuffer,
+                "   (GPT protective MBR; GPT itself not parsed)",
+            );
         }
     }
 
     if !any_entry {
-        console.write_output_line("no partition entries (all empty)");
+        console.write_output_line(framebuffer, "no partition entries (all empty)");
     }
 }
 

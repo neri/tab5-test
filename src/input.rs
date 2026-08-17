@@ -136,7 +136,11 @@ impl InputManager {
         let first = self.next_source;
         for source in [first, other_source(first)] {
             let key = match source {
-                KeySource::CardKb => self.cardkb.as_mut().and_then(CardKb::poll).map(key_from_ascii),
+                KeySource::CardKb => self
+                    .cardkb
+                    .as_mut()
+                    .and_then(CardKb::poll)
+                    .map(key_from_ascii),
                 KeySource::Usb => self.usb_host.poll_keyboards(),
             };
             if let Some(key) = key {

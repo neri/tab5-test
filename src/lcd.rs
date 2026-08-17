@@ -4,11 +4,13 @@
 //! DW-GDMA. The DSI Host's Video Pattern Generator remains available as a
 //! fallback diagnostic when framebuffer setup fails.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::delay::{delay_ms, delay_us};
 use crate::gpio::Pin;
 use crate::i2c;
 use crate::uart;
-use crate::{framebuffer::DoubleBuffer, gpio, interrupts, psram::Psram};
+use crate::{framebuffer::Framebuffer, gpio, icm, interrupts, psram::Psram};
 
 mod st7121;
 
@@ -19,8 +21,43 @@ const DW_GDMA: usize = 0x5008_1000;
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const PMU: usize = 0x5011_5000;
 
+/// `DSI_BRG_INT_RAW`/`INT_CLR` bit 0: the DPI FIFO ran dry mid-frame. The
+/// bridge then drives its underrun output for the remainder of that frame,
+/// which the panel shows as a solid light blue flash.
+const UNDERRUN_STATUS: u32 = 1 << 0;
+const VSYNC_STATUS: u32 = 1 << 1;
+
+/// Frames that underran since `Display::start`. Kept in a static rather than
+/// on `Display` so the shell can report it without borrowing the display the
+/// frame loop owns.
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+
+/// Total frames whose scanout underran since the display started.
+pub fn underrun_count() -> u32 {
+    UNDERRUNS.load(Ordering::Relaxed)
+}
+
 const WIDTH: u32 = 720;
 const HEIGHT: u32 = 1280;
+
+/// Vertical timing, in panel lines.
+///
+/// These are the values the panel was brought up with, and the front porch is
+/// **not** a free parameter despite the registers accepting a wide range.
+/// Stretching it was tried as a way to widen the blanking interval -- during
+/// which scanout reads no PSRAM at all, so the frame loop would have had the
+/// memory to itself for longer -- but this panel visibly flickers at anything
+/// other than 200, at least down to 37 Hz. It is a panel constraint, not a
+/// controller one, so lowering the refresh rate is not a lever available here.
+const VSYNC_LINES: u32 = 20;
+const VBP_LINES: u32 = 24;
+const VFP_LINES: u32 = 200;
+const VTOTAL_LINES: u32 = VSYNC_LINES + VBP_LINES + HEIGHT + VFP_LINES;
+
+/// `VID_HLINE_TIME`: one line in lane-byte-clock periods. With two lanes at
+/// 960 Mbps the lane byte clock is 120 MHz, so a line is 1375/120 MHz =
+/// 11.458 us, and 1524 lines give the panel's 57.3 Hz.
+const HLINE_LANE_BYTE_CLOCKS: u32 = 1375;
 
 #[derive(Clone, Copy)]
 pub(super) struct InitCommand {
@@ -50,36 +87,39 @@ pub fn start_pattern() -> bool {
 
 /// A running DSI/DMA display and its double-buffered framebuffer storage.
 ///
-/// The application owns its event loop and draws through `framebuffers_mut`;
+/// The application owns its event loop and draws through `framebuffer_mut`;
 /// this type owns only panel initialization and frame-boundary synchronization.
 pub struct Display {
-    framebuffers: DoubleBuffer,
+    framebuffer: Framebuffer,
     dma: DmaDisplay,
     sequence: u32,
+    /// Whether the previous frame already underran, so a burst spanning
+    /// several frames logs one line instead of one per frame.
+    underrun_active: bool,
 }
 
 impl Display {
-    /// Allocates the framebuffer pair. Callers should prepare both buffers
-    /// before calling `start`, because that starts scanout immediately.
+    /// Allocates the framebuffer. Callers should prepare it before calling
+    /// `start`, because that starts scanout immediately.
     pub fn new(psram: Psram) -> Option<Self> {
-        let Some(framebuffers) = DoubleBuffer::new(psram) else {
-            uart::log(b"FB: two buffers do not fit in mapped PSRAM\r\n");
+        let Some(framebuffer) = Framebuffer::new(psram) else {
+            uart::log(b"FB: framebuffer does not fit in mapped PSRAM\r\n");
             return None;
         };
-        let fb0 = framebuffers.address(0)?;
-        let fb1 = framebuffers.address(1)?;
+        let address = framebuffer.address()?;
         Some(Self {
-            framebuffers,
-            dma: DmaDisplay::new(fb0, fb1),
+            framebuffer,
+            dma: DmaDisplay::new(address),
             sequence: 0,
+            underrun_active: false,
         })
     }
 
-    pub fn framebuffers_mut(&mut self) -> &mut DoubleBuffer {
-        &mut self.framebuffers
+    pub fn framebuffer_mut(&mut self) -> &mut Framebuffer {
+        &mut self.framebuffer
     }
 
-    /// Initializes the panel and starts framebuffer scanout from buffer zero.
+    /// Initializes the panel and starts framebuffer scanout.
     pub fn start(&mut self) -> bool {
         if !init_panel() {
             return false;
@@ -89,17 +129,20 @@ impl Display {
             uart::log(b"LCD: DW-GDMA initialization failed\r\n");
             return false;
         }
-        let Some(fb0) = self.framebuffers.address(0) else {
+        let Some(address) = self.framebuffer.address() else {
             return false;
         };
-        let Some(fb1) = self.framebuffers.address(1) else {
-            return false;
-        };
-        interrupts::install(fb0, fb1);
+        // Scanout reads must outrank CPU and cache PSRAM traffic before the
+        // bridge starts consuming them, otherwise the very first full-frame
+        // redraw can already underrun.
+        icm::prioritize_display_reads();
+        interrupts::install(address);
         unsafe {
-            write(DSI_BRG + 0x50, 1); // clear a stale FIFO-underrun indication
+            // INT_CLR is 0x54; 0x50 is INT_ENA. Clear both raw indications
+            // rather than enabling an interrupt nothing services.
+            write(DSI_BRG + 0x54, UNDERRUN_STATUS | VSYNC_STATUS);
         }
-        if !self.dma.start(0) {
+        if !self.dma.start() {
             uart::log(b"LCD: DW-GDMA setup failed\r\n");
             return false;
         }
@@ -125,9 +168,9 @@ impl Display {
         true
     }
 
-    /// Waits for the next frame boundary and returns the displayed buffer.
-    /// Returns `None` after a DMA error, which has already been logged.
-    pub fn wait_for_frame(&mut self) -> Option<usize> {
+    /// Waits for the next frame boundary. Returns `None` after a DMA error,
+    /// which has already been logged.
+    pub fn wait_for_frame(&mut self) -> Option<()> {
         loop {
             let error = interrupts::dma_error();
             if error != 0 {
@@ -145,10 +188,103 @@ impl Display {
             let next_sequence = interrupts::frame_sequence();
             if next_sequence != self.sequence {
                 self.sequence = next_sequence;
-                return Some(interrupts::active_framebuffer());
+                self.poll_underrun();
+                return Some(());
             }
         }
     }
+
+    /// Records a DPI FIFO underrun for the frame that just completed.
+    ///
+    /// The bridge sets this without any interrupt being enabled, so polling it
+    /// once per frame costs one register read and turns the "screen flashed
+    /// light blue" report into something the UART log can confirm.
+    fn poll_underrun(&mut self) {
+        if !take_underrun() {
+            self.underrun_active = false;
+            return;
+        }
+        // One line per burst: a starved redraw spans several frames, and
+        // logging each of them over USB serial would itself steal bandwidth.
+        // The frame number separates a one-off at pipeline start-up (frame 0
+        // or 1, harmless) from one caused by a redraw seconds into the session.
+        if !self.underrun_active {
+            self.underrun_active = true;
+            uart::log_hex(b"LCD: DPI FIFO underrun at frame=", self.sequence);
+            uart::log_hex(b"LCD: DPI FIFO underruns total=", underrun_count());
+        }
+    }
+}
+
+/// Consumes the bridge's underrun indication, counting it if it was set.
+///
+/// The indication is a single sticky bit, so it says "at least one underrun
+/// since this was last cleared" rather than how many. Anything wanting to
+/// count them has to come back often enough that they cannot pile up behind
+/// one bit -- the frame loop does that once per frame, and a long-running
+/// command that never yields has to call this itself or it will read zero for
+/// the whole time it was busy.
+pub fn take_underrun() -> bool {
+    let underran = unsafe { read(DSI_BRG + 0x58) } & UNDERRUN_STATUS != 0;
+    if !underran {
+        return false;
+    }
+    unsafe {
+        write(DSI_BRG + 0x54, UNDERRUN_STATUS);
+    }
+    UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Stops framebuffer scanout left running by a previous boot, and puts the
+/// interconnect arbitration back to its power-on state.
+///
+/// `startup::reboot` resets only the HP CPU core. Everything else keeps
+/// running, so DW-GDMA streams the old framebuffer out of PSRAM straight
+/// through the next boot's `psram::init` -- which resets the MSPI controller
+/// and re-tunes the DQS phase underneath it. That was always wrong; it only
+/// became visible once `icm` started giving this master priority over the CPU,
+/// because then the CPU's own PSRAM accesses lose to it outright and bring-up
+/// either hangs or leaves PSRAM returning corrupt data.
+///
+/// Call this before touching PSRAM on the way up, and again before triggering
+/// a reboot so the bootloader's own flash reads are not competing with a DMA
+/// master this firmware promoted.
+pub fn quiesce_dma() {
+    unsafe {
+        // Registers of a block that was never clocked out of reset must not be
+        // read: on ECO2 that bus access does not return. On a cold boot that
+        // is also proof no transfer can be in flight, so there is nothing to
+        // stop.
+        let bus_clock = read(HP_SYS_CLKRST + 0x14) & (1 << 13) != 0;
+        let register_clock = read(HP_SYS_CLKRST + 0x18) & (1 << 5) != 0;
+        let held_in_reset = read(HP_SYS_CLKRST + 0xC0) & (1 << 21) != 0;
+        if !bus_clock || !register_clock || held_in_reset {
+            icm::restore_default_priority();
+            return;
+        }
+
+        if read(DW_GDMA + 0x18) & 1 != 0 {
+            // Clearing CHEN0's enable bit does not reliably stop a channel
+            // mid-transfer. Request the abort through CHEN1 and wait for it,
+            // as dw_gdma_ll_channel_abort does, so no AXI read is left in
+            // flight against the PSRAM controller that is about to be reset.
+            write(DW_GDMA + 0x1C, 0x101);
+            let mut timeout = 1_000_000;
+            while read(DW_GDMA + 0x1C) & 0x101 != 0 {
+                if timeout == 0 {
+                    uart::log(b"LCD: stale DMA channel abort timed out\r\n");
+                    break;
+                }
+                timeout -= 1;
+            }
+        }
+
+        // Then hold the block in reset briefly so nothing can re-arm it.
+        modify(HP_SYS_CLKRST + 0xC0, 1 << 21, 1 << 21);
+        modify(HP_SYS_CLKRST + 0xC0, 1 << 21, 0);
+    }
+    icm::restore_default_priority();
 }
 
 fn init_panel() -> bool {
@@ -465,10 +601,10 @@ fn start_video_pattern() {
         write(DSI_HOST + 0x44, 0);
         write(DSI_HOST + 0x48, 3);
         write(DSI_HOST + 0x4C, 69);
-        write(DSI_HOST + 0x50, 1375);
-        write(DSI_HOST + 0x54, 20);
-        write(DSI_HOST + 0x58, 24);
-        write(DSI_HOST + 0x5C, 200);
+        write(DSI_HOST + 0x50, HLINE_LANE_BYTE_CLOCKS);
+        write(DSI_HOST + 0x54, VSYNC_LINES);
+        write(DSI_HOST + 0x58, VBP_LINES);
+        write(DSI_HOST + 0x5C, VFP_LINES);
         write(DSI_HOST + 0x60, HEIGHT);
 
         // Start from a complete normal DPI-bridge configuration. ESP-IDF's VPG
@@ -476,8 +612,8 @@ fn start_video_pattern() {
         // omitting these bridge timing registers leaves the Host VPG black.
         write(DSI_BRG + 0x00, 1);
         write(DSI_BRG + 0x18, 2); // RGB565 raw input type
-        write(DSI_BRG + 0x30, 1524 | (HEIGHT << 16)); // vtotal, vdisplay
-        write(DSI_BRG + 0x34, 24 | (20 << 16)); // vback porch, vsync
+        write(DSI_BRG + 0x30, VTOTAL_LINES | (HEIGHT << 16)); // vtotal, vdisplay
+        write(DSI_BRG + 0x34, VBP_LINES | (VSYNC_LINES << 16)); // vback porch, vsync
         write(DSI_BRG + 0x38, 917 | (WIDTH << 16)); // compensated htotal, hdisplay
         write(DSI_BRG + 0x3C, 40 | (2 << 16)); // hback porch, hsync
         write(DSI_BRG + 0x40, 1 | (WIDTH << 4)); // DPI on, underrun discard
@@ -514,37 +650,42 @@ fn configure_video_dma() {
         write(DSI_HOST + 0x44, 0);
         write(DSI_HOST + 0x48, 3);
         write(DSI_HOST + 0x4C, 69);
-        write(DSI_HOST + 0x50, 1375);
-        write(DSI_HOST + 0x54, 20);
-        write(DSI_HOST + 0x58, 24);
-        write(DSI_HOST + 0x5C, 200);
+        write(DSI_HOST + 0x50, HLINE_LANE_BYTE_CLOCKS);
+        write(DSI_HOST + 0x54, VSYNC_LINES);
+        write(DSI_HOST + 0x58, VBP_LINES);
+        write(DSI_HOST + 0x5C, VFP_LINES);
         write(DSI_HOST + 0x60, HEIGHT);
 
         write(DSI_BRG, 1); // force bridge register clock
         write(DSI_BRG + 0x08, 256); // 256 64-bit words per requested burst
         write(DSI_BRG + 0x0C, (1 << 31) | (WIDTH * HEIGHT * 16 / 64));
         write(DSI_BRG + 0x18, 2); // RGB565 input and output
-        write(DSI_BRG + 0x30, 1524 | (HEIGHT << 16));
-        write(DSI_BRG + 0x34, 24 | (20 << 16));
+        write(DSI_BRG + 0x30, VTOTAL_LINES | (HEIGHT << 16));
+        write(DSI_BRG + 0x34, VBP_LINES | (VSYNC_LINES << 16));
         write(DSI_BRG + 0x38, 917 | (WIDTH << 16));
         write(DSI_BRG + 0x3C, 40 | (2 << 16));
         write(DSI_BRG + 0x40, WIDTH << 4); // enable after DMA starts
-        write(DSI_BRG + 0x84, 1 << 4); // DMA flow controller, one block/frame
-        write(DSI_BRG + 0x88, 768); // 1024-word FIFO minus 256-word burst
+        // DMA_FLOW_CTRL is at 0x88 and RAW_BUF_ALMOST_EMPTY_THRD at 0x8C.
+        // These two were previously written one register low, which left the
+        // almost-empty threshold at its 512-word reset value: the bridge then
+        // asked GDMA for the next burst only once the FIFO was half empty,
+        // roughly halving the slack it has to absorb a PSRAM stall.
+        write(DSI_BRG + 0x88, 1 << 4); // DMAC as flow controller, one block/frame
+        write(DSI_BRG + 0x8C, 768); // refill request at 1024-word FIFO minus 256-word burst
         write(DSI_BRG + 0x04, 1);
         write(DSI_BRG + 0x44, 1);
     }
 }
 
 struct DmaDisplay {
-    addresses: [u32; 2],
+    address: u32,
     initialized: bool,
 }
 
 impl DmaDisplay {
-    fn new(fb0: u32, fb1: u32) -> Self {
+    fn new(address: u32) -> Self {
         Self {
-            addresses: [fb0, fb1],
+            address,
             initialized: false,
         }
     }
@@ -601,8 +742,8 @@ impl DmaDisplay {
         true
     }
 
-    fn start(&mut self, framebuffer: usize) -> bool {
-        if framebuffer >= self.addresses.len() || !self.initialize() {
+    fn start(&mut self) -> bool {
+        if !self.initialize() {
             return false;
         }
 
@@ -612,7 +753,7 @@ impl DmaDisplay {
 
         unsafe {
             let channel = DW_GDMA + 0x100;
-            write(channel, self.addresses[framebuffer]);
+            write(channel, self.address);
             write(channel + 0x98, u32::MAX);
             write(DW_GDMA + 0x18, 0x101);
         }

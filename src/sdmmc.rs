@@ -409,7 +409,10 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
     unsafe {
         write(BLKSIZ, buffer.len() as u32);
         write(BYTCNT, buffer.len() as u32);
-        write(CARDTHRCTL, (buffer.len() as u32) << 16 | CARDTHRCTL_CARDRDTHREN);
+        write(
+            CARDTHRCTL,
+            (buffer.len() as u32) << 16 | CARDTHRCTL_CARDRDTHREN,
+        );
         modify(CTRL, CTRL_USE_INTERNAL_DMA, CTRL_USE_INTERNAL_DMA);
         modify(BMOD, BMOD_DE | BMOD_FB, BMOD_DE | BMOD_FB);
         write(DBADDR, descriptor_address as u32);
@@ -419,7 +422,9 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
     // Group 1 (Access Mode) at bits[3:0], all other groups (2-6, bits[23:4])
     // sent as 0xF ("no change"), matching ESP-IDF's group_shift=0 case.
     let arg = ((switch_mode as u32) << 31) | 0x00FFFFF0 | (group1_function & 0xF);
-    let flags = CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC | CMD_DATA_EXPECTED
+    let flags = CMD_RESPONSE_EXPECT
+        | CMD_CHECK_RESPONSE_CRC
+        | CMD_DATA_EXPECTED
         | CMD_WAIT_PRVDATA_COMPLETE;
     if send_command(6, arg, flags).is_err() {
         unsafe { modify(CTRL, CTRL_USE_INTERNAL_DMA, 0) };
@@ -478,8 +483,8 @@ fn set_high_speed() -> Result<bool, ()> {
         uart::log(b"SDMMC: CMD6 check (SWITCH_FUNC) failed; staying at Default Speed\r\n");
         return Ok(false);
     };
-    let supported =
-        ((status[SFUNC_GROUP1_SUPPORTED_HI] as u16) << 8) | status[SFUNC_GROUP1_SUPPORTED_LO] as u16;
+    let supported = ((status[SFUNC_GROUP1_SUPPORTED_HI] as u16) << 8)
+        | status[SFUNC_GROUP1_SUPPORTED_LO] as u16;
     if supported & (1 << SD_ACCESS_MODE_HIGH_SPEED) == 0 {
         uart::log(b"SDMMC: card does not advertise High Speed support\r\n");
         return Ok(false);
@@ -542,15 +547,20 @@ pub fn read_block(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bo
         // Card read threshold = block size. Undocumented in ESP-IDF (which
         // never touches this register), but this is a common DW-MMC pattern
         // for making the FIFO-to-RAM burst engine actually start.
-        write(CARDTHRCTL, (BLOCK_BYTES as u32) << 16 | CARDTHRCTL_CARDRDTHREN);
+        write(
+            CARDTHRCTL,
+            (BLOCK_BYTES as u32) << 16 | CARDTHRCTL_CARDRDTHREN,
+        );
         modify(CTRL, CTRL_USE_INTERNAL_DMA, CTRL_USE_INTERNAL_DMA);
         modify(BMOD, BMOD_DE | BMOD_FB, BMOD_DE | BMOD_FB);
         write(DBADDR, descriptor_address as u32);
         write(PLDMND, 1);
     }
 
-    let flags =
-        CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC | CMD_DATA_EXPECTED | CMD_WAIT_PRVDATA_COMPLETE;
+    let flags = CMD_RESPONSE_EXPECT
+        | CMD_CHECK_RESPONSE_CRC
+        | CMD_DATA_EXPECTED
+        | CMD_WAIT_PRVDATA_COMPLETE;
     if send_command(17, address, flags).is_err() {
         uart::log(b"SDMMC: CMD17 (READ_SINGLE_BLOCK) failed\r\n");
         return false;
@@ -634,7 +644,10 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
         return false;
     };
     let descriptors_address = descriptors.as_mut_ptr() as usize;
-    cache_writeback_invalidate(descriptors_address, descriptor_count * size_of::<Descriptor>());
+    cache_writeback_invalidate(
+        descriptors_address,
+        descriptor_count * size_of::<Descriptor>(),
+    );
 
     unsafe {
         write(BLKSIZ, BLOCK_BYTES as u32);

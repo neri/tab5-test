@@ -19,11 +19,13 @@ mod delay;
 mod framebuffer;
 mod gpio;
 mod i2c;
-mod input;
+mod icm;
 mod ina226;
+mod input;
 mod interrupts;
 mod lcd;
 mod mbr;
+mod membench;
 mod paint;
 mod power;
 mod psram;
@@ -120,6 +122,10 @@ fn main() -> ! {
     if i2c::initialize_board_bus().is_err() {
         uart::log(b"I2C: board-bus recovery failed\r\n");
     }
+    // A CPU-only reset leaves the previous boot's scanout DMA reading PSRAM.
+    // It has to stop before `psram::init` resets and re-tunes that controller
+    // underneath it.
+    lcd::quiesce_dma();
     if let Some(psram) = psram::init() {
         let (heap_start, heap_size) = psram.heap();
         unsafe {

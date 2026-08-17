@@ -4,7 +4,7 @@
 //! only the test's rendering, input, and motion simulation.
 
 use crate::bmi270::{Bmi270, InitError, MotionSample};
-use crate::framebuffer::{DoubleBuffer, BLACK, CYAN, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
+use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
 use crate::input::InputManager;
 use crate::{interrupts, uart};
 
@@ -53,11 +53,11 @@ const HUD_HEIGHT: usize = 88;
 const HUD_INTERVAL_FRAMES: u8 = 4;
 
 /// Opens the tilt-controlled ball test. Any managed keyboard key exits.
-pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
+pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let sensor = match Bmi270::init(&BMI270_MINIMUM_FIRMWARE) {
         Ok(sensor) => sensor,
         Err(error) => {
-            show_unavailable(framebuffers, error);
+            show_unavailable(framebuffer, error);
             wait_for_key(input);
             return;
         }
@@ -65,15 +65,12 @@ pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
 
     uart::log(b"Axis test: BMI270 ready; tilt the Tab5 to roll the ball\r\n");
     let mut sample = sensor.read_motion().unwrap_or(MotionSample::ZERO);
-    let displayed = interrupts::active_framebuffer();
-    for index in [displayed ^ 1, displayed] {
-        draw_scene(framebuffers, index);
-        draw_hud(framebuffers, index, sample);
-        draw_ball(framebuffers, index, WIDTH as i32 / 2, HEIGHT as i32 / 2);
-        if !framebuffers.flush(index) {
-            uart::log(b"Axis test: initial flush failed\r\n");
-            return;
-        }
+    draw_scene(framebuffer);
+    draw_hud(framebuffer, sample);
+    draw_ball(framebuffer, WIDTH as i32 / 2, HEIGHT as i32 / 2);
+    if !framebuffer.flush() {
+        uart::log(b"Axis test: initial flush failed\r\n");
+        return;
     }
 
     let mut x = WIDTH as i32 * FIXED / 2;
@@ -146,36 +143,29 @@ pub fn run(framebuffers: &mut DoubleBuffer, input: &mut InputManager) {
             ARENA_BOTTOM - BALL_RADIUS,
         );
 
-        let displayed = interrupts::active_framebuffer();
-        for index in [displayed ^ 1, displayed] {
-            erase_ball_path(
-                framebuffers,
-                index,
-                last_x / FIXED,
-                last_y / FIXED,
-                x / FIXED,
-                y / FIXED,
-            );
-            draw_ball(framebuffers, index, x / FIXED, y / FIXED);
-            if !framebuffers.flush_rect(
-                index,
-                ball_dirty_left(last_x, x),
-                ball_dirty_top(last_y, y),
-                ball_dirty_width(last_x, x),
-                ball_dirty_height(last_y, y),
-            ) {
-                uart::log(b"Axis test: flush failed\r\n");
-                return;
-            }
+        erase_ball_path(
+            framebuffer,
+            last_x / FIXED,
+            last_y / FIXED,
+            x / FIXED,
+            y / FIXED,
+        );
+        draw_ball(framebuffer, x / FIXED, y / FIXED);
+        if !framebuffer.flush_rect(
+            ball_dirty_left(last_x, x),
+            ball_dirty_top(last_y, y),
+            ball_dirty_width(last_x, x),
+            ball_dirty_height(last_y, y),
+        ) {
+            uart::log(b"Axis test: flush failed\r\n");
+            return;
         }
         if hud_frames == 0 {
             if hud_changed(sample, shown_sample) {
-                for index in [displayed ^ 1, displayed] {
-                    draw_hud(framebuffers, index, sample);
-                    if !framebuffers.flush_rect(index, 0, HUD_TOP, WIDTH, HUD_HEIGHT) {
-                        uart::log(b"Axis test: HUD flush failed\r\n");
-                        return;
-                    }
+                draw_hud(framebuffer, sample);
+                if !framebuffer.flush_rect(0, HUD_TOP, WIDTH, HUD_HEIGHT) {
+                    uart::log(b"Axis test: HUD flush failed\r\n");
+                    return;
                 }
                 shown_sample = sample;
             }
@@ -210,11 +200,10 @@ fn bounce(position: &mut i32, velocity: &mut i32, low: i32, high: i32) {
     }
 }
 
-fn draw_scene(framebuffers: &mut DoubleBuffer, index: usize) {
-    framebuffers.fill(index, BLACK);
-    framebuffers.draw_text(index, 16, 12, "AXIS SENSOR TEST", 3, CYAN, None);
-    framebuffers.draw_text(
-        index,
+fn draw_scene(framebuffer: &mut Framebuffer) {
+    framebuffer.fill(BLACK);
+    framebuffer.draw_text(16, 12, "AXIS SENSOR TEST", 3, CYAN, None);
+    framebuffer.draw_text(
         16,
         40,
         "TILT THE TAB5 - THE BALL ROLLS DOWNHILL",
@@ -222,8 +211,7 @@ fn draw_scene(framebuffers: &mut DoubleBuffer, index: usize) {
         WHITE,
         None,
     );
-    framebuffers.stroke_rect(
-        index,
+    framebuffer.stroke_rect(
         ARENA_LEFT as usize,
         ARENA_TOP as usize,
         (ARENA_RIGHT - ARENA_LEFT) as usize,
@@ -232,35 +220,26 @@ fn draw_scene(framebuffers: &mut DoubleBuffer, index: usize) {
     );
 }
 
-fn draw_hud(framebuffers: &mut DoubleBuffer, index: usize, sample: MotionSample) {
-    framebuffers.fill_rect(index, 0, HUD_TOP, WIDTH, HUD_HEIGHT, BLACK);
+fn draw_hud(framebuffer: &mut Framebuffer, sample: MotionSample) {
+    framebuffer.fill_rect(0, HUD_TOP, WIDTH, HUD_HEIGHT, BLACK);
     for (row, axis) in [b'X', b'Y', b'Z'].into_iter().enumerate() {
         let mut acceleration = AxisLine::new();
         acceleration.push_str("ACC ");
         acceleration.push_byte(axis);
         acceleration.push_str(": ");
         acceleration.push_g(sample.acceleration[row]);
-        framebuffers.draw_text(
-            index,
-            16,
-            64 + row * 20,
-            acceleration.as_str(),
-            2,
-            CYAN,
-            None,
-        );
+        framebuffer.draw_text(16, 64 + row * 20, acceleration.as_str(), 2, CYAN, None);
 
         let mut gyroscope = AxisLine::new();
         gyroscope.push_str("GYR ");
         gyroscope.push_byte(axis);
         gyroscope.push_str(": ");
         gyroscope.push_dps(sample.gyroscope[row]);
-        framebuffers.draw_text(index, 300, 64 + row * 20, gyroscope.as_str(), 2, CYAN, None);
+        framebuffer.draw_text(300, 64 + row * 20, gyroscope.as_str(), 2, CYAN, None);
     }
 
     let level = is_level(sample.acceleration[0], sample.acceleration[1]);
-    framebuffers.draw_text(
-        index,
+    framebuffer.draw_text(
         600,
         84,
         if level { "HORIZONTAL" } else { "TILTED" },
@@ -269,8 +248,7 @@ fn draw_hud(framebuffers: &mut DoubleBuffer, index: usize, sample: MotionSample)
         None,
     );
     draw_level(
-        framebuffers,
-        index,
+        framebuffer,
         sample.acceleration[0],
         sample.acceleration[1],
         level,
@@ -309,7 +287,7 @@ fn hud_changed(current: MotionSample, shown: MotionSample) -> bool {
     current_x.abs_diff(shown_x) >= 2 || current_y.abs_diff(shown_y) >= 2
 }
 
-fn draw_level(framebuffers: &mut DoubleBuffer, index: usize, raw_x: i16, raw_y: i16, level: bool) {
+fn draw_level(framebuffer: &mut Framebuffer, raw_x: i16, raw_y: i16, level: bool) {
     const LEFT: usize = 1040;
     const TOP: usize = 44;
     const WIDTH: usize = 200;
@@ -317,18 +295,16 @@ fn draw_level(framebuffers: &mut DoubleBuffer, index: usize, raw_x: i16, raw_y: 
     const CENTER_X: i32 = LEFT as i32 + WIDTH as i32 / 2;
     const CENTER_Y: i32 = TOP as i32 + HEIGHT as i32 / 2 + 8;
 
-    framebuffers.stroke_rect(index, LEFT, TOP, WIDTH, HEIGHT, CYAN);
-    framebuffers.draw_text(index, LEFT + 8, TOP + 6, "LEVEL", 2, WHITE, None);
-    framebuffers.draw_line(
-        index,
+    framebuffer.stroke_rect(LEFT, TOP, WIDTH, HEIGHT, CYAN);
+    framebuffer.draw_text(LEFT + 8, TOP + 6, "LEVEL", 2, WHITE, None);
+    framebuffer.draw_line(
         CENTER_X as usize - 48,
         CENTER_Y as usize,
         CENTER_X as usize + 48,
         CENTER_Y as usize,
         0x7BEF,
     );
-    framebuffers.draw_line(
-        index,
+    framebuffer.draw_line(
         CENTER_X as usize,
         CENTER_Y as usize - 20,
         CENTER_X as usize,
@@ -336,8 +312,8 @@ fn draw_level(framebuffers: &mut DoubleBuffer, index: usize, raw_x: i16, raw_y: 
         0x7BEF,
     );
     let (x, y) = level_position(raw_x, raw_y);
-    framebuffers.fill_circle(index, x, y, 10, if level { GREEN } else { YELLOW });
-    framebuffers.draw_circle(index, x, y, 10, WHITE);
+    framebuffer.fill_circle(x, y, 10, if level { GREEN } else { YELLOW });
+    framebuffer.draw_circle(x, y, 10, WHITE);
 }
 
 struct AxisLine {
@@ -415,35 +391,26 @@ fn level_position(raw_x: i16, raw_y: i16) -> (usize, usize) {
     (x, y)
 }
 
-fn draw_ball(framebuffers: &mut DoubleBuffer, index: usize, x: i32, y: i32) {
+fn draw_ball(framebuffer: &mut Framebuffer, x: i32, y: i32) {
     let x = x as usize;
     let y = y as usize;
-    framebuffers.fill_circle(
-        index,
+    framebuffer.fill_circle(
         x.saturating_add(5),
         y.saturating_add(6),
         BALL_RADIUS as usize,
         0x2104,
     );
-    framebuffers.fill_circle(index, x, y, BALL_RADIUS as usize, RED);
-    framebuffers.draw_circle(index, x, y, BALL_RADIUS as usize, YELLOW);
-    framebuffers.fill_circle(index, x.saturating_sub(10), y.saturating_sub(10), 7, WHITE);
+    framebuffer.fill_circle(x, y, BALL_RADIUS as usize, RED);
+    framebuffer.draw_circle(x, y, BALL_RADIUS as usize, YELLOW);
+    framebuffer.fill_circle(x.saturating_sub(10), y.saturating_sub(10), 7, WHITE);
 }
 
-fn erase_ball_path(
-    framebuffers: &mut DoubleBuffer,
-    index: usize,
-    old_x: i32,
-    old_y: i32,
-    new_x: i32,
-    new_y: i32,
-) {
+fn erase_ball_path(framebuffer: &mut Framebuffer, old_x: i32, old_y: i32, new_x: i32, new_y: i32) {
     let left = old_x.min(new_x) - BALL_RADIUS - 8;
     let top = old_y.min(new_y) - BALL_RADIUS - 8;
     let right = old_x.max(new_x) + BALL_RADIUS + 9;
     let bottom = old_y.max(new_y) + BALL_RADIUS + 9;
-    framebuffers.fill_rect(
-        index,
+    framebuffer.fill_rect(
         left.max(0) as usize,
         top.max(0) as usize,
         (right - left).max(0) as usize,
@@ -468,17 +435,14 @@ fn ball_dirty_height(old_y: i32, new_y: i32) -> usize {
     (old_y.max(new_y) / FIXED - old_y.min(new_y) / FIXED + BALL_RADIUS * 2 + 18) as usize
 }
 
-fn show_unavailable(framebuffers: &mut DoubleBuffer, error: InitError) {
-    let displayed = interrupts::active_framebuffer();
-    for index in [displayed ^ 1, displayed] {
-        framebuffers.fill(index, BLACK);
-        framebuffers.draw_text(index, 16, 16, "AXIS SENSOR TEST", 3, CYAN, None);
-        framebuffers.draw_text(index, 16, 72, error.message(), 3, RED, None);
-        framebuffers.draw_text(index, 16, 120, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
-        if !framebuffers.flush(index) {
-            uart::log(b"Axis test: unavailable-screen flush failed\r\n");
-            return;
-        }
+fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
+    framebuffer.fill(BLACK);
+    framebuffer.draw_text(16, 16, "AXIS SENSOR TEST", 3, CYAN, None);
+    framebuffer.draw_text(16, 72, error.message(), 3, RED, None);
+    framebuffer.draw_text(16, 120, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
+    if !framebuffer.flush() {
+        uart::log(b"Axis test: unavailable-screen flush failed\r\n");
+        return;
     }
     uart::log(error.log_message());
 }

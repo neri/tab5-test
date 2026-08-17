@@ -5,8 +5,8 @@
 //! output P4. The factory firmware drives that input as three 100 ms pulses.
 
 use crate::delay::delay_ms;
-use crate::usb;
 use crate::uart;
+use crate::usb;
 
 /// PI4IOE2 P4 is wired to the board power controller's `PWROFF_PULSE` input.
 const POWEROFF_PULSE_BIT: u8 = 4;

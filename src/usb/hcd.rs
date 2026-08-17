@@ -69,18 +69,14 @@ fn record_packet_failure(kind: u32, hcint: u32, qtd_status: u32) {
     LAST_PACKET_FAILURE_GINTMSK.store(unsafe { read(GINTMSK) }, Ordering::Relaxed);
     LAST_PACKET_FAILURE_HCFG.store(unsafe { read(HCFG) }, Ordering::Relaxed);
     LAST_PACKET_FAILURE_UTMI_FC06.store(unsafe { read(USB_UTMI_FC06) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_USBOTG20_CTRL.store(
-        unsafe { read(HP_SYSTEM_USBOTG20_CTRL) },
-        Ordering::Relaxed,
-    );
+    LAST_PACKET_FAILURE_USBOTG20_CTRL
+        .store(unsafe { read(HP_SYSTEM_USBOTG20_CTRL) }, Ordering::Relaxed);
     LAST_PACKET_FAILURE_SOC_CLK_CTRL1.store(
         unsafe { read(HP_SYS_CLKRST_SOC_CLK_CTRL1) },
         Ordering::Relaxed,
     );
-    LAST_PACKET_FAILURE_HP_USB_CTRL1.store(
-        unsafe { read(LP_CLKRST_HP_USB_CTRL1) },
-        Ordering::Relaxed,
-    );
+    LAST_PACKET_FAILURE_HP_USB_CTRL1
+        .store(unsafe { read(LP_CLKRST_HP_USB_CTRL1) }, Ordering::Relaxed);
     // Publish last so a reader never observes a new kind with stale fields.
     LAST_PACKET_FAILURE_KIND.store(kind, Ordering::Release);
 }
@@ -288,7 +284,11 @@ fn rmw_bit(register: u8, bit: u8, set_bit: bool) -> bool {
         return false;
     };
     let mask = 1u8 << bit;
-    let updated = if set_bit { current | mask } else { current & !mask };
+    let updated = if set_bit {
+        current | mask
+    } else {
+        current & !mask
+    };
     pi4ioe2_write(register, updated)
 }
 
@@ -530,7 +530,10 @@ struct QtdSlot {
 
 impl QtdSlot {
     const fn zeroed() -> Self {
-        Self { control: 0, buffer: 0 }
+        Self {
+            control: 0,
+            buffer: 0,
+        }
     }
 }
 
@@ -834,7 +837,11 @@ fn reset_utmi_and_core() {
     unsafe {
         // Assert both resets, then release PHY before controller, matching
         // ESP-IDF's `_usb_utmi_ll_reset_register`.
-        modify(LP_CLKRST_HP_USB_CTRL1, HP_USB_CTRL1_RST_OTG20, HP_USB_CTRL1_RST_OTG20);
+        modify(
+            LP_CLKRST_HP_USB_CTRL1,
+            HP_USB_CTRL1_RST_OTG20,
+            HP_USB_CTRL1_RST_OTG20,
+        );
         modify(
             LP_CLKRST_HP_USB_CTRL1,
             HP_USB_CTRL1_RST_OTG20_PHY,
@@ -847,7 +854,11 @@ fn reset_utmi_and_core() {
 
 fn configure_utmi_phy() {
     unsafe {
-        modify(HP_SYSTEM_USBOTG20_CTRL, USBOTG20_CTRL_OTG_SUSPENDM, USBOTG20_CTRL_OTG_SUSPENDM);
+        modify(
+            HP_SYSTEM_USBOTG20_CTRL,
+            USBOTG20_CTRL_OTG_SUSPENDM,
+            USBOTG20_CTRL_OTG_SUSPENDM,
+        );
         // ESP-IDF's `usb_utmi_ll_configure_ls(hw, true)`: parallel
         // Low-Speed mode plus Low-Speed keep-alive, and then the preamble
         // bit it does not set.
@@ -928,7 +939,10 @@ fn configure_fifos(fifo_depth_words: u32) {
     unsafe {
         write(GRXFSIZ, rx_lines);
         write(GNPTXFSIZ, (rx_lines & 0xFFFF) | (nptx_lines << 16));
-        write(HPTXFSIZ, ((rx_lines + nptx_lines) & 0xFFFF) | (ptx_lines << 16));
+        write(
+            HPTXFSIZ,
+            ((rx_lines + nptx_lines) & 0xFFFF) | (ptx_lines << 16),
+        );
     }
     flush_fifos();
 }
@@ -1238,7 +1252,10 @@ pub fn run_packet(
     }
     if status != QTD_STATUS_SUCCESS {
         if !quiet_errors {
-            uart::log_hex(b"USB: transfer QTD error, status=", status >> QTD_STATUS_SHIFT);
+            uart::log_hex(
+                b"USB: transfer QTD error, status=",
+                status >> QTD_STATUS_SHIFT,
+            );
         }
         return PacketOutcome::Error;
     }
@@ -1308,11 +1325,16 @@ fn run_split_packet(
         // Unreachable via the current callers (all chunk by MPS, which is
         // at most 64 on a Full/Low-Speed endpoint), but silently truncating
         // a transfer would be far worse than refusing it.
-        uart::log_hex(b"USB: split packet larger than the staging buffer, len=", xfer_len as u32);
+        uart::log_hex(
+            b"USB: split packet larger than the staging buffer, len=",
+            xfer_len as u32,
+        );
         return PacketOutcome::Error;
     }
 
-    let mut staging = SplitStaging { bytes: [0u8; SPLIT_STAGING_MAX] };
+    let mut staging = SplitStaging {
+        bytes: [0u8; SPLIT_STAGING_MAX],
+    };
     if !endpoint.is_in {
         staging.bytes[..xfer_len].copy_from_slice(buffer);
     }
@@ -1322,7 +1344,11 @@ fn run_split_packet(
     let hcchar = (endpoint.mps as u32 & 0x7FF)
         | ((endpoint.endpoint_number as u32 & 0xF) << 11)
         | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
-        | (if endpoint.route.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
+        | (if endpoint.route.low_speed_via_hub {
+            HCCHAR_LSPDDEV
+        } else {
+            0
+        })
         | endpoint.endpoint_type
         | HCCHAR_MC_ONE
         | ((endpoint.device_address as u32 & 0x7F) << 22);

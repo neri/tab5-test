@@ -2,11 +2,15 @@
 //!
 //! ECO2 does not expose the DSI Bridge VSYNC event. ESP-IDF therefore treats
 //! the full-frame DW-GDMA completion as a synthetic VSYNC and immediately
-//! rearms the next framebuffer. This module implements the same policy without
-//! an RTOS or PAC.
+//! rearms the framebuffer. This module implements the same policy without an
+//! RTOS or PAC.
+//!
+//! Scanout is single-buffered: the ISR re-arms the same address every frame,
+//! so there is no page flip to sequence and the foreground loop can draw at
+//! any point in the frame.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const DW_GDMA: usize = 0x5008_1000;
 const CHANNEL: usize = DW_GDMA + 0x100;
@@ -26,10 +30,7 @@ const CLIC_INTERRUPT: u32 = CPU_INTERRUPT_LINE + 16;
 const DMA_FULL_DONE: u32 = 1 << 1;
 const DMA_ERROR_MASK: u32 = 0x0000_3FE0;
 
-static FRAMEBUFFER_0: AtomicU32 = AtomicU32::new(0);
-static FRAMEBUFFER_1: AtomicU32 = AtomicU32::new(0);
-static REQUESTED: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static FRAMEBUFFER: AtomicU32 = AtomicU32::new(0);
 static FRAME_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static DMA_ERROR: AtomicU32 = AtomicU32::new(0);
 
@@ -128,11 +129,8 @@ _start_trap:
 /// Installs the full-frame DMA interrupt and enables machine interrupts.
 ///
 /// Call only after the GDMA register clock and channel configuration exist.
-pub fn install(framebuffer_0: u32, framebuffer_1: u32) {
-    FRAMEBUFFER_0.store(framebuffer_0, Ordering::Relaxed);
-    FRAMEBUFFER_1.store(framebuffer_1, Ordering::Relaxed);
-    REQUESTED.store(0, Ordering::Relaxed);
-    ACTIVE.store(0, Ordering::Relaxed);
+pub fn install(framebuffer: u32) {
+    FRAMEBUFFER.store(framebuffer, Ordering::Relaxed);
     FRAME_SEQUENCE.store(0, Ordering::Relaxed);
     DMA_ERROR.store(0, Ordering::Relaxed);
 
@@ -170,17 +168,6 @@ pub fn install(framebuffer_0: u32, framebuffer_1: u32) {
     }
 }
 
-#[allow(dead_code)]
-pub fn request_framebuffer(index: usize) {
-    if index < 2 {
-        REQUESTED.store(index, Ordering::Release);
-    }
-}
-
-pub fn active_framebuffer() -> usize {
-    ACTIVE.load(Ordering::Acquire)
-}
-
 pub fn frame_sequence() -> u32 {
     FRAME_SEQUENCE.load(Ordering::Acquire)
 }
@@ -211,15 +198,8 @@ extern "C" fn esp32p4_interrupt(cause: u32) {
         }
 
         if status & DMA_FULL_DONE != 0 {
-            let next = REQUESTED.load(Ordering::Acquire);
-            let address = if next == 0 {
-                FRAMEBUFFER_0.load(Ordering::Relaxed)
-            } else {
-                FRAMEBUFFER_1.load(Ordering::Relaxed)
-            };
-            write(CHANNEL, address);
+            write(CHANNEL, FRAMEBUFFER.load(Ordering::Relaxed));
             write(DW_GDMA + 0x18, 0x101);
-            ACTIVE.store(next, Ordering::Release);
             FRAME_SEQUENCE.fetch_add(1, Ordering::Release);
         }
     }
