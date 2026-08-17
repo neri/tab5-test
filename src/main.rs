@@ -16,6 +16,7 @@ mod bmi270;
 mod cardkb;
 mod console;
 mod delay;
+mod dma2d;
 mod framebuffer;
 mod gpio;
 mod i2c;
@@ -28,6 +29,7 @@ mod mbr;
 mod membench;
 mod paint;
 mod power;
+mod ppa;
 mod psram;
 mod sdmmc;
 mod shell;
@@ -126,6 +128,12 @@ fn main() -> ! {
     // It has to stop before `psram::init` resets and re-tunes that controller
     // underneath it.
     lcd::quiesce_dma();
+    // Same reasoning for the other master that can be left addressing PSRAM
+    // across a CPU-only reset, and the point at which its registers become
+    // readable at all.
+    if !ppa::init() {
+        uart::log(b"PPA: unavailable, fills stay on the CPU\r\n");
+    }
     if let Some(psram) = psram::init() {
         let (heap_start, heap_size) = psram.heap();
         unsafe {

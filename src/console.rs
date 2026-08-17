@@ -5,10 +5,12 @@
 //! span back to PSRAM before returning, so the two never drift apart and no
 //! caller has to remember to flush anything afterwards.
 //!
-//! Writes that move cells *under* the pixels already on screen -- a bottom-row
-//! scroll, `clear`, or a return from a full-screen mode -- cannot be expressed
-//! as a span, so they adjust the cell array first and then repaint the whole
-//! screen from it.
+//! Writes that move cells *under* the pixels already on screen cannot be
+//! expressed as a span, so they adjust the cell array first and then bring the
+//! pixels back into line with it. `clear` and a return from a full-screen mode
+//! repaint everything. A scroll does not: the rows that merely moved already
+//! hold the right pixels one row higher, so `scroll_screen` slides them with a
+//! block copy and repaints only what the copy could not have carried.
 
 use core::cell::UnsafeCell;
 
@@ -28,7 +30,9 @@ const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 // uses a half-width '>' rather than the full-width '＞' a shell would show.
 const PROMPT: [char; 2] = ['>', ' '];
 
-/// Longest command line `submit` can capture: one row minus the prompt.
+/// Longest command line `submit` can capture: one row minus the prompt. This
+/// is the hard limit on input, not a buffer that happens to be this size --
+/// `put` stops accepting characters when the row is full.
 const MAX_LINE: usize = COLUMNS - PROMPT.len();
 
 /// Terminal-like text storage for the keyboard input echo display.
@@ -183,7 +187,7 @@ impl Console {
 
         let first_row = self.row;
         self.column = 0;
-        let mut scrolled = false;
+        let mut scrolled_rows = 0;
         // Widest column any of this line's rows reached. Only these columns
         // are painted and written back; a writeback's cost is set by its
         // column span (CW rotation makes that a run of native rows), so a
@@ -195,15 +199,22 @@ impl Console {
             self.column += 1;
             widest = widest.max(self.column);
             if self.column == COLUMNS {
-                scrolled |= self.advance_row();
+                scrolled_rows += usize::from(self.advance_row());
             }
         }
-        scrolled |= self.advance_row();
+        scrolled_rows += usize::from(self.advance_row());
 
-        if scrolled {
-            // The rows moved under the pixels already on screen, and
-            // `first_row` no longer names the row this line started on.
-            self.redraw(framebuffer);
+        if scrolled_rows > 0 {
+            // The rows moved under the pixels already on screen, so
+            // `first_row` no longer names the row this line started on: it is
+            // now that many rows higher. From there down is exactly this
+            // line's own cells plus the row the scroll cleared, none of which
+            // any pixel on screen reflects yet.
+            self.scroll_screen(
+                framebuffer,
+                scrolled_rows,
+                first_row.saturating_sub(scrolled_rows),
+            );
             return;
         }
         for row in first_row..self.row {
@@ -239,6 +250,14 @@ impl Console {
         }
     }
 
+    /// Inserts one character at the cursor.
+    ///
+    /// A command line is one screen row and no more: `submit` reads the
+    /// current row's cells and nothing else, and `Submission` is sized to
+    /// match. So a full row stops accepting characters rather than continuing
+    /// somewhere `submit` will not look. It used to wrap onto a fresh prompt
+    /// row here, which put the typed text out of `submit`'s reach and silently
+    /// discarded the command.
     fn put(&mut self, framebuffer: &mut Framebuffer, ch: char) {
         if self.input_end == COLUMNS {
             return;
@@ -251,12 +270,6 @@ impl Console {
         self.cells[row][self.column] = ch;
         self.column += 1;
         self.input_end += 1;
-        if self.input_end == COLUMNS {
-            // The row is full. `new_line` paints its tail along with the
-            // wrap, so that the scrolling case can skip it entirely.
-            self.new_line(framebuffer, previous_column);
-            return;
-        }
         self.draw_edit(framebuffer, previous_column, self.input_end);
     }
 
@@ -335,7 +348,10 @@ impl Console {
         let submitted_row = self.row;
         let submitted_column = self.column;
         if self.advance_row() {
-            self.redraw(framebuffer);
+            // The submitted row's own pixels move up correctly, but it still
+            // carries the cursor block where the cursor no longer is, so it
+            // has to be repainted along with the row the scroll cleared.
+            self.scroll_screen(framebuffer, 1, submitted_row.saturating_sub(1));
         } else {
             // Nothing on the submitted row changed, but the cursor left it,
             // so its block has to be erased where it stood.
@@ -370,22 +386,39 @@ impl Console {
         scrolled
     }
 
-    /// Advances to the next row, writes a fresh prompt into it, and paints
-    /// both rows. Used for plain input newlines, where the next row is always
-    /// ready for more typing immediately.
+    /// Moves the grid up by `rows` cell rows on screen, then repaints rows
+    /// `repaint_from..ROWS` from the cell array.
     ///
-    /// `dirty_from` is the first column of the finished row this edit changed;
-    /// a scroll repaints everything anyway and ignores it.
-    fn new_line(&mut self, framebuffer: &mut Framebuffer, dirty_from: usize) {
-        let finished_row = self.row;
-        let scrolled = self.advance_row();
-        self.set_prompt_cells();
-        if scrolled {
+    /// The cell array has already been shifted by `advance_row`; this brings
+    /// the pixels into line with it. Every row that only moved already says
+    /// what it should say one row higher, so a block copy expresses that part
+    /// of the operation entirely and the CPU touches none of those pixels --
+    /// where a full repaint would re-render every glyph on screen, at roughly
+    /// the price of a screen clear.
+    ///
+    /// `repaint_from` is the caller's business because "what the copy got
+    /// right" is: the copy carries the pixels that were *on screen*, and cells
+    /// written during this update never were. A wrapped output line has
+    /// already filled several rows of the array that no pixel anywhere
+    /// reflects, so it is not enough to repaint only what the scroll exposed
+    /// at the bottom -- the caller knows how far up its own writes reached and
+    /// says so.
+    ///
+    /// Falls back to a full repaint when there is nothing left worth
+    /// preserving, or when the copy did not happen. `redraw` is correct in
+    /// every case; it is only slower.
+    fn scroll_screen(&self, framebuffer: &mut Framebuffer, rows: usize, repaint_from: usize) {
+        let grid_height = ROWS * CELL_HEIGHT;
+        if rows >= ROWS
+            || repaint_from == 0
+            || !framebuffer.scroll_up(TOP, grid_height, rows * CELL_HEIGHT)
+        {
             self.redraw(framebuffer);
             return;
         }
-        self.draw_span(framebuffer, finished_row, dirty_from, COLUMNS);
-        self.draw_span(framebuffer, self.row, 0, self.column + 1);
+        for row in repaint_from..ROWS {
+            self.draw_span(framebuffer, row, 0, COLUMNS);
+        }
     }
 
     /// Fills the current row's prompt cells and positions `column` after

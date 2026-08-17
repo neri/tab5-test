@@ -108,6 +108,18 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "ppafill",
+        usage: "ppafill <x> <y> <w> <h> <color> [cpu] | ppafill sweep",
+        lines: &[
+            "fill a rectangle through the PPA and report how long it took.",
+            "color is RGB565, decimal or 0x-prefixed. add 'cpu' to fill the",
+            "same rectangle with the CPU store loop instead; the two must be",
+            "indistinguishable on the panel. 'sweep' times both paths from",
+            "one console cell up to the full screen, which is what decides",
+            "the size below which the DMA setup costs more than it saves.",
+        ],
+    },
+    HelpEntry {
         name: "paint",
         usage: "paint",
         lines: &["touch drawing screen"],
@@ -298,6 +310,7 @@ pub fn execute(
         b"stress" => cmd_stress(console, framebuffer, argument),
         b"backlight" => cmd_backlight(console, framebuffer, argument),
         b"icm" => cmd_icm(console, framebuffer, argument),
+        b"ppafill" => cmd_ppafill(console, framebuffer, argument),
         b"sdinfo" => cmd_sdinfo(console, framebuffer),
         b"sdread" => cmd_sdread(console, framebuffer, argument),
         b"sdreadn" => cmd_sdreadn(console, framebuffer, argument),
@@ -1746,11 +1759,94 @@ fn cmd_icm(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]
     line.push_hex(status.master_arqos, 8);
     console.write_output_line(framebuffer, line.as_str());
 
-    console.write_output_line(framebuffer, "(DW-GDMA occupies bits 12-19 of both)");
+    let mut line = Line::new();
+    line.push_str("mst_awqos: 0x");
+    line.push_hex(status.master_awqos, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    console.write_output_line(
+        framebuffer,
+        "(DW-GDMA bits 12-19, 2D-DMA bits 8-11, in all three)",
+    );
 
     let mut line = Line::new();
     line.push_str("DPI FIFO underruns: ");
     line.push_u32(lcd::underrun_count());
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Fills one rectangle, by DMA or by CPU, and reports how long it took.
+///
+/// The two paths exist side by side because that is the only way to answer the
+/// two questions this stage has. Whether the PPA writes the right pixels is
+/// decided by putting the same rectangle on the panel both ways and seeing no
+/// difference; where the crossover between them lies is decided by the times,
+/// and it has to be measured rather than assumed -- a DMA that has to be set
+/// up, started and waited for loses to a store loop below some size.
+fn cmd_ppafill(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    const USAGE: &str = "usage: ppafill <x> <y> <w> <h> <color> | ppafill sweep";
+    if trim(argument) == b"sweep" {
+        cmd_ppafill_sweep(console, framebuffer);
+        return;
+    }
+    let (x, rest) = split_first_word(argument);
+    let (y, rest) = split_first_word(trim(rest));
+    let (width, rest) = split_first_word(trim(rest));
+    let (height, rest) = split_first_word(trim(rest));
+    let (color, rest) = split_first_word(trim(rest));
+    let (Some(x), Some(y), Some(width), Some(height), Some(color)) = (
+        parse_u32(x),
+        parse_u32(y),
+        parse_u32(width),
+        parse_u32(height),
+        parse_number(color),
+    ) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    let use_cpu = match trim(rest) {
+        b"" => false,
+        b"cpu" => true,
+        _ => {
+            console.write_output_line(framebuffer, USAGE);
+            return;
+        }
+    };
+    if color > u16::MAX as u32 {
+        console.write_output_line(framebuffer, "color must be a 16-bit RGB565 value");
+        return;
+    }
+    let (x, y) = (x as usize, y as usize);
+    let (width, height) = (width as usize, height as usize);
+    let color = color as u16;
+
+    let start = membench::cycles();
+    let filled = if use_cpu {
+        framebuffer.fill_rect(x, y, width, height, color);
+        framebuffer.flush_rect(x, y, width, height)
+    } else {
+        framebuffer.ppa_fill_rect(x, y, width, height, color)
+    };
+    let elapsed = membench::cycles().wrapping_sub(start);
+
+    if !filled {
+        console.write_output_line(framebuffer, "ppafill: fill failed or rectangle is empty");
+        return;
+    }
+
+    let microseconds = ((elapsed as u64) * 1_000_000 / startup::cpu_hz() as u64) as u32;
+    let mut line = Line::new();
+    line.push_str("ppafill: ");
+    line.push_u32(width as u32);
+    line.push_str("x");
+    line.push_u32(height as u32);
+    line.push_str(if use_cpu {
+        " by CPU in "
+    } else {
+        " by PPA in "
+    });
+    line.push_u32(microseconds);
+    line.push_str(" us");
     console.write_output_line(framebuffer, line.as_str());
 }
 
@@ -1779,6 +1875,140 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
             return None;
         }
         value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+/// Times both fill paths across a range of rectangle sizes, so the size at
+/// which the DMA starts winning is measured rather than guessed.
+///
+/// That number is what `Framebuffer::fill_rect` needs in order to route: below
+/// the crossover a store loop beats setting up, starting and waiting for a
+/// transfer, and the console's own repaints -- one 12x16 cell at a time -- sit
+/// firmly in that region. Sizes here run from exactly that cell up to the full
+/// screen. Each is repeated, because scanout is still running and a single
+/// short fill lands wherever it happens to land against that traffic.
+fn cmd_ppafill_sweep(console: &mut Console, framebuffer: &mut Framebuffer) {
+    /// Logical width x height. The first is one console cell.
+    const SIZES: &[(usize, usize)] = &[
+        (12, 16),
+        (24, 32),
+        (48, 64),
+        (96, 128),
+        (192, 256),
+        (384, 512),
+        (768, 640),
+        (crate::framebuffer::WIDTH, crate::framebuffer::HEIGHT),
+    ];
+    const REPEATS: u32 = 8;
+
+    // Measure everything before reporting anything. The larger sizes paint
+    // over the console, so restoring it has to happen once at the end --
+    // repainting between sizes would both erase the results already printed
+    // and charge each size for the repaint.
+    let mut results = Vec::new();
+    for &(width, height) in SIZES {
+        let ppa = time_fills(framebuffer, width, height, REPEATS, false);
+        let cpu = time_fills(framebuffer, width, height, REPEATS, true);
+        results.push((width, height, ppa, cpu));
+    }
+    console.clear(framebuffer);
+
+    const NAME_COLUMNS: usize = 12;
+    const VALUE_COLUMNS: usize = 10;
+
+    let mut header = Line::new();
+    header.push_str("size");
+    pad_to(&mut header, NAME_COLUMNS);
+    push_right_str(&mut header, "ppa", VALUE_COLUMNS);
+    push_right_str(&mut header, "cpu", VALUE_COLUMNS);
+    header.push_str("   (us per fill)");
+    console.write_output_line(framebuffer, header.as_str());
+
+    for (width, height, ppa, cpu) in results {
+        let mut line = Line::new();
+        line.push_u32(width as u32);
+        line.push_str("x");
+        line.push_u32(height as u32);
+        pad_to(&mut line, NAME_COLUMNS);
+        for value in [ppa, cpu] {
+            match value {
+                Some(microseconds) => {
+                    let mut digits = Line::new();
+                    digits.push_u32(microseconds);
+                    push_right_str(&mut line, digits.as_str(), VALUE_COLUMNS);
+                }
+                None => push_right_str(&mut line, "n/a", VALUE_COLUMNS),
+            }
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+/// Runs one size `repeats` times and returns the mean in microseconds, or
+/// `None` if a fill was refused.
+fn time_fills(
+    framebuffer: &mut Framebuffer,
+    width: usize,
+    height: usize,
+    repeats: u32,
+    use_cpu: bool,
+) -> Option<u32> {
+    // Alternate the colour so a repeat cannot be optimised away anywhere in
+    // the path and so a stuck fill is visible on the panel.
+    let start = membench::cycles();
+    for index in 0..repeats {
+        let color = if index % 2 == 0 {
+            crate::framebuffer::BLACK
+        } else {
+            crate::framebuffer::BLUE
+        };
+        if use_cpu {
+            framebuffer.fill_rect(0, 0, width, height, color);
+            if !framebuffer.flush_rect(0, 0, width, height) {
+                return None;
+            }
+        } else if !framebuffer.ppa_fill_rect(0, 0, width, height, color) {
+            return None;
+        }
+    }
+    let elapsed = membench::cycles().wrapping_sub(start);
+    let total = (elapsed as u64) * 1_000_000 / startup::cpu_hz() as u64;
+    Some((total / repeats as u64) as u32)
+}
+
+/// Pads a line with spaces out to `columns`, for table layout in the
+/// console's fixed-width cells.
+fn pad_to(line: &mut Line, columns: usize) {
+    while line.as_str().len() < columns {
+        line.push_str(" ");
+    }
+}
+
+/// Appends `text` right-aligned in a field `columns` wide.
+fn push_right_str(line: &mut Line, text: &str, columns: usize) {
+    for _ in text.len()..columns {
+        line.push_str(" ");
+    }
+    line.push_str(text);
+}
+
+/// Parses a decimal value, or a hexadecimal one written with a `0x` prefix.
+/// Colours are the reason: RGB565 constants are only recognisable in hex.
+fn parse_number(bytes: &[u8]) -> Option<u32> {
+    let Some(digits) = bytes
+        .strip_prefix(b"0x")
+        .or_else(|| bytes.strip_prefix(b"0X"))
+    else {
+        return parse_u32(bytes);
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for &byte in digits {
+        let digit = (byte as char).to_digit(16)?;
+        value = value.checked_mul(16)?.checked_add(digit)?;
     }
     Some(value)
 }

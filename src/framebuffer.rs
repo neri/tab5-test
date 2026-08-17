@@ -1,6 +1,8 @@
 //! CW-rotated RGB565 drawing primitives backed by external PSRAM.
 
-use crate::psram::{FRAMEBUFFER_BYTES, HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH};
+use crate::dma2d;
+use crate::ppa;
+use crate::psram::{HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH};
 
 mod font;
 
@@ -8,6 +10,38 @@ mod font;
 /// scan layout.
 pub const WIDTH: usize = NATIVE_HEIGHT;
 pub const HEIGHT: usize = NATIVE_WIDTH;
+
+/// Writeback granularity. Small enough that GDMA's scanout reads get the bus
+/// back between chunks; see `Framebuffer::flush`.
+const WRITEBACK_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Rectangle area from which `fill_rect` hands the work to the PPA.
+///
+/// A DMA transfer has to be described, started and waited for, and that fixed
+/// cost has to be earned back. `ppafill sweep` measured where it is, in
+/// microseconds per fill on this hardware:
+///
+/// ```text
+///   12x16 (one console cell)      14 ppa     15 cpu
+///   24x32                         21 ppa     41 cpu
+///   48x64                         51 ppa    133 cpu
+///   96x128                       314 ppa   1503 cpu
+///   1280x720 (full screen)     12879 ppa  94408 cpu
+/// ```
+///
+/// At a console cell the two are the same to within noise, and the gap opens
+/// from there. 24x32 is the smallest size measured to be clearly ahead, so
+/// that is the threshold: the console's per-cell repaints -- by far the most
+/// frequent fills, and the ones on the cursor-blink path -- stay on the CPU
+/// where they gain nothing, and everything the full-screen modes repaint goes
+/// to the DMA.
+///
+/// Area is the test rather than width or height, which is an approximation: a
+/// wide, short rectangle covers a large native span for few pixels, because
+/// rotation makes logical width the thing that strides across memory. It costs
+/// nothing to be wrong about, since the cache pass over that span is the same
+/// either way and the caller pays it regardless of which path filled.
+const PPA_FILL_MIN_PIXELS: usize = 24 * 32;
 
 pub const BLACK: u16 = 0x0000;
 pub const WHITE: u16 = 0xFFFF;
@@ -39,7 +73,30 @@ impl Framebuffer {
         self.memory.framebuffer().map(|pointer| pointer as u32)
     }
 
+    /// Clears the whole framebuffer, by DMA where that is available.
+    ///
+    /// This is the single most expensive thing the console does and the reason
+    /// the PPA path exists. Written by the CPU, the clear costs about 86 ms:
+    /// each 2-byte store misses a 64-byte line, write-allocate reads that line
+    /// back from PSRAM before overwriting it, and the core cannot overlap the
+    /// misses, so 1.8 MiB of writes drag 1.8 MiB of pointless reads through
+    /// the same PSRAM read path the display is being starved on. The PPA path
+    /// issues none of those reads and is not serialised on cache-miss latency.
+    ///
+    /// Unlike the CPU path this one leaves the result in PSRAM rather than in
+    /// dirty cache lines. Callers flush afterwards either way, and that flush
+    /// stays correct -- it just has less to write back.
     pub fn fill(&mut self, color: u16) {
+        if self.ppa_fill_rect(0, 0, WIDTH, HEIGHT, color) {
+            return;
+        }
+        self.fill_with_cpu(color);
+    }
+
+    /// The store-loop clear, used when the PPA is unavailable or refused the
+    /// transfer. Keeping it means a failed PPA bring-up costs speed and
+    /// nothing else.
+    fn fill_with_cpu(&mut self, color: u16) {
         let Some(pointer) = self.memory.framebuffer() else {
             return;
         };
@@ -98,7 +155,14 @@ impl Framebuffer {
         }
     }
 
+    /// Fills a logical rectangle, by DMA once the rectangle is big enough to
+    /// be worth setting one up.
     pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: u16) {
+        if width.saturating_mul(height) >= PPA_FILL_MIN_PIXELS
+            && self.ppa_fill_rect(x, y, width, height, color)
+        {
+            return;
+        }
         let Some(pointer) = self.memory.framebuffer() else {
             return;
         };
@@ -316,21 +380,128 @@ impl Framebuffer {
     /// once. Interconnect arbitration (`icm::prioritize_display_reads`) is
     /// what actually guarantees those reads win; this only smooths the peak.
     pub fn flush(&self) -> bool {
-        const CHUNK_BYTES: usize = 64 * 1024;
-        let mut offset = 0;
-        while offset < FRAMEBUFFER_BYTES {
-            let bytes = CHUNK_BYTES.min(FRAMEBUFFER_BYTES - offset);
-            if !self.memory.writeback_range(offset, bytes) {
-                return false;
-            }
-            offset += bytes;
+        self.flush_rect(0, 0, WIDTH, HEIGHT)
+    }
+
+    /// Fills a logical rectangle through the PPA instead of the CPU, keeping
+    /// the caches consistent on both sides of the transfer.
+    ///
+    /// CW rotation costs nothing here. A logical rectangle is still a
+    /// rectangle in the native 720x1280 picture -- just a transposed one, with
+    /// logical Y running along a native row and logical X running up the rows
+    /// from the bottom -- and describing a block inside a larger picture is
+    /// exactly what a 2D-DMA descriptor does.
+    ///
+    /// Both cache passes are needed, and for opposite reasons. Beforehand,
+    /// because a dirty line still held over this region would be evicted after
+    /// the DMA had written and would put the old pixels back on top of it.
+    /// Afterwards, because the DMA does not go through the cache, so a clean
+    /// line left resident holds pre-fill content that a later partial write by
+    /// the CPU would hit and write on top of. `flush_rect` writes back and
+    /// invalidates, which serves both.
+    ///
+    /// Returns false if the rectangle is empty, does not fit, or the transfer
+    /// did not complete; the caller can then fall back to `fill_rect`.
+    pub fn ppa_fill_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: u16,
+    ) -> bool {
+        let Some(pointer) = self.memory.framebuffer() else {
+            return false;
+        };
+        let x_start = x.min(WIDTH);
+        let y_start = y.min(HEIGHT);
+        let x_end = x.saturating_add(width).min(WIDTH);
+        let y_end = y.saturating_add(height).min(HEIGHT);
+        if x_start >= x_end || y_start >= y_end {
+            return false;
         }
-        true
+        let width = x_end - x_start;
+        let height = y_end - y_start;
+
+        if !self.flush_rect(x_start, y_start, width, height) {
+            return false;
+        }
+        // Native row `NATIVE_HEIGHT - 1 - x` holds logical column x, so the
+        // block's top row is the one belonging to the rectangle's right edge.
+        let picture = native_picture(pointer);
+        let destination = dma2d::Block {
+            picture: &picture,
+            x: y_start,
+            y: NATIVE_HEIGHT - x_end,
+        };
+        let filled = ppa::fill_rgb565(&destination, height, width, color);
+        // Invalidate even on failure: a partial fill still leaves the cache
+        // disagreeing with PSRAM.
+        self.flush_rect(x_start, y_start, width, height);
+        filled
+    }
+
+    /// Moves a band of the screen up by `distance` logical Y pixels, by DMA.
+    ///
+    /// This is what a text console does on every scroll, and by far the
+    /// cheapest way to do it: the pixels already say what they should say one
+    /// row higher, so nothing needs re-rendering except the row exposed at the
+    /// bottom. The CPU touches no pixel at all.
+    ///
+    /// The band runs the full logical width and covers logical Y in
+    /// `[top, top + height)`; afterwards its bottom `distance` rows still hold
+    /// their old contents and are the caller's to repaint.
+    ///
+    /// **Only upwards.** Rotation puts logical Y along a native row, so moving
+    /// up means moving to a *lower* address within each row, which is the
+    /// direction the engine's own read-before-write ordering makes safe --
+    /// see `dma2d::copy_rgb565`. Moving down would need the opposite order and
+    /// is not offered.
+    ///
+    /// Returns false if the geometry is empty or the transfer did not
+    /// complete, leaving the caller to repaint the band itself.
+    pub fn scroll_up(&mut self, top: usize, height: usize, distance: usize) -> bool {
+        let Some(pointer) = self.memory.framebuffer() else {
+            return false;
+        };
+        let bottom = top.saturating_add(height).min(HEIGHT);
+        if distance == 0 || top >= bottom || distance >= bottom - top {
+            return false;
+        }
+        // Native columns: logical Y indexes along a native row directly.
+        let moved = bottom - top - distance;
+
+        // One writeback-invalidate over the whole band, covering source and
+        // destination together. Afterwards nothing of the band is resident, so
+        // the DMA's writes cannot be overwritten by an eviction and cannot be
+        // shadowed by a stale clean line.
+        if !self.flush_rect(0, top, WIDTH, height) {
+            return false;
+        }
+        let picture = native_picture(pointer);
+        let source = dma2d::Block {
+            picture: &picture,
+            x: top + distance,
+            y: 0,
+        };
+        let destination = dma2d::Block {
+            picture: &picture,
+            x: top,
+            y: 0,
+        };
+        let copied = dma2d::copy_rgb565(&source, &destination, moved, NATIVE_HEIGHT);
+        self.flush_rect(0, top, WIDTH, height);
+        copied
     }
 
     /// Synchronises the native-memory span covering a logical rectangle.
     /// Rotation makes the rows sparse, so this includes the short gaps
     /// between them while remaining far smaller than a complete framebuffer.
+    ///
+    /// The span is written back in chunks, for the reason described on
+    /// `flush`: one uninterrupted multi-megabyte writeback takes the bus away
+    /// from GDMA's scanout reads for long enough to empty the DSI bridge's
+    /// FIFO. Small rectangles are one chunk and pay nothing for the loop.
     pub fn flush_rect(&self, x: usize, y: usize, width: usize, height: usize) -> bool {
         let x_start = x.min(WIDTH);
         let y_start = y.min(HEIGHT);
@@ -342,10 +513,16 @@ impl Framebuffer {
 
         let first_pixel = (NATIVE_HEIGHT - x_end) * NATIVE_WIDTH + y_start;
         let end_pixel = (NATIVE_HEIGHT - 1 - x_start) * NATIVE_WIDTH + y_end;
-        self.memory.writeback_range(
-            first_pixel * core::mem::size_of::<u16>(),
-            (end_pixel - first_pixel) * core::mem::size_of::<u16>(),
-        )
+        let mut offset = first_pixel * core::mem::size_of::<u16>();
+        let end = end_pixel * core::mem::size_of::<u16>();
+        while offset < end {
+            let bytes = WRITEBACK_CHUNK_BYTES.min(end - offset);
+            if !self.memory.writeback_range(offset, bytes) {
+                return false;
+            }
+            offset += bytes;
+        }
+        true
     }
 
     /// Paints the bring-up quadrant pattern and confirms it reached PSRAM.
@@ -589,6 +766,16 @@ impl Glyph<'_> {
 #[inline(always)]
 fn native_offset(x: usize, y: usize) -> usize {
     (NATIVE_HEIGHT - 1 - x) * NATIVE_WIDTH + y
+}
+
+/// Describes the framebuffer to the 2D-DMA in its own scan orientation: 720
+/// pixels per row, 1280 rows, whatever the logical geometry above says.
+fn native_picture(pointer: *mut u16) -> dma2d::Picture {
+    dma2d::Picture {
+        buffer: pointer as usize,
+        width: NATIVE_WIDTH,
+        height: NATIVE_HEIGHT,
+    }
 }
 
 fn coordinate_label(axis: u8, value: usize) -> [u8; 5] {
