@@ -40,7 +40,7 @@ static DMA_ERROR: AtomicU32 = AtomicU32::new(0);
 // ESP-IDF and save all integer registers that Rust may use.
 global_asm!(
     r#"
-    .section .trap.start, "ax"
+    .section .iram.text.critical.interrupt.entry, "ax"
     .balign 64
     .global _start_trap
     .type _start_trap, @function
@@ -181,6 +181,7 @@ pub fn wait_for_interrupt() {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".iram.text.critical.interrupt")]
 extern "C" fn esp32p4_interrupt(cause: u32) {
     unsafe {
         if cause & 0x8000_0000 == 0 || cause & 0x0FFF != CLIC_INTERRUPT {

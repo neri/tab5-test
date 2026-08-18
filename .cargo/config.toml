@@ -9,5 +9,6 @@ runner = "espflash flash --chip esp32p4 --after no-reset"
 rustflags = [
   "-C", "link-arg=-Tmemory.x",
   "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=--emit-relocs",
   "-C", "force-frame-pointers",
 ]

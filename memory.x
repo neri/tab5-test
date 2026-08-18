@@ -16,28 +16,22 @@
  *   at run time: ESP-IDF defaults to 128 KiB (top = 0x4ffa_0000) while the
  *   hardware reset value is 256 KiB (top = 0x4ff8_0000).  The intersection,
  *   0x00040000, is safe either way and is what this used to be sized for.
- *   `startup::log_ram_limit` prints the split that is actually in effect, and
- *   on the target device it reports the 128 KiB split, so the window is now
- *   the full 0x00060000 up to 0x4ffa_0000.  That check is not advisory: a
- *   bootloader configured for a 256 KiB cache would put the top of the stack
- *   inside the cache area, which is why `log_ram_limit` shouts about exactly
- *   that case at boot.
+ *   `startup::log_ram_limit` prints the split that is actually in effect. XIP
+ *   frees enough SRAM to use only the intersection safe for both cache sizes:
+ *   0x4ff4_0000..0x4ff8_0000. The stack therefore never overlaps the cache,
+ *   even when a different bootloader selects the larger 256 KiB cache.
  *
  * `riscv-rt` consumes the REGION_* aliases below.
  */
 MEMORY
 {
-    /* The P4 IDF bootloader expects exactly two XIP segments. Keep an 8-byte
-     * virtual gap between the descriptor segment and compatibility segment:
-     * espflash then preserves two headers without adding a padding segment. */
-    /* The 0x1018-byte first segment makes the following image segment's
-     * physical payload start at +0x1040, matching ROM_TEXT's page offset. */
-    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x00001018
-    /* A four-byte compatibility segment is enough to satisfy the ECO2
-     * bootloader's exactly-two-XIP-segments invariant. Application code is
-     * loaded into HP SRAM instead of executing through the flash cache. */
-    ROM_TEXT : ORIGIN = 0x40001040, LENGTH = 0x00000004
-    RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00060000
+    /* The P4 IDF bootloader expects exactly two XIP segments.  Fill DROM up to
+     * eight bytes before the next 64 KiB page boundary: the following segment
+     * header then puts the IROM payload at image offset +0x20000, matching the
+     * virtual address below without an extra espflash padding segment. */
+    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0001ffd8
+    ROM_TEXT : ORIGIN = 0x40020000, LENGTH = 0x003e0000
+    RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
 }
 
 REGION_ALIAS("REGION_TEXT", RAM);
@@ -47,8 +41,63 @@ REGION_ALIAS("REGION_BSS", RAM);
 REGION_ALIAS("REGION_HEAP", RAM);
 REGION_ALIAS("REGION_STACK", RAM);
 
+/* Keep reset/trap handling and the complete flash-critical call graph in
+ * internal RAM.  This block is inserted before riscv-rt's .text.dummy so that
+ * the latter can still use _stext as the start of ordinary application text. */
+SECTIONS
+{
+    .iram.text : ALIGN(64)
+    {
+        __siram_text = .;
+        KEEP(*(.init));
+        KEEP(*(.init.rust));
+        *(.iram.text.startup .iram.text.startup.*);
+
+        . = ALIGN(64);
+        __sflash_critical = .;
+        *(.iram.text.critical .iram.text.critical.*);
+        . = ALIGN(4);
+        __eflash_critical = .;
+        __eiram_text = .;
+    } > RAM
+
+    .dram.rodata : ALIGN(4)
+    {
+        __sdram_rodata = .;
+        KEEP(*(.dram.rodata .dram.rodata.*));
+        . = ALIGN(4);
+        __edram_rodata = .;
+    } > RAM
+
+    /* The firmware installs its own CLIC-aware _start_trap in the critical
+     * IRAM block above. Drop riscv-rt's unused generic trap implementation so
+     * it cannot leave a second, flash-dependent trap path in RAM. */
+    /DISCARD/ :
+    {
+        *(.trap.vector);
+        *(.trap.start .trap.start.*);
+        *(.trap.continue);
+        *(.trap.rust);
+        *(.trap .trap.*);
+    }
+}
+INSERT BEFORE .text.dummy;
+
+/* riscv-rt requires its dummy/default .text output to live in REGION_TEXT.
+ * Ordinary text inputs are consumed by .flash.text below, so park that empty
+ * output after the internal-only RAM sections. */
+_stext = ALIGN(ADDR(.dram.rodata) + SIZEOF(.dram.rodata), 64);
+
 /* ESP-IDF reads the descriptor immediately after the 32-byte image header.
- * Collect all read-only data in the same first XIP segment. */
+ * Collect ordinary read-only data after it in the same DROM segment.  The
+ * final location-counter assignment deliberately pads the segment to the
+ * physical/virtual page boundary required by the next IROM segment.
+ *
+ * REGION_RODATA remains RAM because riscv-rt also uses it as .data's load
+ * region.  The bootloader already loads .data directly to its RAM VMA, so
+ * keeping that behavior avoids a second startup copy without consuming any
+ * additional run-time RAM.  These input sections are consumed here before
+ * riscv-rt's otherwise-empty default .rodata/.eh_frame outputs. */
 SECTIONS
 {
     .flash.appdesc : ALIGN(4)
@@ -56,14 +105,29 @@ SECTIONS
         KEEP(*(.flash.appdesc));
     } > ROM_RODATA
 
-    .eco2.rodata : ALIGN(4)
+    .flash.rodata : ALIGN(4)
     {
-        KEEP(*(.eco2.pad));
+        KEEP(*(.eco2.rodata.probe.pre));
+        /* Keep the post-reset probe out of the pre-reset cache line. */
+        . = ALIGN(256);
+        KEEP(*(.eco2.rodata.probe.post));
+        *(.srodata .srodata.*);
+        *(.rodata .rodata.*);
+        KEEP(*(.eh_frame .eh_frame.*));
+        . = ORIGIN(ROM_RODATA) + LENGTH(ROM_RODATA) - 1;
+        BYTE(0);
     } > ROM_RODATA
 
-    .eco2.xip_stub : ALIGN(4)
+    .flash.text : ALIGN(4)
     {
-        KEEP(*(.eco2.xip_stub));
+        KEEP(*(.eco2.xip_stub.pre));
+        /* A distinct cache line makes the post-reset call a real XIP miss. */
+        . = ALIGN(256);
+        KEEP(*(.eco2.xip_stub.post));
+        /* The IRAM blocks inserted before .text.dummy have already consumed
+         * startup, trap/ISR and PSRAM-critical functions. */
+        *(.text.abort);
+        *(.text .text.*);
     } > ROM_TEXT
 }
 INSERT BEFORE .text;
@@ -76,5 +140,15 @@ INSERT BEFORE .text;
  * offset.  Both checks fail at link time instead of failing to boot. */
 ASSERT(ORIGIN(ROM_TEXT) - ORIGIN(ROM_RODATA) == LENGTH(ROM_RODATA) + 8,
        "ROM_TEXT must start one segment header after the end of ROM_RODATA");
-ASSERT(ADDR(.eco2.rodata) + SIZEOF(.eco2.rodata) == ORIGIN(ROM_RODATA) + LENGTH(ROM_RODATA),
-       "XIP_SEGMENT_PAD no longer fills ROM_RODATA exactly");
+ASSERT(ADDR(.flash.rodata) + SIZEOF(.flash.rodata) == ORIGIN(ROM_RODATA) + LENGTH(ROM_RODATA),
+       "DROM segment no longer fills ROM_RODATA exactly");
+ASSERT(ADDR(.flash.text) >= ORIGIN(ROM_TEXT) &&
+       ADDR(.flash.text) + SIZEOF(.flash.text) <= ORIGIN(ROM_TEXT) + LENGTH(ROM_TEXT),
+       "IROM text is outside ROM_TEXT");
+ASSERT(__siram_text >= ORIGIN(RAM) && __eiram_text <= ORIGIN(RAM) + LENGTH(RAM),
+       "IRAM text is outside RAM");
+ASSERT(__sdram_rodata >= ORIGIN(RAM) && __edram_rodata <= ORIGIN(RAM) + LENGTH(RAM),
+       "DRAM rodata is outside RAM");
+ASSERT(SIZEOF(.text) == 0, "ordinary text leaked back into RAM");
+ASSERT(SIZEOF(.rodata) == 0, "ordinary rodata leaked back into RAM");
+ASSERT(SIZEOF(.stack) >= 0x20000, "less than 128 KiB remains for the stack");

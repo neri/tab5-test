@@ -125,10 +125,6 @@ const DESC_FIRST: u32 = 1 << 3;
 const DESC_CHAINED: u32 = 1 << 4;
 const DESC_OWNED_BY_IDMAC: u32 = 1 << 31;
 
-const ROM_CACHE_WRITEBACK_INVALIDATE_ADDR: usize = 0x4FC0_03FC;
-const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
-const CACHE_MAP_L2_CACHE: u32 = 1 << 5;
-
 /// One IDMAC descriptor. Layout and 64-byte size (the extra `reserved` words
 /// are cache-line padding on P4) match ESP-IDF's `sdmmc_desc_t` exactly.
 /// `read_block` builds a single one, non-chained, since one block fits in a
@@ -919,12 +915,7 @@ fn init_dma() {
 /// wrote there. Mirrors `psram.rs`'s `writeback_range`, but for internal
 /// SRAM rather than PSRAM.
 fn cache_writeback_invalidate(address: usize, length: usize) {
-    let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
-        unsafe { core::mem::transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
-    unsafe {
-        writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
-        writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
-    }
+    crate::psram::writeback_invalidate(address, length);
 }
 
 /// Programs slot 0's card clock divider (`SDHOST_CLKDIV_REG`'s divisor is

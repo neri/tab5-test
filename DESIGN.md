@@ -33,31 +33,38 @@ CPLLの新規有効化やregi2cキャリブレーションを行わず、ブー�
 ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では次の配置を
 定義しています。
 
-- `0x40000020`: アプリケーション記述子とXIP位置調整用パディング
-- `0x40001040`: 4 byteのXIP互換セグメント（実行しない）
-- `0x4ff40000`: 実行コード、読み取り専用データ、データ、BSS、スタック
+- `0x40000020..0x4001fff8`: アプリケーション記述子、通常の読み取り専用データ、
+  `.eh_frame`、IROMとの位置関係を固定するパディング（DROM）
+- `0x40020000`以降: 通常の実行コード（IROM）
+- `0x4ff40000..0x4ff80000`: FLASH停止中にも必要なコードと定数、`.data`、
+  `.bss`、スタック（内部L2MEM）
 
 アプリケーション記述子は`src/main.rs`の`EspAppDesc`です。
 
-Rust本体はフラッシュから実行せず、2nd-stage bootloaderが内部HP SRAMへロードします。
-容量上の理由ではありません。本体は約34 KiB、イメージ全体でも約39 KiBで、16 MiBの
-フラッシュにも4 MiBのXIP窓にも収まります。SRAM実行を選ぶ理由は、`src/psram.rs`が
-実行中にMSPIのPHY電源とクロックを張り替え、ROMのキャッシュ・MMU操作を呼ぶためです。
-ESP-IDFはこの種のコードを`IRAM_ATTR`で内部RAMへ退避しますが、本プロジェクトには
-その仕分けがないため、全体をSRAMへ置く方が単純で安全です。GDMA完了ISRの応答時間が
-フラッシュキャッシュの状態に依存しなくなる利点もあります。
+通常のRustコードはFLASHから直接実行し、通常の定数もFLASHから参照します。一方、
+エントリポイント、起動処理、独自CLIC trap、ISR、panic最小経路、PSRAM/MSPI初期化、
+ROMキャッシュ操作のラッパーは`.iram.text`、それらが参照する定数は
+`.dram.rodata`へ分離します。PSRAM初期化中はmachine interruptを禁止し、通常動作中の
+キャッシュ同期では表示割り込みを止めない構成です。後者が安全であることは、trap/ISRを
+含むFLASH非依存閉包を`tools/check_elf_layout.py`で検査します。
 
-一方でESP-IDF v5.5.3のESP32-P4ブートローダーは、XIP領域にあるセグメントが
+`.data`はFLASH側へロードイメージを複製せず、2nd-stage bootloaderがRAMのVMAへ
+直接ロードします。リンク時に`__sidata == __sdata`を検査し、起動時にも複数の非ゼロ
+`.data`とゼロ初期化`.bss`を検査します。
+
+ESP-IDF v5.5.3のESP32-P4ブートローダーは、XIP領域にあるセグメントが
 ちょうど2本であることを要求します（`bootloader_utility.c`の`unpack_load_app`、
-`assert(rom_index == 2)`）。SRAM実行にすると本来XIPセグメントは記述子だけの1本に
-なるため、4 byteの互換セグメントを追加して2本に揃えています。あわせて先頭セグメントの
-長さを調整し、次のイメージセグメントの物理アドレスと仮想アドレスの64 KiBページ内
-オフセットを一致させることで、`espflash`による余分なパディングセグメントを防ぎます。
-これが崩れるとXIPセグメントが3本になり、ビルドは通るのに起動しなくなるため、
-`memory.x`の末尾で両方の条件をリンク時に検査しています。
+`assert(rom_index == 2)`）。DROMを固定終端までパディングし、続くIROMとの物理・仮想
+アドレスの64 KiBページ内オフセットを一致させることで、`espflash`による余分な
+パディングセグメントを防ぎます。これが崩れるとビルドは通っても起動しないため、
+`memory.x`のリンク時ASSERTと`tools/check_esp_image.py`の変換後イメージ検査を
+併用します。最終イメージはDROM/IROMのXIP 2本とRAMロード2本です。
 
-結果としてイメージはXIP 2本とRAMロード1本になり、アプリ本体はフラッシュキャッシュ
-を経由せずに実行されます。`.data`先頭には`BOOT_LAYOUT_MARKER`も配置しています。
+PSRAM初期化前後には、互いに別の64 byteキャッシュラインにあるDROM/IROMプローブを
+実行します。初期実装ではPSRAM用dual-MSPIリセットのbit 23/25ではなくFLASH側の
+bit 22/24を操作していたため、初期化後の最初の通常DROM参照で停止しました。
+ESP-IDF v5.5.3と同じbit 23/25へ修正し、キャッシュヒットで誤通過しないcold probeに
+分離した構成で実機確認しています。
 
 ## RAMの範囲
 
@@ -69,25 +76,21 @@ ECO2ではL2キャッシュがL2MEMの上位から確保されるため、使用
 
 キャッシュサイズを決めるのは2nd-stage bootloaderで、ESP-IDFの既定は128 KiB
 （上限`0x4ffa0000`）、ハードウェアのリセット値は256 KiB（上限`0x4ff80000`）です。
-リンク時には判別できないため、`memory.x`は長らく両方で安全な`0x4ff80000`を上限と
-していました。実機の`startup::log_ram_limit`が128 KiB分割を報告することを確認した
-ので、現在は`0x00060000`（上限`0x4ffa0000`）まで広げています。この確認は形式的な
-ものではありません。256 KiBキャッシュに設定されたbootloaderで起動するとスタックの
-先頭がキャッシュ領域に入るため、`log_ram_limit`はまさにその状態を起動時に警告します。
+リンク時には判別できないため、`memory.x`は両方で安全な共通部分である
+`0x4ff40000..0x4ff80000`（256 KiB）だけを使用します。実機は128 KiB分割を報告し、
+`RAM: usable top=0x4FFA0000`に対して`RAM: stack top=0x4FF80000`となるため、さらに
+128 KiBの安全余白があります。256 KiB設定でもstack topとusable topが一致し、
+キャッシュ領域とは重なりません。
 
 なおchip revision v3以降はキャッシュがL2MEMの下位から確保され、上限は
 `0x4ffaefc0`になります。この値をECO2に適用してはいけません。
 
-上限を広げたのは`win`とHID Bootマウスを入れるためです。それ以前の
-`0x00040000`では、`.bss`の終端`__ebss = 0x4ff7e480`から
-`_stack_start = 0x4ff80000`までの7040バイトが、スタックに使える残り全部でした。
-`.text`が約9 KiB増える追加はこれに収まらず、リンクが
-`section '.bss' will not fit in region 'RAM'`で失敗します。イメージは`.text`／`.rodata`／
-`.data`／`.bss`／`.heap`／`.stack`が全て同じ`RAM`リージョンへ順に並ぶので、
-コードが増えた分だけそのままスタックが削られます（ヒープはPSRAM側にあり
-`_heap_size = 0`なので、ここには効きません）。`src/app/win.rs`の描画呼び出しを
-`#[inline(never)]`なラッパーへまとめているのはこのためです。まとめる前の増加は
-約18 KiB、つまりインライン展開だけで倍近く膨らんでいました。
+XIP移行前は通常`.text`と`.rodata`も同じRAM窓を消費し、機能追加がそのまま
+スタックを削っていました。最終release配置では通常RAM `.text`/`.rodata`は0 byte、
+`.iram.text` 6,172 byte、`.dram.rodata` 908 byte、`.data` 19,088 byte、`.bss`
+49,268 byte、残り`.stack` 186,636 byteです。リンク時に通常コードのRAM回帰を禁止し、
+stack 128 KiB以上をASSERTするため、通常アプリコードの増加はスタックを圧迫しません。
+今後RAM量に効くのはIRAM/DRAMへ明示したcritical処理と可変データです。
 
 同種の変更を足すときは、`llvm-nm --size-sort --print-size`でシンボル単位の
 増分を見るのが手早い方法です。増分が大きいのはたいてい新しいコードそのもの
@@ -101,11 +104,14 @@ riscv-rt
   → CPUクロックを90 MHzから360 MHz(CPLL/1)へ引き上げ
   → USB Serial/JTAG初期化
   → L2キャッシュ分割とRAM上限をログ出力
-  → PSRAM電源・クロック・DQS調整・MMU割り当て
+  → .data/.bssのboot配置を検査
+  → PSRAM初期化前のcold DROM/IROMプローブ
+  → 割り込みを止め、IRAM内でPSRAM電源・クロック・DQS調整・MMU割り当て
+  → PSRAM初期化後の別cache lineによるcold DROM/IROMプローブ
   → RGB565コンソール画面を描画してキャッシュを同期
   → LCDリセット・D-PHY・パネル初期化
   → DSI BridgeとDW-GDMAを準備してvideo modeを開始
-  → InputManagerが統合キーボード入力に応じて変更セルだけを描画・部分同期
+  → IROM上の通常アプリへ移り、InputManagerが変更セルだけを描画・部分同期
 ```
 
 DSI HostのVideo Pattern Generatorは使用しません。ECO2では動作中のVPGからBridge
@@ -142,7 +148,11 @@ DQS調整では、この実機で繰り返し選択された`phase=0, data=0, dq
 
 CPUが描画した内容をGDMAから参照できるよう、転送前にROMの
 `Cache_WriteBack_Invalidate_Addr`をL1 DCache、L2 Cacheの順に呼び出します。
-その後、既知画素を再読出しし、外部PSRAMへ同期されたことを確認します。
+PSRAM、SD、USBの全呼び出しは`src/psram.rs`の
+`iram_cache_writeback_invalidate`へ集約し、ROM処理中のcall/return経路が
+IROM命令に依存しないようにします。同期中もLCDのframe ISRは動かすためmachine
+interruptは許可したままですが、trap入口、ISR、参照定数、状態はIRAM/DRAM内に
+閉じています。その後、既知画素を再読出しし、外部PSRAMへ同期されたことを確認します。
 
 ### ヒープ（グローバルアロケータ）
 
@@ -214,7 +224,9 @@ GDMA完了ISRは次の最小処理だけを行います。
 ECO2は初期版CLICを使用します。汎用`riscv-rt`のトラップ入口はCLIC拡張された
 `mcause`を保存しないため、`src/interrupts.rs`に専用入口を置いています。この入口は
 全整数レジスタ、`mcause`、`mstatus`、`mepc`を保存・復元します。DW-GDMA割り込み
-source 24をCPU external line 1、CLIC interrupt 17へ接続しています。
+source 24をCPU external line 1、CLIC interrupt 17へ接続しています。`_start_trap`、
+`ExceptionHandler`、`esp32p4_interrupt`は常にIRAMへ配置し、release ELFの
+relocation検査でDROM/IROM参照がないことを確認します。
 
 ## 表示帯域とFIFOアンダーラン
 
@@ -240,31 +252,31 @@ GDMAの読み出しが間に合わなくなります。1セル更新で再現し
 
 | 測定 | PSRAM | L1ヒット（参考） |
 | --- | --- | --- |
-| 逐次書き込み u32 | 20 MB/s | 442 MB/s |
-| 逐次書き込み u16 | 20 MB/s | 239 MB/s |
-| 逐次読み出し u32 | 39 MB/s | 479 MB/s |
-| 64 byteライン1本の書き込み | **3017 ns** | 8 ns |
-| 64 byteライン1本の読み出し | **1351 ns** | 8 ns |
-| 同、4 KiB飛び（プリフェッチ無効化） | 1281 ns | 10 ns |
+| 逐次書き込み u32 | 20 MB/s | 409 MB/s |
+| 逐次書き込み u16 | 20 MB/s | 235 MB/s |
+| 逐次読み出し u32 | 38 MB/s | 460 MB/s |
+| 64 byteライン1本の書き込み | **3019 ns** | 17 ns |
+| 64 byteライン1本の読み出し | **1350 ns** | 11 ns |
+| 同、4 KiB飛び（プリフェッチ無効化） | 1239 ns | 23 ns |
 
 読み取れることが4つある。
 
 - **CPUのPSRAMスループットは、ラインあたりのレイテンシで決まっている。**
-  `64 byte ÷ 1351 ns = 47 MB/s`が読み出しの実測39 MB/sと、
-  `64 byte ÷ 3017 ns = 21 MB/s`が書き込みの実測20 MB/sとほぼ一致する。
+  `64 byte ÷ 1350 ns = 47 MB/s`が読み出しの実測38 MB/sと、
+  `64 byte ÷ 3019 ns = 21 MB/s`が書き込みの実測20 MB/sとほぼ一致する。
   CPUには複数のミスを同時に走らせる仕組みがないため、**1本ずつ待つ**。
   ミスが重ならないので、帯域ではなくレイテンシが上限を決める
-- **write-allocateのコストがそのまま出ている。** 書き込み3017 nsは
-  読み出し1351 nsのおよそ2.2倍で、「ラインを読んでから、あとで書き戻す」
+- **write-allocateのコストがそのまま出ている。** 書き込み3019 nsは
+  読み出し1350 nsのおよそ2.2倍で、「ラインを読んでから、あとで書き戻す」
   の2回分に一致する。書き込みミスが読み出しミスの倍かかる理由がこれ
-- **プリフェッチは働いていない。** 4 KiB飛びの1281 nsが逐次の1351 nsより
+- **プリフェッチは働いていない。** 4 KiB飛びの1239 nsが逐次の1350 nsより
   むしろ速い。ライン粒度では逐次アクセスの利得がない（ライン内は当然別）
 - **u32化は無意味だった。** 逐次書き込みはu32もu16も20 MB/s。コストは
   ストア回数ではなくラインフィルで決まるため。L1に載るデータでは
-  442対239 MB/sで効くので、`fill`のu32化が無駄なのはPSRAMに対してだけ
+  409対235 MB/sで効くので、`fill`のu32化が無駄なのはPSRAMに対してだけ
 
 この値で全画面クリアを計算し直すと、1,843,200 byte ＝ 28,800ライン、
-**28,800 × 3017 ns ≒ 86 ms**。`stress`コマンドによる実測は
+**28,800 × 3019 ns ≒ 87 ms**。CPU経路の過去の`stress`実測は
 **1回あたり94 ms**（20回で1894 ms、`fill`と`flush`の合計）で、
 モデルと1割の範囲で一致する。57 Hzのフレーム5枚分を全画面クリア1回で
 使い切っている計算になり、コンソールはスクロールのたびにこれを行っている。
@@ -391,21 +403,24 @@ CPU経路はwrite-allocateのために1.8 MiBの読み込みを余計に出し�
 「PSRAMは飽和していない」という前節の推測はこれで裏付けられました。CPUが
 レイテンシ律速で帯域を使い切れていなかっただけです。
 
-矩形が小さいうちはDMAの起動と完了待ちの固定費が勝つので、`fill_rect`は
-面積でCPUとPPAを切り替えます。しきい値は`ppafill sweep`——両経路を1セルから
-全画面まで計測する診断コマンド——の実測で決めました。
+`fill_rect`は面積でCPUとPPAを切り替えます。しきい値は`ppafill sweep`——両経路を
+1セルから全画面まで計測する診断コマンド——の実測と、セル単位描画をDMAへ渡す
+キャッシュ同期コストを含めて決めました。
 
 | 矩形 | PPA | CPU |
 | --- | --- | --- |
-| 12×16（コンソール1セル） | 14 µs | 15 µs |
-| 24×32 | 21 µs | 41 µs |
-| 48×64 | 51 µs | 133 µs |
-| 96×128 | 314 µs | 1503 µs |
-| 1280×720 | 12879 µs | 94408 µs |
+| 12×16（コンソール1セル） | 18 µs | 28 µs |
+| 24×32 | 21 µs | 30 µs |
+| 48×64 | 52 µs | 59 µs |
+| 96×128 | 272 µs | 346 µs |
+| 192×256 | 1162 µs | 1096 µs |
+| 384×512 | 2801 µs | 3196 µs |
+| 768×640 | 6034 µs | 7294 µs |
+| 1280×720 | 12439 µs | 12401 µs |
 
-1セルでは誤差の範囲、24×32で明確に開くので、しきい値は24×32＝768画素です。
-コンソールのセル単位再描画——最も頻度が高く、カーソル点滅経路にも乗ります——は
-CPUのまま残ります。
+単独測定ではサイズによる優劣が単調ではありませんが、しきい値は24×32＝768画素を
+維持します。コンソールのセル単位再描画——最も頻度が高く、カーソル点滅経路にも
+乗ります——はCPUのまま残します。
 
 スクロールは2D-DMAのメモリ間ブロックコピー（M2M）です。回転により論理Yは
 ネイティブ行に沿って並ぶので、コンソールを1セル行スクロールする操作は
@@ -1059,6 +1074,11 @@ bit-bangバスでは7バイトの途中で桁上がりが起こり得る（23:59
   段階分けと実装上の判断は[`USB_HOST_PLAN.md`](docs/USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
+- `tools/check_elf_layout.py`: release ELFのXIP/IRAM/DRAM配置、critical relocation、
+  RAM範囲、stack下限を検査
+- `tools/check_esp_image.py`: `espflash save-image`後のXIPセグメント数、appdesc、
+  物理・仮想64 KiBページ内オフセットを検査
+- `docs/FLASH_XIP_MIGRATION_PLAN.md`: XIP移行のStage、判断、実測結果
 
 `esp-idf-reference/`には、レジスタ設定との比較に使用したESP-IDF v5.5.3版の
 参照実装があります。
@@ -1088,10 +1108,16 @@ MMIOプリミティブ）は`unsafe fn`として定義します。呼び出し�
 RAM: L2 cache bytes=0x...
 RAM: usable top=0x...
 RAM: stack top=0x...
+XIP: pre-PSRAM DROM probe start
+XIP: pre-PSRAM IROM probe start
+XIP: pre-PSRAM DROM+IROM ok
 DMA2D: version=0x02304110
 PPA: version=0x02304041
 PPA: clocked, out of reset, registers verified
 PSRAM: ready (framebuffer + heap)
+XIP: post-PSRAM DROM probe start
+XIP: post-PSRAM IROM probe start
+XIP: post-PSRAM DROM+IROM ok
 LCD: D-PHY 4/4 ready
 LCD: DCS init complete
 ICM: clk_en=0x...
@@ -1129,6 +1155,9 @@ USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::re
 
 - `CPU: unexpected boot clock source, staying at 90 MHz`: ブートローダーがCPLL/4以外の経路でCPUを構成した（分周比を書き換えず90 MHzのまま継続）
 - `RAM: stack top is inside the L2 cache area`: `memory.x`の`RAM`範囲が広すぎる
+- `MEM: .data/.bss initialization failed`: bootloaderのRAMロードまたはゼロ初期化が不正
+- pre側の`XIP: DROM probe failed`／`XIP: IROM probe actual=...`: bootloaderによる初期FLASHマッピングが不正
+- post側の同ログ、またはpost probe途中の停止: PSRAM/MSPI初期化後にFLASHデータまたは命令取得へ復帰できない
 - `PSRAM: mode-register transaction failed`: MSPI3コマンド経路
 - `PSRAM: no valid DQS phase`: DQS位相調整
 - `PSRAM: mapped memory test failed`: MMUまたはキャッシュ経路

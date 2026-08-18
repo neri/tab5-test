@@ -1570,21 +1570,12 @@ fn force_halt_channel() {
 // Cache sync, timing, and raw MMIO
 // ------------------------------------------------------------------------
 
-const ROM_CACHE_WRITEBACK_INVALIDATE_ADDR: usize = 0x4FC0_03FC;
-const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
-const CACHE_MAP_L2_CACHE: u32 = 1 << 5;
-
 /// Writes back dirty cache lines over `address..address+length` and
 /// invalidates them, matching `sdmmc.rs`'s helper of the same name (same
 /// ROM call, same reasoning: the QTD list and transfer buffers here are
 /// DMA-shared memory, exactly like SD's IDMAC descriptors).
 fn cache_writeback_invalidate(address: usize, length: usize) {
-    let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
-        unsafe { core::mem::transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
-    unsafe {
-        writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
-        writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
-    }
+    crate::psram::writeback_invalidate(address, length);
 }
 
 /// # Safety

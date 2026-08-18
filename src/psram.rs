@@ -60,6 +60,71 @@ struct RomSpiCommand {
 #[repr(align(4))]
 struct AlignedBytes<const N: usize>([u8; N]);
 
+macro_rules! dram_message {
+    ($name:ident, $value:expr) => {
+        #[used]
+        #[unsafe(link_section = ".dram.rodata.psram")]
+        static $name: [u8; ($value).len()] = *($value);
+    };
+}
+
+dram_message!(
+    MODE_REGISTER_TRANSACTION_FAILED,
+    b"PSRAM: mode-register transaction failed\r\n"
+);
+dram_message!(
+    MODE_REGISTER_WRITE_FAILED,
+    b"PSRAM: mode-register write failed\r\n"
+);
+dram_message!(MR8_READ_FAILED, b"PSRAM: MR8 read failed\r\n");
+dram_message!(MR8_WRITE_FAILED, b"PSRAM: MR8 write failed\r\n");
+dram_message!(
+    COMMAND_TRANSACTION_TIMEOUT,
+    b"PSRAM: command-path transaction timed out\r\n"
+);
+dram_message!(COMMAND_READ_LABEL, b"PSRAM: command read=");
+dram_message!(COMMAND_TEST_FAILED, b"PSRAM: command-path test failed\r\n");
+dram_message!(MMU_ERROR_LABEL, b"PSRAM: MMU error=");
+dram_message!(MAPPED_TEST_FAILED, b"PSRAM: mapped memory test failed\r\n");
+dram_message!(READY_MESSAGE, b"PSRAM: ready (framebuffer + heap)\r\n");
+dram_message!(
+    TUNING_WRITE_TIMEOUT,
+    b"PSRAM: tuning reference write timed out\r\n"
+);
+dram_message!(
+    PREFERRED_DQS_FAILED,
+    b"PSRAM: preferred DQS point failed; running full sweep\r\n"
+);
+dram_message!(NO_VALID_DQS_PHASE, b"PSRAM: no valid DQS phase\r\n");
+dram_message!(
+    NO_STABLE_DQS_WINDOW,
+    b"PSRAM: no stable DQS delay window\r\n"
+);
+dram_message!(BAD_ADDRESS_LABEL, b"PSRAM: bad address=");
+dram_message!(BAD_VALUE_LABEL, b"PSRAM: bad value=");
+dram_message!(
+    MSPI3_BUSY,
+    b"PSRAM: MSPI3 busy before command configuration\r\n"
+);
+dram_message!(MSPI3_TIMEOUT, b"PSRAM: MSPI3 command timeout\r\n");
+dram_message!(MSPI3_CMD_LABEL, b"PSRAM: MSPI3 CMD=");
+dram_message!(MSPI3_CLOCK_LABEL, b"PSRAM: MSPI3 CLOCK=");
+dram_message!(MSPI3_USER_LABEL, b"PSRAM: MSPI3 USER=");
+dram_message!(MSPI3_MISC_LABEL, b"PSRAM: MSPI3 MISC=");
+dram_message!(HP_CLK_LABEL, b"PSRAM: HP CLK=");
+dram_message!(LDO2_LABEL, b"PSRAM: LDO2=");
+dram_message!(LDO2_ANA_LABEL, b"PSRAM: LDO2 ANA=");
+dram_message!(RF_PWC_LABEL, b"PSRAM: RF PWC=");
+
+#[used]
+#[unsafe(link_section = ".dram.rodata.psram")]
+static TUNING_REFERENCE_WORDS: [u32; 32] = [
+    0x7f786655, 0xa5ff005a, 0x3f3c33aa, 0xa5ff5a00, 0x1f1e9955, 0xa5005aff, 0x0f0fccaa, 0xa55a00ff,
+    0x07876655, 0xffa55a00, 0x03c333aa, 0xff00a55a, 0x01e19955, 0xff005aa5, 0x00f0ccaa, 0xff5a00a5,
+    0x80786655, 0x00a5ff5a, 0xc03c33aa, 0x00a55aff, 0xe01e9355, 0x00ff5aa5, 0xf00fccaa, 0x005affa5,
+    0xf8876655, 0x5aa5ff00, 0xfcc333aa, 0x5affa500, 0xfee19955, 0x5a00a5ff, 0x11f0ccaa, 0x5a00ffa5,
+];
+
 #[derive(Clone, Copy)]
 pub struct Psram {
     base: usize,
@@ -108,14 +173,7 @@ impl Psram {
         };
         let address = framebuffer as usize + aligned_offset;
         let length = aligned_end - aligned_offset;
-        let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
-            unsafe { transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
-        unsafe {
-            // Push dirty L1 lines into L2 first, then push L2 into PSRAM.
-            let l1 = writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, length as u32);
-            let l2 = writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, length as u32);
-            l1 == 0 && l2 == 0
-        }
+        iram_cache_writeback_invalidate(address as u32, length as u32)
     }
 }
 
@@ -126,11 +184,26 @@ impl Psram {
 /// wanting a cold cache before each pass -- can drop it out of both levels.
 /// The caller is responsible for the span lying inside the mapping.
 pub fn writeback_invalidate(address: usize, bytes: usize) {
+    let _ = iram_cache_writeback_invalidate(address as u32, bytes as u32);
+}
+
+/// Performs the ROM cache operation from IRAM so the call and return path do
+/// not depend on IROM while the cache controller is maintaining L1/L2 state.
+///
+/// Machine interrupts deliberately remain enabled. The LCD ISR and its full
+/// relocation closure are IRAM/DRAM-only, and a full framebuffer writeback is
+/// far too long to mask frame-completion interrupts without causing underruns.
+#[inline(never)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".iram.text.critical.cache")]
+extern "C" fn iram_cache_writeback_invalidate(address: u32, bytes: u32) -> bool {
     let writeback_invalidate: unsafe extern "C" fn(u32, u32, u32) -> i32 =
         unsafe { transmute(ROM_CACHE_WRITEBACK_INVALIDATE_ADDR) };
     unsafe {
-        writeback_invalidate(CACHE_MAP_L1_DCACHE, address as u32, bytes as u32);
-        writeback_invalidate(CACHE_MAP_L2_CACHE, address as u32, bytes as u32);
+        // Push dirty L1 lines into L2 first, then push L2 into memory.
+        let l1 = writeback_invalidate(CACHE_MAP_L1_DCACHE, address, bytes);
+        let l2 = writeback_invalidate(CACHE_MAP_L2_CACHE, address, bytes);
+        l1 == 0 && l2 == 0
     }
 }
 
@@ -138,7 +211,70 @@ pub fn writeback_invalidate(address: usize, bytes: usize) {
 ///
 /// A failure is reported over USB serial and returns `None`; it never leaves a
 /// partially verified framebuffer for DMA to consume.
+#[inline(never)]
+#[unsafe(export_name = "iram_psram_init")]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 pub fn init() -> Option<Psram> {
+    let interrupt_state = disable_machine_interrupts();
+    let result = init_critical();
+    restore_machine_interrupts(interrupt_state);
+    result
+}
+
+#[inline(always)]
+fn disable_machine_interrupts() -> usize {
+    let previous: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrrc {previous}, mstatus, {mask}",
+            previous = out(reg) previous,
+            mask = in(reg) 1usize << 3,
+            options(nomem, nostack),
+        );
+    }
+    previous
+}
+
+#[inline(always)]
+fn restore_machine_interrupts(previous: usize) {
+    if previous & (1 << 3) != 0 {
+        unsafe {
+            core::arch::asm!(
+                "csrs mstatus, {mask}",
+                mask = in(reg) 1usize << 3,
+                options(nomem, nostack),
+            );
+        }
+    }
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn zero_memory(bytes: *mut u8, length: usize) {
+    for index in 0..length {
+        unsafe { bytes.add(index).write_volatile(0) };
+    }
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    for index in 0..left.len() {
+        let left_byte = unsafe { left.as_ptr().add(index).read_volatile() };
+        let right_byte = unsafe { right.as_ptr().add(index).read_volatile() };
+        if left_byte != right_byte {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn init_critical() -> Option<Psram> {
     enable_power_and_clock();
     configure_pins();
     configure_device_timing();
@@ -150,7 +286,7 @@ pub fn init() -> Option<Psram> {
         || !common_read(REG_READ, 2, REG_READ_DUMMY_BITS, &mut mr23.0)
         || !common_read(REG_READ, 4, REG_READ_DUMMY_BITS, &mut mr48.0)
     {
-        uart::log(b"PSRAM: mode-register transaction failed\r\n");
+        uart::log(&MODE_REGISTER_TRANSACTION_FAILED);
         return None;
     }
     // Preserve vendor-defined bits while selecting fixed latency, 10-cycle
@@ -158,18 +294,18 @@ pub fn init() -> Option<Psram> {
     mr01.0[0] = (mr01.0[0] & !0x3F) | (2 << 2) | (1 << 5);
     mr48.0[0] = (mr48.0[0] & 0x1F) | (2 << 5);
     if !common_write(REG_WRITE, 0, 0, &mr01.0) || !common_write(REG_WRITE, 4, 0, &mr48.0) {
-        uart::log(b"PSRAM: mode-register write failed\r\n");
+        uart::log(&MODE_REGISTER_WRITE_FAILED);
         return None;
     }
 
     let mut mr8 = AlignedBytes([0u8; 2]);
     if !common_read(REG_READ, 8, REG_READ_DUMMY_BITS, &mut mr8.0[..1]) {
-        uart::log(b"PSRAM: MR8 read failed\r\n");
+        uart::log(&MR8_READ_FAILED);
         return None;
     }
     mr8.0[0] = (mr8.0[0] & !0x4F) | 3 | (1 << 3) | (1 << 6);
     if !common_write(REG_WRITE, 8, 0, &mr8.0) {
-        uart::log(b"PSRAM: MR8 write failed\r\n");
+        uart::log(&MR8_WRITE_FAILED);
         return None;
     }
 
@@ -178,12 +314,12 @@ pub fn init() -> Option<Psram> {
     if !common_write(SYNC_WRITE, 0, WRITE_DUMMY_BITS, &reference.0)
         || !common_read(SYNC_READ, 0, READ_DUMMY_BITS, &mut received.0)
     {
-        uart::log(b"PSRAM: command-path transaction timed out\r\n");
+        uart::log(&COMMAND_TRANSACTION_TIMEOUT);
         return None;
     }
     if received.0 != reference.0 {
-        uart::log_hex(b"PSRAM: command read=", u32::from_le_bytes(received.0));
-        uart::log(b"PSRAM: command-path test failed\r\n");
+        uart::log_hex(&COMMAND_READ_LABEL, u32::from_le_bytes(received.0));
+        uart::log(&COMMAND_TEST_FAILED);
         return None;
     }
 
@@ -203,7 +339,7 @@ pub fn init() -> Option<Psram> {
         )
     };
     if result != 0 {
-        uart::log_hex(b"PSRAM: MMU error=", result as u32);
+        uart::log_hex(&MMU_ERROR_LABEL, result as u32);
         return None;
     }
 
@@ -213,7 +349,7 @@ pub fn init() -> Option<Psram> {
     invalidate_mapped_cache();
 
     if !mapped_memory_test() {
-        uart::log(b"PSRAM: mapped memory test failed\r\n");
+        uart::log(&MAPPED_TEST_FAILED);
         return None;
     }
 
@@ -221,10 +357,12 @@ pub fn init() -> Option<Psram> {
         base: PSRAM_VADDR,
         bytes: MAPPED_BYTES,
     };
-    uart::log(b"PSRAM: ready (framebuffer + heap)\r\n");
+    uart::log(&READY_MESSAGE);
     Some(psram)
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn enable_power_and_clock() {
     unsafe {
         // Tab5 connects PSRAM VDD and the optional MPLL domain to LDO channel 2.
@@ -272,18 +410,26 @@ fn enable_power_and_clock() {
 ///
 /// The ordering matches ESP-IDF's PSRAM controller reset: assert AXI, assert
 /// APB, then release APB before AXI.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn reset_mspi() {
-    const RST_EN_MSPI_AXI: u32 = 1 << 22;
-    const RST_EN_MSPI_APB: u32 = 1 << 24;
+    // ESP32-P4 has separate reset bits for the flash MSPI (22/24) and the
+    // dual-MSPI PSRAM controller (23/25). Reset only the latter: resetting
+    // 22/24 destroys the bootloader's flash setup and makes the next uncached
+    // DROM/IROM access stall even though already-cached probe lines still work.
+    const RST_EN_DUAL_MSPI_AXI: u32 = 1 << 23;
+    const RST_EN_DUAL_MSPI_APB: u32 = 1 << 25;
 
     unsafe {
-        modify(HP_RST_EN0, RST_EN_MSPI_AXI, RST_EN_MSPI_AXI);
-        modify(HP_RST_EN0, RST_EN_MSPI_APB, RST_EN_MSPI_APB);
-        modify(HP_RST_EN0, RST_EN_MSPI_APB, 0);
-        modify(HP_RST_EN0, RST_EN_MSPI_AXI, 0);
+        modify(HP_RST_EN0, RST_EN_DUAL_MSPI_AXI, RST_EN_DUAL_MSPI_AXI);
+        modify(HP_RST_EN0, RST_EN_DUAL_MSPI_APB, RST_EN_DUAL_MSPI_APB);
+        modify(HP_RST_EN0, RST_EN_DUAL_MSPI_APB, 0);
+        modify(HP_RST_EN0, RST_EN_DUAL_MSPI_AXI, 0);
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn invalidate_mapped_cache() {
     let invalidate: unsafe extern "C" fn(u32, u32, u32) =
         unsafe { transmute(ROM_CACHE_INVALIDATE_ADDR) };
@@ -298,6 +444,8 @@ fn invalidate_mapped_cache() {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn configure_pins() {
     unsafe {
         // D0..D7, CLK, CS and D8..D15 have the same two-bit drive field.
@@ -313,6 +461,8 @@ fn configure_pins() {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn configure_device_timing() {
     unsafe {
         // CS setup=4, hold=4, hold-delay=3, split transfers, 2048-byte pages.
@@ -325,6 +475,8 @@ fn configure_device_timing() {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn configure_cache_access() {
     let cache_sctrl = 1
         | (1 << 3)
@@ -355,6 +507,8 @@ fn configure_cache_access() {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn tune_dqs() -> Option<(u8, u8, u8)> {
     // The tested Tab5 repeatedly selected the centre point below. Validate it
     // with the same 100 reads used for every full-sweep candidate and avoid
@@ -364,15 +518,8 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     const PREFERRED_DATA_DELAY: u8 = 0;
     const PREFERRED_DQS_DELAY: u8 = 0;
 
-    const REFERENCE_WORDS: [u32; 32] = [
-        0x7f786655, 0xa5ff005a, 0x3f3c33aa, 0xa5ff5a00, 0x1f1e9955, 0xa5005aff, 0x0f0fccaa,
-        0xa55a00ff, 0x07876655, 0xffa55a00, 0x03c333aa, 0xff00a55a, 0x01e19955, 0xff005aa5,
-        0x00f0ccaa, 0xff5a00a5, 0x80786655, 0x00a5ff5a, 0xc03c33aa, 0x00a55aff, 0xe01e9355,
-        0x00ff5aa5, 0xf00fccaa, 0x005affa5, 0xf8876655, 0x5aa5ff00, 0xfcc333aa, 0x5affa500,
-        0xfee19955, 0x5a00a5ff, 0x11f0ccaa, 0x5a00ffa5,
-    ];
     let reference =
-        unsafe { core::slice::from_raw_parts(REFERENCE_WORDS.as_ptr() as *const u8, 128) };
+        unsafe { core::slice::from_raw_parts(TUNING_REFERENCE_WORDS.as_ptr() as *const u8, 128) };
 
     // Write the reference at 20 MHz with all tuning delays cleared.
     set_bus_divider(MSPI2 + 0x50, 24);
@@ -385,7 +532,7 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
             WRITE_DUMMY_BITS,
             &reference[chunk as usize * 64..chunk as usize * 64 + 64],
         ) {
-            uart::log(b"PSRAM: tuning reference write timed out\r\n");
+            uart::log(&TUNING_WRITE_TIMEOUT);
             return None;
         }
     }
@@ -403,30 +550,34 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
         }
         return Some((PREFERRED_PHASE, PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY));
     }
-    uart::log(b"PSRAM: preferred DQS point failed; running full sweep\r\n");
+    uart::log(&PREFERRED_DQS_FAILED);
 
-    let mut phase_good = [false; 4];
+    let mut phase_storage = core::mem::MaybeUninit::<[bool; 4]>::uninit();
+    zero_memory(phase_storage.as_mut_ptr().cast::<u8>(), 4);
+    let phase_good = unsafe { phase_storage.assume_init_mut() };
     for phase in 0..4u8 {
         set_dqs_phase(phase);
         phase_good[phase as usize] = reference_matches(reference, 1);
     }
-    let (phase_len, phase_end) = longest_run(&phase_good);
+    let (phase_len, phase_end) = longest_run(phase_good);
     if phase_len == 0 {
-        uart::log(b"PSRAM: no valid DQS phase\r\n");
+        uart::log(&NO_VALID_DQS_PHASE);
         return None;
     }
     let best_phase = (phase_end + 1 - phase_len) as u8;
 
-    let mut delay_good = [false; 31];
+    let mut delay_storage = core::mem::MaybeUninit::<[bool; 31]>::uninit();
+    zero_memory(delay_storage.as_mut_ptr().cast::<u8>(), 31);
+    let delay_good = unsafe { delay_storage.assume_init_mut() };
     for index in 0..31u8 {
         let (data, dqs) = delay_pair(index);
         set_dqs_phase(best_phase);
         set_all_delays(data, dqs);
         delay_good[index as usize] = reference_matches(reference, 100);
     }
-    let (delay_len, delay_end) = longest_run(&delay_good);
+    let (delay_len, delay_end) = longest_run(delay_good);
     if delay_len <= 1 {
-        uart::log(b"PSRAM: no stable DQS delay window\r\n");
+        uart::log(&NO_STABLE_DQS_WINDOW);
         return None;
     }
     let best_index = delay_end - delay_len / 2;
@@ -439,8 +590,12 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     Some((best_phase, best_data, best_dqs))
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn reference_matches(reference: &[u8], attempts: usize) -> bool {
-    let mut received = AlignedBytes([0u8; 128]);
+    let mut received_storage = core::mem::MaybeUninit::<AlignedBytes<128>>::uninit();
+    zero_memory(received_storage.as_mut_ptr().cast::<u8>(), 128);
+    let received = unsafe { received_storage.assume_init_mut() };
     for _ in 0..attempts {
         for chunk in 0..2 {
             if !common_read(
@@ -452,13 +607,15 @@ fn reference_matches(reference: &[u8], attempts: usize) -> bool {
                 return false;
             }
         }
-        if received.0 != reference {
+        if !bytes_equal(&received.0, reference) {
             return false;
         }
     }
     true
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn delay_pair(index: u8) -> (u8, u8) {
     if index < 16 {
         (0, 15 - index)
@@ -467,6 +624,8 @@ fn delay_pair(index: u8) -> (u8, u8) {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn longest_run(values: &[bool]) -> (usize, usize) {
     let mut best_len = 0;
     let mut best_end = 0;
@@ -485,11 +644,15 @@ fn longest_run(values: &[bool]) -> (usize, usize) {
     (best_len, best_end)
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn clear_tuning() {
     set_dqs_phase(0);
     set_all_delays(0, 0);
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn set_dqs_phase(phase: u8) {
     unsafe {
         for offset in [0x3C, 0x68] {
@@ -498,6 +661,8 @@ fn set_dqs_phase(phase: u8) {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn set_all_delays(data: u8, dqs: u8) {
     unsafe {
         for offset in (0x1C..=0x38).step_by(4) {
@@ -516,6 +681,8 @@ fn set_all_delays(data: u8, dqs: u8) {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn mapped_memory_test() -> bool {
     let locations = [
         PSRAM_VADDR,
@@ -537,22 +704,28 @@ fn mapped_memory_test() -> bool {
     for index in 0..locations.len() {
         let value = unsafe { (locations[index] as *const u32).read_volatile() };
         if value != patterns[index] {
-            uart::log_hex(b"PSRAM: bad address=", locations[index] as u32);
-            uart::log_hex(b"PSRAM: bad value=", value);
+            uart::log_hex(&BAD_ADDRESS_LABEL, locations[index] as u32);
+            uart::log_hex(&BAD_VALUE_LABEL, value);
             return false;
         }
     }
     true
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn common_read(command: u32, address: u32, dummy_bits: u32, output: &mut [u8]) -> bool {
     transaction(command, address, dummy_bits, None, Some(output))
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn common_write(command: u32, address: u32, dummy_bits: u32, input: &[u8]) -> bool {
     transaction(command, address, dummy_bits, Some(input), None)
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn transaction(
     command: u32,
     mut address: u32,
@@ -594,7 +767,7 @@ fn transaction(
         // after a CPU-only restart degrades to the PSRAM fallback instead of
         // permanently wedging the boot.
         if !wait_for_mspi3_idle() {
-            uart::log(b"PSRAM: MSPI3 busy before command configuration\r\n");
+            uart::log(&MSPI3_BUSY);
             log_mspi3_state();
             return false;
         }
@@ -610,7 +783,7 @@ fn transaction(
         let mut timeout = 5_000_000u32;
         while read(MSPI3) & (1 << 18) != 0 {
             if timeout == 0 {
-                uart::log(b"PSRAM: MSPI3 command timeout\r\n");
+                uart::log(&MSPI3_TIMEOUT);
                 log_mspi3_state();
                 return false;
             }
@@ -632,6 +805,8 @@ fn transaction(
 ///
 /// # Safety
 /// MSPI3 must be a valid MMIO block clocked for CPU access.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 unsafe fn wait_for_mspi3_idle() -> bool {
     let mut timeout = 5_000_000u32;
     while unsafe { read(MSPI3) } != 0 {
@@ -646,19 +821,23 @@ unsafe fn wait_for_mspi3_idle() -> bool {
 
 /// # Safety
 /// MSPI3, the clock-control block and PMU must be valid MMIO blocks.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 unsafe fn log_mspi3_state() {
     unsafe {
-        uart::log_hex(b"PSRAM: MSPI3 CMD=", read(MSPI3));
-        uart::log_hex(b"PSRAM: MSPI3 CLOCK=", read(MSPI3 + 0x14));
-        uart::log_hex(b"PSRAM: MSPI3 USER=", read(MSPI3 + 0x18));
-        uart::log_hex(b"PSRAM: MSPI3 MISC=", read(MSPI3 + 0x34));
-        uart::log_hex(b"PSRAM: HP CLK=", read(HP_SYS_CLKRST + 0x30));
-        uart::log_hex(b"PSRAM: LDO2=", read(PMU + 0x1D0));
-        uart::log_hex(b"PSRAM: LDO2 ANA=", read(PMU + 0x1D4));
-        uart::log_hex(b"PSRAM: RF PWC=", read(PMU + 0x15C));
+        uart::log_hex(&MSPI3_CMD_LABEL, read(MSPI3));
+        uart::log_hex(&MSPI3_CLOCK_LABEL, read(MSPI3 + 0x14));
+        uart::log_hex(&MSPI3_USER_LABEL, read(MSPI3 + 0x18));
+        uart::log_hex(&MSPI3_MISC_LABEL, read(MSPI3 + 0x34));
+        uart::log_hex(&HP_CLK_LABEL, read(HP_SYS_CLKRST + 0x30));
+        uart::log_hex(&LDO2_LABEL, read(PMU + 0x1D0));
+        uart::log_hex(&LDO2_ANA_LABEL, read(PMU + 0x1D4));
+        uart::log_hex(&RF_PWC_LABEL, read(PMU + 0x15C));
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn set_bus_divider(register: usize, divider: u32) {
     let value = ((divider - 1) << 16) | ((divider / 2 - 1) << 8) | (divider - 1);
     unsafe {
@@ -666,6 +845,8 @@ fn set_bus_divider(register: usize, divider: u32) {
     }
 }
 
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
 fn delay() {
     for _ in 0..200_000 {
         core::hint::spin_loop();
