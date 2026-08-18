@@ -268,6 +268,51 @@ impl Framebuffer {
         true
     }
 
+    /// Copies a logical rectangle back out of the framebuffer, the exact
+    /// counterpart of `blit_rgb565`: same clipping against the right and
+    /// bottom edges, same `image_width` row stride in `pixels`. Reading a
+    /// rectangle out with one and writing it back with the other therefore
+    /// restores it unchanged even where the rectangle hangs off an edge,
+    /// because both touch the same clipped subrectangle and address
+    /// `pixels` the same way.
+    ///
+    /// This is what lets a moving sprite -- `app::win`'s mouse cursor --
+    /// put back what it covered without the caller having to be able to
+    /// redraw the scene underneath it procedurally.
+    ///
+    /// Reads are ordinary cached loads and so are coherent with both
+    /// drawing paths: the CPU ones leave their pixels in the same cache
+    /// this reads through, and `ppa_fill_rect` invalidates the region after
+    /// its DMA writes so a later read misses and fetches what the DMA
+    /// actually wrote.
+    pub fn read_rect(
+        &self,
+        x: usize,
+        y: usize,
+        image_width: usize,
+        image_height: usize,
+        pixels: &mut [u16],
+    ) -> bool {
+        if pixels.len() < image_width.saturating_mul(image_height) {
+            return false;
+        }
+        let Some(pointer) = self.memory.framebuffer() else {
+            return false;
+        };
+        let copy_width = image_width.min(WIDTH.saturating_sub(x));
+        let copy_height = image_height.min(HEIGHT.saturating_sub(y));
+        for row in 0..copy_height {
+            for column in 0..copy_width {
+                pixels[row * image_width + column] = unsafe {
+                    pointer
+                        .add(native_offset(x + column, y + row))
+                        .read_volatile()
+                };
+            }
+        }
+        true
+    }
+
     /// Draws scaled 5x7 ASCII, upper and lower case each with their own
     /// glyphs. Non-ASCII is drawn as a space; ASCII the table has no glyph
     /// for (control codes, a few punctuation marks) is drawn as '?'.

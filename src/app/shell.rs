@@ -155,6 +155,15 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "win",
+        usage: "win",
+        lines: &[
+            "Windows 95 desktop mock-up: a USB HID Boot Mouse moves the",
+            "pointer and drags the window by its title bar, and the taskbar",
+            "shows the RTC clock; any key exits",
+        ],
+    },
+    HelpEntry {
         name: "rtc",
         usage: "rtc | rtc set <YYYY-MM-DD> <HH:MM:SS> | rtc regs | rtc test",
         lines: &[
@@ -296,6 +305,8 @@ pub enum Outcome {
     AxisTest,
     /// Hand the display over to the INA226 battery monitor.
     Battery,
+    /// Hand the display over to the Windows 95 desktop mock-up.
+    Win,
 }
 
 /// Parses and runs one command line, returning what the caller should do
@@ -360,6 +371,7 @@ pub fn execute(
         b"coordtest" => return Outcome::CoordTest,
         b"axistest" => return Outcome::AxisTest,
         b"battery" | b"batinfo" => return Outcome::Battery,
+        b"win" => return Outcome::Win,
         b"reboot" | b"reset" => {
             console.write_output_line(framebuffer, "rebooting...");
             return Outcome::Reboot;
@@ -1762,6 +1774,7 @@ fn device_kind_text(kind: &usb::DeviceKind) -> Line {
     line.push_str("  driver: ");
     line.push_str(match kind {
         usb::DeviceKind::Keyboard(_) => "HID Boot keyboard",
+        usb::DeviceKind::Mouse(_) => "HID Boot mouse",
         usb::DeviceKind::MassStorage(_) => "Mass Storage (Bulk-Only Transport)",
     });
     line
@@ -2104,6 +2117,7 @@ fn cmd_usbhub(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &u
             line.push_str("  [");
             line.push_str(match device.kind {
                 usb::DeviceKind::Keyboard(_) => "keyboard",
+                usb::DeviceKind::Mouse(_) => "mouse",
                 usb::DeviceKind::MassStorage(_) => "mass storage",
             });
             line.push_str("]");

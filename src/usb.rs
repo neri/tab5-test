@@ -7,9 +7,14 @@
 //!   PHY, dedicated pins, the VBUS switch bit).
 //! - `protocol`: generic USB control transfers and standard descriptor
 //!   enumeration (USB2.0 chapter 9), independent of any device class.
+//! - `hid`: the parts of HID 1.11's Boot Protocol shared by every boot
+//!   device class driver -- the `SET_PROTOCOL`/`SET_IDLE` sequence, the
+//!   boot-interface descriptor walk, and the Interrupt IN report session.
 //! - `hid_keyboard`: the HID Boot Protocol keyboard class driver
-//!   (`UsbKeyboard`) built on top of the two layers above -- the actual
-//!   `docs/USB_HOST_PLAN.md` Stage 3 milestone.
+//!   (`UsbKeyboard`) built on top of `hid` and the two layers above -- the
+//!   actual `docs/USB_HOST_PLAN.md` Stage 3 milestone.
+//! - `hid_mouse`: the HID Boot Protocol mouse class driver (`UsbMouse`),
+//!   `hid_keyboard`'s sibling over the same `hid` layer.
 //! - `hub`: the USB hub class driver, a sibling of `hid_keyboard` on top
 //!   of the same two layers.
 //! - `msc`: the USB Mass Storage (Bulk-Only Transport) class driver, another
@@ -27,7 +32,9 @@
 //! which replaced this module's old single-keyboard `connect_keyboard`.
 
 mod hcd;
+mod hid;
 mod hid_keyboard;
+mod hid_mouse;
 mod hub;
 mod msc;
 mod protocol;
@@ -36,5 +43,6 @@ mod registry;
 pub use hcd::{
     FORCE_FS_LS_ONLY_HOST, Speed, probe_split_support, set_pi4ioe2_output_bit, set_vbus_bit,
 };
+pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
 pub use registry::{DeviceKind, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost};

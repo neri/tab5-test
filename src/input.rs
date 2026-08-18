@@ -1,9 +1,18 @@
-//! Unified keyboard input and input-source lifecycle management.
+//! Unified keyboard input, pointer input, and input-source lifecycle
+//! management.
 //!
 //! This module is the application-level owner of all sources that can emit
 //! console keys.  It deliberately does not replace `usb::UsbHost`: that type
 //! remains the sole owner of USB-A enumeration, hub state, and non-keyboard
 //! USB devices such as Mass Storage.
+//!
+//! Pointer input is forwarded rather than normalized the way keys are.  A
+//! key is meaningful on its own, so `Key` hides which keyboard produced it;
+//! mouse motion is relative and only becomes a position once something
+//! decides what it is moving across, so `poll_mouse` hands `usb::MouseUpdate`
+//! straight through and leaves the cursor position to the screen that draws
+//! one (`app::win`).  That also keeps this module free of any dependency on
+//! the framebuffer's geometry.
 
 use crate::cardkb::CardKb;
 use crate::{interrupts, uart, usb};
@@ -173,6 +182,23 @@ impl InputManager {
                 return;
             }
         }
+    }
+
+    /// Returns this frame's combined mouse motion and button state across
+    /// every attached USB mouse, or `None` if none of them moved.
+    ///
+    /// Unlike `poll_key` this has no CardKB counterpart to alternate with,
+    /// and no per-call limit: `UsbHost::poll_mice` drains and sums whatever
+    /// arrived since the last call, so calling it once per frame loses no
+    /// motion.
+    pub fn poll_mouse(&mut self) -> Option<usb::MouseUpdate> {
+        self.usb_host.poll_mice()
+    }
+
+    /// True if a USB mouse is currently attached, so a pointer-driven screen
+    /// can say up front that there is nothing to move the cursor with.
+    pub fn has_mouse(&self) -> bool {
+        self.usb_host.has_mouse()
     }
 
     /// Mutable USB bus registry for commands such as `usbrescan` and MSC I/O.

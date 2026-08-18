@@ -18,6 +18,7 @@ mod membench;
 mod paint;
 mod shell;
 mod touch_test;
+mod win;
 
 use crate::delay::delay_ms;
 use crate::input::InputManager;
@@ -115,6 +116,10 @@ pub fn run(psram: Psram) {
             }
             shell::Outcome::Battery => {
                 battery::run(framebuffer, &mut input);
+                console.clear(framebuffer);
+            }
+            shell::Outcome::Win => {
+                win::run(framebuffer, &mut input);
                 console.clear(framebuffer);
             }
             shell::Outcome::Continue => {}

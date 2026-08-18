@@ -14,10 +14,14 @@
  *
  *   The cache size is chosen by the 2nd-stage bootloader, so it is only known
  *   at run time: ESP-IDF defaults to 128 KiB (top = 0x4ffa_0000) while the
- *   hardware reset value is 256 KiB (top = 0x4ff8_0000).  The window below is
- *   the intersection and is therefore safe either way.  `startup::log_ram_limit`
- *   prints the split that is actually in effect; once a 128 KiB split is
- *   confirmed on the target device this can be raised to 0x00060000.
+ *   hardware reset value is 256 KiB (top = 0x4ff8_0000).  The intersection,
+ *   0x00040000, is safe either way and is what this used to be sized for.
+ *   `startup::log_ram_limit` prints the split that is actually in effect, and
+ *   on the target device it reports the 128 KiB split, so the window is now
+ *   the full 0x00060000 up to 0x4ffa_0000.  That check is not advisory: a
+ *   bootloader configured for a 256 KiB cache would put the top of the stack
+ *   inside the cache area, which is why `log_ram_limit` shouts about exactly
+ *   that case at boot.
  *
  * `riscv-rt` consumes the REGION_* aliases below.
  */
@@ -33,7 +37,7 @@ MEMORY
      * bootloader's exactly-two-XIP-segments invariant. Application code is
      * loaded into HP SRAM instead of executing through the flash cache. */
     ROM_TEXT : ORIGIN = 0x40001040, LENGTH = 0x00000004
-    RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
+    RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00060000
 }
 
 REGION_ALIAS("REGION_TEXT", RAM);

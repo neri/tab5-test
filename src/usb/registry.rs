@@ -17,6 +17,7 @@
 
 use super::hcd::{self, HostPort, Route, Speed, SplitTarget};
 use super::hid_keyboard::UsbKeyboard;
+use super::hid_mouse::{MouseUpdate, UsbMouse};
 use super::hub::{self, Hub};
 use super::msc::UsbMassStorage;
 use super::protocol::{self, EnumeratedDevice};
@@ -47,11 +48,11 @@ pub enum Location {
 }
 
 /// The class driver actually driving a slot's device. Devices this project
-/// has no driver for (a mouse, say) are noted in the UART log at attach
-/// time and otherwise left out of the registry -- there is nothing to poll
-/// or dispatch to.
+/// has no driver for are noted in the UART log at attach time and otherwise
+/// left out of the registry -- there is nothing to poll or dispatch to.
 pub enum DeviceKind {
     Keyboard(UsbKeyboard),
+    Mouse(UsbMouse),
     MassStorage(UsbMassStorage),
 }
 
@@ -188,8 +189,18 @@ impl UsbHost {
             .flatten()
             .find_map(|slot| match &mut slot.kind {
                 DeviceKind::MassStorage(storage) => Some(storage),
-                DeviceKind::Keyboard(_) => None,
+                DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
             })
+    }
+
+    /// True if any attached device is a HID Boot mouse. Lets a pointer-driven
+    /// screen say so up front instead of leaving the user to guess why the
+    /// cursor never moves.
+    pub fn has_mouse(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|slot| matches!(slot.kind, DeviceKind::Mouse(_)))
     }
 
     /// Cheap liveness check (one HPRT read, no transaction): true once
@@ -238,6 +249,7 @@ impl UsbHost {
     pub fn needs_reinit(&self) -> bool {
         self.slots.iter().flatten().any(|slot| match &slot.kind {
             DeviceKind::Keyboard(keyboard) => keyboard.needs_reinit(),
+            DeviceKind::Mouse(mouse) => mouse.needs_reinit(),
             DeviceKind::MassStorage(_) => false,
         })
     }
@@ -278,6 +290,36 @@ impl UsbHost {
             }
         }
         None
+    }
+
+    /// Polls every attached mouse and returns their combined motion for this
+    /// frame, or `None` if none of them reported anything.
+    ///
+    /// Unlike `poll_keyboards` there is no round-robin here, and nothing to
+    /// starve: a key is a discrete event that has to be delivered one at a
+    /// time, whereas motion is additive, so every mouse can be drained on
+    /// every call and the results summed. Two mice therefore both move the
+    /// one pointer, which is also how a desktop OS behaves.
+    pub fn poll_mice(&mut self) -> Option<MouseUpdate> {
+        let mut combined: Option<MouseUpdate> = None;
+        for slot in self.slots.iter_mut().flatten() {
+            let DeviceKind::Mouse(mouse) = &mut slot.kind else {
+                continue;
+            };
+            let Some(update) = mouse.poll() else { continue };
+            match &mut combined {
+                None => combined = Some(update),
+                Some(total) => {
+                    total.dx += update.dx;
+                    total.dy += update.dy;
+                    total.wheel += update.wheel;
+                    total.buttons |= update.buttons;
+                    total.pressed |= update.pressed;
+                    total.released |= update.released;
+                }
+            }
+        }
+        combined
     }
 
     /// Tears down and rebuilds the entire registry from scratch: probes
@@ -465,6 +507,7 @@ impl UsbHost {
             Some(kind) => {
                 uart::log(match kind {
                     DeviceKind::Keyboard(_) => b"USB: keyboard attached on hub port " as &[u8],
+                    DeviceKind::Mouse(_) => b"USB: mouse attached on hub port ",
                     DeviceKind::MassStorage(_) => b"USB: mass storage attached on hub port ",
                 });
                 uart::log_hex(b"", port as u32);
@@ -513,14 +556,22 @@ fn route_behind_hub(hub_address: u8, port: u8, hub_speed: Speed, device_speed: S
 }
 
 /// Tries every class driver this project has, in order, and returns the
-/// first that accepts the device. Both `UsbKeyboard::attach` and
-/// `UsbMassStorage::attach` are no-ops (no control transfers at all) unless
-/// they actually find their interface in `device`'s configuration
-/// descriptor, so trying one that turns out not to match has no side
-/// effect on the device.
+/// first that accepts the device. Each `attach` is a no-op (no control
+/// transfers at all) unless it actually finds its interface in `device`'s
+/// configuration descriptor, so trying one that turns out not to match has
+/// no side effect on the device.
+///
+/// A device exposing more than one of these interfaces -- a keyboard with
+/// an integrated trackpad, or a wireless dongle presenting both -- is
+/// driven by whichever comes first here, since a slot holds one driver.
+/// Order therefore matters, and keyboard is first because it is the one
+/// that also serves as the way out of every full-screen mode.
 fn attach_class_driver(device: &EnumeratedDevice) -> Option<DeviceKind> {
     if let Some(keyboard) = UsbKeyboard::attach(device) {
         return Some(DeviceKind::Keyboard(keyboard));
+    }
+    if let Some(mouse) = UsbMouse::attach(device) {
+        return Some(DeviceKind::Mouse(mouse));
     }
     if let Some(storage) = UsbMassStorage::attach(device) {
         return Some(DeviceKind::MassStorage(storage));
