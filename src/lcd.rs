@@ -1,6 +1,6 @@
 //! Tab5 ST7121-compatible MIPI-DSI output for ESP32-P4 ECO2.
 //!
-//! Scanout streams an RGB565 double framebuffer from PSRAM through DW-GDMA.
+//! Scanout streams an RGB565 framebuffer from PSRAM through DW-GDMA.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -64,7 +64,7 @@ pub(super) struct InitCommand {
     delay_ms: u32,
 }
 
-/// A running DSI/DMA display and its double-buffered framebuffer storage.
+/// A running DSI/DMA display and its single framebuffer storage.
 ///
 /// The application owns its event loop and draws through `framebuffer_mut`;
 /// this type owns only panel initialization and frame-boundary synchronization.

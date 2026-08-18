@@ -1,6 +1,6 @@
 //! CPU-side memory cost measurement for internal SRAM and PSRAM.
 //!
-//! Everything in `DESIGN.md`'s bandwidth discussion rests on how much a store
+//! Everything in `docs/DISPLAY_BANDWIDTH.md` rests on how much a store
 //! into PSRAM actually costs, and that had been estimated rather than measured:
 //! a 64-byte line, 18 dummy cycles, CS setup and hold, and a command phase
 //! whose length was a guess. This replaces the guess.

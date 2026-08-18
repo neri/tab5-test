@@ -24,7 +24,7 @@
 //! The block also has a token-bucket rate regulator per master port, reached
 //! through a command interface at `+0x400`. Throttling the cache master with
 //! it never had any effect on this hardware, at any rate down to one
-//! transaction per 4096 cycles -- see `DESIGN.md`.
+//! transaction per 4096 cycles -- see `docs/DISPLAY_BANDWIDTH.md`.
 
 use crate::uart;
 

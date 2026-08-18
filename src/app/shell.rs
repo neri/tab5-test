@@ -544,7 +544,7 @@ fn misa_has_extension(misa: u32, extension: u8) -> bool {
     misa & (1 << (extension - b'A')) != 0
 }
 
-/// Bytes of PSRAM past the two framebuffers, matching `Psram::heap`'s split
+/// Bytes of PSRAM past the framebuffer, matching `Psram::heap`'s split
 /// and backing the global allocator installed in `main`.
 fn heap_bytes() -> usize {
     psram::MAPPED_BYTES - psram::FRAMEBUFFER_BYTES

@@ -1,5 +1,9 @@
 # USB Mass Storage対応 実装計画
 
+> 索引: [`../DESIGN.md`](../DESIGN.md)
+> この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
+> コードを優先してください。
+
 ## 状態: Stage 1〜6 ✅ 完了（実機確認済み、本計画のゴール達成）
 
 USB-A**直結**のUSBメモリで、列挙・Bulk-Only Transport・SCSI
@@ -25,8 +29,8 @@ MBRパース（`mbr::show`、`usbmbr`/`sdmbr`）まで実機確認済み。
 
 ## 方針
 
-`../DESIGN.md`の方針（ESP-IDF/RTOSをリンクせずレジスタ操作で実装、1機能=1モジュール=
-実機確認可能な単位でコミット）を踏襲する。[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)の
+本計画ではESP-IDF/RTOSをリンクせずレジスタ操作で実装し、1機能を1モジュール・
+実機確認可能な単位でコミットする。[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)の
 「将来検討」に挙げていた項目の着手であり、`hcd.rs`（チャネル/パケットプリミティブ）・
 `protocol.rs`（コントロール転送・標準列挙）は変更せず、その上にクラスドライバ
 `src/usb/msc.rs`を追加する形で進める（`hid_keyboard.rs`・`hub.rs`と同じ位置付け）。
@@ -222,8 +226,8 @@ TEST UNIT READY、REQUEST SENSE、READ CAPACITY(10)、READ(10)）。今回はレ
   `mbr::show(console: &mut Console, sector: &[u8; 512])`）
 - SD/USB間でディスパッチする最小限の抽象を用意する。このプロジェクトは
   現状`dyn`/トレイトオブジェクトを一切使っておらず（`usb::connect_keyboard`の
-  直結/ハブ分岐も`if`で完結する具体型のみ）、`../DESIGN.md`の「最小限の抽象化」
-  という方針にも合わせ、trait objectではなく列挙型で表現することを推奨する:
+  直結/ハブ分岐も`if`で完結する具体型のみ）、本計画の「最小限の抽象化」という
+  方針にも合わせ、trait objectではなく列挙型で表現することを推奨する:
 
   ```rust
   enum BlockDevice {
@@ -264,7 +268,7 @@ TEST UNIT READY、REQUEST SENSE、READ CAPACITY(10)、READ(10)）。今回はレ
 常に`sdmmc::read_block`、`usbmbr`は常に`UsbMassStorage::read_blocks`）、
 実行時にSD/USBを切り替える呼び出し元が1つも無い。この状態で
 `BlockDevice`を導入すると、一度も`match`されない列挙型と一度も呼ばれない
-メソッドが残るだけになり（`dead_code`警告の対象）、`../DESIGN.md`の
+メソッドが残るだけになり（`dead_code`警告の対象）、本計画の
 「タスクが要求する以上の抽象化をしない」という方針に反する。そのため
 Stage 6は「`mbr::show`によるパース処理の共通化」だけを実装し、
 デバイス選択の抽象化はまだ導入していない。将来Stage 4b（ファイル

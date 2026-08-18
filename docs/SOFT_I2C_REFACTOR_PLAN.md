@@ -1,5 +1,9 @@
 # SoftI2CトランザクションAPI化計画
 
+> 索引: [`../DESIGN.md`](../DESIGN.md)
+> この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
+> コードを優先してください。
+
 ## 状態: 完了（実装・実機動作確認済み）
 
 通常の`write`/`read`/`write_read`、可変長用の`transaction`、既存I2Cドライバの
@@ -238,7 +242,7 @@ bus.transaction(|tx| {
 
 - `src/i2c.rs`のモジュールdocに、通常は`write`/`read`/`write_read`を使い、
   可変長だけ`transaction`を使う契約を記載する。
-- 必要なら`DESIGN.md`のI2C構成説明を、バイト操作ではなくトランザクションAPIを
+- 必要なら[`FILE_LAYOUT.md`](FILE_LAYOUT.md)のI2C構成説明を、バイト操作ではなくトランザクションAPIを
   提供する記述へ更新する。
 - `cargo check`と`cargo build --release`を通す。
 - 実機で次を確認する。

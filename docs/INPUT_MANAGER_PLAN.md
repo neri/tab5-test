@@ -1,5 +1,9 @@
 # 入力マネージャ計画: 複数キーボードの統合
 
+> 索引: [`../DESIGN.md`](../DESIGN.md)
+> この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
+> コードを優先してください。
+
 ## 状態: 完了（Stage 1〜5実装・実機確認済み、特殊キー拡張も実機確認済み）
 
 ## 背景・目的（着手時）
@@ -201,8 +205,9 @@ USB ホストを複製・再生成していないことがコードレビュー�
 
 ### Stage 5: ドキュメント・回帰確認 ✅ 完了
 
-- `DESIGN.md`、`README.md`、各モジュール doc comment の `CardKB` 固定表現と、古い
-  `lcd.rs` 所有の説明を `InputManager` / `app.rs` の実態に更新する
+- [`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)、[`FILE_LAYOUT.md`](FILE_LAYOUT.md)、各モジュール
+  doc commentの`CardKB`固定表現と、古い`lcd.rs`所有の説明を`InputManager`／`app.rs`の
+  実態に更新する。`README.md`との不一致は人間管理ルールに従って報告だけにとどめる
 - 少なくとも次の実機マトリクスを実行する
 
 | ケース | 期待結果 |

@@ -13,12 +13,13 @@
 //!
 //! This is Stage 1 of `docs/USB_HOST_PLAN.md`: core bring-up and host-port
 //! connect/reset/speed detection only, driven by polling (no interrupt
-//! routing yet). Stage 4 added one knob here, `FORCE_FS_LS_ONLY_HOST`,
-//! which holds the whole bus at Full-Speed. That is how FS/LS devices
-//! behind a hub work here today: this driver implements no split
-//! transactions, so it avoids ever needing one. The hardware itself does
-//! support them -- see `probe_split_support`, which contradicts
-//! Espressif's documentation on real silicon.
+//! routing yet). Stage 6 added split transactions (`HCSPLT`, set up from
+//! `Route` and driven by `await_packet`), so the bus runs at High-Speed
+//! and an FS/LS device behind a hub is reached through that hub's TT. The
+//! silicon supports them even though Espressif's documentation says it
+//! does not -- see `probe_split_support`. Stage 4's
+//! `FORCE_FS_LS_ONLY_HOST`, which held the whole bus at Full-Speed to
+//! avoid ever needing a split, is kept as a fallback but is off.
 //!
 //! The USB-A 5V (VBUS) switch is one bit of the second PI4IOE5V6408 I/O
 //! expander (I2C address 0x44, "E2"), the counterpart to `lcd.rs`'s PI4IOE1

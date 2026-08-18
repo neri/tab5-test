@@ -353,7 +353,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
 /// path -- but `fill_rect` alone carries both a PPA and a CPU path, and
 /// this module fills around thirty rectangles. Thirty inlined copies cost
 /// several kilobytes of a part that has 256 KiB of RAM for code, data and
-/// stack together (see DESIGN.md's "RAMの範囲"), which is far more than a
+/// stack together (see docs/BOOT.md's "RAMの範囲"), which is far more than a
 /// mock-up desktop is worth. None of these calls is hot: the screen is
 /// painted once and then only the pointer and the clock change.
 #[inline(never)]
