@@ -77,6 +77,9 @@ const CONTROL_RETRY_DELAY_US: u32 = 1_000;
 
 const STAGE_SETUP: &[u8] = b"SETUP";
 const STAGE_IN_DATA: &[u8] = b"IN data";
+// Kept for a future class driver that needs a host-to-device EP0 payload.
+#[allow(dead_code)]
+const STAGE_OUT_DATA: &[u8] = b"OUT data";
 const STAGE_OUT_STATUS: &[u8] = b"OUT status";
 const STAGE_IN_STATUS: &[u8] = b"IN status";
 
@@ -342,6 +345,25 @@ pub fn control_transfer_out_no_data(pipe: &ControlPipe, setup: &[u8; 8]) -> bool
     .is_some()
 }
 
+/// Runs a full host-to-device control transfer (SETUP, OUT data stage, IN
+/// status stage). Class drivers use this for requests whose payload belongs
+/// on EP0, such as a UFI/CBI 12-byte command descriptor.
+#[allow(dead_code)]
+pub fn control_transfer_out(pipe: &ControlPipe, setup: &[u8; 8], data: &mut [u8]) -> bool {
+    retry_control_transfer(true, |quiet_errors| {
+        let mut setup_buf = *setup;
+        run_control_packet(pipe, false, true, false, quiet_errors, &mut setup_buf)
+            .ok_or(STAGE_SETUP)?;
+        if !data.is_empty() {
+            data_stage_out(pipe, data, quiet_errors).ok_or(STAGE_OUT_DATA)?;
+        }
+        run_control_packet(pipe, true, false, true, quiet_errors, &mut [])
+            .ok_or(STAGE_IN_STATUS)?;
+        Ok(())
+    })
+    .is_some()
+}
+
 /// Re-runs a complete EP0 transaction after a transient packet failure.
 ///
 /// The HCD's first two attempts are deliberately quiet.  When diagnostics
@@ -362,7 +384,15 @@ fn retry_control_transfer<T>(
                 }
                 return None;
             }
-            Err(_) => delay_us(CONTROL_RETRY_DELAY_US),
+            Err(_) => {
+                // A failed descriptor-DMA packet can leave channel 0 or its
+                // FIFO state unsuitable for a new SETUP, even though the
+                // root port is still enabled. Reset that controller-local
+                // state before replaying the complete transfer; a new SETUP
+                // then also resets the USB control-transfer state on EP0.
+                hcd::recover_channel_after_packet_failure();
+                delay_us(CONTROL_RETRY_DELAY_US);
+            }
         }
     }
     unreachable!("control-transfer retry loop always returns");
@@ -404,6 +434,31 @@ fn data_stage_in(pipe: &ControlPipe, buffer: &mut [u8], quiet_errors: bool) -> O
         }
     }
     Some(received)
+}
+
+/// Sends MPS-sized OUT packets in a control transfer. Like the IN direction,
+/// the first data packet is DATA1 and subsequent packets alternate.
+#[allow(dead_code)]
+fn data_stage_out(pipe: &ControlPipe, buffer: &mut [u8], quiet_errors: bool) -> Option<()> {
+    let mut offset = 0usize;
+    let mut pid_data1 = true;
+    while offset < buffer.len() {
+        let chunk_len = (buffer.len() - offset).min(pipe.mps.max(1) as usize);
+        let sent = run_control_packet(
+            pipe,
+            false,
+            false,
+            pid_data1,
+            quiet_errors,
+            &mut buffer[offset..offset + chunk_len],
+        )?;
+        if sent != chunk_len {
+            return None;
+        }
+        offset += sent;
+        pid_data1 = !pid_data1;
+    }
+    Some(())
 }
 
 /// `hcd::run_packet` on EP0 (control transfers). NAKs are expected to retry

@@ -114,8 +114,9 @@ impl InputManager {
         // deliberately rescanned only at a coarse interval because probing
         // it performs a blocking USB reset and debounce sequence.
         if self.usb_host.root_disconnected() {
-            if !self.usb_host.is_empty() {
-                self.usb_host.clear();
+            let had_registered_device = !self.usb_host.is_empty();
+            self.usb_host.clear();
+            if had_registered_device {
                 uart::log(b"USB: nothing connected to USB-A\r\n");
             }
         } else if self.usb_host.needs_reinit() {

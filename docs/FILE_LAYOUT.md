@@ -79,8 +79,13 @@
       `poll`は待機中のレポートを全て読み切って合算する
     - `src/usb/hub.rs`: USBハブのクラスドライバー。ディスクリプタ取得、ポート電源、
       接続検出、リセット、速度判定を担当
-    - `src/usb/msc.rs`: USB Mass StorageのBulk-Only TransportとSCSI読み込みコマンドを
-      実装するクラスドライバー
+    - `src/usb/bot.rs`: USB Mass StorageのBulk-Only Transport。Bulk IN/OUT、
+      endpointごとのデータトグル、CBW/CSW、STALL回復を実装し、`msc.rs`が利用する
+    - `src/usb/msc.rs`: SCSI Transparent USB Mass StorageのSCSI読み込みコマンドを
+      実装するクラスドライバー。BOTの転送処理は`bot.rs`へ委譲する
+    - `src/usb/floppy.rs`: 中断したUFI/CBI USB Floppyのクラスドライバー試作。記述子検出、
+      CBIの制御転送、固定1.44 MB FAT12メディア認識を実装するが、現在は`usb.rs`から
+      読み込まれず、レジストリも選択しない
     - `src/usb/registry.rs`: USBバスの単一オーナーである`UsbHost`とデバイスレジストリ。
       直結デバイス、または1段のハブの全ポートを列挙し、キーボードとMSCのハンドルを保持
   現状は[`USB.md`](USB.md)、段階分けと実装上の判断は

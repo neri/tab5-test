@@ -324,6 +324,7 @@ const GHWCFG3: usize = USB_DWC_HS + 0x4C;
 const GHWCFG4: usize = USB_DWC_HS + 0x50;
 const HPTXFSIZ: usize = USB_DWC_HS + 0x100;
 const HCFG: usize = USB_DWC_HS + 0x400;
+const HFNUM: usize = USB_DWC_HS + 0x408;
 const HPRT: usize = USB_DWC_HS + 0x440;
 
 const GAHBCFG_DMAEN: u32 = 1 << 5;
@@ -1206,7 +1207,17 @@ pub fn run_packet(
         | (if endpoint.route.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
         | endpoint.endpoint_type
         | ((endpoint.device_address as u32 & 0x7F) << 22);
-    let hctsiz = HCTSIZ_SCHED_INFO_ALL | (if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 });
+    // In descriptor-DMA mode the QTD's SUP bit marks the descriptor as a
+    // setup packet, but HCTSIZ must still select the SETUP PID. DATA0 is
+    // correct only for a non-setup control OUT data packet.
+    let hctsiz = HCTSIZ_SCHED_INFO_ALL
+        | if is_setup {
+            HCTSIZ_PID_SETUP
+        } else if pid_data1 {
+            HCTSIZ_PID_DATA1
+        } else {
+            0
+        };
 
     unsafe {
         write(CHAN0_HCINT, 0xFFFF_FFFF); // clear stale status from a previous packet
@@ -1550,6 +1561,13 @@ fn await_packet(
 /// prtovrcurract (bit 4) means the board's 5V supply gave up.
 fn log_port_state() {
     uart::log_hex(b"USB:   HPRT=", unsafe { read(HPRT) });
+    // A Full-Speed device may enter suspend after a few milliseconds without
+    // bus activity. Sampling HFNUM across one millisecond tells a failed
+    // control-transfer caller whether this host is still generating frames.
+    let hfnum = unsafe { read(HFNUM) };
+    uart::log_hex(b"USB:   HFNUM before +1ms=", hfnum);
+    delay_us(1_000);
+    uart::log_hex(b"USB:   HFNUM +1ms=", unsafe { read(HFNUM) });
 }
 
 /// Explicitly requests a channel halt and waits (briefly) for it, so a

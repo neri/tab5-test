@@ -32,6 +32,7 @@ use crate::uart;
 pub const MAX_HUB_PORTS: u8 = 8;
 
 const SLOT_COUNT: usize = MAX_HUB_PORTS as usize + 1; // index 0 = Direct, N = HubPort(N)
+const ALL_SLOT_BITS: u16 = (1u16 << SLOT_COUNT) - 1;
 /// A background port scan runs roughly once a second. Do not stop discovery
 /// for a one-off hub/host hiccup; pause only after this many consecutive
 /// full scan failures, then emit the existing one-shot diagnostic.
@@ -135,6 +136,11 @@ pub struct UsbHost {
     /// each delivered key prevents a low-numbered USB keyboard from starving
     /// another one that is also producing input.
     next_keyboard_slot: usize,
+    /// Slots at which an enumerated device had no usable class driver. The
+    /// background scanner must keep probing those slots for future support,
+    /// but reports each unsupported physical attachment only once rather
+    /// than filling the UART log every scan interval.
+    unhandled_slots: u16,
     slots: [Option<Slot>; SLOT_COUNT],
 }
 
@@ -149,6 +155,7 @@ impl UsbHost {
             hub_port_scan_paused: false,
             hub_port_scan_failures: 0,
             next_keyboard_slot: 0,
+            unhandled_slots: 0,
             slots: [NONE_SLOT; SLOT_COUNT],
         }
     }
@@ -216,6 +223,17 @@ impl UsbHost {
     /// what `InputManager` calls once `root_disconnected` reports the cable
     /// itself came out.
     pub fn clear(&mut self) {
+        self.clear_registry();
+        self.last_probe = None;
+        self.unhandled_slots = 0;
+    }
+
+    /// Drops registered driver state but preserves which still-connected
+    /// unsupported slots have already been reported. `rescan` uses this
+    /// variant so its periodic retry remains quiet; `clear` above is the
+    /// physical root-disconnect path and re-arms diagnostics for the next
+    /// attachment.
+    fn clear_registry(&mut self) {
         self.hub = None;
         self.hub_speed = Speed::Unknown;
         self.hub_summary = None;
@@ -331,11 +349,14 @@ impl UsbHost {
     /// anyway; there is no persistent bus state to keep in sync
     /// incrementally.
     pub fn rescan(&mut self) {
-        self.clear();
+        self.clear_registry();
 
         let port = hcd::probe_port();
         self.last_probe = Some(port);
         if !port.enabled {
+            if !port.connected {
+                self.clear_unhandled_slot(0);
+            }
             return;
         }
 
@@ -351,13 +372,14 @@ impl UsbHost {
         if device.device_class == hub::DEVICE_CLASS_HUB {
             self.attach_hub(&device, port.speed);
         } else if let Some(kind) = attach_class_driver(&device) {
+            self.clear_unhandled_slot(0);
             self.slots[0] = Some(Slot {
                 location: Location::Direct,
                 summary: DeviceSummary::from(&device),
                 kind,
             });
         } else {
-            uart::log(b"USB: no class driver for the device on USB-A\r\n");
+            self.report_unhandled_slot(0, &device);
         }
     }
 
@@ -397,7 +419,10 @@ impl UsbHost {
         for port in 1..=port_count {
             match hub.debounce_connected_port(port) {
                 Some(true) => {}
-                Some(false) => continue,
+                Some(false) => {
+                    self.clear_unhandled_slot(port as usize);
+                    continue;
+                }
                 None => {
                     uart::log(b"USB: hub stopped answering while scanning ports\r\n");
                     break;
@@ -442,7 +467,10 @@ impl UsbHost {
             }
             match hub.debounce_connected_port_quiet(port) {
                 Some(true) => {}
-                Some(false) => continue,
+                Some(false) => {
+                    self.clear_unhandled_slot(port as usize);
+                    continue;
+                }
                 None => {
                     // This scan is only an opportunistic way to notice new
                     // devices.  A root reset here would discard every
@@ -505,6 +533,7 @@ impl UsbHost {
 
         match attach_class_driver(&downstream) {
             Some(kind) => {
+                self.clear_unhandled_slot(port as usize);
                 uart::log(match kind {
                     DeviceKind::Keyboard(_) => b"USB: keyboard attached on hub port " as &[u8],
                     DeviceKind::Mouse(_) => b"USB: mouse attached on hub port ",
@@ -517,8 +546,57 @@ impl UsbHost {
                     kind,
                 });
             }
-            None => uart::log_hex(b"USB: no class driver for device on hub port ", port as u32),
+            None => self.report_unhandled_slot(port as usize, &downstream),
         }
+    }
+
+    fn report_unhandled_slot(&mut self, slot_index: usize, device: &EnumeratedDevice) {
+        let bit = 1u16 << slot_index;
+        if self.unhandled_slots & bit != 0 {
+            return;
+        }
+        self.unhandled_slots |= bit;
+        if slot_index == 0 {
+            uart::log(b"USB: no class driver for the device on USB-A\r\n");
+        } else {
+            uart::log_hex(
+                b"USB: no class driver for device on hub port ",
+                slot_index as u32,
+            );
+        }
+        log_unhandled_interfaces(device);
+    }
+
+    fn clear_unhandled_slot(&mut self, slot_index: usize) {
+        self.unhandled_slots &= ALL_SLOT_BITS ^ (1u16 << slot_index);
+    }
+}
+
+/// Leaves enough descriptor evidence in the UART log to decide whether a
+/// newly seen device needs a class driver or merely reported a different
+/// subclass/transport than the intended one. Enumeration already fetched the
+/// complete configuration descriptor, so this costs no additional USB traffic.
+fn log_unhandled_interfaces(device: &EnumeratedDevice) {
+    let config = device.config_bytes();
+    let mut offset = 0usize;
+    while offset + 2 <= config.len() {
+        let length = config[offset] as usize;
+        if length < 2 || offset + length > config.len() {
+            break;
+        }
+        if config[offset + 1] == protocol::DESCRIPTOR_TYPE_INTERFACE && length >= 9 {
+            let descriptor = u32::from_be_bytes([
+                config[offset + 2],
+                config[offset + 5],
+                config[offset + 6],
+                config[offset + 7],
+            ]);
+            uart::log_hex(
+                b"USB: unhandled interface (number/class/subclass/protocol)=",
+                descriptor,
+            );
+        }
+        offset += length;
     }
 }
 

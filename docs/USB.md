@@ -2,11 +2,11 @@
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
 > [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)、[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md)、
-> [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)
+> [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)、[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)
 
 Tab5のUSB-Aコネクタに繋がるHigh-Speed USB-DWCコントローラーをホストとして
 使用します。モジュールの層構成（`hcd`／`protocol`／`hid`／`hid_keyboard`／
-`hid_mouse`／`hub`／`msc`／`registry`）は[`FILE_LAYOUT.md`](FILE_LAYOUT.md)を
+`hid_mouse`／`bot`／`msc`／`registry`）は[`FILE_LAYOUT.md`](FILE_LAYOUT.md)を
 参照してください。この文書は現在どこまで動くかを説明します。
 
 USB-C側のFull-Speed OTGコントローラー（GPIO26/27）と、`uart.rs`が使う
@@ -22,6 +22,17 @@ USB Serial/JTAG（GPIO24/25）は対象外です。
 - USB Mass Storageの読み出し（`src/usb/msc.rs`）。詳細は
   [`STORAGE.md`](STORAGE.md)。直結・ハブ経由のどちらでも動作します。
 - High-Speedハブ配下にFull/Low-Speedデバイスを繋ぐ構成（Split Transaction）。
+
+## 中断したFloppy実装
+
+UFI/CBI USB Floppy用の試作クラスドライバは`src/usb/floppy.rs`に保持するが、現在の
+ビルドには含めず、レジストリも選択しない。したがってUFI/CBIデバイスは未対応として
+一度だけログに出力され、`usbfloppy`と`usbfloppyprobe`コマンドは存在しない。
+
+直結実機（VID:PID `054C:002C`、interface `08/04/00`、Bulk IN `0x81`、Bulk OUT
+`0x02`、status Interrupt IN `0x83`）でのCBI ADSC制御要求は、descriptor-DMAの
+SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再開条件は
+[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)を参照する。
 
 ## バスの所有とスキャン周期
 
@@ -75,6 +86,13 @@ Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_
 | `usbhw` | DWCコアの`GHWCFG`ダンプと`HCSPLT`の実在検査 |
 | `usbvbus <0-7> on\|off` | PI4IOE2（`0x44`）の出力ビット直接操作（bit 3がVBUS）。診断用 |
 | `usbmsc`／`usbread`／`usbmbr` | USB Mass Storage（[`STORAGE.md`](STORAGE.md)） |
+
+未対応デバイスが列挙まで成功した場合、UARTには各interfaceの
+`number/class/subclass/protocol`（上位byteから順）を16進で出す。これは対応する
+クラスドライバまたは転送方式を判断する診断情報であり、`usbrescan`を繰り返さずに
+記述子の内容を確認するために使う。同じ未対応デバイスが接続されている間は、
+定期再スキャンを続けてもこのログを繰り返さない。物理的に切断された後の次回接続では
+再び1回出力する。
 
 起動時のログと再接続時のログは[`DIAGNOSTICS.md`](DIAGNOSTICS.md)を参照して
 ください。

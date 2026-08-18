@@ -17,8 +17,11 @@
 //!   `hid_keyboard`'s sibling over the same `hid` layer.
 //! - `hub`: the USB hub class driver, a sibling of `hid_keyboard` on top
 //!   of the same two layers.
-//! - `msc`: the USB Mass Storage (Bulk-Only Transport) class driver, another
-//!   sibling of `hid_keyboard`/`hub`.
+//! - `bot`: the Bulk-Only Transport envelope used by the SCSI Transparent
+//!   USB-memory class driver.
+//! - `msc`: the SCSI Transparent USB Mass Storage class driver.
+//! - `floppy`: suspended UFI Control/Bulk/Interrupt USB Floppy driver source
+//!   (not included in this build).
 //! - `registry`: `UsbHost`, the single owner of the bus and the device
 //!   registry that decides *what is plugged in* -- one device directly, or
 //!   every occupied port of a hub -- and holds every class driver handle
@@ -31,6 +34,7 @@
 //! `msc` follows `docs/USB_MSC_PLAN.md`. `registry` follows `docs/USB_REFACTOR_PLAN.md`,
 //! which replaced this module's old single-keyboard `connect_keyboard`.
 
+mod bot;
 mod hcd;
 mod hid;
 mod hid_keyboard;
