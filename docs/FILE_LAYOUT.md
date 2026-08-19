@@ -91,7 +91,9 @@
   現状は[`USB.md`](USB.md)、段階分けと実装上の判断は
   [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
-- `.cargo/config.toml`: ターゲット、リンカー、`espflash` runner
+- `.cargo/config.toml`: ターゲット、リンカー、`partitions.csv`の`factory`アプリを
+  選ぶ`espflash` runner
+- `partitions.csv`: Tab5の16 MiB SPI Flash向けESP-IDF互換パーティション表
 - `tools/check_elf_layout.py`: release ELFのXIP/IRAM/DRAM配置、critical relocation、
   RAM範囲、stack下限を検査
 - `tools/check_esp_image.py`: `espflash save-image`後のXIPセグメント数、appdesc、
