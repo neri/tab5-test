@@ -239,6 +239,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "usbfs",
+        usage: "usbfs on|off",
+        lines: &[
+            "force the root host to FS/LS-only or restore High-Speed mode,",
+            "then reset and re-enumerate the bus (diagnostic)",
+        ],
+    },
+    HelpEntry {
         name: "usbvbus",
         usage: "usbvbus <0-7> on|off",
         lines: &[
@@ -268,6 +276,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &[
             "dump the DWC core's GHWCFG registers and probe HCSPLT to show",
             "whether split transactions exist in hardware at all",
+        ],
+    },
+    HelpEntry {
+        name: "usbperiodic",
+        usage: "usbperiodic",
+        lines: &[
+            "run one channel-1 HID Interrupt IN transaction through the DWC",
+            "32-entry periodic frame list; press/release a key within 5 seconds",
         ],
     },
     HelpEntry {
@@ -371,9 +387,11 @@ pub fn execute(
         b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
         b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
         b"usbrescan" => cmd_usbrescan(console, framebuffer, usb_host),
+        b"usbfs" => cmd_usbfs(console, framebuffer, argument, usb_host),
         b"usbvbus" => cmd_usbvbus(console, framebuffer, argument),
         b"usbhub" => cmd_usbhub(console, framebuffer, usb_host),
         b"usbhw" => cmd_usbhw(console, framebuffer, usb_host),
+        b"usbperiodic" => cmd_usbperiodic(console, framebuffer, usb_host),
         b"usbmsc" => cmd_usbmsc(console, framebuffer, usb_host),
         b"usbread" => cmd_usbread(console, framebuffer, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
@@ -1738,7 +1756,7 @@ fn report_last_probe(
     // whether the host was allowed to negotiate High-Speed at all.
     console.write_output_line(
         framebuffer,
-        if usb::FORCE_FS_LS_ONLY_HOST {
+        if usb::fs_ls_only_host_forced() {
             "host: FS/LS-only forced (HCFG.FSLSSupp)"
         } else {
             "host: High-Speed capable, split transactions on (see 'usbhw')"
@@ -1796,6 +1814,37 @@ fn cmd_usbrescan(
     usb_host: &mut usb::UsbHost,
 ) {
     console.write_output_line(framebuffer, "probing USB-A host port (USB-DWC HS)...");
+    usb_host.rescan();
+    report_usb_state(console, framebuffer, usb_host);
+}
+
+/// Changes the host-speed policy and immediately rebuilds the entire USB
+/// registry. A High-Speed hub attached while this is on enumerates at
+/// Full-Speed and behaves as a plain repeater, which makes it useful for
+/// testing non-Split periodic HID channels without special FS-only hardware.
+fn cmd_usbfs(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    let forced = match argument {
+        b"on" => true,
+        b"off" => false,
+        _ => {
+            console.write_output_line(framebuffer, "usage: usbfs on|off");
+            return;
+        }
+    };
+    usb::set_fs_ls_only_host_forced(forced);
+    console.write_output_line(
+        framebuffer,
+        if forced {
+            "USB host FS/LS-only forced; resetting and rescanning..."
+        } else {
+            "USB host High-Speed restored; resetting and rescanning..."
+        },
+    );
     usb_host.rescan();
     report_usb_state(console, framebuffer, usb_host);
 }
@@ -2090,6 +2139,255 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
             "  -> bits stuck; real HCSPLT would read 0x8001FFFF"
         },
     );
+
+    let irq = usb::interrupt_diagnostics();
+    let mut line = Line::new();
+    line.push_str("USB IRQ source=");
+    line.push_u32(irq.source);
+    line.push_str(" global=");
+    line.push_u32(if irq.global_signal_enabled { 1 } else { 0 });
+    line.push_str(" total=");
+    line.push_u32(irq.total);
+    line.push_str(" ch0=");
+    line.push_u32(irq.channel0);
+    line.push_str(" ch1=");
+    line.push_u32(irq.channel1);
+    line.push_str(" port=");
+    line.push_u32(irq.port);
+    line.push_str(" spurious=");
+    line.push_u32(irq.spurious);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ waits: sleep=");
+    line.push_u32(irq.sleep_waits);
+    line.push_str(" poll=");
+    line.push_u32(irq.poll_waits);
+    line.push_str(" wfi=");
+    line.push_u32(irq.wfi_count);
+    line.push_str(" last/max cycles=");
+    line.push_u32(irq.last_wait_cycles);
+    line.push_str("/");
+    line.push_u32(irq.max_wait_cycles);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ slots: submit=");
+    line.push_u32(irq.submits);
+    line.push_str(" reap=");
+    line.push_u32(irq.reaps);
+    line.push_str(" cancel=");
+    line.push_u32(irq.cancels);
+    line.push_str(" stale-token=");
+    line.push_u32(irq.stale_tokens);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ periodic: channels=0x");
+    line.push_hex(irq.periodic_channel_mask, 2);
+    line.push_str(" irqs=");
+    line.push_u32(irq.periodic_interrupts);
+    line.push_str(" pending=0x");
+    line.push_hex(irq.periodic_pending_mask, 2);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ periodic work: complete=");
+    line.push_u32(irq.periodic_completions);
+    line.push_str(" rearm=");
+    line.push_u32(irq.periodic_rearms);
+    line.push_str(" errors=");
+    line.push_u32(irq.periodic_errors);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ split: packets=");
+    line.push_u32(irq.split_packets);
+    line.push_str(" rounds=");
+    line.push_u32(irq.split_rounds);
+    line.push_str(" conflicts=");
+    line.push_u32(irq.split_mode_conflicts);
+    line.push_str(" active=");
+    line.push_u32(irq.split_mode_active as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ masks: GINT=0x");
+    line.push_hex(irq.live_gintmsk, 8);
+    line.push_str(" HAINT=0x");
+    line.push_hex(irq.live_haintmsk, 8);
+    line.push_str(" HCINT0=0x");
+    line.push_hex(irq.live_hcintmsk0, 8);
+    line.push_str(" HCINT1=0x");
+    line.push_hex(irq.live_hcintmsk1, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ last: GINT=0x");
+    line.push_hex(irq.last_gintsts, 8);
+    line.push_str(" HAINT=0x");
+    line.push_hex(irq.last_haint, 8);
+    line.push_str(" HCINT0=0x");
+    line.push_hex(irq.last_hcint0, 8);
+    line.push_str(" HCINT1=0x");
+    line.push_hex(irq.last_hcint1, 8);
+    line.push_str(" HPRT=0x");
+    line.push_hex(irq.last_hprt, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("IRQ pending: ch0=0x");
+    line.push_hex(irq.pending_channel0, 8);
+    line.push_str(" ch1=0x");
+    line.push_hex(irq.pending_channel1, 8);
+    line.push_str(" port=0x");
+    line.push_hex(irq.pending_port, 8);
+    line.push_str(" unknown-cause=0x");
+    line.push_hex(interrupts::unknown_external_cause(), 8);
+    line.push_str(" count=");
+    line.push_u32(interrupts::unknown_external_count());
+    console.write_output_line(framebuffer, line.as_str());
+
+    // Mirror the interrupt snapshot to UART so Stage 1 hardware results can
+    // be pasted verbatim into the implementation record. This is foreground
+    // diagnostics; the ISR itself never logs.
+    uart::log_hex(b"USB IRQ: source=", irq.source);
+    uart::log_hex(
+        b"USB IRQ: global enabled=",
+        irq.global_signal_enabled as u32,
+    );
+    uart::log_hex(b"USB IRQ: total=", irq.total);
+    uart::log_hex(b"USB IRQ: channel0=", irq.channel0);
+    uart::log_hex(b"USB IRQ: channel1=", irq.channel1);
+    uart::log_hex(b"USB IRQ: port=", irq.port);
+    uart::log_hex(b"USB IRQ: spurious=", irq.spurious);
+    uart::log_hex(b"USB IRQ: sleep waits=", irq.sleep_waits);
+    uart::log_hex(b"USB IRQ: poll waits=", irq.poll_waits);
+    uart::log_hex(b"USB IRQ: wfi=", irq.wfi_count);
+    uart::log_hex(b"USB IRQ: last wait cycles=", irq.last_wait_cycles);
+    uart::log_hex(b"USB IRQ: max wait cycles=", irq.max_wait_cycles);
+    uart::log_hex(b"USB IRQ: submits=", irq.submits);
+    uart::log_hex(b"USB IRQ: reaps=", irq.reaps);
+    uart::log_hex(b"USB IRQ: cancels=", irq.cancels);
+    uart::log_hex(b"USB IRQ: stale tokens=", irq.stale_tokens);
+    uart::log_hex(b"USB IRQ: periodic active=", irq.periodic_active as u32);
+    uart::log_hex(
+        b"USB IRQ: periodic channel mask=",
+        irq.periodic_channel_mask,
+    );
+    uart::log_hex(b"USB IRQ: periodic interrupts=", irq.periodic_interrupts);
+    uart::log_hex(
+        b"USB IRQ: periodic pending mask=",
+        irq.periodic_pending_mask,
+    );
+    uart::log_hex(b"USB IRQ: periodic completions=", irq.periodic_completions);
+    uart::log_hex(b"USB IRQ: periodic rearms=", irq.periodic_rearms);
+    uart::log_hex(b"USB IRQ: periodic errors=", irq.periodic_errors);
+    uart::log_hex(b"USB IRQ: split packets=", irq.split_packets);
+    uart::log_hex(b"USB IRQ: split rounds=", irq.split_rounds);
+    uart::log_hex(b"USB IRQ: split mode conflicts=", irq.split_mode_conflicts);
+    uart::log_hex(b"USB IRQ: split mode active=", irq.split_mode_active as u32);
+    uart::log_hex(b"USB IRQ: channel2=", irq.periodic_irq_counts[1]);
+    uart::log_hex(b"USB IRQ: channel3=", irq.periodic_irq_counts[2]);
+    uart::log_hex(b"USB IRQ: channel4=", irq.periodic_irq_counts[3]);
+    uart::log_hex(b"USB IRQ: GINTMSK=", irq.live_gintmsk);
+    uart::log_hex(b"USB IRQ: HAINTMSK=", irq.live_haintmsk);
+    uart::log_hex(b"USB IRQ: HCINTMSK0=", irq.live_hcintmsk0);
+    uart::log_hex(b"USB IRQ: HCINTMSK1=", irq.live_hcintmsk1);
+    uart::log_hex(b"USB IRQ: HCINTMSK2=", irq.periodic_hcintmsk[1]);
+    uart::log_hex(b"USB IRQ: HCINTMSK3=", irq.periodic_hcintmsk[2]);
+    uart::log_hex(b"USB IRQ: HCINTMSK4=", irq.periodic_hcintmsk[3]);
+    uart::log_hex(b"USB IRQ: last GINTSTS=", irq.last_gintsts);
+    uart::log_hex(b"USB IRQ: last HAINT=", irq.last_haint);
+    uart::log_hex(b"USB IRQ: last HCINT0=", irq.last_hcint0);
+    uart::log_hex(b"USB IRQ: last HCINT1=", irq.last_hcint1);
+    uart::log_hex(b"USB IRQ: last HCINT2=", irq.periodic_last_hcint[1]);
+    uart::log_hex(b"USB IRQ: last HCINT3=", irq.periodic_last_hcint[2]);
+    uart::log_hex(b"USB IRQ: last HCINT4=", irq.periodic_last_hcint[3]);
+    uart::log_hex(b"USB IRQ: last HPRT=", irq.last_hprt);
+    uart::log_hex(b"USB IRQ: pending channel0=", irq.pending_channel0);
+    uart::log_hex(b"USB IRQ: pending channel1=", irq.pending_channel1);
+    uart::log_hex(b"USB IRQ: pending channel2=", irq.periodic_pending[1]);
+    uart::log_hex(b"USB IRQ: pending channel3=", irq.periodic_pending[2]);
+    uart::log_hex(b"USB IRQ: pending channel4=", irq.periodic_pending[3]);
+    uart::log_hex(b"USB IRQ: pending port=", irq.pending_port);
+    uart::log_hex(
+        b"USB IRQ: unknown cause=",
+        interrupts::unknown_external_cause(),
+    );
+    uart::log_hex(
+        b"USB IRQ: unknown count=",
+        interrupts::unknown_external_count(),
+    );
+}
+
+fn cmd_usbperiodic(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) {
+    console.write_output_line(
+        framebuffer,
+        "periodic probe armed: press/release a HID key or move the mouse within 5 seconds",
+    );
+    let Some((kind, result)) = usb_host.probe_periodic_hid() else {
+        console.write_output_line(framebuffer, "no HID keyboard or mouse attached");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("periodic HID=");
+    line.push_str(kind);
+    line.push_str(" requested interval=");
+    line.push_u32(result.requested_interval as u32);
+    line.push_str(" scheduled=");
+    line.push_u32(result.scheduled_interval as u32);
+    line.push_str(" entries=");
+    line.push_u32(result.scheduled_entries as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    if !result.attempted {
+        console.write_output_line(
+            framebuffer,
+            "periodic probe unsupported for this route or max packet size",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("frame list addr/readback=0x");
+    line.push_hex(result.frame_list_address, 8);
+    line.push_str("/0x");
+    line.push_hex(result.frame_list_readback, 8);
+    line.push_str(" HCFG=0x");
+    line.push_hex(result.hcfg_during, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("periodic result=");
+    line.push_str(if result.completed {
+        "complete"
+    } else if result.timed_out {
+        "timeout"
+    } else {
+        "error"
+    });
+    line.push_str(" halted=");
+    line.push_u32(result.channel_halted as u32);
+    line.push_str(" ch1-irqs=");
+    line.push_u32(result.channel1_irqs);
+    line.push_str(" wfi=");
+    line.push_u32(result.wfi_count);
+    line.push_str(" bytes=");
+    line.push_u32(result.transferred as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("periodic HCINT=0x");
+    line.push_hex(result.hcint, 8);
+    line.push_str(" QTD=0x");
+    line.push_hex(result.qtd_control, 8);
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 fn cmd_usbhub(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {

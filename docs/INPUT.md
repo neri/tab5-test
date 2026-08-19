@@ -47,7 +47,17 @@
 フレーム境界ごとに`service`（接続状態の保守）と`poll_key`（キーの読み出し）を
 それぞれ1回呼びます。CardKBが不在のときは60フレームごとに再初期化を試みます。
 USB側のスキャン周期は[`USB.md`](USB.md)を参照してください。全画面アプリが
-共通で使うキー待ちは`wait_for_key`です。
+共通で使うキー待ちは`wait_for_key`です。USB root-portの物理接続変化はISRが記録し、
+`service`がフレーム境界でtakeして即時再列挙します。割り込みを取り逃した場合に備え、
+rootが空の間の低頻度fallback scanも残します。
+
+rootへFS/LSで直結、またはFull-Speedハブ配下のUSB keyboard／mouseがperiodic channel 1〜4を確保できた場合、
+`poll_key`／`poll_mouse`はフレームごとにUSB transactionを発行せず、ISRが完了済みにしたreportだけを
+takeします。idle NAKの処理はDWCのframe list側で継続します。最大4 endpointで、割当て不能時と
+High-Speedハブ配下（SplitとのDMA mode調停前）は従来のframe pollです。実機確認済みなのは
+root直結LS keyboardとroot直結Full-Speed mouseのchannel 1経路です。Full-Speedハブ配下の
+複数slotはHigh-Speedハブを`usbfs on`でFull-Speed列挙する代替試験により、keyboardをchannel 1、
+mouseをchannel 2へ同時登録して確認済みです。
 
 ## ポインタ（USBマウス）
 

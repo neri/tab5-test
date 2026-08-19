@@ -112,6 +112,14 @@ impl UsbMouse {
         self.endpoint.needs_reinit()
     }
 
+    pub fn probe_periodic(&mut self) -> super::hcd::PeriodicProbeResult {
+        self.endpoint.probe_periodic()
+    }
+
+    pub fn enable_periodic(&mut self) -> Option<u8> {
+        self.endpoint.enable_periodic()
+    }
+
     /// Drains every report the mouse already has waiting and returns their
     /// combined effect, or `None` if it had nothing to say this frame.
     ///

@@ -62,6 +62,14 @@ impl UsbKeyboard {
         self.endpoint.needs_reinit()
     }
 
+    pub fn probe_periodic(&mut self) -> super::hcd::PeriodicProbeResult {
+        self.endpoint.probe_periodic()
+    }
+
+    pub fn enable_periodic(&mut self) -> Option<u8> {
+        self.endpoint.enable_periodic()
+    }
+
     /// Returns the next newly-pressed key, or `None` if nothing new is
     /// available this frame. ASCII and HID-only keys (Esc, arrows, and so
     /// on) use the same `input::Key` contract that `InputManager` exposes.

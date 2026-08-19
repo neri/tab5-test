@@ -15,7 +15,7 @@
 //! transfers and directly on `hcd.rs` for the Interrupt IN polling, which
 //! is not a control transfer and so does not go through `protocol.rs`.
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
+use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
 use super::protocol::{self, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::uart;
 
@@ -75,6 +75,7 @@ pub struct BootInterface {
     pub interface_number: u8,
     pub endpoint_address: u8,
     pub max_packet_size: u16,
+    pub interval: u8,
 }
 
 /// Walks a configuration descriptor's interface/endpoint chain (see
@@ -124,7 +125,8 @@ pub fn find_boot_interface(config: &[u8], interface_protocol: u8) -> Option<Boot
                                 max_packet_size: u16::from_le_bytes([
                                     config[endpoint_offset + 4],
                                     config[endpoint_offset + 5],
-                                ]),
+                                ]) & 0x07FF,
+                                interval: config[endpoint_offset + 6],
                             });
                         }
                     }
@@ -195,6 +197,8 @@ pub struct InterruptIn {
     /// directly or into a hub port.
     endpoint: Endpoint,
     next_pid_data1: bool,
+    interval: u8,
+    periodic: Option<hcd::PeriodicHandle>,
     /// Consecutive hard errors from `read_report`; drives `needs_reinit`
     /// and also whether it asks `hcd::run_packet` to stay quiet about
     /// repeats of an already-logged error.
@@ -215,6 +219,8 @@ impl InterruptIn {
             // Every endpoint's data toggle resets to DATA0 on
             // SET_CONFIGURATION (USB2.0 9.4.5).
             next_pid_data1: false,
+            interval: interface.interval.max(1),
+            periodic: None,
             consecutive_hard_errors: 0,
         }
     }
@@ -225,6 +231,43 @@ impl InterruptIn {
     /// device answers with a short packet anyway.
     pub fn max_packet_size(&self) -> usize {
         self.endpoint.mps as usize
+    }
+
+    /// Exercises the controller's periodic frame-list path on channel 1.
+    /// The live HID path remains on its proven fallback until this diagnostic
+    /// succeeds on each relevant speed/topology.
+    pub fn probe_periodic(&mut self) -> hcd::PeriodicProbeResult {
+        const PROBE_BUFFER_BYTES: usize = 64;
+        let mps = self.max_packet_size();
+        if mps == 0 || mps > PROBE_BUFFER_BYTES {
+            return hcd::probe_periodic_interrupt_in(
+                &self.endpoint,
+                self.interval,
+                self.next_pid_data1,
+                &mut [],
+            );
+        }
+        let mut report = [0u8; PROBE_BUFFER_BYTES];
+        let result = hcd::probe_periodic_interrupt_in(
+            &self.endpoint,
+            self.interval,
+            self.next_pid_data1,
+            &mut report[..mps],
+        );
+        if result.completed {
+            self.next_pid_data1 = !self.next_pid_data1;
+        }
+        result
+    }
+
+    /// Promotes this endpoint from the frame-driven fallback to the proven
+    /// persistent periodic path. Returns the allocated host-channel number.
+    pub fn enable_periodic(&mut self) -> Option<u8> {
+        if let Some(handle) = self.periodic {
+            return Some(handle.channel());
+        }
+        self.periodic = hcd::enable_periodic_hid(&self.endpoint, self.interval);
+        self.periodic.map(hcd::PeriodicHandle::channel)
     }
 
     /// True once polling has failed for long enough that the session
@@ -257,6 +300,20 @@ impl InterruptIn {
     /// fixed per boot protocol, and a device that answered with fewer bytes
     /// than that layout needs has not produced one.
     pub fn read_report(&mut self, report: &mut [u8]) -> Option<usize> {
+        if let Some(handle) = self.periodic {
+            return match hcd::take_periodic_hid_report(handle, report) {
+                hcd::PeriodicRead::Pending => None,
+                hcd::PeriodicRead::Complete(transferred) => {
+                    self.consecutive_hard_errors = 0;
+                    Some(transferred)
+                }
+                hcd::PeriodicRead::Error => {
+                    self.consecutive_hard_errors = self.consecutive_hard_errors.wrapping_add(1);
+                    None
+                }
+            };
+        }
+
         // Once a streak of hard errors has already logged its first
         // occurrence, every repeat is diagnosing the exact same stale
         // session (see `hcd::run_packet`'s `quiet_errors` doc) -- log
@@ -269,6 +326,7 @@ impl InterruptIn {
             self.next_pid_data1,
             INTERRUPT_POLL_TIMEOUT_ITERATIONS,
             INTERRUPT_POLL_SPLIT_ROUNDS,
+            CompletionWait::PollIdleNak,
             true,
             quiet_errors,
             report,

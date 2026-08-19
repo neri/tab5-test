@@ -7,7 +7,7 @@
 //!
 //! This is Stage 2 of `docs/USB_HOST_PLAN.md`.
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome, Route};
+use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome, Route};
 use crate::delay::{delay_ms, delay_us};
 use crate::uart;
 
@@ -495,6 +495,7 @@ fn run_control_packet(
         pid_data1,
         CONTROL_TIMEOUT_ITERATIONS,
         CONTROL_SPLIT_ROUNDS,
+        CompletionWait::Interrupt,
         quiet_errors,
         quiet_errors,
         buffer,

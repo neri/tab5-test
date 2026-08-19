@@ -40,6 +40,7 @@ class Section:
 class Symbol:
     name: str
     value: int
+    size: int
     section_index: str
 
 
@@ -86,7 +87,11 @@ def parse_symbols(output: str) -> dict[str, Symbol]:
         except ValueError:
             continue
         name = parts[7]
-        symbols[name] = Symbol(name, value, parts[6])
+        try:
+            size = int(parts[2])
+        except ValueError:
+            continue
+        symbols[name] = Symbol(name, value, size, parts[6])
     return symbols
 
 
@@ -117,6 +122,11 @@ def symbol_value(symbols: dict[str, Symbol], name: str) -> int:
         return symbols[name].value
     except KeyError as error:
         raise ValueError(f"required linker symbol {name} is missing") from error
+
+
+def symbol_ending_with(symbols: dict[str, Symbol], suffix: str) -> Symbol | None:
+    matches = [symbol for name, symbol in symbols.items() if name.endswith(suffix)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def containing_section(sections: dict[str, Section], address: int) -> Section | None:
@@ -196,6 +206,42 @@ def validate(elf: Path, readelf: str) -> None:
     if stack.size < MIN_STACK_BYTES:
         errors.append(
             f"stack is {stack.size} byte, below the {MIN_STACK_BYTES}-byte minimum"
+        )
+
+    periodic_dma: dict[str, int] = {}
+    for suffix, alignment in (
+        ("PERIODIC_HID_FRAME_LIST", 512),
+        ("PERIODIC_HID_QTD", 512),
+        ("PERIODIC_HID_BUFFER", 4),
+    ):
+        symbol = symbol_ending_with(symbols, suffix)
+        if symbol is None:
+            errors.append(f"required periodic DMA symbol *{suffix} is missing or ambiguous")
+            continue
+        periodic_dma[suffix] = symbol.value
+        if symbol.value % alignment != 0:
+            errors.append(
+                f"{suffix} at 0x{symbol.value:08x} is not {alignment}-byte aligned"
+            )
+        if not (RAM_START <= symbol.value < RAM_END):
+            errors.append(f"{suffix} at 0x{symbol.value:08x} is outside internal RAM")
+        elif symbol.value + symbol.size > RAM_END:
+            errors.append(
+                f"{suffix} at 0x{symbol.value:08x}.."
+                f"0x{symbol.value + symbol.size:08x} exceeds internal RAM"
+            )
+
+    periodic_qtd = symbol_ending_with(symbols, "PERIODIC_HID_QTD")
+    if periodic_qtd is not None and periodic_qtd.size != 4 * 512:
+        errors.append(
+            f"PERIODIC_HID_QTD is {periodic_qtd.size} byte; expected four "
+            "512-byte-stride QTD slots"
+        )
+    periodic_buffer = symbol_ending_with(symbols, "PERIODIC_HID_BUFFER")
+    if periodic_buffer is not None and periodic_buffer.size != 4 * 64:
+        errors.append(
+            f"PERIODIC_HID_BUFFER is {periodic_buffer.size} byte; expected four "
+            "64-byte report buffers"
         )
 
     try:
@@ -310,6 +356,13 @@ def validate(elf: Path, readelf: str) -> None:
         f"  flash-critical=0x{critical_start:08x}..0x{critical_end:08x} "
         f"relocations={len(critical_relocations)}"
     )
+    if len(periodic_dma) == 3:
+        print(
+            "  USB periodic DMA: "
+            f"frame-list=0x{periodic_dma['PERIODIC_HID_FRAME_LIST']:08x} "
+            f"QTD=0x{periodic_dma['PERIODIC_HID_QTD']:08x} "
+            f"buffer=0x{periodic_dma['PERIODIC_HID_BUFFER']:08x}"
+        )
 
     if errors:
         for error in errors:

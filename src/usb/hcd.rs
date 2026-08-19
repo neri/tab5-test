@@ -12,8 +12,10 @@
 //! flashing/logging.
 //!
 //! This is Stage 1 of `docs/USB_HOST_PLAN.md`: core bring-up and host-port
-//! connect/reset/speed detection only, driven by polling (no interrupt
-//! routing yet). Stage 6 added split transactions (`HCSPLT`, set up from
+//! connect/reset/speed detection. `docs/USB_INTERRUPT_REFACTOR_PLAN.md`
+//! adds the first interrupt-driven completion layer while preserving the
+//! synchronous packet API during migration. Stage 6 added split transactions
+//! (`HCSPLT`, set up from
 //! `Route` and driven by `await_packet`), so the bus runs at High-Speed
 //! and an FS/LS device behind a hub is reached through that hub's TT. The
 //! silicon supports them even though Espressif's documentation says it
@@ -30,7 +32,8 @@
 use crate::delay::{delay_ms, delay_us};
 use crate::i2c;
 use crate::uart;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Whether the current continuously-disconnected root-port state has
 /// already produced its timeout log.  `probe_port` is intentionally
@@ -38,6 +41,80 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// empty, so this small bit prevents that normal polling from flooding the
 /// UART.
 static NO_DEVICE_TIMEOUT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+// The ISR only snapshots and acknowledges hardware. Foreground code owns
+// every transfer state transition and consumes `CHANNEL0_PENDING`; counters
+// remain monotonic across rescans so `usbhw` can expose interrupt storms.
+static USB_INTERRUPT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_CHANNEL0_INTERRUPT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_PERIODIC_INTERRUPT_COUNT: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static USB_PORT_INTERRUPT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_SPURIOUS_INTERRUPT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_CHANNEL0_PENDING: AtomicU32 = AtomicU32::new(0);
+static USB_PERIODIC_PENDING: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static USB_PORT_PENDING: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_GINTSTS: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_HAINT: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_HCINT0: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_PERIODIC_HCINT: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static USB_LAST_HPRT: AtomicU32 = AtomicU32::new(0);
+static USB_SLEEP_WAIT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_POLL_WAIT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_WFI_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_WAIT_CYCLES: AtomicU32 = AtomicU32::new(0);
+static USB_MAX_WAIT_CYCLES: AtomicU32 = AtomicU32::new(0);
+static USB_TRANSFER_GENERATION: AtomicU32 = AtomicU32::new(0);
+static USB_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_REAP_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_CANCEL_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_STALE_TOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
+static PERIODIC_HID_ACTIVE_MASK: AtomicU32 = AtomicU32::new(0);
+static PERIODIC_HID_GENERATION: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static PERIODIC_HID_MPS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static PERIODIC_HID_INTERVAL: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static PERIODIC_HID_PID_DATA1: [AtomicBool; 4] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+static PERIODIC_HID_COMPLETION_COUNT: AtomicU32 = AtomicU32::new(0);
+static PERIODIC_HID_REARM_COUNT: AtomicU32 = AtomicU32::new(0);
+static PERIODIC_HID_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+static SPLIT_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SPLIT_PACKET_COUNT: AtomicU32 = AtomicU32::new(0);
+static SPLIT_ROUND_COUNT: AtomicU32 = AtomicU32::new(0);
+static SPLIT_MODE_CONFLICT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn note_root_device_connected() {
     // A later disconnect is a new state transition and deserves one timeout
@@ -315,6 +392,8 @@ const USB_DWC_HS: usize = 0x5000_0000;
 const GAHBCFG: usize = USB_DWC_HS + 0x08;
 const GUSBCFG: usize = USB_DWC_HS + 0x0C;
 const GRSTCTL: usize = USB_DWC_HS + 0x10;
+const GINTSTS: usize = USB_DWC_HS + 0x14;
+const GINTMSK: usize = USB_DWC_HS + 0x18;
 const GRXFSIZ: usize = USB_DWC_HS + 0x24;
 const GNPTXFSIZ: usize = USB_DWC_HS + 0x28;
 const GSNPSID: usize = USB_DWC_HS + 0x40;
@@ -325,10 +404,19 @@ const GHWCFG4: usize = USB_DWC_HS + 0x50;
 const HPTXFSIZ: usize = USB_DWC_HS + 0x100;
 const HCFG: usize = USB_DWC_HS + 0x400;
 const HFNUM: usize = USB_DWC_HS + 0x408;
+const HAINT: usize = USB_DWC_HS + 0x414;
+const HAINTMSK: usize = USB_DWC_HS + 0x418;
+const HFLBADDR: usize = USB_DWC_HS + 0x41C;
 const HPRT: usize = USB_DWC_HS + 0x440;
 
+const GAHBCFG_GLBLINTRMSK: u32 = 1 << 0;
 const GAHBCFG_DMAEN: u32 = 1 << 5;
 const GAHBCFG_HBSTLEN_MASK: u32 = 0xF << 1;
+
+const GINT_HCHINT: u32 = 1 << 25;
+const GINT_PRTINT: u32 = 1 << 24;
+const GINT_DISCONNINT: u32 = 1 << 29;
+const GINT_ENABLED_MASK: u32 = GINT_HCHINT | GINT_PRTINT | GINT_DISCONNINT;
 
 const GUSBCFG_TOUTCAL_MASK: u32 = 0x7;
 const GUSBCFG_PHYIF: u32 = 1 << 3;
@@ -358,6 +446,8 @@ const GHWCFG3_DFIFODEPTH_SHIFT: u32 = 16;
 
 const HCFG_FSLSSUPP: u32 = 1 << 2;
 const HCFG_DESCDMA: u32 = 1 << 23;
+const HCFG_FRLISTEN_MASK: u32 = 0x3 << 24;
+const HCFG_FRLISTEN_32: u32 = 0x2 << 24;
 const HCFG_PERSCHEDENA: u32 = 1 << 26;
 
 /// Stage 4 of `docs/USB_HOST_PLAN.md`: when true, the host is restricted to
@@ -390,6 +480,19 @@ const HCFG_PERSCHEDENA: u32 = 1 << 26;
 /// host driver never sets this bit, so unlike most of this file there is no
 /// reference implementation behind it.
 pub const FORCE_FS_LS_ONLY_HOST: bool = false;
+static FORCE_FS_LS_ONLY_HOST_RUNTIME: AtomicBool = AtomicBool::new(FORCE_FS_LS_ONLY_HOST);
+
+/// Current runtime value of the diagnostic FS/LS-only host mode.
+pub fn fs_ls_only_host_forced() -> bool {
+    FORCE_FS_LS_ONLY_HOST_RUNTIME.load(Ordering::Acquire)
+}
+
+/// Selects the speed policy applied by the next root-port probe/reset.
+/// Foreground must rescan after changing it; the shell's `usbfs` command
+/// does both as one operation.
+pub fn set_fs_ls_only_host_forced(forced: bool) {
+    FORCE_FS_LS_ONLY_HOST_RUNTIME.store(forced, Ordering::Release);
+}
 
 const HPRT_PRTCONNSTS: u32 = 1 << 0;
 const HPRT_PRTENA: u32 = 1 << 2;
@@ -407,10 +510,8 @@ const HPRT_PRTSPD_MASK: u32 = 0x3 << HPRT_PRTSPD_SHIFT;
 // side effect.
 const HPRT_W1C_MASK: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
 
-// Host channel registers. Only channel 0 is ever used (control transfers
-// and, from Stage 3, Interrupt IN polling to a single directly-attached
-// device -- no hub, no channel allocator needed), so these are fixed
-// offsets rather than a per-channel accessor.
+// Host channel registers. Channel 0 owns synchronous control/bulk work;
+// channels 1..=4 are fixed periodic HID slots.
 const HOST_CHANS: usize = USB_DWC_HS + 0x500; // channel stride is 0x20; channel 0 needs no offset
 // Offset 0x04 is HCSPLT, the split-transaction control register. Nothing
 // here programs it yet, but -- contrary to every piece of Espressif
@@ -419,8 +520,26 @@ const HOST_CHANS: usize = USB_DWC_HS + 0x500; // channel stride is 0x20; channel
 const CHAN0_HCSPLT: usize = HOST_CHANS + 0x04;
 const CHAN0_HCCHAR: usize = HOST_CHANS;
 const CHAN0_HCINT: usize = HOST_CHANS + 0x08;
+const CHAN0_HCINTMSK: usize = HOST_CHANS + 0x0C;
 const CHAN0_HCTSIZ: usize = HOST_CHANS + 0x10;
 const CHAN0_HCDMA: usize = HOST_CHANS + 0x14;
+const CHAN1_HCCHAR: usize = HOST_CHANS + 0x20;
+const CHAN1_HCSPLT: usize = HOST_CHANS + 0x24;
+const CHAN1_HCINT: usize = HOST_CHANS + 0x28;
+const CHAN1_HCINTMSK: usize = HOST_CHANS + 0x2C;
+const CHAN1_HCTSIZ: usize = HOST_CHANS + 0x30;
+const CHAN1_HCDMA: usize = HOST_CHANS + 0x34;
+
+const fn channel_register(channel: usize, offset: usize) -> usize {
+    HOST_CHANS + channel * 0x20 + offset
+}
+
+const HCCHAR_OFFSET: usize = 0x00;
+const HCSPLT_OFFSET: usize = 0x04;
+const HCINT_OFFSET: usize = 0x08;
+const HCINTMSK_OFFSET: usize = 0x0C;
+const HCTSIZ_OFFSET: usize = 0x10;
+const HCDMA_OFFSET: usize = 0x14;
 
 const HCCHAR_CHDIS: u32 = 1 << 30;
 const HCCHAR_CHENA: u32 = 1 << 31;
@@ -454,6 +573,7 @@ const HCCHAR_LSPDDEV: u32 = 1 << 17;
 // hardware.
 pub const HCCHAR_EPTYPE_CTRL: u32 = 0 << 18;
 pub const HCCHAR_EPTYPE_BULK: u32 = 2 << 18;
+const HCCHAR_EPTYPE_INTR: u32 = 3 << 18;
 
 /// HCCHAR bits[21:20], the field the databook calls MC/EC. With
 /// `HCSPLT.SpltEna` clear it is a periodic multi-count and 0 is harmless
@@ -468,6 +588,12 @@ const HCCHAR_MC_ONE: u32 = 1 << 20;
 // and this is just cleanup.
 const HALT_CONFIRM_ITERATIONS: u32 = 5_000;
 
+// The old timeout unit was one foreground loop containing atomics plus an
+// HCINT MMIO read. Eight CPU cycles is deliberately conservative: successful
+// interrupt waits return on the USB IRQ, while a missing IRQ is still bounded
+// by approximately the same order of wall-clock time as the former loop.
+const WAIT_TIMEOUT_CYCLES_PER_ITERATION: u32 = 8;
+
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD: u32 = 1 << 1;
 const HCINT_STALL: u32 = 1 << 3;
@@ -476,6 +602,83 @@ const HCINT_XACTERR: u32 = 1 << 7;
 const HCINT_BBLERR: u32 = 1 << 8;
 const HCINT_XCS_XACT_ERR: u32 = 1 << 12;
 const HCINT_ERROR_MASK: u32 = HCINT_STALL | HCINT_XACTERR | HCINT_BBLERR | HCINT_XCS_XACT_ERR;
+// Matches ESP-IDF v5.5.3's channel mask and additionally retains every
+// handshake needed by this driver's software-driven split state machine.
+const HCINT_ENABLED_MASK: u32 = 0x0000_3FFF;
+
+/// Minimal USB-DWC ISR: acknowledge hardware and publish raw snapshots.
+///
+/// Transfer parsing, cache maintenance, retries, logging, and port state
+/// transitions all remain foreground work. Keeping this function limited to
+/// MMIO and atomics makes it safe to call from the shared IRAM trap entry.
+#[unsafe(link_section = ".iram.text.critical.usb.interrupt")]
+pub(crate) fn handle_interrupt() {
+    unsafe {
+        let active = read(GINTSTS) & read(GINTMSK);
+        USB_LAST_GINTSTS.store(active, Ordering::Relaxed);
+        if active == 0 {
+            USB_SPURIOUS_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if active & GINT_HCHINT != 0 {
+            let channels = read(HAINT) & read(HAINTMSK);
+            USB_LAST_HAINT.store(channels, Ordering::Relaxed);
+            if channels & 1 != 0 {
+                let hcint = read(CHAN0_HCINT) & read(CHAN0_HCINTMSK);
+                if hcint != 0 {
+                    write(CHAN0_HCINT, hcint);
+                    USB_LAST_HCINT0.store(hcint, Ordering::Relaxed);
+                    USB_CHANNEL0_PENDING.fetch_or(hcint, Ordering::Release);
+                    USB_CHANNEL0_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    USB_SPURIOUS_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            handle_periodic_channel_interrupt(channels, 1, 0);
+            handle_periodic_channel_interrupt(channels, 2, 1);
+            handle_periodic_channel_interrupt(channels, 3, 2);
+            handle_periodic_channel_interrupt(channels, 4, 3);
+        }
+
+        if active & (GINT_PRTINT | GINT_DISCONNINT) != 0 {
+            let hprt = read(HPRT);
+            USB_LAST_HPRT.store(hprt, Ordering::Relaxed);
+            let changes = hprt & (HPRT_W1C_MASK & !HPRT_PRTENA);
+            if active & GINT_PRTINT != 0 {
+                // Match `usb_dwc_ll_hprt_intr_read_and_clear`: preserve the
+                // control fields, W1C the change bits, but write PRTENA as 0
+                // because writing it as 1 disables the port.
+                write(HPRT, hprt & !HPRT_PRTENA);
+            }
+            USB_PORT_PENDING.fetch_or(changes | (active & GINT_DISCONNINT), Ordering::Release);
+            USB_PORT_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // GINTSTS fields are W1C or read-only. Channel and HPRT causes have
+        // already been acknowledged above, so clear the latched core causes.
+        write(GINTSTS, active);
+        USB_INTERRUPT_COUNT.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[inline(always)]
+unsafe fn handle_periodic_channel_interrupt(channels: u32, channel: usize, slot: usize) {
+    if channels & (1 << channel) == 0 {
+        return;
+    }
+    let hcint_address = channel_register(channel, HCINT_OFFSET);
+    let hcintmsk_address = channel_register(channel, HCINTMSK_OFFSET);
+    let hcint = unsafe { read(hcint_address) & read(hcintmsk_address) };
+    if hcint != 0 {
+        unsafe { write(hcint_address, hcint) };
+        USB_LAST_PERIODIC_HCINT[slot].store(hcint, Ordering::Relaxed);
+        USB_PERIODIC_PENDING[slot].fetch_or(hcint, Ordering::Release);
+        USB_PERIODIC_INTERRUPT_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+    } else {
+        USB_SPURIOUS_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // HCSPLT: the split-transaction control register, present and functional on
 // this silicon despite Espressif's documentation (see
@@ -535,6 +738,175 @@ impl QtdSlot {
         Self {
             control: 0,
             buffer: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferSlotState {
+    Idle,
+    Armed,
+    CompletionPending,
+    Reaped,
+}
+
+/// Identifies one use of the reusable channel-0 transfer slot.
+///
+/// The current synchronous compatibility wrapper cannot observe an old token,
+/// but carrying the generation now makes the submit/reap boundary safe to
+/// expose to the Stage 3 scheduler without changing its completion contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TransferToken(u32);
+
+/// One caller-owned, fixed-capacity descriptor slot for an unsplit packet.
+///
+/// Keeping the QTD inside the object preserves its 512-byte alignment and its
+/// lifetime from `submit` through `reap`. `run_packet` owns exactly one of
+/// these today; Stage 3 can place the same object in a fixed channel array.
+struct Channel0Transfer<'a> {
+    qtd: QtdSlot,
+    endpoint: Endpoint,
+    is_setup: bool,
+    pid_data1: bool,
+    buffer: &'a mut [u8],
+    state: TransferSlotState,
+    token: TransferToken,
+    completion: u32,
+}
+
+impl<'a> Channel0Transfer<'a> {
+    fn new(endpoint: &Endpoint, is_setup: bool, pid_data1: bool, buffer: &'a mut [u8]) -> Self {
+        Self {
+            qtd: QtdSlot::zeroed(),
+            endpoint: *endpoint,
+            is_setup,
+            pid_data1,
+            buffer,
+            state: TransferSlotState::Idle,
+            token: TransferToken(0),
+            completion: 0,
+        }
+    }
+
+    /// Publishes the QTD and starts channel 0, returning this slot generation.
+    fn submit(&mut self) -> TransferToken {
+        debug_assert!(self.state == TransferSlotState::Idle);
+        let xfer_len = self.buffer.len();
+        let data_ptr = self.buffer.as_mut_ptr();
+        if xfer_len > 0 {
+            cache_writeback_invalidate(data_ptr as usize, xfer_len);
+        }
+
+        let mut qtd_control = xfer_len as u32 & QTD_XFER_SIZE_MASK;
+        if self.is_setup {
+            qtd_control |= QTD_IS_SETUP;
+        }
+        qtd_control |= QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
+
+        let qtd_address = &raw mut self.qtd as usize;
+        unsafe {
+            write(qtd_address, qtd_control);
+            write(qtd_address + 4, data_ptr as u32);
+        }
+        cache_writeback_invalidate(qtd_address, 8);
+
+        let endpoint = self.endpoint;
+        let hcchar = (endpoint.mps as u32 & 0x7FF)
+            | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+            | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
+            | (if endpoint.route.low_speed_via_hub {
+                HCCHAR_LSPDDEV
+            } else {
+                0
+            })
+            | endpoint.endpoint_type
+            | ((endpoint.device_address as u32 & 0x7F) << 22);
+        let hctsiz = HCTSIZ_SCHED_INFO_ALL
+            | if self.is_setup {
+                HCTSIZ_PID_SETUP
+            } else if self.pid_data1 {
+                HCTSIZ_PID_DATA1
+            } else {
+                0
+            };
+
+        let generation = USB_TRANSFER_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.token = TransferToken(generation);
+        self.state = TransferSlotState::Armed;
+        USB_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        prepare_channel0_interrupt();
+        unsafe {
+            write(CHAN0_HCSPLT, 0);
+            write(CHAN0_HCCHAR, hcchar);
+            write(CHAN0_HCTSIZ, hctsiz);
+            write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
+            modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+        }
+        self.token
+    }
+
+    fn note_completion(&mut self, token: TransferToken, hcint: u32) -> bool {
+        if self.state != TransferSlotState::Armed || token != self.token {
+            USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.completion = hcint;
+        self.state = TransferSlotState::CompletionPending;
+        true
+    }
+
+    /// Cache-synchronizes and classifies one ISR-completed QTD.
+    fn reap(&mut self, token: TransferToken, quiet_errors: bool) -> PacketOutcome {
+        if self.state != TransferSlotState::CompletionPending || token != self.token {
+            USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            return PacketOutcome::Error;
+        }
+
+        let qtd_address = &raw mut self.qtd as usize;
+        cache_writeback_invalidate(qtd_address, 8);
+        let control_after = unsafe { read(qtd_address) };
+        let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+        let status = control_after & QTD_STATUS_MASK;
+        let transferred = self.buffer.len().saturating_sub(remaining);
+        self.state = TransferSlotState::Reaped;
+        USB_REAP_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        if self.completion & HCINT_STALL != 0 {
+            if !quiet_errors {
+                uart::log(b"USB: transfer STALL\r\n");
+            }
+            return PacketOutcome::Error;
+        }
+        if self.completion & HCINT_ERROR_MASK != 0 {
+            if !quiet_errors {
+                uart::log_hex(b"USB: transfer transaction error, HCINT=", self.completion);
+                log_port_state();
+            }
+            return PacketOutcome::Error;
+        }
+        if status != QTD_STATUS_SUCCESS {
+            if !quiet_errors {
+                uart::log_hex(
+                    b"USB: transfer QTD error, status=",
+                    status >> QTD_STATUS_SHIFT,
+                );
+            }
+            return PacketOutcome::Error;
+        }
+        if self.endpoint.is_in && transferred > 0 {
+            cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+        }
+        PacketOutcome::Ok(transferred)
+    }
+
+    fn cancel(&mut self, token: TransferToken) {
+        if token == self.token {
+            self.state = TransferSlotState::Reaped;
+            USB_CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -632,6 +1004,132 @@ pub struct SplitSupport {
     /// `0x1234_5678 & 0x8001_FFFF` = `0x0000_5678`; a constant or an
     /// aliased read returns something else.
     pub hcsplt_pattern_readback: u32,
+}
+
+/// Read-only snapshot exposed by `usbhw` while the interrupt migration is
+/// being validated on real hardware.
+#[derive(Clone, Copy)]
+pub struct InterruptDiagnostics {
+    pub source: u32,
+    pub total: u32,
+    pub channel0: u32,
+    pub channel1: u32,
+    pub port: u32,
+    pub spurious: u32,
+    pub pending_channel0: u32,
+    pub pending_channel1: u32,
+    pub pending_port: u32,
+    pub last_gintsts: u32,
+    pub last_haint: u32,
+    pub last_hcint0: u32,
+    pub last_hcint1: u32,
+    pub last_hprt: u32,
+    pub live_gintmsk: u32,
+    pub live_haintmsk: u32,
+    pub live_hcintmsk0: u32,
+    pub live_hcintmsk1: u32,
+    pub global_signal_enabled: bool,
+    pub sleep_waits: u32,
+    pub poll_waits: u32,
+    pub wfi_count: u32,
+    pub last_wait_cycles: u32,
+    pub max_wait_cycles: u32,
+    pub submits: u32,
+    pub reaps: u32,
+    pub cancels: u32,
+    pub stale_tokens: u32,
+    pub periodic_active: bool,
+    pub periodic_channel_mask: u32,
+    pub periodic_interrupts: u32,
+    pub periodic_pending_mask: u32,
+    pub periodic_irq_counts: [u32; PERIODIC_HID_SLOT_COUNT],
+    pub periodic_pending: [u32; PERIODIC_HID_SLOT_COUNT],
+    pub periodic_last_hcint: [u32; PERIODIC_HID_SLOT_COUNT],
+    pub periodic_hcintmsk: [u32; PERIODIC_HID_SLOT_COUNT],
+    pub periodic_completions: u32,
+    pub periodic_rearms: u32,
+    pub periodic_errors: u32,
+    pub split_mode_active: bool,
+    pub split_packets: u32,
+    pub split_rounds: u32,
+    pub split_mode_conflicts: u32,
+}
+
+pub fn interrupt_diagnostics() -> InterruptDiagnostics {
+    InterruptDiagnostics {
+        source: crate::interrupts::USB_OTG_HS_INTERRUPT_SOURCE as u32,
+        total: USB_INTERRUPT_COUNT.load(Ordering::Acquire),
+        channel0: USB_CHANNEL0_INTERRUPT_COUNT.load(Ordering::Acquire),
+        channel1: USB_PERIODIC_INTERRUPT_COUNT[0].load(Ordering::Acquire),
+        port: USB_PORT_INTERRUPT_COUNT.load(Ordering::Acquire),
+        spurious: USB_SPURIOUS_INTERRUPT_COUNT.load(Ordering::Acquire),
+        pending_channel0: USB_CHANNEL0_PENDING.load(Ordering::Acquire),
+        pending_channel1: USB_PERIODIC_PENDING[0].load(Ordering::Acquire),
+        pending_port: USB_PORT_PENDING.load(Ordering::Acquire),
+        last_gintsts: USB_LAST_GINTSTS.load(Ordering::Acquire),
+        last_haint: USB_LAST_HAINT.load(Ordering::Acquire),
+        last_hcint0: USB_LAST_HCINT0.load(Ordering::Acquire),
+        last_hcint1: USB_LAST_PERIODIC_HCINT[0].load(Ordering::Acquire),
+        last_hprt: USB_LAST_HPRT.load(Ordering::Acquire),
+        live_gintmsk: unsafe { read(GINTMSK) },
+        live_haintmsk: unsafe { read(HAINTMSK) },
+        live_hcintmsk0: unsafe { read(CHAN0_HCINTMSK) },
+        live_hcintmsk1: unsafe { read(CHAN1_HCINTMSK) },
+        global_signal_enabled: unsafe { read(GAHBCFG) } & GAHBCFG_GLBLINTRMSK != 0,
+        sleep_waits: USB_SLEEP_WAIT_COUNT.load(Ordering::Acquire),
+        poll_waits: USB_POLL_WAIT_COUNT.load(Ordering::Acquire),
+        wfi_count: USB_WFI_COUNT.load(Ordering::Acquire),
+        last_wait_cycles: USB_LAST_WAIT_CYCLES.load(Ordering::Acquire),
+        max_wait_cycles: USB_MAX_WAIT_CYCLES.load(Ordering::Acquire),
+        submits: USB_SUBMIT_COUNT.load(Ordering::Acquire),
+        reaps: USB_REAP_COUNT.load(Ordering::Acquire),
+        cancels: USB_CANCEL_COUNT.load(Ordering::Acquire),
+        stale_tokens: USB_STALE_TOKEN_COUNT.load(Ordering::Acquire),
+        periodic_active: PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) != 0,
+        periodic_channel_mask: PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) << 1,
+        periodic_interrupts: USB_PERIODIC_INTERRUPT_COUNT
+            .iter()
+            .fold(0u32, |total, count| {
+                total.wrapping_add(count.load(Ordering::Acquire))
+            }),
+        periodic_pending_mask: USB_PERIODIC_PENDING.iter().enumerate().fold(
+            0u32,
+            |mask, (slot, pending)| {
+                mask | if pending.load(Ordering::Acquire) != 0 {
+                    1 << (slot + 1)
+                } else {
+                    0
+                }
+            },
+        ),
+        periodic_irq_counts: core::array::from_fn(|slot| {
+            USB_PERIODIC_INTERRUPT_COUNT[slot].load(Ordering::Acquire)
+        }),
+        periodic_pending: core::array::from_fn(|slot| {
+            USB_PERIODIC_PENDING[slot].load(Ordering::Acquire)
+        }),
+        periodic_last_hcint: core::array::from_fn(|slot| {
+            USB_LAST_PERIODIC_HCINT[slot].load(Ordering::Acquire)
+        }),
+        periodic_hcintmsk: core::array::from_fn(|slot| unsafe {
+            read(channel_register(slot + 1, HCINTMSK_OFFSET))
+        }),
+        periodic_completions: PERIODIC_HID_COMPLETION_COUNT.load(Ordering::Acquire),
+        periodic_rearms: PERIODIC_HID_REARM_COUNT.load(Ordering::Acquire),
+        periodic_errors: PERIODIC_HID_ERROR_COUNT.load(Ordering::Acquire),
+        split_mode_active: SPLIT_MODE_ACTIVE.load(Ordering::Acquire),
+        split_packets: SPLIT_PACKET_COUNT.load(Ordering::Acquire),
+        split_rounds: SPLIT_ROUND_COUNT.load(Ordering::Acquire),
+        split_mode_conflicts: SPLIT_MODE_CONFLICT_COUNT.load(Ordering::Acquire),
+    }
+}
+
+/// Consumes root-port IRQ state and reports whether the physical connection
+/// changed. Enable/over-current changes remain visible in diagnostics but do
+/// not by themselves invalidate the device registry.
+pub fn take_root_connection_change() -> bool {
+    let events = USB_PORT_PENDING.swap(0, Ordering::AcqRel);
+    events & ((1 << 1) | GINT_DISCONNINT) != 0
 }
 
 /// Asks the hardware directly whether it can do split transactions, which
@@ -745,6 +1243,7 @@ pub fn probe_port() -> HostPort {
 
     configure_host_speed_support();
     hprt_modify(HPRT_PRTPWR, HPRT_PRTPWR); // port power on
+    enable_controller_interrupts();
 
     if !wait_for_connect() {
         // The foreground periodically probes an empty root port. Emit this
@@ -898,6 +1397,11 @@ fn core_soft_reset() -> bool {
 
 fn set_core_defaults() {
     unsafe {
+        // A rescan resets the DWC while the CLIC route remains installed.
+        // Keep the peripheral signal quiet until host-mode registers and all
+        // stale status have been initialized again.
+        modify(GAHBCFG, GAHBCFG_GLBLINTRMSK, 0);
+        write(GINTMSK, 0);
         modify(GAHBCFG, GAHBCFG_DMAEN, GAHBCFG_DMAEN);
         modify(GAHBCFG, GAHBCFG_HBSTLEN_MASK, 0); // AHB burst = SINGLE
 
@@ -908,6 +1412,59 @@ fn set_core_defaults() {
         modify(GUSBCFG, GUSBCFG_ULPIUTMISEL, 0); // UTMI+
         modify(GUSBCFG, GUSBCFG_PHYSEL, 0); // HS PHY
         modify(GUSBCFG, GUSBCFG_FORCEHSTMODE, GUSBCFG_FORCEHSTMODE);
+    }
+}
+
+/// Clears stale causes and enables the minimal Stage 1 interrupt set.
+///
+/// This runs after the force-host-mode delay, so HAINT and channel registers
+/// are valid. Port interrupts are diagnostic for now; foreground still uses
+/// the current HPRT connection state and its existing debounce policy.
+fn enable_controller_interrupts() {
+    unsafe {
+        modify(GAHBCFG, GAHBCFG_GLBLINTRMSK, 0);
+        write(GINTMSK, 0);
+        write(HAINTMSK, 0);
+        write(CHAN0_HCINTMSK, 0);
+        write(CHAN0_HCINT, 0xFFFF_FFFF);
+        for channel in 1..=PERIODIC_HID_SLOT_COUNT {
+            write(channel_register(channel, HCINTMSK_OFFSET), 0);
+            write(channel_register(channel, HCINT_OFFSET), 0xFFFF_FFFF);
+        }
+        write(GINTSTS, 0xFFFF_FFFF);
+    }
+    USB_CHANNEL0_PENDING.store(0, Ordering::Release);
+    for pending in &USB_PERIODIC_PENDING {
+        pending.store(0, Ordering::Release);
+    }
+    USB_PORT_PENDING.store(0, Ordering::Release);
+
+    crate::interrupts::install_usb();
+
+    unsafe {
+        write(CHAN0_HCINTMSK, HCINT_ENABLED_MASK);
+        write(HAINTMSK, 1);
+        write(GINTMSK, GINT_ENABLED_MASK);
+        modify(GAHBCFG, GAHBCFG_GLBLINTRMSK, GAHBCFG_GLBLINTRMSK);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+}
+
+/// Starts a new channel-0 generation without inheriting an ISR snapshot from
+/// the preceding packet. The channel is idle at every call site.
+fn prepare_channel0_interrupt() {
+    unsafe {
+        write(CHAN0_HCINTMSK, 0);
+        modify(HAINTMSK, 1, 0);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+        write(CHAN0_HCINT, 0xFFFF_FFFF);
+        write(GINTSTS, GINT_HCHINT);
+    }
+    USB_CHANNEL0_PENDING.store(0, Ordering::Release);
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+        write(CHAN0_HCINTMSK, HCINT_ENABLED_MASK);
+        modify(HAINTMSK, 1, 1);
     }
 }
 
@@ -922,10 +1479,16 @@ fn set_core_defaults() {
 /// from chirping. `finish_port_enable`'s later HCFG writes are
 /// read-modify-write, so they preserve this bit.
 fn configure_host_speed_support() {
-    if FORCE_FS_LS_ONLY_HOST {
-        unsafe {
-            modify(HCFG, HCFG_FSLSSUPP, HCFG_FSLSSUPP);
-        }
+    unsafe {
+        modify(
+            HCFG,
+            HCFG_FSLSSUPP,
+            if fs_ls_only_host_forced() {
+                HCFG_FSLSSUPP
+            } else {
+                0
+            },
+        );
     }
 }
 
@@ -984,10 +1547,10 @@ pub fn recover_channel_after_packet_failure() {
         force_halt_channel();
     }
     unsafe {
-        write(CHAN0_HCINT, 0xFFFF_FFFF);
         write(CHAN0_HCSPLT, 0);
         modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
     }
+    prepare_channel0_interrupt();
     flush_fifos();
 }
 
@@ -1058,6 +1621,23 @@ pub enum PacketOutcome {
     Error,
 }
 
+/// How foreground should wait for this packet's channel halt.
+///
+/// Logging policy is deliberately separate: control-transfer retries often
+/// suppress diagnostics on early attempts, but those packets still have a
+/// real completion IRQ and should sleep. Only the manually scheduled HID
+/// idle poll needs the bounded polling exception described below.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CompletionWait {
+    /// Control, bulk, and any packet expected to halt with a completion or
+    /// handshake interrupt.
+    Interrupt,
+    /// A directly addressed HID Interrupt IN endpoint presented to the DWC
+    /// as BULK. Descriptor DMA retries idle NAK internally without CHHLTD,
+    /// so sleeping here would wait for an unrelated display frame.
+    PollIdleNak,
+}
+
 /// Where a packet is going. Grouped into one value because the same
 /// destination is reused across the packets of a transfer (and, for an
 /// interrupt endpoint, across every poll), while only the per-packet
@@ -1126,6 +1706,571 @@ pub struct Endpoint {
     pub route: Route,
 }
 
+const PERIODIC_FRAME_LIST_ENTRIES: usize = 32;
+const PERIODIC_PROBE_TIMEOUT_SECONDS: u32 = 5;
+const PERIODIC_HID_SLOT_COUNT: usize = 4;
+
+#[repr(C, align(512))]
+struct PeriodicFrameList {
+    entries: [u32; PERIODIC_FRAME_LIST_ENTRIES],
+}
+
+#[repr(C, align(4))]
+struct PeriodicReportBuffer {
+    bytes: [u8; 64],
+}
+
+#[repr(C, align(512))]
+struct PeriodicQtdBank {
+    slots: [QtdSlot; PERIODIC_HID_SLOT_COUNT],
+}
+
+#[repr(C, align(4))]
+struct PeriodicBufferBank {
+    slots: [PeriodicReportBuffer; PERIODIC_HID_SLOT_COUNT],
+}
+
+#[repr(transparent)]
+struct DmaCell<T>(UnsafeCell<T>);
+
+// One foreground USB owner mutates these cells. The ISR never dereferences
+// them; it only publishes HCINT into `USB_PERIODIC_PENDING`.
+unsafe impl<T> Sync for DmaCell<T> {}
+
+impl<T> DmaCell<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+static PERIODIC_HID_FRAME_LIST: DmaCell<PeriodicFrameList> = DmaCell::new(PeriodicFrameList {
+    entries: [0; PERIODIC_FRAME_LIST_ENTRIES],
+});
+static PERIODIC_HID_QTD: DmaCell<PeriodicQtdBank> = DmaCell::new(PeriodicQtdBank {
+    slots: [
+        QtdSlot::zeroed(),
+        QtdSlot::zeroed(),
+        QtdSlot::zeroed(),
+        QtdSlot::zeroed(),
+    ],
+});
+static PERIODIC_HID_BUFFER: DmaCell<PeriodicBufferBank> = DmaCell::new(PeriodicBufferBank {
+    slots: [
+        PeriodicReportBuffer { bytes: [0; 64] },
+        PeriodicReportBuffer { bytes: [0; 64] },
+        PeriodicReportBuffer { bytes: [0; 64] },
+        PeriodicReportBuffer { bytes: [0; 64] },
+    ],
+});
+
+#[derive(Clone, Copy)]
+pub struct PeriodicHandle {
+    slot: u8,
+    generation: u32,
+}
+
+impl PeriodicHandle {
+    pub fn channel(self) -> u8 {
+        self.slot + 1
+    }
+}
+
+pub enum PeriodicRead {
+    Pending,
+    Complete(usize),
+    Error,
+}
+
+/// Permanently assigns one of channels 1..=4 to a non-Split HID endpoint.
+/// All active slots share one 32-entry frame list; each owns its QTD, report
+/// buffer, data toggle, pending IRQ state, and generation token.
+pub fn enable_periodic_hid(endpoint: &Endpoint, interval: u8) -> Option<PeriodicHandle> {
+    let mps = endpoint.mps as usize;
+    if endpoint.route.split.is_some() || mps == 0 || mps > 64 {
+        return None;
+    }
+
+    let scheduled_interval = periodic_interval_frames(interval);
+    let mut active = PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire);
+    let slot = loop {
+        if active == (1 << PERIODIC_HID_SLOT_COUNT) - 1
+            || (active == 0 && unsafe { read(HCFG) } & HCFG_PERSCHEDENA != 0)
+        {
+            return None;
+        }
+        let free = (!active & ((1 << PERIODIC_HID_SLOT_COUNT) - 1)).trailing_zeros() as usize;
+        match PERIODIC_HID_ACTIVE_MASK.compare_exchange_weak(
+            active,
+            active | (1 << free),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break free,
+            Err(updated) => active = updated,
+        }
+    };
+    let channel = slot + 1;
+    let hcchar_address = channel_register(channel, HCCHAR_OFFSET);
+    if unsafe { read(hcchar_address) } & HCCHAR_CHENA != 0 {
+        PERIODIC_HID_ACTIVE_MASK.fetch_and(!(1 << slot), Ordering::AcqRel);
+        return None;
+    }
+
+    PERIODIC_HID_MPS[slot].store(mps as u32, Ordering::Release);
+    PERIODIC_HID_INTERVAL[slot].store(scheduled_interval as u32, Ordering::Release);
+    PERIODIC_HID_PID_DATA1[slot].store(false, Ordering::Release);
+    USB_PERIODIC_PENDING[slot].store(0, Ordering::Release);
+    rebuild_periodic_frame_list();
+
+    let frame_list_address = PERIODIC_HID_FRAME_LIST.get() as usize;
+    let generation = PERIODIC_HID_GENERATION[slot]
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+
+    unsafe {
+        write(channel_register(channel, HCINTMSK_OFFSET), 0);
+        modify(HAINTMSK, 1 << channel, 0);
+        write(channel_register(channel, HCINT_OFFSET), u32::MAX);
+        write(channel_register(channel, HCSPLT_OFFSET), 0);
+        write(HFLBADDR, frame_list_address as u32);
+        modify(
+            HCFG,
+            HCFG_FRLISTEN_MASK | HCFG_PERSCHEDENA,
+            HCFG_FRLISTEN_32 | HCFG_PERSCHEDENA,
+        );
+        let hcchar = (endpoint.mps as u32 & 0x7FF)
+            | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+            | HCCHAR_EPDIR_IN
+            | (if endpoint.route.low_speed_via_hub {
+                HCCHAR_LSPDDEV
+            } else {
+                0
+            })
+            | HCCHAR_EPTYPE_INTR
+            | ((endpoint.device_address as u32 & 0x7F) << 22);
+        write(hcchar_address, hcchar);
+        write(
+            channel_register(channel, HCINTMSK_OFFSET),
+            HCINT_ENABLED_MASK,
+        );
+        modify(HAINTMSK, 1 << channel, 1 << channel);
+    }
+    arm_periodic_hid(slot);
+    Some(PeriodicHandle {
+        slot: slot as u8,
+        generation,
+    })
+}
+
+/// Takes one completed periodic report without waiting. The next QTD is
+/// rearmed before returning the bytes, so idle CPU polling is eliminated and
+/// the controller resumes polling at the descriptor's interval immediately.
+pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> PeriodicRead {
+    let slot = handle.slot as usize;
+    if slot >= PERIODIC_HID_SLOT_COUNT
+        || PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) & (1 << slot) == 0
+        || handle.generation != PERIODIC_HID_GENERATION[slot].load(Ordering::Acquire)
+    {
+        return PeriodicRead::Error;
+    }
+    let hcint = USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
+    if hcint & HCINT_CHHLTD == 0 {
+        return PeriodicRead::Pending;
+    }
+
+    let qtd_address = periodic_qtd_address(slot);
+    cache_writeback_invalidate(qtd_address, 8);
+    let control_after = unsafe { read(qtd_address) };
+    let status = control_after & QTD_STATUS_MASK;
+    let mps = PERIODIC_HID_MPS[slot].load(Ordering::Acquire) as usize;
+    let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+    let transferred = mps.saturating_sub(remaining.min(mps));
+    if hcint & HCINT_XFERCOMPL == 0 || hcint & (HCINT_STALL | HCINT_ERROR_MASK) != 0 || status != 0
+    {
+        PERIODIC_HID_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Leave the channel halted and invalidate the driver's token. Every
+        // later foreground read then returns Error as well, allowing the HID
+        // driver's consecutive-error threshold to request a full rescan
+        // instead of getting stuck forever after one failed completion.
+        PERIODIC_HID_GENERATION[slot].fetch_add(1, Ordering::AcqRel);
+        return PeriodicRead::Error;
+    }
+
+    let buffer_address = periodic_buffer_address(slot);
+    if transferred > 0 {
+        cache_writeback_invalidate(buffer_address, transferred);
+        let source =
+            unsafe { core::slice::from_raw_parts(buffer_address as *const u8, transferred) };
+        let copied = transferred.min(report.len());
+        report[..copied].copy_from_slice(&source[..copied]);
+    }
+    PERIODIC_HID_COMPLETION_COUNT.fetch_add(1, Ordering::Relaxed);
+    PERIODIC_HID_PID_DATA1[slot].fetch_xor(true, Ordering::AcqRel);
+    arm_periodic_hid(slot);
+    PeriodicRead::Complete(transferred.min(report.len()))
+}
+
+fn arm_periodic_hid(slot: usize) {
+    let channel = slot + 1;
+    let mps = PERIODIC_HID_MPS[slot].load(Ordering::Acquire) as usize;
+    let qtd_address = periodic_qtd_address(slot);
+    let buffer_address = periodic_buffer_address(slot);
+    unsafe {
+        core::slice::from_raw_parts_mut(buffer_address as *mut u8, mps).fill(0);
+        write(
+            qtd_address,
+            (mps as u32 & QTD_XFER_SIZE_MASK) | QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE,
+        );
+        write(qtd_address + 4, buffer_address as u32);
+    }
+    cache_writeback_invalidate(buffer_address, mps);
+    cache_writeback_invalidate(qtd_address, 8);
+
+    unsafe {
+        write(channel_register(channel, HCINTMSK_OFFSET), 0);
+        write(channel_register(channel, HCINT_OFFSET), u32::MAX);
+    }
+    USB_PERIODIC_PENDING[slot].store(0, Ordering::Release);
+    unsafe {
+        write(
+            channel_register(channel, HCINTMSK_OFFSET),
+            HCINT_ENABLED_MASK,
+        );
+        write(
+            channel_register(channel, HCTSIZ_OFFSET),
+            HCTSIZ_SCHED_INFO_ALL
+                | if PERIODIC_HID_PID_DATA1[slot].load(Ordering::Acquire) {
+                    HCTSIZ_PID_DATA1
+                } else {
+                    0
+                },
+        );
+        write(
+            channel_register(channel, HCDMA_OFFSET),
+            (qtd_address as u32) & 0xFFFF_FE00,
+        );
+        modify(
+            channel_register(channel, HCCHAR_OFFSET),
+            HCCHAR_CHENA | HCCHAR_CHDIS,
+            HCCHAR_CHENA,
+        );
+    }
+    PERIODIC_HID_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn periodic_qtd_address(slot: usize) -> usize {
+    PERIODIC_HID_QTD.get() as usize + slot * core::mem::size_of::<QtdSlot>()
+}
+
+fn periodic_buffer_address(slot: usize) -> usize {
+    PERIODIC_HID_BUFFER.get() as usize + slot * core::mem::size_of::<PeriodicReportBuffer>()
+}
+
+fn rebuild_periodic_frame_list() {
+    let active = PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire);
+    let frame_list = unsafe { &mut *PERIODIC_HID_FRAME_LIST.get() };
+    frame_list.entries.fill(0);
+    for slot in 0..PERIODIC_HID_SLOT_COUNT {
+        if active & (1 << slot) == 0 {
+            continue;
+        }
+        let interval = PERIODIC_HID_INTERVAL[slot].load(Ordering::Acquire) as usize;
+        for index in (0..PERIODIC_FRAME_LIST_ENTRIES).step_by(interval.max(1)) {
+            frame_list.entries[index] |= 1 << (slot + 1);
+        }
+    }
+    cache_writeback_invalidate(
+        PERIODIC_HID_FRAME_LIST.get() as usize,
+        core::mem::size_of::<PeriodicFrameList>(),
+    );
+}
+
+/// Stops the persistent periodic HID channel before a registry teardown or
+/// controller reset. Static DMA storage remains valid even if halt recovery is
+/// delayed, but periodic scheduling and both DMA addresses are cleared before
+/// returning.
+pub fn disable_periodic_hid() -> bool {
+    let active = PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire);
+    if active == 0 {
+        return true;
+    }
+    let mut all_halted = true;
+    for slot in 0..PERIODIC_HID_SLOT_COUNT {
+        if active & (1 << slot) == 0 {
+            continue;
+        }
+        let channel = slot + 1;
+        let hcchar_address = channel_register(channel, HCCHAR_OFFSET);
+        if unsafe { read(hcchar_address) } & HCCHAR_CHENA != 0 {
+            unsafe { modify(hcchar_address, HCCHAR_CHDIS, HCCHAR_CHDIS) };
+            let _ = wait_for_periodic_channel_halt(slot, crate::startup::cpu_hz() / 10);
+        }
+        let halted = unsafe { read(hcchar_address) } & HCCHAR_CHENA == 0;
+        all_halted &= halted;
+        unsafe {
+            write(channel_register(channel, HCINTMSK_OFFSET), 0);
+            modify(HAINTMSK, 1 << channel, 0);
+            write(channel_register(channel, HCDMA_OFFSET), 0);
+            write(channel_register(channel, HCSPLT_OFFSET), 0);
+            write(channel_register(channel, HCINT_OFFSET), u32::MAX);
+            if !halted {
+                write(hcchar_address, 0);
+            }
+        }
+        USB_PERIODIC_PENDING[slot].store(0, Ordering::Release);
+        PERIODIC_HID_MPS[slot].store(0, Ordering::Release);
+        PERIODIC_HID_INTERVAL[slot].store(0, Ordering::Release);
+        PERIODIC_HID_PID_DATA1[slot].store(false, Ordering::Release);
+    }
+    unsafe {
+        modify(HCFG, HCFG_PERSCHEDENA, 0);
+        write(HFLBADDR, 0);
+    }
+    PERIODIC_HID_ACTIVE_MASK.store(0, Ordering::Release);
+    rebuild_periodic_frame_list();
+    all_halted
+}
+
+/// Result of the opt-in channel-1 periodic scheduler diagnostic.
+#[derive(Clone, Copy)]
+pub struct PeriodicProbeResult {
+    pub attempted: bool,
+    pub completed: bool,
+    pub timed_out: bool,
+    pub channel_halted: bool,
+    pub requested_interval: u8,
+    pub scheduled_interval: u8,
+    pub scheduled_entries: u8,
+    pub frame_list_address: u32,
+    pub frame_list_readback: u32,
+    pub hcfg_during: u32,
+    pub hcint: u32,
+    pub qtd_control: u32,
+    pub transferred: usize,
+    pub channel1_irqs: u32,
+    pub wfi_count: u32,
+}
+
+impl PeriodicProbeResult {
+    fn unsupported(interval: u8) -> Self {
+        Self {
+            attempted: false,
+            completed: false,
+            timed_out: false,
+            channel_halted: true,
+            requested_interval: interval,
+            scheduled_interval: 0,
+            scheduled_entries: 0,
+            frame_list_address: 0,
+            frame_list_readback: 0,
+            hcfg_during: unsafe { read(HCFG) },
+            hcint: 0,
+            qtd_control: 0,
+            transferred: 0,
+            channel1_irqs: 0,
+            wfi_count: 0,
+        }
+    }
+}
+
+/// Runs one HID-sized Interrupt IN QTD through the DWC periodic scheduler.
+///
+/// This is deliberately an opt-in diagnostic rather than the live HID path:
+/// channel 1, the frame list, and `HCFG.PerSchedEna` have not yet been proven
+/// on ESP32-P4's Low-Speed root-port mode. Channel 0 remains idle while the
+/// shell invokes this function, and every periodic register is disabled again
+/// before the stack-owned DMA objects leave scope.
+pub fn probe_periodic_interrupt_in(
+    endpoint: &Endpoint,
+    interval: u8,
+    pid_data1: bool,
+    buffer: &mut [u8],
+) -> PeriodicProbeResult {
+    if endpoint.route.split.is_some()
+        || buffer.is_empty()
+        || buffer.len() > QTD_XFER_SIZE_MASK as usize
+        || unsafe { read(HCFG) } & HCFG_PERSCHEDENA != 0
+    {
+        return PeriodicProbeResult::unsupported(interval);
+    }
+
+    let scheduled_interval = periodic_interval_frames(interval);
+    let mut frame_list = PeriodicFrameList {
+        entries: [0; PERIODIC_FRAME_LIST_ENTRIES],
+    };
+    let mut scheduled_entries = 0u8;
+    for index in (0..PERIODIC_FRAME_LIST_ENTRIES).step_by(scheduled_interval as usize) {
+        frame_list.entries[index] = 1 << 1; // periodic channel 1
+        scheduled_entries += 1;
+    }
+    let frame_list_address = &raw mut frame_list as usize;
+    cache_writeback_invalidate(
+        frame_list_address,
+        core::mem::size_of::<PeriodicFrameList>(),
+    );
+
+    let mut qtd = QtdSlot::zeroed();
+    let qtd_address = &raw mut qtd as usize;
+    let data_address = buffer.as_mut_ptr() as usize;
+    cache_writeback_invalidate(data_address, buffer.len());
+    let qtd_control =
+        (buffer.len() as u32 & QTD_XFER_SIZE_MASK) | QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
+    unsafe {
+        write(qtd_address, qtd_control);
+        write(qtd_address + 4, data_address as u32);
+    }
+    cache_writeback_invalidate(qtd_address, 8);
+
+    let saved_hcfg = unsafe { read(HCFG) };
+    let saved_hflbaddr = unsafe { read(HFLBADDR) };
+    let irq_before = USB_PERIODIC_INTERRUPT_COUNT[0].load(Ordering::Acquire);
+    USB_PERIODIC_PENDING[0].store(0, Ordering::Release);
+    unsafe {
+        write(CHAN1_HCINTMSK, 0);
+        modify(HAINTMSK, 1 << 1, 0);
+        write(CHAN1_HCINT, u32::MAX);
+        write(CHAN1_HCSPLT, 0);
+        write(HFLBADDR, frame_list_address as u32);
+        modify(
+            HCFG,
+            HCFG_FRLISTEN_MASK | HCFG_PERSCHEDENA,
+            HCFG_FRLISTEN_32 | HCFG_PERSCHEDENA,
+        );
+        write(CHAN1_HCINTMSK, HCINT_ENABLED_MASK);
+        modify(HAINTMSK, 1 << 1, 1 << 1);
+
+        let hcchar = (endpoint.mps as u32 & 0x7FF)
+            | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+            | HCCHAR_EPDIR_IN
+            | (if endpoint.route.low_speed_via_hub {
+                HCCHAR_LSPDDEV
+            } else {
+                0
+            })
+            | HCCHAR_EPTYPE_INTR
+            | ((endpoint.device_address as u32 & 0x7F) << 22);
+        write(CHAN1_HCCHAR, hcchar);
+        // FS/LS periodic channels use all eight schedule-info bits. The
+        // 32-entry frame list above selects which USB frames own channel 1.
+        write(
+            CHAN1_HCTSIZ,
+            HCTSIZ_SCHED_INFO_ALL | if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 },
+        );
+        write(CHAN1_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
+        modify(CHAN1_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+    }
+
+    let frame_list_readback = unsafe { read(HFLBADDR) };
+    let hcfg_during = unsafe { read(HCFG) };
+    let timeout_cycles = crate::startup::cpu_hz().saturating_mul(PERIODIC_PROBE_TIMEOUT_SECONDS);
+    let (completion, wfi_count) = wait_for_channel1_halt(timeout_cycles);
+
+    let mut channel_halted = unsafe { read(CHAN1_HCCHAR) } & HCCHAR_CHENA == 0;
+    if !channel_halted {
+        unsafe {
+            modify(CHAN1_HCCHAR, HCCHAR_CHDIS, HCCHAR_CHDIS);
+        }
+        let _ = wait_for_channel1_halt(crate::startup::cpu_hz() / 10);
+        channel_halted = unsafe { read(CHAN1_HCCHAR) } & HCCHAR_CHENA == 0;
+    }
+
+    unsafe {
+        write(CHAN1_HCINTMSK, 0);
+        modify(HAINTMSK, 1 << 1, 0);
+        modify(
+            HCFG,
+            HCFG_FRLISTEN_MASK | HCFG_PERSCHEDENA,
+            saved_hcfg & (HCFG_FRLISTEN_MASK | HCFG_PERSCHEDENA),
+        );
+        write(HFLBADDR, saved_hflbaddr);
+        write(CHAN1_HCSPLT, 0);
+        write(CHAN1_HCINT, u32::MAX);
+        if !channel_halted {
+            // Periodic scheduling is now disabled, so channel 1 cannot fetch
+            // either stack-owned DMA object. Also remove the stale addresses
+            // before returning a failed diagnostic to foreground.
+            write(CHAN1_HCDMA, 0);
+            write(CHAN1_HCCHAR, 0);
+        }
+    }
+    USB_PERIODIC_PENDING[0].store(0, Ordering::Release);
+
+    cache_writeback_invalidate(qtd_address, 8);
+    let control_after = unsafe { read(qtd_address) };
+    let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+    let status = control_after & QTD_STATUS_MASK;
+    let transferred = buffer.len().saturating_sub(remaining.min(buffer.len()));
+    if transferred > 0 {
+        cache_writeback_invalidate(data_address, transferred);
+    }
+    let hcint = completion.unwrap_or(0);
+    let completed =
+        completion.is_some() && hcint & HCINT_XFERCOMPL != 0 && status == QTD_STATUS_SUCCESS;
+
+    PeriodicProbeResult {
+        attempted: true,
+        completed,
+        timed_out: completion.is_none(),
+        channel_halted,
+        requested_interval: interval,
+        scheduled_interval,
+        scheduled_entries,
+        frame_list_address: frame_list_address as u32,
+        frame_list_readback,
+        hcfg_during,
+        hcint,
+        qtd_control: control_after,
+        transferred,
+        channel1_irqs: USB_PERIODIC_INTERRUPT_COUNT[0]
+            .load(Ordering::Acquire)
+            .wrapping_sub(irq_before),
+        wfi_count,
+    }
+}
+
+fn periodic_interval_frames(interval: u8) -> u8 {
+    let capped = interval.clamp(1, PERIODIC_FRAME_LIST_ENTRIES as u8);
+    1 << (7 - capped.leading_zeros() as u8)
+}
+
+fn wait_for_channel1_halt(timeout_cycles: u32) -> (Option<u32>, u32) {
+    wait_for_periodic_channel_halt(0, timeout_cycles)
+}
+
+fn wait_for_periodic_channel_halt(slot: usize, timeout_cycles: u32) -> (Option<u32>, u32) {
+    let channel = slot + 1;
+    let start = cycle_count();
+    let mut observed = 0u32;
+    let mut wfi_count = 0u32;
+    loop {
+        observed |= USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
+        if observed & HCINT_CHHLTD != 0 {
+            return (Some(observed), wfi_count);
+        }
+        if cycle_count().wrapping_sub(start) >= timeout_cycles {
+            return (None, wfi_count);
+        }
+
+        let interrupts_were_enabled = crate::interrupts::mask_machine_interrupts();
+        observed |= USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
+        let hardware = unsafe { read(channel_register(channel, HCINT_OFFSET)) };
+        if hardware != 0 {
+            unsafe { write(channel_register(channel, HCINT_OFFSET), hardware) };
+            observed |= hardware;
+        }
+        if observed & HCINT_CHHLTD == 0 && cycle_count().wrapping_sub(start) < timeout_cycles {
+            wfi_count += 1;
+            USB_WFI_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::interrupts::wait_for_interrupt();
+        }
+        crate::interrupts::restore_machine_interrupts(interrupts_were_enabled);
+    }
+}
+
 /// Runs one packet (a single-entry, halt-on-complete QTD) on channel 0 to
 /// completion and returns the number of bytes actually transferred.
 ///
@@ -1164,6 +2309,7 @@ pub fn run_packet(
     pid_data1: bool,
     timeout_iterations: u32,
     max_split_rounds: u32,
+    completion_wait: CompletionWait,
     quiet_timeout: bool,
     quiet_errors: bool,
     buffer: &mut [u8],
@@ -1181,54 +2327,16 @@ pub fn run_packet(
         );
     }
 
-    let xfer_len = buffer.len();
-    let data_ptr = buffer.as_mut_ptr();
-    if xfer_len > 0 {
-        cache_writeback_invalidate(data_ptr as usize, xfer_len);
-    }
-
-    let mut qtd_control = xfer_len as u32 & QTD_XFER_SIZE_MASK;
-    if is_setup {
-        qtd_control |= QTD_IS_SETUP;
-    }
-    qtd_control |= QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
-
-    let mut qtd = QtdSlot::zeroed();
-    let qtd_address = &raw mut qtd as usize;
-    unsafe {
-        write(qtd_address, qtd_control);
-        write(qtd_address + 4, data_ptr as u32);
-    }
-    cache_writeback_invalidate(qtd_address, 8);
-
-    let hcchar = (endpoint.mps as u32 & 0x7FF) // bits[10:0]: MPS
-        | ((endpoint.endpoint_number as u32 & 0xF) << 11)
-        | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
-        | (if endpoint.route.low_speed_via_hub { HCCHAR_LSPDDEV } else { 0 })
-        | endpoint.endpoint_type
-        | ((endpoint.device_address as u32 & 0x7F) << 22);
-    // In descriptor-DMA mode the QTD's SUP bit marks the descriptor as a
-    // setup packet, but HCTSIZ must still select the SETUP PID. DATA0 is
-    // correct only for a non-setup control OUT data packet.
-    let hctsiz = HCTSIZ_SCHED_INFO_ALL
-        | if is_setup {
-            HCTSIZ_PID_SETUP
-        } else if pid_data1 {
-            HCTSIZ_PID_DATA1
-        } else {
-            0
-        };
-
-    unsafe {
-        write(CHAN0_HCINT, 0xFFFF_FFFF); // clear stale status from a previous packet
-        write(CHAN0_HCSPLT, 0); // this path never splits; see `run_split_packet`
-        write(CHAN0_HCCHAR, hcchar);
-        write(CHAN0_HCTSIZ, hctsiz);
-        write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
-        modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
-    }
-
-    let hcint = match await_packet(0, 0, timeout_iterations, max_split_rounds) {
+    let mut transfer = Channel0Transfer::new(endpoint, is_setup, pid_data1, buffer);
+    let token = transfer.submit();
+    let sleep_on_interrupt = completion_wait == CompletionWait::Interrupt;
+    let hcint = match await_packet(
+        0,
+        0,
+        timeout_iterations,
+        max_split_rounds,
+        sleep_on_interrupt,
+    ) {
         Some(hcint) => hcint,
         None => {
             if !quiet_timeout {
@@ -1239,42 +2347,17 @@ pub fn run_packet(
             // gave up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is
             // not racing whatever the core was still doing.
             force_halt_channel();
+            transfer.cancel(token);
             return PacketOutcome::Timeout;
         }
     };
-
-    cache_writeback_invalidate(qtd_address, 8); // see the QTD fields the core wrote back
-    let control_after = unsafe { read(qtd_address) };
-    let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
-    let status = control_after & QTD_STATUS_MASK;
-    let transferred = xfer_len.saturating_sub(remaining);
-
-    if hcint & HCINT_STALL != 0 {
+    if !transfer.note_completion(token, hcint) {
         if !quiet_errors {
-            uart::log(b"USB: transfer STALL\r\n");
+            uart::log(b"USB: stale channel completion token\r\n");
         }
         return PacketOutcome::Error;
     }
-    if hcint & HCINT_ERROR_MASK != 0 {
-        if !quiet_errors {
-            uart::log_hex(b"USB: transfer transaction error, HCINT=", hcint);
-            log_port_state();
-        }
-        return PacketOutcome::Error;
-    }
-    if status != QTD_STATUS_SUCCESS {
-        if !quiet_errors {
-            uart::log_hex(
-                b"USB: transfer QTD error, status=",
-                status >> QTD_STATUS_SHIFT,
-            );
-        }
-        return PacketOutcome::Error;
-    }
-    if endpoint.is_in && transferred > 0 {
-        cache_writeback_invalidate(data_ptr as usize, transferred);
-    }
-    PacketOutcome::Ok(transferred)
+    transfer.reap(token, quiet_errors)
 }
 
 /// Largest split packet `run_split_packet` will stage. A device reached
@@ -1343,6 +2426,12 @@ fn run_split_packet(
         );
         return PacketOutcome::Error;
     }
+    if !enter_split_mode() {
+        if !quiet_errors {
+            uart::log(b"USB: split transfer blocked by active periodic channels\r\n");
+        }
+        return PacketOutcome::Error;
+    }
 
     let mut staging = SplitStaging {
         bytes: [0u8; SPLIT_STAGING_MAX],
@@ -1376,9 +2465,9 @@ fn run_split_packet(
     let hctsiz = (xfer_len as u32 & HCTSIZ_XFERSIZE_MASK) | (1 << HCTSIZ_PKTCNT_SHIFT) | pid;
     let hcsplt = endpoint.route.hcsplt();
 
+    prepare_channel0_interrupt();
     unsafe {
         modify(HCFG, HCFG_DESCDMA, 0); // buffer DMA for this packet only
-        write(CHAN0_HCINT, 0xFFFF_FFFF);
         write(CHAN0_HCSPLT, hcsplt);
         write(CHAN0_HCCHAR, hcchar);
         write(CHAN0_HCTSIZ, hctsiz);
@@ -1386,7 +2475,10 @@ fn run_split_packet(
         modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
     }
 
-    let outcome = await_packet(hcsplt, hctsiz, timeout_iterations, max_split_rounds);
+    // Unlike a directly addressed HID endpoint, each software-driven split
+    // phase halts on its ACK/NAK/NYET handshake. It can therefore sleep for
+    // the channel IRQ even when an idle HID caller requested a quiet timeout.
+    let outcome = await_packet(hcsplt, hctsiz, timeout_iterations, max_split_rounds, true);
 
     // Giving up leaves the channel enabled in the middle of a split, so it
     // has to be stopped *before* the controller's DMA mode changes back
@@ -1417,7 +2509,9 @@ fn run_split_packet(
     unsafe {
         write(CHAN0_HCSPLT, 0);
         modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
     }
+    leave_split_mode();
 
     let Some(hcint) = outcome else {
         if !quiet_timeout {
@@ -1500,14 +2594,20 @@ fn await_packet(
     hctsiz: u32,
     timeout_iterations: u32,
     max_split_rounds: u32,
+    sleep_on_interrupt: bool,
 ) -> Option<u32> {
     let mut rounds = 0u32;
     loop {
-        if !poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, timeout_iterations) {
-            return None;
+        let strategy = if sleep_on_interrupt {
+            WaitStrategy::Interrupt
+        } else {
+            WaitStrategy::Poll
+        };
+        let hcint = wait_for_channel0_halt(timeout_iterations, strategy)?;
+
+        if hcsplt & HCSPLT_SPLTENA != 0 {
+            SPLIT_ROUND_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        let hcint = unsafe { read(CHAN0_HCINT) };
-        unsafe { write(CHAN0_HCINT, hcint) }; // W1C
 
         if hcsplt & HCSPLT_SPLTENA == 0 {
             return Some(hcint);
@@ -1536,6 +2636,7 @@ fn await_packet(
             uart::log(b"USB: giving up mid-split; the hub's TT never answered\r\n");
             return None;
         }
+        prepare_channel0_interrupt();
         unsafe {
             if in_complete_split {
                 write(CHAN0_HCSPLT, hcsplt | HCSPLT_COMPSPLT);
@@ -1547,10 +2648,35 @@ fn await_packet(
                 write(CHAN0_HCSPLT, hcsplt);
                 write(CHAN0_HCTSIZ, hctsiz);
             }
-            write(CHAN0_HCINT, 0xFFFF_FFFF);
             modify(CHAN0_HCCHAR, HCCHAR_CHENA | HCCHAR_CHDIS, HCCHAR_CHENA);
         }
     }
+}
+
+/// Enters the controller-wide buffer-DMA mode used by Split transactions.
+///
+/// Periodic descriptor DMA and Split buffer DMA cannot coexist on this DWC.
+/// The registry deliberately leaves HS-hub HIDs on the serialized Split
+/// fallback; this guard turns that topology rule into an HCD invariant so a
+/// future allocator change cannot silently switch DMA mode underneath an
+/// active periodic channel.
+fn enter_split_mode() -> bool {
+    const PERIODIC_CHANNEL_MASK: u32 = 0x1E;
+    if PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) != 0
+        || unsafe { read(HAINTMSK) } & PERIODIC_CHANNEL_MASK != 0
+        || SPLIT_MODE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        SPLIT_MODE_CONFLICT_COUNT.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    SPLIT_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+fn leave_split_mode() {
+    SPLIT_MODE_ACTIVE.store(false, Ordering::Release);
 }
 
 /// Logs the raw root-port register alongside a failed transfer. A device
@@ -1579,10 +2705,118 @@ fn force_halt_channel() {
     unsafe {
         modify(CHAN0_HCCHAR, HCCHAR_CHDIS, HCCHAR_CHDIS);
     }
-    let _ = poll_until(CHAN0_HCINT, HCINT_CHHLTD, true, HALT_CONFIRM_ITERATIONS);
-    unsafe {
-        write(CHAN0_HCINT, 0xFFFF_FFFF);
+    // Cleanup must remain short even if the core fails to raise a halt IRQ;
+    // sleeping until the next display frame would unnecessarily add ~17 ms
+    // to an already failed transfer.
+    let _ = wait_for_channel0_halt(HALT_CONFIRM_ITERATIONS, WaitStrategy::Poll);
+    prepare_channel0_interrupt();
+}
+
+#[derive(Clone, Copy)]
+enum WaitStrategy {
+    /// Sleep until the USB or another enabled interrupt fires. Used for
+    /// control, bulk, and split phases which are expected to halt normally.
+    Interrupt,
+    /// Retain the bounded foreground poll for directly addressed idle HID
+    /// endpoints (descriptor DMA retries NAK without halting) and cleanup.
+    Poll,
+}
+
+/// Waits for channel 0 to halt and consumes the status published by the ISR.
+///
+/// The interrupt path masks `mstatus.MIE`, rechecks both the Atomic snapshot
+/// and HCINT, then executes `wfi`. This closes the classic check-before-sleep
+/// race: a USB source arriving after the recheck remains pending and wakes the
+/// core, then is dispatched as soon as MIE is restored. The direct HCINT read
+/// is a recovery path for a routing failure, not a continuous success-path
+/// poll.
+fn wait_for_channel0_halt(timeout_iterations: u32, strategy: WaitStrategy) -> Option<u32> {
+    let start = cycle_count();
+    let mut observed = 0u32;
+    match strategy {
+        WaitStrategy::Poll => {
+            USB_POLL_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut remaining = timeout_iterations;
+            loop {
+                observed |= USB_CHANNEL0_PENDING.swap(0, Ordering::AcqRel);
+                observed |= take_channel0_hardware_status();
+                if observed & HCINT_CHHLTD != 0 {
+                    record_wait_cycles(start);
+                    return Some(observed);
+                }
+                if remaining == 0 {
+                    record_wait_cycles(start);
+                    return None;
+                }
+                remaining -= 1;
+                core::hint::spin_loop();
+            }
+        }
+        WaitStrategy::Interrupt => {
+            USB_SLEEP_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            let cycle_budget = timeout_iterations
+                .saturating_mul(WAIT_TIMEOUT_CYCLES_PER_ITERATION)
+                .max(1);
+            loop {
+                observed |= USB_CHANNEL0_PENDING.swap(0, Ordering::AcqRel);
+                if observed & HCINT_CHHLTD != 0 {
+                    record_wait_cycles(start);
+                    return Some(observed);
+                }
+                if cycle_count().wrapping_sub(start) >= cycle_budget {
+                    record_wait_cycles(start);
+                    return None;
+                }
+
+                let interrupts_were_enabled = crate::interrupts::mask_machine_interrupts();
+                observed |= USB_CHANNEL0_PENDING.swap(0, Ordering::AcqRel);
+                observed |= take_channel0_hardware_status();
+                if observed & HCINT_CHHLTD == 0 && cycle_count().wrapping_sub(start) < cycle_budget
+                {
+                    USB_WFI_COUNT.fetch_add(1, Ordering::Relaxed);
+                    crate::interrupts::wait_for_interrupt();
+                }
+                crate::interrupts::restore_machine_interrupts(interrupts_were_enabled);
+            }
+        }
     }
+}
+
+/// Acknowledges channel status only when foreground has beaten the ISR or the
+/// interrupt route failed. The normal interrupt wait reads this once inside
+/// its masked check-before-sleep window rather than continuously.
+fn take_channel0_hardware_status() -> u32 {
+    let hardware = unsafe { read(CHAN0_HCINT) };
+    if hardware != 0 {
+        unsafe { write(CHAN0_HCINT, hardware) };
+    }
+    hardware
+}
+
+fn record_wait_cycles(start: u32) {
+    let elapsed = cycle_count().wrapping_sub(start);
+    USB_LAST_WAIT_CYCLES.store(elapsed, Ordering::Release);
+    let mut maximum = USB_MAX_WAIT_CYCLES.load(Ordering::Relaxed);
+    while elapsed > maximum {
+        match USB_MAX_WAIT_CYCLES.compare_exchange_weak(
+            maximum,
+            elapsed,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => maximum = current,
+        }
+    }
+}
+
+#[inline(always)]
+fn cycle_count() -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));
+    }
+    value
 }
 
 // ------------------------------------------------------------------------

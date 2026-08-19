@@ -6,7 +6,7 @@
 //! The command set carried in a CDB (SCSI transparent or UFI) belongs to the
 //! class driver above it.
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
+use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::uart;
 
@@ -203,6 +203,7 @@ impl BulkOnlyTransport {
                 self.out_toggle,
                 BULK_TIMEOUT_ITERATIONS,
                 BULK_SPLIT_ROUNDS,
+                CompletionWait::Interrupt,
                 false,
                 false,
                 &mut data[offset..offset + chunk_len],
@@ -238,6 +239,7 @@ impl BulkOnlyTransport {
                 self.in_toggle,
                 BULK_TIMEOUT_ITERATIONS,
                 BULK_SPLIT_ROUNDS,
+                CompletionWait::Interrupt,
                 false,
                 false,
                 &mut buffer[received..received + chunk_len],

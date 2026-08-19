@@ -37,7 +37,8 @@
 - `src/rtc.rs`: RX8130CE（`0x32`）のカレンダー読み書き、BCDと週ビットフィールドの検証、フラグ・制御レジスタの読出し（`rtc`コマンド）
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
-- `src/interrupts.rs`: CLICトラップ入口とGDMA ISR
+- `src/interrupts.rs`: 共通CLICトラップ入口、表示用DW-GDMA ISR、USB-A High-Speed DWC
+  割り込みのディスパッチ。表示を高い優先度、USBを低い優先度の別CLIC lineへ割り当てる
 - `src/icm.rs`: システムAXIインターコネクトの調停優先度。表示DMAのPSRAM読み出しを最優先にしてDSI BridgeのFIFOアンダーラン（水色フラッシュ）を防ぐ。2D-DMAマスターは逆に最低優先度へ明示的に固定する
 - `src/dma2d.rs`: 2D-DMA。矩形ブロックを単位に転送するエンジンで、ディスクリプタが
   「画像の中のブロック」を表すためCW回転した配置をそのまま扱える。クロック投入、
@@ -60,7 +61,14 @@
       PI4IOE5V6408、2個目、0x44を叩く）、および同expanderのビット単位
       read-modify-write、コア初期化・ホストポート電源投入・
       接続検出・リセット・速度判定、チャネル/パケット実行のプリミティブ
-      （`run_packet`）。レジスタ・チャネル・パケットのことだけを知っており、
+      （`run_packet`）。USB割り込みのmask／ack、channel 0、periodic channel 1〜4とroot-portのAtomic診断
+      スナップショットも持つ。通常転送は世代付き固定slotへsubmitし、競合防止付き`WFI`後に
+      reapする。periodic slotを確保できない追加HID／Split HIDのidle NAKだけ短いbounded pollで
+      回収する。channel 1を使うperiodic Interrupt INの旧Go/No-Go診断、およびchannel 1〜4で共有する
+      static frame list、channel別QTD／report buffer bankとallocatorもここに置く。
+      FS/LS-only host modeは既定offのruntime診断設定として保持し、`usbfs`が切替え後に再列挙する。
+      Split buffer DMAは排他modeで実行し、periodic descriptor DMAがactiveなら切替えを拒否する。
+      レジスタ・チャネル・パケットのことだけを知っており、
       USBデバイスや記述子の意味は一切知らない
     - `src/usb/protocol.rs`: 汎用USBプロトコル層（Stage 2相当）。コントロール
       転送（SETUP/DATA/STATUS）の組み立てと標準記述子（USB2.0 chapter 9）に

@@ -1,4 +1,4 @@
-//! ESP32-P4 ECO2 CLIC interrupt glue for the display DMA.
+//! ESP32-P4 ECO2 CLIC interrupt glue for the display DMA and USB-A host.
 //!
 //! ECO2 does not expose the DSI Bridge VSYNC event. ESP-IDF therefore treats
 //! the full-frame DW-GDMA completion as a synthetic VSYNC and immediately
@@ -17,6 +17,10 @@ const CHANNEL: usize = DW_GDMA + 0x100;
 
 const INTERRUPT_CORE0: usize = 0x500D_6000;
 const DW_GDMA_SOURCE: usize = 24;
+/// `ETS_USB_OTG_INTR_SOURCE` in ESP-IDF v5.5.3's ESP32-P4 interrupt table.
+/// Controller 0 is the High-Speed DWC wired to Tab5's USB-A connector;
+/// controller 1 is the unrelated Full-Speed block on GPIO26/27.
+pub const USB_OTG_HS_INTERRUPT_SOURCE: usize = 93;
 
 const CLIC_CONFIG: usize = 0x2080_0000;
 const CLIC_THRESHOLD: usize = 0x2080_0008;
@@ -24,8 +28,10 @@ const CLIC_CTRL: usize = 0x2080_1000;
 
 // Peripheral interrupt line 1 maps to CLIC interrupt 17. Interrupt line 6 is
 // reserved by ESP-IDF; line 1 is a normal external level interrupt.
-const CPU_INTERRUPT_LINE: u32 = 1;
-const CLIC_INTERRUPT: u32 = CPU_INTERRUPT_LINE + 16;
+const DISPLAY_CPU_INTERRUPT_LINE: u32 = 1;
+const DISPLAY_CLIC_INTERRUPT: u32 = DISPLAY_CPU_INTERRUPT_LINE + 16;
+const USB_CPU_INTERRUPT_LINE: u32 = 2;
+const USB_CLIC_INTERRUPT: u32 = USB_CPU_INTERRUPT_LINE + 16;
 
 const DMA_FULL_DONE: u32 = 1 << 1;
 const DMA_ERROR_MASK: u32 = 0x0000_3FE0;
@@ -33,6 +39,8 @@ const DMA_ERROR_MASK: u32 = 0x0000_3FE0;
 static FRAMEBUFFER: AtomicU32 = AtomicU32::new(0);
 static FRAME_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static DMA_ERROR: AtomicU32 = AtomicU32::new(0);
+static UNKNOWN_EXTERNAL_CAUSE: AtomicU32 = AtomicU32::new(0);
+static UNKNOWN_EXTERNAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // riscv-rt's generic trap entry does not preserve CLIC's extended mcause
 // fields. ESP32-P4 requires mcause to be restored before mret because it also
@@ -145,7 +153,7 @@ pub fn install(framebuffer: u32) {
         write(CHANNEL + 0x90, DMA_FULL_DONE | DMA_ERROR_MASK);
 
         // Route peripheral source 24 to external CPU line 1 (CLIC interrupt 17).
-        write(INTERRUPT_CORE0 + DW_GDMA_SOURCE * 4, CLIC_INTERRUPT);
+        write(INTERRUPT_CORE0 + DW_GDMA_SOURCE * 4, DISPLAY_CLIC_INTERRUPT);
 
         // Configure three interrupt-level bits, then disable any stale external
         // enables inherited from the bootloader before enabling our level IRQ.
@@ -154,7 +162,7 @@ pub fn install(framebuffer: u32) {
             modify(CLIC_CTRL + interrupt * 4, 1 << 8, 0);
         }
         modify(
-            CLIC_CTRL + CLIC_INTERRUPT as usize * 4,
+            CLIC_CTRL + DISPLAY_CLIC_INTERRUPT as usize * 4,
             (0xFF << 24) | (0x3 << 17) | (1 << 16) | (1 << 8),
             (0x3F << 24) | (1 << 8),
         );
@@ -168,6 +176,27 @@ pub fn install(framebuffer: u32) {
     }
 }
 
+/// Routes the High-Speed USB-DWC interrupt below the display DMA's priority.
+///
+/// Display initialization installs the shared trap entry and enables machine
+/// interrupts before `InputManager` constructs the USB host. Reinstalling the
+/// trap here would be harmless, but configuring only this additional source
+/// makes it explicit that a USB rescan must not disturb the live display IRQ.
+pub fn install_usb() {
+    unsafe {
+        write(
+            INTERRUPT_CORE0 + USB_OTG_HS_INTERRUPT_SOURCE * 4,
+            USB_CLIC_INTERRUPT,
+        );
+        modify(
+            CLIC_CTRL + USB_CLIC_INTERRUPT as usize * 4,
+            (0xFF << 24) | (0x3 << 17) | (1 << 16) | (1 << 8),
+            (0x20 << 24) | (1 << 8),
+        );
+        asm!("fence iorw, iorw", options(nostack));
+    }
+}
+
 pub fn frame_sequence() -> u32 {
     FRAME_SEQUENCE.load(Ordering::Acquire)
 }
@@ -176,32 +205,77 @@ pub fn dma_error() -> u32 {
     DMA_ERROR.load(Ordering::Acquire)
 }
 
+pub fn unknown_external_cause() -> u32 {
+    UNKNOWN_EXTERNAL_CAUSE.load(Ordering::Acquire)
+}
+
+pub fn unknown_external_count() -> u32 {
+    UNKNOWN_EXTERNAL_COUNT.load(Ordering::Acquire)
+}
+
 pub fn wait_for_interrupt() {
     unsafe { asm!("wfi", options(nomem, nostack)) };
+}
+
+/// Temporarily blocks trap entry while a foreground waiter closes the
+/// check-before-sleep race. Peripheral interrupt enables are left untouched,
+/// so a source which becomes pending in this short window still wakes `wfi`.
+pub(crate) fn mask_machine_interrupts() -> bool {
+    let previous: usize;
+    unsafe {
+        asm!(
+            "csrrc {previous}, mstatus, {mie}",
+            previous = out(reg) previous,
+            mie = in(reg) 1usize << 3,
+            options(nomem, nostack)
+        );
+    }
+    previous & (1 << 3) != 0
+}
+
+/// Restores `mstatus.MIE` after `mask_machine_interrupts`.
+pub(crate) fn restore_machine_interrupts(was_enabled: bool) {
+    if was_enabled {
+        unsafe { asm!("csrsi mstatus, 8", options(nomem, nostack)) };
+    }
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".iram.text.critical.interrupt")]
 extern "C" fn esp32p4_interrupt(cause: u32) {
     unsafe {
-        if cause & 0x8000_0000 == 0 || cause & 0x0FFF != CLIC_INTERRUPT {
+        if cause & 0x8000_0000 == 0 {
             loop {
                 core::hint::spin_loop();
             }
         }
 
-        let status = read(CHANNEL + 0x88);
-        write(CHANNEL + 0x98, status);
-        let errors = status & DMA_ERROR_MASK;
-        if errors != 0 {
-            DMA_ERROR.store(errors, Ordering::Release);
-            return;
-        }
+        let interrupt = cause & 0x0FFF;
+        match interrupt {
+            DISPLAY_CLIC_INTERRUPT => {
+                let status = read(CHANNEL + 0x88);
+                write(CHANNEL + 0x98, status);
+                let errors = status & DMA_ERROR_MASK;
+                if errors != 0 {
+                    DMA_ERROR.store(errors, Ordering::Release);
+                    return;
+                }
 
-        if status & DMA_FULL_DONE != 0 {
-            write(CHANNEL, FRAMEBUFFER.load(Ordering::Relaxed));
-            write(DW_GDMA + 0x18, 0x101);
-            FRAME_SEQUENCE.fetch_add(1, Ordering::Release);
+                if status & DMA_FULL_DONE != 0 {
+                    write(CHANNEL, FRAMEBUFFER.load(Ordering::Relaxed));
+                    write(DW_GDMA + 0x18, 0x101);
+                    FRAME_SEQUENCE.fetch_add(1, Ordering::Release);
+                }
+            }
+            USB_CLIC_INTERRUPT => crate::usb::handle_interrupt(),
+            _ => {
+                // An enabled level interrupt with no owner would immediately
+                // retrigger after `mret`. Latch it for foreground diagnostics
+                // and mask that one CLIC line instead of wedging forever.
+                UNKNOWN_EXTERNAL_CAUSE.store(cause, Ordering::Release);
+                UNKNOWN_EXTERNAL_COUNT.fetch_add(1, Ordering::Release);
+                modify(CLIC_CTRL + interrupt as usize * 4, 1 << 8, 0);
+            }
         }
     }
 }

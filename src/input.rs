@@ -109,16 +109,22 @@ impl InputManager {
             }
         }
 
-        // A root-port disconnect is a cheap register read.  A stale keyboard
-        // session needs immediate recovery, while an empty root port is
-        // deliberately rescanned only at a coarse interval because probing
-        // it performs a blocking USB reset and debounce sequence.
+        // The ISR supplies the connection edge; HPRT's current status remains
+        // the authoritative disconnect check. Rescans caused by a real insert
+        // happen immediately, while the coarse fallback below remains for a
+        // missed interrupt or a device already present before IRQ setup.
+        let root_connection_changed = self.usb_host.take_root_connection_change();
         if self.usb_host.root_disconnected() {
             let had_registered_device = !self.usb_host.is_empty();
             self.usb_host.clear();
+            self.usb_reconnect_frames = 0;
             if had_registered_device {
                 uart::log(b"USB: nothing connected to USB-A\r\n");
             }
+        } else if root_connection_changed {
+            uart::log(b"USB: root-port connection changed, rescanning...\r\n");
+            self.usb_host.rescan();
+            self.usb_reconnect_frames = 0;
         } else if self.usb_host.needs_reinit() {
             uart::log(b"USB: a device session went stale, rescanning...\r\n");
             self.usb_host.rescan();

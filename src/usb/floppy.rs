@@ -1,6 +1,6 @@
 //! USB Floppy driver for UFI over Control/Bulk/Interrupt (CBI).
 
-use super::hcd::{self, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome};
+use super::hcd::{self, CompletionWait, Endpoint, PacketOutcome, HCCHAR_EPTYPE_BULK};
 use super::protocol::{self, ControlPipe, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::uart;
 
@@ -220,6 +220,7 @@ impl UsbFloppy {
                 self.bulk_in_toggle,
                 BULK_TIMEOUT_ITERATIONS,
                 BULK_SPLIT_ROUNDS,
+                CompletionWait::Interrupt,
                 false,
                 false,
                 &mut buffer[received..received + chunk_len],
@@ -264,6 +265,7 @@ impl UsbFloppy {
             self.status_in_toggle,
             BULK_TIMEOUT_ITERATIONS,
             BULK_SPLIT_ROUNDS,
+            CompletionWait::Interrupt,
             false,
             false,
             &mut status,

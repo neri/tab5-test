@@ -44,8 +44,10 @@ mod msc;
 mod protocol;
 mod registry;
 
+pub(crate) use hcd::handle_interrupt;
 pub use hcd::{
-    FORCE_FS_LS_ONLY_HOST, Speed, probe_split_support, set_pi4ioe2_output_bit, set_vbus_bit,
+    Speed, fs_ls_only_host_forced, interrupt_diagnostics, probe_split_support,
+    set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit,
 };
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
