@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
-use crate::{icm, interrupts, lcd, power, psram, rtc, sdmmc, startup, uart, usb};
+use crate::{icm, interrupts, lcd, pma, power, psram, rtc, sdmmc, startup, uart, usb};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 /// Fixed, because the panel only tolerates the one set of vertical timings
@@ -55,6 +55,16 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "cpuinfo",
         usage: "cpuinfo",
         lines: &["show RISC-V machine identification CSRs"],
+    },
+    HelpEntry {
+        name: "pma",
+        usage: "pma",
+        lines: &[
+            "decode all RISC-V Physical Memory Attribute entries as a memory",
+            "map. ranges are [start,end); show mode, R/W/X, enable/lock, and",
+            "cache attributes (WB, WT, NC, WNA, RNA). OFF entries supply a",
+            "following TOR entry's lower bound and therefore have no range.",
+        ],
     },
     HelpEntry {
         name: "mem",
@@ -342,6 +352,7 @@ pub fn execute(
         b"echo" => console.write_output_line(framebuffer, as_str(argument)),
         b"about" | b"version" => console.write_output_line(framebuffer, "Tab5 Shell 0.1"),
         b"cpuinfo" => cmd_cpuinfo(console, framebuffer),
+        b"pma" => cmd_pma(console, framebuffer),
         b"mem" => cmd_mem(console, framebuffer),
         b"alloctest" => cmd_alloctest(console, framebuffer, argument),
         b"uptime" => cmd_uptime(console, framebuffer),
@@ -499,6 +510,85 @@ fn cmd_cpuinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
     push_misa_isa(&mut line, misa);
     line.push_str(")");
     console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Decodes the bootloader-installed PMA CSRs into the ranges they match.
+///
+/// PMA entries are not a conventional linear table: an OFF entry has no
+/// region of its own, but its address register supplies the lower bound for
+/// the next Top Of Range (TOR) entry.  Keeping those rows in the output makes
+/// that dependency explicit and avoids presenting a misleading gap map.
+fn cmd_pma(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "PMA map (ranges are [start,end)):");
+    console.write_output_line(
+        framebuffer,
+        "# range                 mode  rwx E L cache       cfg",
+    );
+
+    for entry in pma::entries() {
+        let mut line = Line::new();
+        line.push_u32(entry.index as u32);
+        line.push_str(" ");
+        match entry.range {
+            Some(range) => {
+                push_address(&mut line, range.start);
+                line.push_str("..");
+                push_address(&mut line, range.end);
+            }
+            None => {
+                line.push_str("off@ ");
+                push_address(&mut line, entry.address_bytes());
+            }
+        }
+        pad_to(&mut line, 22);
+        line.push_str(entry.mode_name());
+        pad_to(&mut line, 28);
+        line.push_str(if entry.readable() { "R" } else { "-" });
+        line.push_str(if entry.writable() { "W" } else { "-" });
+        line.push_str(if entry.executable() { "X" } else { "-" });
+        line.push_str(if entry.enabled() { " E" } else { " -" });
+        line.push_str(if entry.locked() { " L " } else { " - " });
+        push_cache_attributes(&mut line, entry);
+        pad_to(&mut line, 51);
+        line.push_hex(entry.config, 8);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+/// Appends an address without a `0x` prefix so PMA map rows stay compact.
+/// Eight digits cover the ESP32-P4 address space; a ninth digit appears only
+/// for a half-open range ending one byte past it.
+fn push_address(line: &mut Line, address: u64) {
+    if address <= u32::MAX as u64 {
+        line.push_hex(address as u32, 8);
+    } else {
+        line.push_u64_hex(address);
+    }
+}
+
+/// Appends the cacheability portion of one PMA entry's attributes.
+fn push_cache_attributes(line: &mut Line, entry: pma::Entry) {
+    let mut has_explicit_policy = false;
+    if entry.non_cacheable() {
+        line.push_str("NC");
+        has_explicit_policy = true;
+    }
+    if entry.write_through() {
+        if has_explicit_policy {
+            line.push_str(" ");
+        }
+        line.push_str("WT");
+        has_explicit_policy = true;
+    }
+    if !has_explicit_policy {
+        line.push_str("WB");
+    }
+    if entry.write_miss_no_alloc() {
+        line.push_str(" WNA");
+    }
+    if entry.read_miss_no_alloc() {
+        line.push_str(" RNA");
+    }
 }
 
 /// Appends the ISA name derivable from `misa`.
@@ -2582,6 +2672,28 @@ impl Line {
             let nibble = (value >> (4 * (digits - 1 - index))) & 0xF;
             if self.len < self.buffer.len() {
                 self.buffer[self.len] = HEX[nibble as usize];
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Appends an unsigned value in hexadecimal without leading zeroes.
+    pub(crate) fn push_u64_hex(&mut self, value: u64) {
+        if value <= u32::MAX as u64 {
+            self.push_hex(value as u32, 8);
+            return;
+        }
+        let mut digits = [0u8; 16];
+        let mut count = 0;
+        let mut remaining = value;
+        while remaining > 0 {
+            digits[count] = b"0123456789ABCDEF"[(remaining & 0xF) as usize];
+            remaining >>= 4;
+            count += 1;
+        }
+        for &digit in digits[..count].iter().rev() {
+            if self.len < self.buffer.len() {
+                self.buffer[self.len] = digit;
                 self.len += 1;
             }
         }

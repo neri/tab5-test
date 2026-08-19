@@ -71,6 +71,14 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 `app::run`側の分岐で処理します。各サブアプリが戻った後は`Console::clear`で
 画面をリセットしてから通常どおりプロンプトを再描画します。
 
+`pma`はESP32-P4の16本の`pmacfgN`／`pmaaddrN` CSRを読み、PMAの属性付きメモリマップを
+表示します。範囲は終端を含まない`[start,end)`で、TOR・NA4・NAPOTをアドレスへ復元し、
+R/W/X、有効（E）、ロック（L）、キャッシュ属性（WB=write-back、WT=write-through、
+NC=non-cacheable、WNA/RNA=write/read miss no-allocate）、生の設定語を併記します。mode=OFFの
+エントリは自身の範囲を持たない一方、`pmaaddrN`が次のTORエントリの下限になるため、`off@`として
+そのアンカーアドレスを残して表示します。CSRは読み出すだけで、ブートローダーがロックしたPMA設定を
+変更しません。
+
 ## 再起動
 
 `reboot`は`src/startup.rs`の`reboot()`が実装しており、HPCPU 0自身の

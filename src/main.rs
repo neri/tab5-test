@@ -24,6 +24,7 @@ mod ina226;
 mod input;
 mod interrupts;
 mod lcd;
+mod pma;
 mod power;
 mod ppa;
 mod psram;

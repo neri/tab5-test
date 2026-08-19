@@ -44,6 +44,8 @@
   チャネル設定、完了待ち、メモリ間ブロックコピー（M2M、スクロールに使用）
 - `src/ppa.rs`: PPAのBlendエンジンによる矩形の単色塗り。PPA自身はDMAを持たないので
   `dma2d.rs`のRXチャネルと組で動く。全画面クリアと大きい矩形の塗りがここを通る
+- `src/pma.rs`: ESP32-P4固有のPMA CSRを読み出し、TOR／NA4／NAPOTの設定語を
+  アドレス範囲と属性へ復元する読み取り専用デコーダ。`pma`シェルコマンドが使用する
 - `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
   経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
   同じ構成。現状は[`STORAGE.md`](STORAGE.md)、実機で踏んだ罠は
