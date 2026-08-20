@@ -25,7 +25,7 @@
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
-    - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（Win95と同じ枠線ドラッグ）だけが動く
+    - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（内容を表示したまま移動）だけが動く
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）

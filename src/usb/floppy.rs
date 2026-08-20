@@ -234,11 +234,11 @@ impl UsbFloppy {
                     uart::log(b"USB Floppy: short bulk IN response\r\n");
                     return None;
                 }
-                PacketOutcome::Timeout => {
+                PacketOutcome::Timeout(_) => {
                     uart::log(b"USB Floppy: bulk IN timed out\r\n");
                     return None;
                 }
-                PacketOutcome::Error => {
+                PacketOutcome::PacketError(_) | PacketOutcome::Error => {
                     uart::log(b"USB Floppy: bulk IN transaction error\r\n");
                     return None;
                 }
@@ -278,11 +278,11 @@ impl UsbFloppy {
                 uart::log(b"USB Floppy: short CBI status\r\n");
                 None
             }
-            PacketOutcome::Timeout => {
+            PacketOutcome::Timeout(_) => {
                 uart::log(b"USB Floppy: CBI status timed out\r\n");
                 None
             }
-            PacketOutcome::Error => {
+            PacketOutcome::PacketError(_) | PacketOutcome::Error => {
                 uart::log(b"USB Floppy: CBI status transaction error\r\n");
                 None
             }

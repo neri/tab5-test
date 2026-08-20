@@ -9,6 +9,7 @@
 
 use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome, Route};
 use crate::delay::{delay_ms, delay_us};
+use crate::startup;
 use crate::uart;
 
 // Standard USB descriptor type codes (USB2.0 table 9-5).
@@ -57,9 +58,11 @@ pub struct ControlPipe {
 const CONFIG_BUFFER_MAX: usize = 128;
 
 // Control transfers let NAKs retry in hardware until success or a real
-// error -- this is a generous wall-clock bound, matching `sdmmc.rs`'s
-// command timeouts, not a retry budget of our own.
-const CONTROL_TIMEOUT_ITERATIONS: u32 = 2_000_000;
+// error. `CompletionWait::Interrupt` assigns eight CPU cycles to one
+// iteration, so derive the budget at runtime: the old fixed 2,000,000 was
+// only ~44 ms after the CPU moved to 360 MHz and could expire while a BOT
+// Mass Storage Reset was still completing its IN status stage.
+const CONTROL_TIMEOUT_MIN_ITERATIONS: u32 = 2_000_000;
 
 /// A control-transfer transaction error can be transient: a hub may need
 /// another frame after waking its downstream logic, and the DWC core can
@@ -493,7 +496,7 @@ fn run_control_packet(
         &endpoint,
         is_setup,
         pid_data1,
-        CONTROL_TIMEOUT_ITERATIONS,
+        control_timeout_iterations(),
         CONTROL_SPLIT_ROUNDS,
         CompletionWait::Interrupt,
         quiet_errors,
@@ -501,6 +504,13 @@ fn run_control_packet(
         buffer,
     ) {
         PacketOutcome::Ok(n) => Some(n),
-        PacketOutcome::Timeout | PacketOutcome::Error => None,
+        PacketOutcome::Timeout(_) | PacketOutcome::PacketError(_) | PacketOutcome::Error => None,
     }
+}
+
+/// Approximately one second, independent of the configured CPU clock.
+fn control_timeout_iterations() -> u32 {
+    startup::cpu_hz()
+        .saturating_div(8)
+        .max(CONTROL_TIMEOUT_MIN_ITERATIONS)
 }

@@ -26,6 +26,10 @@ const MSPI3: usize = 0x5008_F000;
 const MSPI_IOMUX: usize = 0x500E_1200;
 const PMU: usize = 0x5011_5000;
 const LP_CLKRST: usize = 0x5011_1000;
+const LP_STORE15: usize = 0x5011_0068;
+const LPPERI: usize = 0x5012_0000;
+const I2C_ANA_MST: usize = 0x5012_4000;
+const FALLBACK_TEST_MAGIC: u32 = 0x5053_4642;
 
 const ROM_SPI_CMD_CONFIG: usize = 0x4FC0_0108;
 const ROM_SPI_SET_OP_MODE: usize = 0x4FC0_0110;
@@ -37,9 +41,97 @@ const SYNC_READ: u32 = 0x0000;
 const SYNC_WRITE: u32 = 0x8080;
 const REG_READ: u32 = 0x4040;
 const REG_WRITE: u32 = 0xC0C0;
-const READ_DUMMY_BITS: u32 = 18;
-const REG_READ_DUMMY_BITS: u32 = 8;
-const WRITE_DUMMY_BITS: u32 = 8;
+
+#[derive(Clone, Copy)]
+enum PsramClockSource {
+    Spll480Mhz,
+    Mpll400Mhz,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum InitStage {
+    Clock = 1,
+    ModeRegisterRead = 2,
+    ModeRegisterWrite = 3,
+    Mr8Read = 4,
+    Mr8Write = 5,
+    CommandPath = 6,
+    Tuning = 7,
+    DirectMemoryTest = 8,
+    MmuMap = 9,
+    MappedMemoryTest = 10,
+}
+
+/// Every value which changes with PSRAM operating frequency.
+///
+/// Keep this in DRAM because `init_critical` reads it while the shared MSPI
+/// block is being reset and normal DROM/IROM access is unavailable. Keeping
+/// both profiles here avoids scattering frequency-specific latency and
+/// divider literals through the driver and makes 80 MHz fallback complete.
+#[derive(Clone, Copy)]
+struct PsramTiming {
+    clock_source: PsramClockSource,
+    frequency_mhz: u32,
+    operating_bus_divider: u32,
+    tuning_bus_divider: u32,
+    read_dummy_bits: u32,
+    write_dummy_bits: u32,
+    register_read_dummy_bits: u32,
+    read_latency_cycles: u32,
+    write_latency_cycles: u32,
+    mr0_read_latency_code: u8,
+    mr4_write_latency_code: u8,
+    use_preferred_dqs: bool,
+    preferred_dqs_phase: u8,
+    preferred_data_delay: u8,
+    preferred_dqs_delay: u8,
+}
+
+#[used]
+#[unsafe(link_section = ".dram.rodata.psram")]
+static PSRAM_80_MHZ: PsramTiming = PsramTiming {
+    clock_source: PsramClockSource::Spll480Mhz,
+    frequency_mhz: 80,
+    operating_bus_divider: 6,
+    tuning_bus_divider: 24,
+    read_dummy_bits: 18,
+    write_dummy_bits: 8,
+    register_read_dummy_bits: 8,
+    read_latency_cycles: 10,
+    write_latency_cycles: 5,
+    mr0_read_latency_code: 2,
+    mr4_write_latency_code: 2,
+    use_preferred_dqs: true,
+    preferred_dqs_phase: 0,
+    preferred_data_delay: 0,
+    preferred_dqs_delay: 0,
+};
+
+/// ESP-IDF v5.5.3's AP Memory Hex-PSRAM 200 MHz timing.
+///
+/// The PSRAM clock is MPLL 400 MHz / 2. Fixed-latency mode uses 14 read
+/// cycles (MR0 code 4) and 7 write cycles (MR4 code 1), hence 26 read-dummy
+/// bits and 12 register-read/write-dummy bits on the DDR command path.
+#[used]
+#[unsafe(link_section = ".dram.rodata.psram")]
+static PSRAM_200_MHZ: PsramTiming = PsramTiming {
+    clock_source: PsramClockSource::Mpll400Mhz,
+    frequency_mhz: 200,
+    operating_bus_divider: 2,
+    tuning_bus_divider: 20,
+    read_dummy_bits: 26,
+    write_dummy_bits: 12,
+    register_read_dummy_bits: 12,
+    read_latency_cycles: 14,
+    write_latency_cycles: 7,
+    mr0_read_latency_code: 4,
+    mr4_write_latency_code: 1,
+    use_preferred_dqs: false,
+    preferred_dqs_phase: 0,
+    preferred_data_delay: 0,
+    preferred_dqs_delay: 0,
+};
 
 const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
 const CACHE_MAP_L2_CACHE: u32 = 1 << 5;
@@ -115,6 +207,23 @@ dram_message!(HP_CLK_LABEL, b"PSRAM: HP CLK=");
 dram_message!(LDO2_LABEL, b"PSRAM: LDO2=");
 dram_message!(LDO2_ANA_LABEL, b"PSRAM: LDO2 ANA=");
 dram_message!(RF_PWC_LABEL, b"PSRAM: RF PWC=");
+dram_message!(PROFILE_MHZ_LABEL, b"PSRAM: profile MHz=");
+dram_message!(READ_LATENCY_LABEL, b"PSRAM: read latency cycles=");
+dram_message!(WRITE_LATENCY_LABEL, b"PSRAM: write latency cycles=");
+dram_message!(DQS_PHASE_LABEL, b"PSRAM: DQS phase=");
+dram_message!(DQS_DATA_DELAY_LABEL, b"PSRAM: DQS data delay=");
+dram_message!(DQS_DELAY_LABEL, b"PSRAM: DQS delay=");
+dram_message!(DQS_WINDOW_START_LABEL, b"PSRAM: DQS window start=");
+dram_message!(DQS_WINDOW_LENGTH_LABEL, b"PSRAM: DQS window length=");
+dram_message!(FALLBACK_STAGE_LABEL, b"PSRAM: 200 MHz failed stage=");
+dram_message!(FALLBACK_MESSAGE, b"PSRAM: falling back to 80 MHz\r\n");
+dram_message!(MPLL_TIMEOUT, b"PSRAM: MPLL calibration timed out\r\n");
+dram_message!(MPLL_READBACK_FAILED, b"PSRAM: MPLL readback failed\r\n");
+dram_message!(DIRECT_TEST_FAILED, b"PSRAM: direct memory test failed\r\n");
+dram_message!(
+    FORCED_FALLBACK,
+    b"PSRAM: diagnostic forced tuning failure\r\n"
+);
 
 #[used]
 #[unsafe(link_section = ".dram.rodata.psram")]
@@ -129,9 +238,15 @@ static TUNING_REFERENCE_WORDS: [u32; 32] = [
 pub struct Psram {
     base: usize,
     bytes: usize,
+    frequency_mhz: u32,
 }
 
 impl Psram {
+    /// Frequency of the profile that passed tuning and both memory tests.
+    pub fn frequency_mhz(&self) -> u32 {
+        self.frequency_mhz
+    }
+
     pub fn framebuffer(&self) -> Option<*mut u16> {
         if FRAMEBUFFER_BYTES > self.bytes {
             return None;
@@ -185,6 +300,13 @@ impl Psram {
 /// The caller is responsible for the span lying inside the mapping.
 pub fn writeback_invalidate(address: usize, bytes: usize) {
     let _ = iram_cache_writeback_invalidate(address as u32, bytes as u32);
+}
+
+/// Marks the next CPU-only reboot to reject an otherwise valid 200 MHz DQS
+/// result. The marker is consumed before PSRAM initialization, exercising the
+/// real post-200-MHz reset and 80 MHz mode-register recovery path once.
+pub fn request_fallback_test() {
+    unsafe { write(LP_STORE15, FALLBACK_TEST_MAGIC) };
 }
 
 /// Performs the ROM cache operation from IRAM so the call and return path do
@@ -275,57 +397,99 @@ fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
 fn init_critical() -> Option<Psram> {
-    enable_power_and_clock();
+    let force_fallback = take_fallback_test_request();
+    match init_profile(&PSRAM_200_MHZ, force_fallback) {
+        Ok((psram, phase, data_delay, dqs_delay)) => {
+            log_ready(&PSRAM_200_MHZ, phase, data_delay, dqs_delay);
+            Some(psram)
+        }
+        Err(stage) => {
+            uart::log_hex(&FALLBACK_STAGE_LABEL, stage as u32);
+            uart::log(&FALLBACK_MESSAGE);
+            match init_profile(&PSRAM_80_MHZ, false) {
+                Ok((psram, phase, data_delay, dqs_delay)) => {
+                    log_ready(&PSRAM_80_MHZ, phase, data_delay, dqs_delay);
+                    Some(psram)
+                }
+                Err(_) => None,
+            }
+        }
+    }
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn init_profile(
+    timing: &PsramTiming,
+    force_tuning_failure: bool,
+) -> Result<(Psram, u8, u8, u8), InitStage> {
+    enable_power_and_clock(timing)?;
     configure_pins();
     configure_device_timing();
 
     let mut mr01 = AlignedBytes([0u8; 2]);
     let mut mr23 = AlignedBytes([0u8; 2]);
     let mut mr48 = AlignedBytes([0u8; 2]);
-    if !common_read(REG_READ, 0, REG_READ_DUMMY_BITS, &mut mr01.0)
-        || !common_read(REG_READ, 2, REG_READ_DUMMY_BITS, &mut mr23.0)
-        || !common_read(REG_READ, 4, REG_READ_DUMMY_BITS, &mut mr48.0)
+    if !common_read(REG_READ, 0, timing.register_read_dummy_bits, &mut mr01.0)
+        || !common_read(REG_READ, 2, timing.register_read_dummy_bits, &mut mr23.0)
+        || !common_read(REG_READ, 4, timing.register_read_dummy_bits, &mut mr48.0)
     {
         uart::log(&MODE_REGISTER_TRANSACTION_FAILED);
-        return None;
+        return Err(InitStage::ModeRegisterRead);
     }
-    // Preserve vendor-defined bits while selecting fixed latency, 10-cycle
-    // reads, 5-cycle writes and the 2048-byte x16 linear burst used by IDF.
-    mr01.0[0] = (mr01.0[0] & !0x3F) | (2 << 2) | (1 << 5);
-    mr48.0[0] = (mr48.0[0] & 0x1F) | (2 << 5);
+    // Preserve vendor-defined bits while selecting the profile's fixed read
+    // and write latency plus the 2048-byte x16 linear burst used by IDF.
+    mr01.0[0] = (mr01.0[0] & !0x3F) | (timing.mr0_read_latency_code << 2) | (1 << 5);
+    mr48.0[0] = (mr48.0[0] & 0x1F) | (timing.mr4_write_latency_code << 5);
     if !common_write(REG_WRITE, 0, 0, &mr01.0) || !common_write(REG_WRITE, 4, 0, &mr48.0) {
         uart::log(&MODE_REGISTER_WRITE_FAILED);
-        return None;
+        return Err(InitStage::ModeRegisterWrite);
     }
 
     let mut mr8 = AlignedBytes([0u8; 2]);
-    if !common_read(REG_READ, 8, REG_READ_DUMMY_BITS, &mut mr8.0[..1]) {
+    if !common_read(
+        REG_READ,
+        8,
+        timing.register_read_dummy_bits,
+        &mut mr8.0[..1],
+    ) {
         uart::log(&MR8_READ_FAILED);
-        return None;
+        return Err(InitStage::Mr8Read);
     }
     mr8.0[0] = (mr8.0[0] & !0x4F) | 3 | (1 << 3) | (1 << 6);
     if !common_write(REG_WRITE, 8, 0, &mr8.0) {
         uart::log(&MR8_WRITE_FAILED);
-        return None;
+        return Err(InitStage::Mr8Write);
     }
 
     let reference = AlignedBytes(0x5A6B_7C8Du32.to_le_bytes());
     let mut received = AlignedBytes([0u8; 4]);
-    if !common_write(SYNC_WRITE, 0, WRITE_DUMMY_BITS, &reference.0)
-        || !common_read(SYNC_READ, 0, READ_DUMMY_BITS, &mut received.0)
+    if !common_write(SYNC_WRITE, 0, timing.write_dummy_bits, &reference.0)
+        || !common_read(SYNC_READ, 0, timing.read_dummy_bits, &mut received.0)
     {
         uart::log(&COMMAND_TRANSACTION_TIMEOUT);
-        return None;
+        return Err(InitStage::CommandPath);
     }
     if received.0 != reference.0 {
         uart::log_hex(&COMMAND_READ_LABEL, u32::from_le_bytes(received.0));
         uart::log(&COMMAND_TEST_FAILED);
-        return None;
+        return Err(InitStage::CommandPath);
     }
 
-    tune_dqs()?;
+    let (phase, data_delay, dqs_delay) = match tune_dqs(timing) {
+        Some(point) => point,
+        None => return Err(InitStage::Tuning),
+    };
+    if force_tuning_failure {
+        uart::log(&FORCED_FALLBACK);
+        return Err(InitStage::Tuning);
+    }
+    if !direct_memory_test(timing) {
+        uart::log(&DIRECT_TEST_FAILED);
+        return Err(InitStage::DirectMemoryTest);
+    }
 
-    configure_cache_access();
+    configure_cache_access(timing);
     let map: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> i32 =
         unsafe { transmute(ROM_CACHE_PSRAM_MMU_SET) };
     let result = unsafe {
@@ -340,7 +504,7 @@ fn init_critical() -> Option<Psram> {
     };
     if result != 0 {
         uart::log_hex(&MMU_ERROR_LABEL, result as u32);
-        return None;
+        return Err(InitStage::MmuMap);
     }
 
     // A CPU-only reset leaves L1/L2 cache lines for the former PSRAM mapping
@@ -350,20 +514,42 @@ fn init_critical() -> Option<Psram> {
 
     if !mapped_memory_test() {
         uart::log(&MAPPED_TEST_FAILED);
-        return None;
+        return Err(InitStage::MappedMemoryTest);
     }
 
     let psram = Psram {
         base: PSRAM_VADDR,
         bytes: MAPPED_BYTES,
+        frequency_mhz: timing.frequency_mhz,
     };
-    uart::log(&READY_MESSAGE);
-    Some(psram)
+    Ok((psram, phase, data_delay, dqs_delay))
 }
 
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
-fn enable_power_and_clock() {
+fn take_fallback_test_request() -> bool {
+    let requested = unsafe { read(LP_STORE15) } == FALLBACK_TEST_MAGIC;
+    if requested {
+        unsafe { write(LP_STORE15, 0) };
+    }
+    requested
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn log_ready(timing: &PsramTiming, phase: u8, data_delay: u8, dqs_delay: u8) {
+    uart::log_hex(&PROFILE_MHZ_LABEL, timing.frequency_mhz);
+    uart::log_hex(&READ_LATENCY_LABEL, timing.read_latency_cycles);
+    uart::log_hex(&WRITE_LATENCY_LABEL, timing.write_latency_cycles);
+    uart::log_hex(&DQS_PHASE_LABEL, phase as u32);
+    uart::log_hex(&DQS_DATA_DELAY_LABEL, data_delay as u32);
+    uart::log_hex(&DQS_DELAY_LABEL, dqs_delay as u32);
+    uart::log(&READY_MESSAGE);
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn enable_power_and_clock(timing: &PsramTiming) -> Result<(), InitStage> {
     unsafe {
         // Tab5 connects PSRAM VDD and the optional MPLL domain to LDO channel 2.
         // Channel 2 is unit 1 / ext_ldo[3].  Nominal ECO2 1.8 V is dref=6,mul=5.
@@ -377,6 +563,10 @@ fn enable_power_and_clock() {
     }
     delay();
 
+    if matches!(timing.clock_source, PsramClockSource::Mpll400Mhz) && !configure_mpll_400mhz() {
+        return Err(InitStage::Clock);
+    }
+
     unsafe {
         // Enable the PSRAM system clock before releasing its controller reset.
         modify(HP_SYS_CLKRST + 0x14, 1 << 31, 1 << 31);
@@ -388,22 +578,153 @@ fn enable_power_and_clock() {
     // both sides of the dual-MSPI block before programming it again.
     reset_mspi();
 
-    unsafe {
-        // Select the already-running 480 MHz SPLL, divide its core by one, then
-        // divide both PSRAM buses by six for an 80 MHz DDR clock.
-        modify(
-            HP_SYS_CLKRST + 0x30,
-            (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
-            (2 << 12) | (1 << 14) | (1 << 15),
-        );
+    match timing.clock_source {
+        PsramClockSource::Spll480Mhz => unsafe {
+            // Select the already-running 480 MHz SPLL and divide its core by
+            // one. The two bus dividers below produce the profile frequency.
+            modify(
+                HP_SYS_CLKRST + 0x30,
+                (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
+                (2 << 12) | (1 << 14) | (1 << 15),
+            );
+        },
+        PsramClockSource::Mpll400Mhz => unsafe {
+            // ESP-IDF selects MPLL with source value 1 after calibrating it
+            // to 400 MHz. Keep both the PLL and PSRAM core clocks enabled.
+            modify(
+                HP_SYS_CLKRST + 0x30,
+                (3 << 12) | (1 << 14) | (1 << 15) | (0xFF << 16),
+                (1 << 12) | (1 << 14) | (1 << 15),
+            );
+        },
     }
-    set_bus_divider(MSPI2 + 0x50, 6);
-    set_bus_divider(MSPI3 + 0x14, 6);
+    set_bus_divider(MSPI2 + 0x50, timing.operating_bus_divider);
+    set_bus_divider(MSPI3 + 0x14, timing.operating_bus_divider);
     unsafe {
         modify(MSPI2 + 0x190, 1 << 5, 1 << 5);
         modify(MSPI2 + 0x180, 1 << 5, 1 << 5);
         modify(MSPI3 + 0x200, 1, 1);
     }
+    Ok(())
+}
+
+/// Configures the ESP32-P4 media PLL exactly as ESP-IDF v5.5.3 does for
+/// 200 MHz Hex PSRAM: 40 MHz XTAL * (19 + 1) / (1 + 1) = 400 MHz.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn configure_mpll_400mhz() -> bool {
+    const MPLL_BLOCK: u8 = 0x63;
+    const MPLL_CAL_RSTB_REG: u8 = 1;
+    const MPLL_DIV_REG: u8 = 2;
+    const MPLL_DHREF_REG: u8 = 3;
+    const MPLL_CAL_RSTB: u8 = 1 << 5;
+    const MPLL_DIV_400MHZ: u8 = (19 << 3) | 1;
+    const MPLL_CAL_END: u32 = 1 << 8;
+    const MPLL_CAL_STOP: u32 = 1 << 9;
+
+    unsafe {
+        // The bootloader normally leaves this clock enabled. Force it on so
+        // CPU-only reboot and future bootloader changes cannot break regi2c.
+        modify(LPPERI, 1 << 27, 1 << 27);
+        modify(I2C_ANA_MST + 0x34, 1, 1);
+
+        // Clearing CAL_STOP starts MPLL self-calibration.
+        modify(HP_SYS_CLKRST + 0xBC, MPLL_CAL_STOP, 0);
+    }
+
+    let Some(dhref) = regi2c_read(MPLL_BLOCK, MPLL_DHREF_REG) else {
+        uart::log(&MPLL_READBACK_FAILED);
+        return false;
+    };
+    if !regi2c_write(MPLL_BLOCK, MPLL_DHREF_REG, dhref | (3 << 4)) {
+        uart::log(&MPLL_READBACK_FAILED);
+        return false;
+    }
+    let Some(cal_rstb) = regi2c_read(MPLL_BLOCK, MPLL_CAL_RSTB_REG) else {
+        uart::log(&MPLL_READBACK_FAILED);
+        return false;
+    };
+    if !regi2c_write(MPLL_BLOCK, MPLL_CAL_RSTB_REG, cal_rstb & !MPLL_CAL_RSTB)
+        || !regi2c_write(MPLL_BLOCK, MPLL_CAL_RSTB_REG, cal_rstb | MPLL_CAL_RSTB)
+        || !regi2c_write(MPLL_BLOCK, MPLL_DIV_REG, MPLL_DIV_400MHZ)
+    {
+        uart::log(&MPLL_READBACK_FAILED);
+        return false;
+    }
+
+    let mut timeout = 5_000_000u32;
+    while unsafe { read(HP_SYS_CLKRST + 0xBC) } & MPLL_CAL_END == 0 {
+        if timeout == 0 {
+            unsafe { modify(HP_SYS_CLKRST + 0xBC, MPLL_CAL_STOP, MPLL_CAL_STOP) };
+            uart::log(&MPLL_TIMEOUT);
+            return false;
+        }
+        timeout -= 1;
+        core::hint::spin_loop();
+    }
+    unsafe { modify(HP_SYS_CLKRST + 0xBC, MPLL_CAL_STOP, MPLL_CAL_STOP) };
+
+    if regi2c_read(MPLL_BLOCK, MPLL_DIV_REG) != Some(MPLL_DIV_400MHZ) {
+        uart::log(&MPLL_READBACK_FAILED);
+        return false;
+    }
+    true
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn regi2c_select_mpll() {
+    unsafe {
+        // ESP32-P4's analog master routes MPLL block 0x63 through bit 9.
+        modify(I2C_ANA_MST + 0x1C, 0x00FF_FFFF, 0);
+        modify(I2C_ANA_MST + 0x20, 0x00FF_FFFF, 1 << 9);
+    }
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn regi2c_wait_idle() -> bool {
+    let mut timeout = 1_000_000u32;
+    while unsafe { read(I2C_ANA_MST) } & (1 << 25) != 0 {
+        if timeout == 0 {
+            return false;
+        }
+        timeout -= 1;
+        core::hint::spin_loop();
+    }
+    true
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn regi2c_read(block: u8, register: u8) -> Option<u8> {
+    regi2c_select_mpll();
+    if !regi2c_wait_idle() {
+        return None;
+    }
+    unsafe {
+        write(I2C_ANA_MST, (block as u32) | ((register as u32) << 8));
+    }
+    if !regi2c_wait_idle() {
+        return None;
+    }
+    Some((unsafe { read(I2C_ANA_MST) } >> 16) as u8)
+}
+
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn regi2c_write(block: u8, register: u8, value: u8) -> bool {
+    regi2c_select_mpll();
+    if !regi2c_wait_idle() {
+        return false;
+    }
+    unsafe {
+        write(
+            I2C_ANA_MST,
+            (block as u32) | ((register as u32) << 8) | ((value as u32) << 16) | (1 << 24),
+        );
+    }
+    regi2c_wait_idle()
 }
 
 /// Resets the shared AXI and APB portions of the dual-MSPI controller.
@@ -477,16 +798,16 @@ fn configure_device_timing() {
 
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
-fn configure_cache_access() {
+fn configure_cache_access(timing: &PsramTiming) {
     let cache_sctrl = 1
         | (1 << 3)
         | (1 << 4)
         | (1 << 5)
-        | ((READ_DUMMY_BITS - 1) << 6)
+        | ((timing.read_dummy_bits - 1) << 6)
         | (31 << 14)
         | (1 << 20)
         | (1 << 21)
-        | ((WRITE_DUMMY_BITS - 1) << 22);
+        | ((timing.write_dummy_bits - 1) << 22);
     unsafe {
         write(MSPI2 + 0x40, cache_sctrl);
         modify(
@@ -509,55 +830,58 @@ fn configure_cache_access() {
 
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
-fn tune_dqs() -> Option<(u8, u8, u8)> {
+fn tune_dqs(timing: &PsramTiming) -> Option<(u8, u8, u8)> {
     // The tested Tab5 repeatedly selected the centre point below. Validate it
     // with the same 100 reads used for every full-sweep candidate and avoid
     // scanning all 31 delay points when it is still stable. Any failure falls
     // through to the complete ESP-IDF-style tuning sweep.
-    const PREFERRED_PHASE: u8 = 0;
-    const PREFERRED_DATA_DELAY: u8 = 0;
-    const PREFERRED_DQS_DELAY: u8 = 0;
-
     let reference =
         unsafe { core::slice::from_raw_parts(TUNING_REFERENCE_WORDS.as_ptr() as *const u8, 128) };
 
-    // Write the reference at 20 MHz with all tuning delays cleared.
-    set_bus_divider(MSPI2 + 0x50, 24);
-    set_bus_divider(MSPI3 + 0x14, 24);
+    // Write the reference at the profile's conservative tuning clock with all
+    // delays cleared before switching back to the operating divider.
+    set_bus_divider(MSPI2 + 0x50, timing.tuning_bus_divider);
+    set_bus_divider(MSPI3 + 0x14, timing.tuning_bus_divider);
     clear_tuning();
     for chunk in 0..2 {
         if !common_write(
             SYNC_WRITE,
             0x80 + chunk * 64,
-            WRITE_DUMMY_BITS,
+            timing.write_dummy_bits,
             &reference[chunk as usize * 64..chunk as usize * 64 + 64],
         ) {
             uart::log(&TUNING_WRITE_TIMEOUT);
             return None;
         }
     }
-    set_bus_divider(MSPI2 + 0x50, 6);
-    set_bus_divider(MSPI3 + 0x14, 6);
+    set_bus_divider(MSPI2 + 0x50, timing.operating_bus_divider);
+    set_bus_divider(MSPI3 + 0x14, timing.operating_bus_divider);
     unsafe {
         modify(MSPI3 + 0xD4, 1 << 1, 0);
     }
 
-    set_dqs_phase(PREFERRED_PHASE);
-    set_all_delays(PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY);
-    if reference_matches(reference, 100) {
-        unsafe {
-            modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+    if timing.use_preferred_dqs {
+        set_dqs_phase(timing.preferred_dqs_phase);
+        set_all_delays(timing.preferred_data_delay, timing.preferred_dqs_delay);
+        if reference_matches(timing, reference, 100) {
+            unsafe {
+                modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
+            }
+            return Some((
+                timing.preferred_dqs_phase,
+                timing.preferred_data_delay,
+                timing.preferred_dqs_delay,
+            ));
         }
-        return Some((PREFERRED_PHASE, PREFERRED_DATA_DELAY, PREFERRED_DQS_DELAY));
+        uart::log(&PREFERRED_DQS_FAILED);
     }
-    uart::log(&PREFERRED_DQS_FAILED);
 
     let mut phase_storage = core::mem::MaybeUninit::<[bool; 4]>::uninit();
     zero_memory(phase_storage.as_mut_ptr().cast::<u8>(), 4);
     let phase_good = unsafe { phase_storage.assume_init_mut() };
     for phase in 0..4u8 {
         set_dqs_phase(phase);
-        phase_good[phase as usize] = reference_matches(reference, 1);
+        phase_good[phase as usize] = reference_matches(timing, reference, 1);
     }
     let (phase_len, phase_end) = longest_run(phase_good);
     if phase_len == 0 {
@@ -573,7 +897,7 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
         let (data, dqs) = delay_pair(index);
         set_dqs_phase(best_phase);
         set_all_delays(data, dqs);
-        delay_good[index as usize] = reference_matches(reference, 100);
+        delay_good[index as usize] = reference_matches(timing, reference, 100);
     }
     let (delay_len, delay_end) = longest_run(delay_good);
     if delay_len <= 1 {
@@ -587,12 +911,14 @@ fn tune_dqs() -> Option<(u8, u8, u8)> {
     unsafe {
         modify(MSPI3 + 0xD4, 1 << 1, 1 << 1);
     }
+    uart::log_hex(&DQS_WINDOW_START_LABEL, (delay_end + 1 - delay_len) as u32);
+    uart::log_hex(&DQS_WINDOW_LENGTH_LABEL, delay_len as u32);
     Some((best_phase, best_data, best_dqs))
 }
 
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
-fn reference_matches(reference: &[u8], attempts: usize) -> bool {
+fn reference_matches(timing: &PsramTiming, reference: &[u8], attempts: usize) -> bool {
     let mut received_storage = core::mem::MaybeUninit::<AlignedBytes<128>>::uninit();
     zero_memory(received_storage.as_mut_ptr().cast::<u8>(), 128);
     let received = unsafe { received_storage.assume_init_mut() };
@@ -601,7 +927,7 @@ fn reference_matches(reference: &[u8], attempts: usize) -> bool {
             if !common_read(
                 SYNC_READ,
                 0x80 + chunk * 64,
-                READ_DUMMY_BITS,
+                timing.read_dummy_bits,
                 &mut received.0[chunk as usize * 64..chunk as usize * 64 + 64],
             ) {
                 return false;
@@ -681,6 +1007,44 @@ fn set_all_delays(data: u8, dqs: u8) {
     }
 }
 
+/// Exercises the tuned direct-command path at both ends and across the two
+/// framebuffer/heap regions before the cache MMU is enabled.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.psram")]
+fn direct_memory_test(timing: &PsramTiming) -> bool {
+    let locations = [
+        0u32,
+        PAGE_BYTES as u32 - 4,
+        FRAMEBUFFER_BYTES as u32 - 4,
+        FRAMEBUFFER_BYTES as u32,
+        (MAPPED_BYTES / 2) as u32,
+        MAPPED_BYTES as u32 - 4,
+    ];
+    for round in 0..16u32 {
+        let walking = 1u32 << ((round * 2) & 31);
+        let pattern = if round & 1 == 0 { walking } else { !walking };
+        for (index, &address) in locations.iter().enumerate() {
+            let expected = pattern ^ address.rotate_left(index as u32);
+            let bytes = AlignedBytes(expected.to_le_bytes());
+            if !common_write(SYNC_WRITE, address, timing.write_dummy_bits, &bytes.0) {
+                return false;
+            }
+        }
+        for (index, &address) in locations.iter().enumerate() {
+            let expected = pattern ^ address.rotate_left(index as u32);
+            let mut bytes = AlignedBytes([0u8; 4]);
+            if !common_read(SYNC_READ, address, timing.read_dummy_bits, &mut bytes.0)
+                || u32::from_le_bytes(bytes.0) != expected
+            {
+                uart::log_hex(&BAD_ADDRESS_LABEL, address);
+                uart::log_hex(&BAD_VALUE_LABEL, u32::from_le_bytes(bytes.0));
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
 fn mapped_memory_test() -> bool {
@@ -689,24 +1053,28 @@ fn mapped_memory_test() -> bool {
         PSRAM_VADDR + PAGE_BYTES - 4,
         PSRAM_VADDR + FRAMEBUFFER_BYTES - 4,
         PSRAM_VADDR + FRAMEBUFFER_BYTES,
+        PSRAM_VADDR + MAPPED_BYTES / 2,
         PSRAM_VADDR + MAPPED_BYTES - 4,
     ];
-    let patterns = [
-        0x0123_4567u32,
-        0x89AB_CDEF,
-        0x55AA_33CC,
-        0xA5A5_5A5A,
-        0xC001_CAFE,
-    ];
-    for index in 0..locations.len() {
-        unsafe { (locations[index] as *mut u32).write_volatile(patterns[index]) };
-    }
-    for index in 0..locations.len() {
-        let value = unsafe { (locations[index] as *const u32).read_volatile() };
-        if value != patterns[index] {
-            uart::log_hex(&BAD_ADDRESS_LABEL, locations[index] as u32);
-            uart::log_hex(&BAD_VALUE_LABEL, value);
-            return false;
+    for round in 0..8u32 {
+        let walking = 1u32 << ((round * 4) & 31);
+        let pattern = if round & 1 == 0 { walking } else { !walking };
+        for (index, &location) in locations.iter().enumerate() {
+            let expected = pattern ^ (location as u32).rotate_left(index as u32);
+            unsafe { (location as *mut u32).write_volatile(expected) };
+            let line = location & !(CACHE_LINE_BYTES - 1);
+            if !iram_cache_writeback_invalidate(line as u32, CACHE_LINE_BYTES as u32) {
+                return false;
+            }
+        }
+        for (index, &location) in locations.iter().enumerate() {
+            let expected = pattern ^ (location as u32).rotate_left(index as u32);
+            let value = unsafe { (location as *const u32).read_volatile() };
+            if value != expected {
+                uart::log_hex(&BAD_ADDRESS_LABEL, location as u32);
+                uart::log_hex(&BAD_VALUE_LABEL, value);
+                return false;
+            }
         }
     }
     true

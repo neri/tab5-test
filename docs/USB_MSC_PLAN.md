@@ -4,7 +4,157 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
 > コードを優先してください。
 
-## 状態: Stage 1〜6 ✅ 完了（実機確認済み、本計画のゴール達成）
+## 状態: Stage 1〜6・第10版120分複合試験完了
+
+## 追補（2026-08-21）: 連続READ(10)のtimeoutとReset Recovery
+
+表示・PSRAM・SD・USBを同時に動かす`mix 1`の実機試験で、USB MSCの4 KiB READ(10)が
+37回完了した後にBulk IN timeoutとなった。`HPRT=0x00001005`はroot portのconnected、
+enabled、poweredが維持され、1 ms間の`HFNUM`も進んでいた。表示は2,138 frame、
+PSRAM heap検査は2,110回、DPI underrunとdisplay DMA errorはともに0だったため、
+PSRAM 200 MHz化によるシステム停止やVBUS断ではなく、USB BOT transport単体の失敗と判断した。
+
+従来は1パケットの待ち時間が固定20,000,000 iterationで、CPU 360 MHz時は約444 msだった。
+さらにtimeout後はchannelをhaltするだけで、persistする`BulkOnlyTransport`のdevice側BOT phaseと
+IN／OUT toggleを同期し直していなかった。このため1回の失敗後も同じsessionを使う個別commandが
+不安定になり得た。HCDの`control transfer timed out`という表示も共通`run_packet`の固定文言で、
+今回のログはcontrol transferではなくBulk IN packetのtimeoutだった。
+
+最初の対策としてpacket timeoutをCPU周波数追従の約2秒へ変更し、command途中のtransport失敗時は
+Mass Storage Reset class request、Bulk IN／OUT両方の`CLEAR_FEATURE(ENDPOINT_HALT)`、host側
+toggleのDATA0復帰を順に行うBOT Reset Recoveryを追加した。READ(10)はread-onlyなのでRecovery後に
+1回だけ再送し、将来のWRITE系commandは共通層で自動再送しない。短い実機試験用に、同じ4 KiBを
+既定100回read・比較してRecovery再送数も表示する`ut [count]`を追加した。`ut`と`mix 1`による
+実機再確認は未完了である。
+
+追加後の`ut`既定100回では、最初のBulk IN timeout後にReset Recoveryが成功してREAD(10)を
+再送できたが、92/100回で2回目のtimeoutとなった。2回目はMass Storage ResetのSETUP後、
+EP0 IN status待ちがtimeoutし、その後の`CLEAR_FEATURE`もQTD status 1で失敗した。
+`HPRT=0x00001005`と`HFNUM`進行は引き続き正常で、data mismatchは0件だった。
+
+control層にも固定2,000,000 iterationが残っており、CPU 360 MHzでは約44 msしかなかった。
+1回目はその時間内にResetが完了したが、2回目は完了前に打ち切られたと判断した。Bulk timeoutを
+約5秒、control timeoutを約1秒のCPU周波数追従値へ変更し、Mass Storage Resetが完了しなかった
+場合は未知のBOT phaseへ後続`CLEAR_FEATURE`を送らずRecovery失敗として終了するよう修正した。
+第2版の`ut`は91/100回でQTD status 1を発生した。最初はCBW Bulk OUTでstatus 1となりBOT Resetは
+成功したが、再送READ(10)のBulk INも同じstatusとなり、その後はReset Recoveryの
+`CLEAR_FEATURE` SETUPもstatus 1で失敗した。command retry 1、failure 1、mismatch 0だった。
+
+ESP-IDF v5.5.3の`usb_dwc_ll.h`ではQTD status 1はpacket errorで、CRC、transaction timeout、
+stuff、false EOPに加えてexcessive NAKも含む。これはCBWをdeviceが受理したという意味ではなく、
+同じDATA PIDでのUSB packet再送が可能な状態である。OUTのACKだけを失ってdeviceが既に受理して
+いた場合も、同じPIDのduplicateは再消費されない。従来はこのstatusを即座にBOT phase破綻として
+Resetへ昇格していたため、deviceの一時的なNAK／packet errorを重いRecoveryへ変換していた。
+
+第3版ではQTD status 1を他のtransaction errorから分離し、toggleを進めず同一packetを50 ms間隔、
+最大20回まで再送する。packet retryを使い切った場合だけ従来のBOT Reset Recoveryへ進む。
+`ut`と`mix`はpacket retryとcommand retryを別々に計数する。
+
+第3版の`ut`は91/100回で5秒のBulk IN timeoutを3回発生した。各timeout後のBOT Reset Recoveryは
+成功し、最初の2回はREAD(10)も再送できたが、3回目でcommand再送を使い切った。結果は
+failure 1、mismatch 0、packet retry 0、command retry 2で、その後deviceがroot portから切断され
+再スキャンとなった。QTD status 1ではなくchannel halt自体が来ない症状で、発生位置が前版と同じ
+約91 commandだったため、timeout値やpacket retryだけではない決定的な累積条件が残っていた。
+
+コードを再確認すると、4 KiB READ(10)をendpoint MPSごとに1 QTDへ分割し、High-Speed MPS
+512 byteの実機ではデータフェーズだけでcommand当たり8回channel 0をhalt／restartしていた。
+`ut` 91回ではCBW／CSWを含め約1,000回の起動となる。一方、ESP-IDF 5.5.3のdescriptor DMA契約では
+1 QTDが複数MPS packetを自動的に処理し、非0 byteのBulk IN QTD長はMPSの倍数でなければならない。
+従来は13 byte CSW等の短いbufferもQTDへ直接渡しており、この契約から外れていた。
+
+第4版では4 KiB READ(10)を1 QTDへまとめ、High-Speedで`ut` 100回のchannel起動を約1,100回から約200回へ
+削減する。13 byte CSW、36 byte INQUIRY、8 byte READ CAPACITYはMPSサイズの内蔵SRAM stagingで
+受け、実受信長だけをコピーする。1 packet QTDだけは第3版の局所再送を維持するが、複数packet
+QTDのstatus 1はdevice toggleが何packet進んだか不明なので全体再送せずBOT Resetへ昇格する。
+
+第4版`ut`も91/100回でBulk INが5秒待ち切れとなり、最初のBOT Reset後のREAD(10)再送も
+Bulk IN timeoutとなった。2回目のRecoveryでは両`CLEAR_FEATURE`のIN statusがQTD status 1で
+失敗し、failure 1、mismatch 0、packet retry 0、command retry 1だった。集約前と同じcommand位置で
+再現したため、channel再起動数を主因とした仮説は棄却する。ただしQTD集約とshort response stagingは
+descriptor DMA契約への適合として維持する。次は既定High-Speedと`usbfs on`のFull-Speedを同じ
+`ut`で比較し、High-Speed PHY／transaction固有か、速度に依存しないBOT／device側かを切り分ける。
+
+Full-Speed切替を依頼した次の`ut`ログは36/100回で4 KiB Bulk IN QTDがstatus 1となったが、
+当時の出力には強制modeとendpoint MPSがなく、実際にFull-Speed再列挙されたことをログ単体では
+証明できない。このfailureでは`packet retries exhausted`と表示した一方、複数packet QTDを即Resetへ
+送る第4版のため`packet_retries=0`だった。続くRecoveryは両`CLEAR_FEATURE`のSETUPでstatus 1となり、
+failure 1、mismatch 0、command retry 0で終了した。
+
+第5版は`ut`開始時に`host=High-Speed|FS-only`とBulk IN MPSを表示する。さらに複数packetのBulk IN
+QTDがstatus 1になった場合、descriptorの残量から正常受信済みの完全MPS packet数を求め、そのbyteを
+保持する。次のDATA PIDを成功packet数の偶奇で進め、未受信のMPS-multiple suffixだけを50 ms後に
+再投入する。進捗がMPS境界でなければ曖昧な状態を再利用せずBOT Resetへ進む。
+
+第5版をbuildし直してもmode/MPS行が出なかった原因は、診断行を`ut`ではなく直前の`mix`に
+誤挿入した実装ミスだった。第5版相当の実機`ut`は引き続き91/100で5秒のBulk IN timeoutを3回
+発生し、各BOT Resetは成功、failure 1、mismatch 0、packet retry 0、command retry 2だった。
+status 1のpartial再投入はこのtimeout経路には入らないため、期待どおり結果を変えなかった。
+
+第6版ではmode/MPS表示を共通helperにして`ut`と`mix`の両方から正しく呼ぶ。Bulk QTDの1回の
+待ちを約1秒へ短縮し、timeout時にchannelをhaltした後のQTD残量をcache同期して回収する。
+正常受信済みの完全MPS prefixを保持し、次DATA PIDと未受信suffixを復元して同じBOT phase内で
+最大4回再投入する。合計待ちは従来と同じ約5秒で、それでも完了しない場合だけBOT Resetへ進む。
+
+第6版をHigh-Speed、Bulk IN MPS 512 byteで実機確認した。`ut`既定100回は100/100、failure 0、
+mismatch 0、QTD retry 2、command retry 0でPASSした。2回の一時停止をBOT Resetへ昇格せず同一
+phase内のQTD再投入で回復しており、従来91/100で再現したfailureを解消した。直接原因はPSRAM
+帯域やHigh-Speed PHYではなく、descriptor DMAが長時間haltしない場合に1個のQTDを5秒間放置し、
+その後すぐBOT Resetしていた回復粒度だった。次の受入試験は`mix 1`、その後`mix`既定120分とする。
+
+同じ第6版の`mix 1`はHigh-Speed／MPS 512 byteで、3,441 frame、SD/USB I/O 57回、PSRAM heap
+検査3,138回を完走した。途中のBulk INはQTD再投入4回を使い切った後にBOT Reset Recoveryと
+READ(10) command再送1回で回復した。外部mediaの不一致、DPI underrun、display DMA errorは
+すべて0で、`mix: PASS`となった。短時間複合試験を合格とし、残る実機条件は120分の`mix`である。
+
+第6版の120分`mix`はI/O 37回目でQTD再投入4回を使い切り、続くBOT Reset Recoveryの両endpoint
+halt解除がEP0 IN statusのQTD status 1で失敗した。2,545 frame、heap検査2,110回までのDPI
+underrunとdisplay DMA errorは0で、USBだけを理由に約44秒で終了した。BOT Resetが完了しないsessionを
+再利用してはならないが、root port reset後の再列挙ならdevice address、configuration、endpoint
+toggleをすべて作り直せる。
+
+第7版の`mix`はUSB transport failure時に現在sessionのretry数を集計してborrowを解放し、root portを
+最大3回rescanする。新しくattachしたMSCをreadyにしてLBA 0の4 KiBを再読出しし、試験開始時の
+referenceと完全一致した場合だけsoakを継続する。不一致は即FAIL、3回連続で再列挙またはreadに
+失敗した場合は`USB transport failed after rescan`で終了する。結果には`rescans`も表示する。
+
+第7版`mix 2`は、起動時のHigh-Speed Hub配下の列挙に失敗してMSCが未登録だったため、soak開始前の
+`no USB Mass Storage`で終了した。第7版はsoak中のBOT failureからだけ再列挙するため、setup時の
+未登録を回復できなかった。第8版はsetupでMSCが未登録またはnot readyの場合にもroot portを最大3回
+同期的にrescanする。readyになった後の基準4 KiB readが失敗した場合も同様に再列挙し、基準dataを
+取得できてから時間計測を開始する。実機識別markerは`MIX TEST: recovery v8`とする。
+第8版はformat/check/release build、ELF/ESP image検査に合格し、app imageは379,632 byte、
+XIP 2 segment＋RAM 2 segmentを維持した。
+
+第8版実機ではHub port 2/3の列挙失敗後、空slotの増分scanが同じ接続を約1秒ごとにreset・再列挙し、
+ログが連続した。第9版は列挙失敗した物理接続を保留し、背景処理はconnection/change bitのquiet監視
+だけを行う。抜き差しまたは明示的full rescanまでdescriptor取得を再試行しない。起動markerは
+`USB ENUM: bounded retry v9`、`mix` markerは`MIX TEST: recovery v9`とする。
+第9版はformat/check/release build、ELF/ESP image検査に合格し、app imageは379,728 byte、
+XIP 2 segment＋RAM 2 segmentを維持した。
+
+第9版`mix 2`では連続background logは止まったが、3回のfull rescanすべてでHub port 2のHS deviceが
+最初のdevice descriptor IN data stageでQTD status 1となり、MSCを取得できなかった。port 1のLS
+keyboardは毎回Split列挙でき、port 3のFS deviceはSplit transaction errorだった。root resetを跨いで
+同じ失敗位置のため、Hub／device側の状態がVBUS維持中に残る可能性がある。
+
+第10版は通常rescanを3回使い切った場合にUSB-A VBUSを1秒offにし、registryを破棄してHubと全deviceを
+電源投入状態から再列挙する。setup、基準read、soak中のtransport failureのいずれでも同じ最終回復を
+使うが、1試験あたり最大1回とする。再列挙後のLBA 0 4 KiBが開始時referenceと一致した場合だけsoakを
+継続し、結果に`power_cycles`を表示する。実機markerは`MIX TEST: recovery v10`とする。
+第10版はformat/check/release build、ELF/ESP image検査に合格し、app imageは381,696 byte、
+XIP 2 segment＋RAM 2 segmentを維持した。
+
+第10版`mix 2`ではsetupのroot rescan 3回後にVBUS power-cycleを1回実行し、LS keyboard、HS MSC
+（Bulk IN MPS 512）、FS mouseを正常列挙できた。soak中にはBulk IN QTD retry exhaustedとBOT Reset
+failureが1回発生したが、root rescan後のread-only 4 KiBがreferenceと完全一致し、試験を継続した。
+6,881 frame、I/O 118回、heap検査6,647回、packet retry 22、command retry 0、rescan 5、
+power-cycle 1、DPI underrun 0、display DMA error 0で`mix: PASS`となった。第10版の短時間複合試験を
+合格とし、残る受入条件は既定120分の`mix`である。
+
+第10版`mix`既定120分は412,801 frame、I/O 7,228回、PSRAM heap検査411,508回を完走した。
+packet retry 132、command retry 0、root rescan 4、VBUS power-cycle 1でUSB read-only sessionを
+回復し、data mismatch、DPI underrun、display DMA errorはいずれも0だった。`mix: PASS`を確認し、
+長時間複合受入条件を完了とする。
 
 USB-A**直結**のUSBメモリで、列挙・Bulk-Only Transport・SCSI
 （INQUIRY/TEST UNIT READY/READ CAPACITY(10)/READ(10)）・SDカードと共通の

@@ -851,6 +851,17 @@ SETUP再同期用に一度実行し、元の`GET_PORT_STATUS`を再試行する�
 このため、既存のキーボード／ストレージのアドレスと構成を一時的なエラーのために
 破棄しない。
 
+### 列挙失敗ポートの再試行上限
+
+増分スキャンで接続中ポートのdevice descriptor取得に失敗するとslotは空のまま残るため、従来は
+次の60 frame周期で同じportを再びreset・列挙していた。永続的なtransaction errorではport 2/3の
+列挙エラーが約1秒ごとに出続け、console入力と診断試験を妨げた。
+
+失敗または未対応deviceのslotを保留maskへ記録し、背景処理ではHubのconnection/change bitだけを
+quietに読む。接続が変わらない間はresetもdescriptor readも行わない。切断／再接続edgeを検出した
+場合、または`usbrescan`や`mix`がfull rescanした場合だけ再試行する。実機識別markerは
+`USB ENUM: bounded retry v9`である。
+
 さらに減らす場合はハブのStatus Change Interruptエンドポイントを使う手があるが、
 全ポート使用中は完全に無音になったため優先度は低い。
 

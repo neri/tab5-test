@@ -357,6 +357,22 @@ fn set_vbus(on: bool) -> bool {
     set_vbus_bit(VBUS_ENABLE_BIT, on)
 }
 
+/// Fully removes and restores USB-A device power. A root-port reset does not
+/// discharge a hub or MSC, so a device-side EP0/TT state can otherwise
+/// survive every software rescan. Callers must discard all live USB sessions
+/// before invoking this function.
+pub(super) fn power_cycle_vbus() -> bool {
+    if !set_vbus(false) {
+        return false;
+    }
+    delay_ms(1_000);
+    if !set_vbus(true) {
+        return false;
+    }
+    delay_ms(250);
+    true
+}
+
 fn rmw_bit(register: u8, bit: u8, set_bit: bool) -> bool {
     let Some(current) = pi4ioe2_read(register) else {
         return false;
@@ -700,7 +716,8 @@ const HCSPLT_SPLTENA: u32 = 1 << 31;
 // (bits[7:0], must be 0xFF for non-periodic channels or the channel can
 // freeze -- ESP-IDF's `usb_dwc_ll_hctsiz_init` comment) and bits[15:8] as
 // NTD (number of transfer descriptors - 1). `run_packet` always runs one
-// QTD per packet, so NTD is always 0.
+// QTD, which may describe one packet or a larger MPS-multiple transfer, so
+// NTD is always 0.
 const HCTSIZ_SCHED_INFO_ALL: u32 = 0xFF;
 const HCTSIZ_PID_DATA1: u32 = 2 << 29; // 2'b10; DATA0 is 2'b00
 
@@ -725,6 +742,7 @@ const QTD_EOL: u32 = 1 << 26;
 const QTD_STATUS_SHIFT: u32 = 28;
 const QTD_STATUS_MASK: u32 = 0x3 << QTD_STATUS_SHIFT;
 const QTD_STATUS_SUCCESS: u32 = 0;
+const QTD_STATUS_PACKET_ERROR: u32 = 1 << QTD_STATUS_SHIFT;
 const QTD_ACTIVE: u32 = 1 << 31;
 
 #[repr(C, align(512))]
@@ -886,10 +904,22 @@ impl<'a> Channel0Transfer<'a> {
             }
             return PacketOutcome::Error;
         }
+        if status == QTD_STATUS_PACKET_ERROR {
+            if self.endpoint.is_in && transferred > 0 {
+                cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+            }
+            if !quiet_errors {
+                uart::log_hex(
+                    b"USB: transfer QTD packet error, status=",
+                    status >> QTD_STATUS_SHIFT,
+                );
+            }
+            return PacketOutcome::PacketError(transferred);
+        }
         if status != QTD_STATUS_SUCCESS {
             if !quiet_errors {
                 uart::log_hex(
-                    b"USB: transfer QTD error, status=",
+                    b"USB: transfer QTD buffer/reserved error, status=",
                     status >> QTD_STATUS_SHIFT,
                 );
             }
@@ -901,12 +931,22 @@ impl<'a> Channel0Transfer<'a> {
         PacketOutcome::Ok(transferred)
     }
 
-    fn cancel(&mut self, token: TransferToken) {
+    fn cancel(&mut self, token: TransferToken) -> usize {
         if token == self.token {
+            let qtd_address = &raw mut self.qtd as usize;
+            cache_writeback_invalidate(qtd_address, 8);
+            let control_after = unsafe { read(qtd_address) };
+            let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+            let transferred = self.buffer.len().saturating_sub(remaining);
+            if self.endpoint.is_in && transferred > 0 {
+                cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+            }
             self.state = TransferSlotState::Reaped;
             USB_CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
+            transferred
         } else {
             USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            0
         }
     }
 }
@@ -1617,7 +1657,11 @@ fn poll_until(address: usize, mask: u32, want_set: bool, timeout_iterations: u32
 /// stale (see `UsbKeyboard::needs_reinit`).
 pub enum PacketOutcome {
     Ok(usize),
-    Timeout,
+    /// Channel did not halt within the budget; payload is QTD byte progress.
+    Timeout(usize),
+    /// QTD status 1: CRC/transaction timeout/stuff/false-EOP/excessive-NAK.
+    /// The payload is the number of bytes completed before the failed packet.
+    PacketError(usize),
     Error,
 }
 
@@ -2271,8 +2315,11 @@ fn wait_for_periodic_channel_halt(slot: usize, timeout_cycles: u32) -> (Option<u
     }
 }
 
-/// Runs one packet (a single-entry, halt-on-complete QTD) on channel 0 to
-/// completion and returns the number of bytes actually transferred.
+/// Runs one single-entry, halt-on-complete QTD on channel 0 and returns the
+/// number of bytes actually transferred. Most callers supply one MPS-sized
+/// packet. An unsplit descriptor-DMA Bulk IN QTD may instead contain a larger
+/// MPS-multiple transfer, which the DWC hardware splits into USB packets while
+/// advancing DATA PID internally.
 ///
 /// Every field is rewritten from scratch on every call (HCCHAR, HCTSIZ,
 /// the QTD) rather than incrementally patched, so a single packet is fully
@@ -2340,15 +2387,15 @@ pub fn run_packet(
         Some(hcint) => hcint,
         None => {
             if !quiet_timeout {
-                uart::log(b"USB: control transfer timed out waiting for channel halt\r\n");
+                uart::log(b"USB: packet timed out waiting for channel halt\r\n");
                 log_port_state();
             }
             // Leave the channel in a known-idle state regardless of why we
             // gave up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is
             // not racing whatever the core was still doing.
             force_halt_channel();
-            transfer.cancel(token);
-            return PacketOutcome::Timeout;
+            let transferred = transfer.cancel(token);
+            return PacketOutcome::Timeout(transferred);
         }
     };
     if !transfer.note_completion(token, hcint) {
@@ -2518,7 +2565,7 @@ fn run_split_packet(
             uart::log(b"USB: split transfer timed out waiting for the hub's TT\r\n");
             log_port_state();
         }
-        return PacketOutcome::Timeout;
+        return PacketOutcome::Timeout(0);
     };
 
     if hcint & HCINT_STALL != 0 {

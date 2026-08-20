@@ -336,7 +336,7 @@ impl InterruptIn {
                 self.consecutive_hard_errors = 0;
                 n
             }
-            PacketOutcome::Timeout => {
+            PacketOutcome::Timeout(_) => {
                 // Routine while idle: `SET_IDLE(0)` means the device NAKs
                 // (silently, in `hcd::run_packet`) until something
                 // actually changes. Not a sign the session is stale, so it
@@ -344,7 +344,7 @@ impl InterruptIn {
                 self.consecutive_hard_errors = 0;
                 return None;
             }
-            PacketOutcome::Error => {
+            PacketOutcome::PacketError(_) | PacketOutcome::Error => {
                 // `hcd::run_packet` already logged the specific HCINT/QTD
                 // status (unless this streak already has). A real
                 // transaction error (as opposed to a NAK timeout) usually

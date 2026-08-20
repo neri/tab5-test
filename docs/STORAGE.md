@@ -42,6 +42,29 @@ INQUIRY、TEST UNIT READY、READ CAPACITY(10)、READ(10)です。Bulk転送は
 コントロール転送ではないため`protocol.rs`を通らず、`hcd.rs`のパケット
 プリミティブを直接使い、エンドポイントごとのデータトグルを自分で管理します。
 
+Bulk QTDはCPU周波数から約1秒で一度区切り、同じBOT phaseのまま最大4回再投入するため、
+合計待ち時間は約5秒です。BOT Reset Recoveryでも使うcontrol packetは約1秒です。CBW送信後に
+Bulk転送がtimeout／transaction error、またはCSW不正になった場合は、BOT Reset
+Recovery（Mass Storage Reset class request、Bulk IN／OUTそれぞれの
+`CLEAR_FEATURE(ENDPOINT_HALT)`、host toggleのDATA0復帰）を実行します。
+読み出し専用のREAD(10)だけはRecovery後に1回再送します。将来WRITE(10)を実装しても、
+書き込み済みか不明なcommandを自動再送しないよう、再送処理はBOT共通層ではなく
+`UsbMassStorage::read_blocks`に限定しています。
+
+descriptor DMAのQTD status 1はESP-IDF 5.5.3と同じくpacket error
+（CRC、transaction timeout、stuff、false EOP、excessive NAK）として扱います。
+1 packetだけのQTDではendpoint toggleを進めず、同一packet／同一DATA PIDを50 ms間隔で
+最大20回まで再送します。ACKを失ったOUTでもdevice側は同じPIDのduplicateを再消費しないため
+安全です。timeoutまたは複数packetのBulk IN QTD errorではdescriptorの残量から正常受信済みの完全MPS packet数を
+求め、そのbyteを保持し、DATA PIDをpacket数だけ進めて未受信suffixだけを再投入します。進捗が
+MPS境界でない場合は安全に再開できないためBOT Reset Recoveryへ昇格します。
+
+Bulk INのデータフェーズは、4 KiB READ(10)をendpoint MPSごとのQTDへ分割せず、descriptor
+DMAが1 QTD内でpacketへ分割します。High-Speed MPS 512 byteの実機では`ut`既定100回で
+約1,000回だったchannel 0の起動を約200回へ減らします。QTDのIN byte数はMPSの倍数にする必要があるため、
+13 byte CSW、36 byte INQUIRY、8 byte READ CAPACITYはMPSサイズの内蔵SRAM stagingへ受け、
+実受信byteだけを呼び出し側へコピーします。
+
 USBハブのポートに挿したUSBメモリも同じレジストリに乗ります
 （[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md) Stage F）。`usbmsc`／
 `usbread`／`usbmbr`はいずれもレジストリを引くので、直結とハブ経由を
@@ -61,6 +84,7 @@ USBハブのポートに挿したUSBメモリも同じレジストリに乗り�
 | `usbmsc` | INQUIRY／TEST UNIT READY／READ CAPACITY(10)の結果を表示 |
 | `usbread <lba>` | SCSI READ(10)で1ブロック読み出してUARTへダンプ |
 | `usbmbr` | LBA 0のMBRを`sdmbr`と同じ書式で表示 |
+| `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数も表示） |
 
 SD関連は起動シーケンスに含まれず、コマンド実行時にのみ`SDMMC: `接頭辞で
 UARTへログを出します（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。

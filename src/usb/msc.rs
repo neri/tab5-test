@@ -34,13 +34,17 @@ pub fn find_msc_interface(config: &[u8]) -> Option<MscInterface> {
 
 pub struct UsbMassStorage {
     bot: BulkOnlyTransport,
+    read_retries: u32,
 }
 
 impl UsbMassStorage {
     pub fn attach(device: &EnumeratedDevice) -> Option<Self> {
         let interface = find_msc_interface(device.config_bytes())?;
         let bot = BulkOnlyTransport::attach(device, interface)?;
-        Some(Self { bot })
+        Some(Self {
+            bot,
+            read_retries: 0,
+        })
     }
 
     pub fn inquiry(&mut self) -> Option<[u8; INQUIRY_RESPONSE_LEN]> {
@@ -74,6 +78,11 @@ impl UsbMassStorage {
             match self.test_unit_ready() {
                 Some(true) => return true,
                 Some(false) => {}
+                // A transport failure has already run BOT Reset Recovery in
+                // execute_command. Continue only when that full sequence
+                // succeeded; otherwise a new CBW would enter an unknown
+                // device-side BOT phase.
+                None if self.bot.last_recovery_succeeded() => {}
                 None => return false,
             }
             if attempt + 1 < attempts {
@@ -161,8 +170,24 @@ impl UsbMassStorage {
             block_count as u8,
             0,
         ];
-        let Some(result) = self.bot.execute_command(&cdb, true, buffer) else {
-            return false;
+        let result = match self.bot.execute_command(&cdb, true, buffer) {
+            Some(result) => result,
+            None => {
+                // execute_command has already completed BOT Reset Recovery.
+                // READ(10) is read-only, so replaying it once is safe. Do not
+                // put this retry in the generic BOT layer: a future write
+                // command must not be replayed without command-specific
+                // knowledge of whether its data reached the device.
+                if !self.bot.last_recovery_succeeded() {
+                    return false;
+                }
+                self.read_retries = self.read_retries.wrapping_add(1);
+                uart::log(b"USB MSC: retrying READ(10) after BOT recovery\r\n");
+                let Some(result) = self.bot.execute_command(&cdb, true, buffer) else {
+                    return false;
+                };
+                result
+            }
         };
         if result.status != CSW_STATUS_PASSED {
             uart::log_hex(
@@ -176,5 +201,21 @@ impl UsbMassStorage {
             return false;
         }
         true
+    }
+
+    /// Monotonic count of read-only READ(10) replays in this attachment.
+    pub fn read_retry_count(&self) -> u32 {
+        self.read_retries
+    }
+
+    /// Monotonic count of lower-level QTD suffix resubmissions.
+    pub fn packet_retry_count(&self) -> u32 {
+        self.bot.packet_retry_count()
+    }
+
+    /// Enumerated Bulk IN maximum packet size, useful for confirming whether
+    /// a diagnostic run actually re-enumerated in High- or Full-Speed mode.
+    pub fn bulk_in_mps(&self) -> u16 {
+        self.bot.bulk_in_mps()
     }
 }

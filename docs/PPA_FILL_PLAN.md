@@ -6,6 +6,12 @@
 
 ## 状態: 完了（Stage 1〜6、実機確認済み）
 
+> 後続調査で、本計画中の「PSRAMは飽和していない」はCPU負荷についてだけ成立し、
+> PPA同時動作時の余裕を証明しないことが判明した。また旧`ppafill sweep`のCPU列は
+> 768画素以上を公開`fill_rect`経由でPPAへ戻していた。PPA移行の速度改善と実機結果は
+> 有効だが、残るアンダーランの切り分けと修正版測定は
+> [`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](DISPLAY_UNDERRUN_REFACTOR_PLAN.md)を優先する。
+
 ## 結果
 
 全画面クリアは**94 ms → 12 ms**、アンダーランは**14/20 → 8/20**。目的は

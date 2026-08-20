@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
-use crate::{icm, interrupts, lcd, pma, power, psram, rtc, sdmmc, startup, uart, usb};
+use crate::{
+    delay, dma2d, icm, interrupts, lcd, pma, power, psram, rtc, sdmmc, startup, uart, usb,
+};
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
 /// Fixed, because the panel only tolerates the one set of vertical timings
@@ -84,6 +86,86 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "many DPI FIFO underruns it caused. a fixed, countable workload,",
             "so settings can be compared: run it, change one thing (say the",
             "'icm' priority), run it again with the same count.",
+        ],
+    },
+    HelpEntry {
+        name: "displaybench",
+        usage: "displaybench <mode> [count] [phase_ms] [burst]",
+        lines: &[
+            "full-screen display-path diagnostic. modes: idle, sync, cpu,",
+            "ppa-raw, ppa-safe, production. phase_ms is 0, 3, 8, or 12;",
+            "burst is 8, 16, 32, 64, or 128 bytes. each draw starts at a",
+            "frame boundary plus phase_ms and consumes the underrun bit.",
+        ],
+    },
+    HelpEntry {
+        name: "db",
+        usage: "db [count]",
+        lines: &[
+            "run the standard displaybench suite with one short command.",
+            "covers idle, cache sync, CPU, raw/safe PPA, production, all",
+            "four frame phases and all five DMA2D bursts; default count 100.",
+        ],
+    },
+    HelpEntry {
+        name: "dp",
+        usage: "dp [count]",
+        lines: &[
+            "run only the production full-screen display path at the normal",
+            "128-byte DMA2D burst; default count 100. unlike db, this skips",
+            "the deliberately hostile short-burst diagnostic cases.",
+        ],
+    },
+    HelpEntry {
+        name: "di",
+        usage: "di [minutes]",
+        lines: &[
+            "idle-display soak with per-frame underrun accounting; default",
+            "30 minutes, maximum 120. sets display ICM priority to 15/15.",
+        ],
+    },
+    HelpEntry {
+        name: "ui",
+        usage: "ui",
+        lines: &[
+            "run 100 real console scrolls, then visit the coordinate, paint,",
+            "touch, axis, and desktop screens. interact with each screen and",
+            "press any key to advance; the final screen reports underruns.",
+        ],
+    },
+    HelpEntry {
+        name: "mix",
+        usage: "mix [minutes]",
+        lines: &[
+            "read-only combined soak: display fills, PSRAM heap verify, SD",
+            "and USB Mass Storage reads. default 120 minutes, maximum 240;",
+            "insert both media before starting. no storage block is written.",
+        ],
+    },
+    HelpEntry {
+        name: "ut",
+        usage: "ut [count]",
+        lines: &[
+            "read and compare the same 4 KiB from USB Mass Storage repeatedly;",
+            "default 100, maximum 1000. read-only; reports packet and BOT retries.",
+        ],
+    },
+    HelpEntry {
+        name: "pf",
+        usage: "pf",
+        lines: &[
+            "reboot once, reject the valid 200 MHz DQS result diagnostically,",
+            "and verify that the same boot recovers with the 80 MHz profile.",
+            "the marker is consumed once; the following reboot tries 200 MHz again.",
+        ],
+    },
+    HelpEntry {
+        name: "rt",
+        usage: "rt [count]",
+        lines: &[
+            "reboot count times automatically; default 20, maximum 100.",
+            "each pass reaches 200 MHz PSRAM, the post-XIP probe, heap, and",
+            "display scanout. the final boot prints one PASS line and stops.",
         ],
     },
     HelpEntry {
@@ -333,6 +415,8 @@ pub enum Outcome {
     Battery,
     /// Hand the display over to the Windows 95 desktop mock-up.
     Win,
+    /// Run all interactive full-screen visual checks in one sequence.
+    VisualQa,
 }
 
 /// Parses and runs one command line, returning what the caller should do
@@ -374,6 +458,45 @@ pub fn execute(
         b"uptime" => cmd_uptime(console, framebuffer),
         b"membench" => cmd_membench(console, framebuffer),
         b"stress" => cmd_stress(console, framebuffer, argument),
+        b"displaybench" => cmd_displaybench(console, framebuffer, argument),
+        b"db" => cmd_displaybench_suite(console, framebuffer, argument),
+        b"dp" => cmd_displaybench_production(console, framebuffer, argument),
+        b"di" => cmd_display_idle_soak(console, framebuffer, argument),
+        b"ui" => {
+            if argument.is_empty() {
+                cmd_ui_scroll_bench(console, framebuffer);
+                return Outcome::VisualQa;
+            }
+            console.write_output_line(framebuffer, "usage: ui");
+        }
+        b"mix" => cmd_mixed_soak(console, framebuffer, argument, usb_host),
+        b"ut" => cmd_usb_read_test(console, framebuffer, argument, usb_host),
+        b"pf" => {
+            if argument.is_empty() {
+                psram::request_fallback_test();
+                console.write_output_line(framebuffer, "forcing one 200-to-80 MHz fallback...");
+                return Outcome::Reboot;
+            }
+            console.write_output_line(framebuffer, "usage: pf");
+        }
+        b"rt" => {
+            let count = if argument.is_empty() {
+                Some(20)
+            } else {
+                parse_u32(argument)
+            };
+            if let Some(count) = count {
+                if startup::request_reboot_test(count) {
+                    let mut line = Line::new();
+                    line.push_str("automatic reboot test: ");
+                    line.push_u32(count);
+                    line.push_str(" boots...");
+                    console.write_output_line(framebuffer, line.as_str());
+                    return Outcome::Reboot;
+                }
+            }
+            console.write_output_line(framebuffer, "usage: rt [1-100]");
+        }
         b"backlight" => cmd_backlight(console, framebuffer, argument),
         b"icm" => cmd_icm(console, framebuffer, argument),
         b"ppafill" => cmd_ppafill(console, framebuffer, argument),
@@ -787,6 +910,1087 @@ fn cmd_stress(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[
     line.push_str("/");
     line.push_u32(count);
     console.write_output_line(framebuffer, line.as_str());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayBenchMode {
+    Idle,
+    Sync,
+    Cpu,
+    PpaRaw,
+    PpaSafe,
+    Production,
+}
+
+impl DisplayBenchMode {
+    fn parse(value: &[u8]) -> Option<Self> {
+        match value {
+            b"idle" => Some(Self::Idle),
+            b"sync" => Some(Self::Sync),
+            b"cpu" => Some(Self::Cpu),
+            b"ppa-raw" => Some(Self::PpaRaw),
+            b"ppa-safe" => Some(Self::PpaSafe),
+            b"production" => Some(Self::Production),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Sync => "sync",
+            Self::Cpu => "cpu",
+            Self::PpaRaw => "ppa-raw",
+            Self::PpaSafe => "ppa-safe",
+            Self::Production => "production",
+        }
+    }
+}
+
+/// Separates the framebuffer's competing traffic sources into reproducible,
+/// fixed-count full-screen workloads.
+///
+/// The existing `stress` command deliberately keeps the production call
+/// sequence. This command is the diagnostic counterpart: a mode names one
+/// exact path, every operation starts at a known frame phase, and the sticky
+/// bridge indication is consumed before another operation can hide behind it.
+fn cmd_displaybench(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    const USAGE: &str = "usage: displaybench <mode> [count] [phase_ms] [burst] (see help)";
+    let (mode, rest) = split_first_word(trim(argument));
+    let Some(mode) = DisplayBenchMode::parse(mode) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    let (count_arg, rest) = split_first_word(trim(rest));
+    let (phase_arg, rest) = split_first_word(trim(rest));
+    let (burst_arg, rest) = split_first_word(trim(rest));
+    if !trim(rest).is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+
+    let count = if count_arg.is_empty() {
+        100
+    } else {
+        match parse_u32(count_arg) {
+            Some(value) if value > 0 && value <= 200_000 => value,
+            _ => {
+                console.write_output_line(framebuffer, "count must be 1-200000");
+                return;
+            }
+        }
+    };
+    let phase_ms = if phase_arg.is_empty() {
+        0
+    } else {
+        match parse_u32(phase_arg) {
+            Some(value @ (0 | 3 | 8 | 12)) => value,
+            _ => {
+                console.write_output_line(framebuffer, "phase_ms must be 0, 3, 8, or 12");
+                return;
+            }
+        }
+    };
+    let burst = if burst_arg.is_empty() {
+        dma2d::diagnostic_burst_bytes()
+    } else {
+        match parse_u32(burst_arg) {
+            Some(value @ (8 | 16 | 32 | 64 | 128)) => value,
+            _ => {
+                console.write_output_line(framebuffer, "burst must be 8, 16, 32, 64, or 128");
+                return;
+            }
+        }
+    };
+
+    let result = run_display_bench(framebuffer, mode, count, phase_ms, burst);
+    console.clear(framebuffer);
+    report_display_bench(console, framebuffer, &result);
+}
+
+#[derive(Clone, Copy)]
+struct DisplayBenchResult {
+    mode: DisplayBenchMode,
+    count: u32,
+    phase_ms: u32,
+    burst: u32,
+    completed: u32,
+    frames: u32,
+    mean_us: u32,
+    underruns: u32,
+}
+
+fn run_display_bench(
+    framebuffer: &mut Framebuffer,
+    mode: DisplayBenchMode,
+    count: u32,
+    phase_ms: u32,
+    burst: u32,
+) -> DisplayBenchResult {
+    // A raw PPA run is safe only if the CPU has no framebuffer cache line to
+    // evict over its result. Flush/invalidate once before the loop, then keep
+    // every CPU pixel access out until the last raw transfer has completed.
+    if mode == DisplayBenchMode::PpaRaw && !framebuffer.flush() {
+        return DisplayBenchResult {
+            mode,
+            count,
+            phase_ms,
+            burst,
+            completed: 0,
+            frames: 0,
+            mean_us: 0,
+            underruns: 0,
+        };
+    }
+
+    let previous_burst = dma2d::diagnostic_set_burst_bytes(burst).unwrap_or(128);
+    lcd::take_underrun();
+    let first_frame = interrupts::frame_sequence();
+    let mut elapsed_cycles = 0u64;
+    let mut underruns = 0u32;
+    let mut completed = 0u32;
+
+    for index in 0..count {
+        if mode == DisplayBenchMode::Idle {
+            let start = membench::cycles();
+            let succeeded = wait_for_next_display_frame();
+            elapsed_cycles += membench::cycles().wrapping_sub(start) as u64;
+            if !succeeded {
+                break;
+            }
+            completed += 1;
+            if lcd::take_underrun() {
+                underruns += 1;
+            }
+            continue;
+        }
+
+        if !wait_for_next_display_frame() {
+            break;
+        }
+        delay::delay_ms(phase_ms);
+        // Exclude an idle-frame indication left before this operation. The
+        // result is collected only after the following boundary, so an
+        // underrun late in the frame still belongs to the operation which
+        // actually provoked it rather than to the next loop iteration.
+        lcd::take_underrun();
+        // Alternate values so every operation really writes the full screen.
+        // Avoid blue here: the Bridge's hardware underrun output is light
+        // blue, and using a legitimate dark-blue test frame made the two
+        // visually different events easy to report as the same failure.
+        let color = if index % 2 == 0 {
+            crate::framebuffer::BLACK
+        } else {
+            crate::framebuffer::RED
+        };
+        let start = membench::cycles();
+        let succeeded = match mode {
+            DisplayBenchMode::Idle => false,
+            DisplayBenchMode::Sync => framebuffer.flush(),
+            DisplayBenchMode::Cpu => {
+                framebuffer.diagnostic_fill_rect_with_cpu(
+                    0,
+                    0,
+                    crate::framebuffer::WIDTH,
+                    crate::framebuffer::HEIGHT,
+                    color,
+                ) && framebuffer.flush()
+            }
+            DisplayBenchMode::PpaRaw => framebuffer.diagnostic_ppa_fill_rect_raw(
+                0,
+                0,
+                crate::framebuffer::WIDTH,
+                crate::framebuffer::HEIGHT,
+                color,
+            ),
+            DisplayBenchMode::PpaSafe => framebuffer.ppa_fill_rect(
+                0,
+                0,
+                crate::framebuffer::WIDTH,
+                crate::framebuffer::HEIGHT,
+                color,
+            ),
+            DisplayBenchMode::Production => {
+                framebuffer.fill(color);
+                framebuffer.flush()
+            }
+        };
+        elapsed_cycles += membench::cycles().wrapping_sub(start) as u64;
+        if !succeeded || !wait_for_next_display_frame() {
+            break;
+        }
+        completed += 1;
+        if lcd::take_underrun() {
+            underruns += 1;
+        }
+    }
+    let frames = interrupts::frame_sequence().wrapping_sub(first_frame);
+    let _ = dma2d::diagnostic_set_burst_bytes(previous_burst);
+
+    // Restore a conventional cache contract before the next mode or the
+    // console repaints over a raw DMA result. This is outside the timed part.
+    if mode == DisplayBenchMode::PpaRaw {
+        let _ = framebuffer.flush();
+    }
+
+    let total_us = elapsed_cycles * 1_000_000 / startup::cpu_hz() as u64;
+    DisplayBenchResult {
+        mode,
+        count,
+        phase_ms,
+        burst,
+        completed,
+        frames,
+        mean_us: if completed == 0 {
+            0
+        } else {
+            (total_us / completed as u64) as u32
+        },
+        underruns,
+    }
+}
+
+fn report_display_bench(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    result: &DisplayBenchResult,
+) {
+    let mut line = Line::new();
+    line.push_str("displaybench: ");
+    line.push_str(result.mode.name());
+    line.push_str(" count=");
+    line.push_u32(result.count);
+    line.push_str(" phase=");
+    line.push_u32(result.phase_ms);
+    line.push_str("ms");
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("burst=");
+    line.push_u32(result.burst);
+    line.push_str(" completed=");
+    line.push_u32(result.completed);
+    line.push_str(" frames=");
+    line.push_u32(result.frames);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("mean=");
+    line.push_u32(result.mean_us);
+    line.push_str("us underrun operations=");
+    line.push_u32(result.underruns);
+    line.push_str("/");
+    line.push_u32(result.completed);
+    console.write_output_line(framebuffer, line.as_str());
+
+    if result.completed != result.count {
+        console.write_output_line(framebuffer, "displaybench: operation or display DMA failed");
+    }
+}
+
+/// Runs the complete Stage 0 matrix without repainting the console or asking
+/// the user to enter each long command. Detailed single cases remain available
+/// through `displaybench` when a later stage needs one variable repeated.
+fn cmd_displaybench_suite(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    let Some(count) =
+        parse_bench_count(argument, "usage: db [count] (1-1000)", console, framebuffer)
+    else {
+        return;
+    };
+    const CASES: &[(DisplayBenchMode, u32, u32)] = &[
+        (DisplayBenchMode::Idle, 0, 128),
+        (DisplayBenchMode::Sync, 0, 128),
+        (DisplayBenchMode::Cpu, 0, 128),
+        (DisplayBenchMode::PpaRaw, 0, 128),
+        (DisplayBenchMode::PpaSafe, 0, 128),
+        (DisplayBenchMode::Production, 0, 128),
+        (DisplayBenchMode::PpaSafe, 3, 128),
+        (DisplayBenchMode::PpaSafe, 8, 128),
+        (DisplayBenchMode::PpaSafe, 12, 128),
+        (DisplayBenchMode::PpaSafe, 0, 8),
+        (DisplayBenchMode::PpaSafe, 0, 16),
+        (DisplayBenchMode::PpaSafe, 0, 32),
+        (DisplayBenchMode::PpaSafe, 0, 64),
+    ];
+
+    icm::set_display_priority(15, 15);
+    let mut results = Vec::new();
+    if results.try_reserve_exact(CASES.len()).is_err() {
+        console.write_output_line(framebuffer, "db: result allocation failed");
+        return;
+    }
+    for &(mode, phase_ms, burst) in CASES {
+        results.push(run_display_bench(framebuffer, mode, count, phase_ms, burst));
+    }
+    console.clear(framebuffer);
+
+    let mut line = Line::new();
+    line.push_str("db: standard suite count=");
+    line.push_u32(count);
+    line.push_str(" ICM=15/15");
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(
+        framebuffer,
+        "mode       phase burst  mean(us)  underruns frames",
+    );
+    for result in results {
+        report_display_bench_compact(console, framebuffer, &result);
+    }
+}
+
+/// Runs only the production configuration used by normal drawing. This is
+/// the short acceptance command after `db` has established which diagnostic
+/// burst/phase combinations are intentionally hostile.
+fn cmd_displaybench_production(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+) {
+    let Some(count) =
+        parse_bench_count(argument, "usage: dp [count] (1-1000)", console, framebuffer)
+    else {
+        return;
+    };
+    icm::set_display_priority(15, 15);
+    let result = run_display_bench(framebuffer, DisplayBenchMode::Production, count, 0, 128);
+    console.clear(framebuffer);
+    console.write_output_line(framebuffer, "dp: production phase=0ms burst=128 ICM=15/15");
+    report_display_bench_compact(console, framebuffer, &result);
+}
+
+/// Runs the Stage 3 idle acceptance test without requiring the user to type a
+/// six-digit frame count. The measured panel is 57.3 Hz; 3,440 frames per
+/// minute rounds upward very slightly so the default covers at least 30 min.
+fn cmd_display_idle_soak(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    const FRAMES_PER_MINUTE: u32 = 3_440;
+    let minutes = if trim(argument).is_empty() {
+        30
+    } else {
+        match parse_u32(trim(argument)) {
+            Some(value) if value > 0 && value <= 120 => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: di [minutes] (1-120)");
+                return;
+            }
+        }
+    };
+    let count = minutes * FRAMES_PER_MINUTE;
+
+    let mut line = Line::new();
+    line.push_str("di: idle soak running for ");
+    line.push_u32(minutes);
+    line.push_str(" minutes...");
+    console.write_output_line(framebuffer, line.as_str());
+
+    icm::set_display_priority(15, 15);
+    let result = run_display_bench(framebuffer, DisplayBenchMode::Idle, count, 0, 128);
+    console.clear(framebuffer);
+
+    let mut line = Line::new();
+    line.push_str("di: idle soak ");
+    line.push_u32(minutes);
+    line.push_str(" minutes ICM=15/15");
+    console.write_output_line(framebuffer, line.as_str());
+    report_display_bench_compact(console, framebuffer, &result);
+}
+
+/// Exercises the real console cell-array + DMA2D scroll path 100 times. This
+/// is deliberately separate from the generic full-screen production fill:
+/// scroll is a simultaneous PSRAM read/write block copy followed by a narrow
+/// CPU repaint, so it has a different contention shape.
+fn cmd_ui_scroll_bench(console: &mut Console, framebuffer: &mut Framebuffer) {
+    const INITIAL_LINES: u32 = 43;
+    const SCROLLS: u32 = 100;
+
+    icm::set_display_priority(15, 15);
+    console.clear(framebuffer);
+    for _ in 0..INITIAL_LINES {
+        console.diagnostic_write_output_line(framebuffer, "UI SCROLL ACCEPTANCE TEST");
+    }
+
+    lcd::take_underrun();
+    let first_frame = interrupts::frame_sequence();
+    let mut completed = 0u32;
+    let mut underruns = 0u32;
+    let mut elapsed_cycles = 0u64;
+    for _ in 0..SCROLLS {
+        if !wait_for_next_display_frame() {
+            break;
+        }
+        lcd::take_underrun();
+        let start = membench::cycles();
+        console.diagnostic_write_output_line(framebuffer, "UI SCROLL ACCEPTANCE TEST");
+        elapsed_cycles += membench::cycles().wrapping_sub(start) as u64;
+        if !wait_for_next_display_frame() {
+            break;
+        }
+        completed += 1;
+        if lcd::take_underrun() {
+            underruns += 1;
+        }
+    }
+    let frames = interrupts::frame_sequence().wrapping_sub(first_frame);
+    let mean_us = if completed == 0 {
+        0
+    } else {
+        (elapsed_cycles * 1_000_000 / startup::cpu_hz() as u64 / completed as u64) as u32
+    };
+
+    console.clear(framebuffer);
+    let mut line = Line::new();
+    line.push_str("ui scroll: completed=");
+    line.push_u32(completed);
+    line.push_str(" underruns=");
+    line.push_u32(underruns);
+    line.push_str("/");
+    line.push_u32(completed);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("mean=");
+    line.push_u32(mean_us);
+    line.push_str("us frames=");
+    line.push_u32(frames);
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(
+        framebuffer,
+        "ui visual: interact with each screen; any key advances",
+    );
+}
+
+/// Final read-only acceptance soak. Scanout never stops; once per second the
+/// command adds a production full-screen fill plus SD and USB MSC reads, while
+/// every foreground iteration writes, flushes and verifies a rotating PSRAM
+/// heap stripe. External media are read at LBA 0 and never modified.
+fn cmd_mixed_soak(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    uart::log(b"MIX TEST: recovery v10\r\n");
+    const FRAMES_PER_MINUTE: u32 = 3_440;
+    const IO_INTERVAL_FRAMES: u32 = 57;
+    const PROGRESS_INTERVAL_FRAMES: u32 = 34_400;
+    const HEAP_BYTES: usize = 4 * 1024 * 1024;
+    const HEAP_STRIPE_BYTES: usize = 4 * 1024;
+    const STORAGE_BYTES: usize = 8 * 512;
+    const USB_RESCAN_ATTEMPTS: u32 = 3;
+
+    let minutes = if trim(argument).is_empty() {
+        120
+    } else {
+        match parse_u32(trim(argument)) {
+            Some(value) if value > 0 && value <= 240 => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: mix [minutes] (1-240)");
+                return;
+            }
+        }
+    };
+
+    console.write_output_line(
+        framebuffer,
+        "mix: read-only soak setup (requires SD + USB Mass Storage)...",
+    );
+    let mut initial_usb_rescans = 0u32;
+    let mut initial_usb_power_cycles = 0u32;
+    if !ensure_usb_mass_storage_ready(
+        usb_host,
+        USB_RESCAN_ATTEMPTS,
+        &mut initial_usb_rescans,
+        &mut initial_usb_power_cycles,
+    ) {
+        console.write_output_line(
+            framebuffer,
+            "mix: no ready USB Mass Storage after automatic rescans",
+        );
+        return;
+    }
+    if let Some(mass_storage) = usb_host.mass_storage_mut() {
+        write_usb_msc_mode(console, framebuffer, "mix", mass_storage);
+    }
+    let Some(card) = sdmmc::init() else {
+        console.write_output_line(framebuffer, "mix: SD activation failed");
+        return;
+    };
+
+    let mut heap = Vec::new();
+    if heap.try_reserve_exact(HEAP_BYTES).is_err() {
+        console.write_output_line(framebuffer, "mix: 4 MiB PSRAM heap allocation failed");
+        return;
+    }
+    heap.resize(HEAP_BYTES, 0u8);
+
+    let mut sd_reference = [0u8; STORAGE_BYTES];
+    let mut sd_current = [0u8; STORAGE_BYTES];
+    let mut usb_reference = [0u8; STORAGE_BYTES];
+    let mut usb_current = [0u8; STORAGE_BYTES];
+    if !sdmmc::read_blocks(&card, 0, &mut sd_reference) {
+        console.write_output_line(framebuffer, "mix: initial SD read failed");
+        return;
+    }
+    if !read_initial_usb_block(
+        usb_host,
+        &mut usb_reference,
+        &mut initial_usb_rescans,
+        &mut initial_usb_power_cycles,
+        USB_RESCAN_ATTEMPTS,
+    ) {
+        console.write_output_line(
+            framebuffer,
+            "mix: initial USB read failed after automatic rescans",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("mix: running ");
+    line.push_u32(minutes);
+    line.push_str(" minutes; external media are read-only...");
+    console.write_output_line(framebuffer, line.as_str());
+
+    icm::set_display_priority(15, 15);
+    let _ = lcd::take_underrun();
+    let initial_underruns = lcd::underrun_count();
+    let start_frame = interrupts::frame_sequence();
+    let target_frames = minutes * FRAMES_PER_MINUTE;
+    let mut last_io_frame = start_frame.wrapping_sub(IO_INTERVAL_FRAMES);
+    let mut next_progress = PROGRESS_INTERVAL_FRAMES;
+    let mut iterations = 0u32;
+    let mut io_operations = 0u32;
+    let mut usb_packet_retries = 0u32;
+    let mut usb_command_retries = 0u32;
+    let mut usb_rescans = initial_usb_rescans;
+    let mut usb_power_cycles = initial_usb_power_cycles;
+    let mut failure: Option<&'static str> = None;
+
+    while interrupts::frame_sequence().wrapping_sub(start_frame) < target_frames {
+        if !wait_for_next_display_frame() {
+            failure = Some("display DMA stopped");
+            break;
+        }
+        if !exercise_heap_stripe(&mut heap, iterations, HEAP_STRIPE_BYTES) {
+            failure = Some("PSRAM heap mismatch");
+            break;
+        }
+        iterations = iterations.wrapping_add(1);
+
+        let frame = interrupts::frame_sequence();
+        if frame.wrapping_sub(last_io_frame) >= IO_INTERVAL_FRAMES {
+            let color = if io_operations & 1 == 0 {
+                crate::framebuffer::BLACK
+            } else {
+                crate::framebuffer::RED
+            };
+            framebuffer.fill(color);
+            if !framebuffer.flush() {
+                failure = Some("framebuffer writeback failed");
+                break;
+            }
+            if !sdmmc::read_blocks(&card, 0, &mut sd_current) || sd_current != sd_reference {
+                failure = Some("SD read mismatch");
+                break;
+            }
+            match read_usb_soak_block(
+                usb_host,
+                &usb_reference,
+                &mut usb_current,
+                &mut usb_packet_retries,
+                &mut usb_command_retries,
+                &mut usb_rescans,
+                &mut usb_power_cycles,
+                USB_RESCAN_ATTEMPTS,
+            ) {
+                UsbSoakRead::Match => {}
+                UsbSoakRead::Mismatch => {
+                    failure = Some("USB data mismatch");
+                    break;
+                }
+                UsbSoakRead::TransportFailed => {
+                    failure = Some("USB transport failed after rescan");
+                    break;
+                }
+            }
+            io_operations += 1;
+            last_io_frame = frame;
+        }
+
+        let elapsed_frames = frame.wrapping_sub(start_frame);
+        if elapsed_frames >= next_progress {
+            uart::log_hex(b"MIX: elapsed frames=", elapsed_frames);
+            next_progress = next_progress.wrapping_add(PROGRESS_INTERVAL_FRAMES);
+        }
+        let _ = lcd::take_underrun();
+        if interrupts::dma_error() != 0 {
+            failure = Some("display DMA error");
+            break;
+        }
+    }
+
+    delay::delay_ms(20);
+    let _ = lcd::take_underrun();
+    let elapsed_frames = interrupts::frame_sequence().wrapping_sub(start_frame);
+    let underruns = lcd::underrun_count().wrapping_sub(initial_underruns);
+    let dma_error = interrupts::dma_error();
+
+    console.clear(framebuffer);
+    let mut line = Line::new();
+    line.push_str("mix: frames=");
+    line.push_u32(elapsed_frames);
+    line.push_str(" io=");
+    line.push_u32(io_operations);
+    line.push_str(" heap=");
+    line.push_u32(iterations);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usb retries: packet=");
+    line.push_u32(usb_packet_retries);
+    line.push_str(" command=");
+    line.push_u32(usb_command_retries);
+    line.push_str(" rescans=");
+    line.push_u32(usb_rescans);
+    line.push_str(" power_cycles=");
+    line.push_u32(usb_power_cycles);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("underruns=");
+    line.push_u32(underruns);
+    line.push_str(" dma_error=0x");
+    line.push_hex(dma_error, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    match failure {
+        Some(reason) => {
+            let mut line = Line::new();
+            line.push_str("mix: FAIL: ");
+            line.push_str(reason);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        None if underruns == 0 && dma_error == 0 && elapsed_frames >= target_frames => {
+            console.write_output_line(framebuffer, "mix: PASS (SD/USB were read-only)");
+        }
+        None => console.write_output_line(framebuffer, "mix: FAIL: incomplete or underrun"),
+    }
+}
+
+/// Short, read-only USB MSC stability test used before the full `mix` soak.
+/// It keeps the same persistent BOT session and repeats the same 4 KiB
+/// READ(10), so a timeout, recovery retry, or silent data mismatch is visible
+/// without requiring the user to type a long command matrix.
+fn cmd_usb_read_test(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    const STORAGE_BYTES: usize = 8 * 512;
+    uart::log(b"USB TEST: recovery v6\r\n");
+    let count = if trim(argument).is_empty() {
+        100
+    } else {
+        match parse_u32(trim(argument)) {
+            Some(value) if value > 0 && value <= 1_000 => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: ut [count] (1-1000)");
+                return;
+            }
+        }
+    };
+
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "ut: no USB Mass Storage; attach one and run usbrescan",
+        );
+        return;
+    };
+    write_usb_msc_mode(console, framebuffer, "ut", mass_storage);
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line(framebuffer, "ut: USB Mass Storage is not ready");
+        return;
+    }
+
+    let mut reference = [0u8; STORAGE_BYTES];
+    let mut current = [0u8; STORAGE_BYTES];
+    let retries_before = mass_storage.read_retry_count();
+    let packet_retries_before = mass_storage.packet_retry_count();
+    if !mass_storage.read_blocks(0, &mut reference) {
+        console.write_output_line(framebuffer, "ut: initial USB read failed");
+        return;
+    }
+
+    let mut completed = 0u32;
+    let mut transport_failures = 0u32;
+    let mut mismatches = 0u32;
+    for _ in 0..count {
+        if !mass_storage.read_blocks(0, &mut current) {
+            transport_failures += 1;
+            break;
+        }
+        if current != reference {
+            mismatches += 1;
+            break;
+        }
+        completed += 1;
+    }
+
+    let retries = mass_storage.read_retry_count().wrapping_sub(retries_before);
+    let packet_retries = mass_storage
+        .packet_retry_count()
+        .wrapping_sub(packet_retries_before);
+    let mut line = Line::new();
+    line.push_str("ut: completed=");
+    line.push_u32(completed);
+    line.push_str("/");
+    line.push_u32(count);
+    line.push_str(" failures=");
+    line.push_u32(transport_failures);
+    line.push_str(" mismatch=");
+    line.push_u32(mismatches);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("ut: packet_retries=");
+    line.push_u32(packet_retries);
+    line.push_str(" command_retries=");
+    line.push_u32(retries);
+    console.write_output_line(framebuffer, line.as_str());
+
+    if completed == count && transport_failures == 0 && mismatches == 0 {
+        console.write_output_line(
+            framebuffer,
+            if retries == 0 {
+                "ut: PASS"
+            } else {
+                "ut: PASS (BOT recovery was used)"
+            },
+        );
+    } else {
+        console.write_output_line(framebuffer, "ut: FAIL");
+    }
+}
+
+fn write_usb_msc_mode(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    command: &str,
+    mass_storage: &usb::UsbMassStorage,
+) {
+    let mut line = Line::new();
+    line.push_str(command);
+    line.push_str(": host=");
+    line.push_str(if usb::fs_ls_only_host_forced() {
+        "FS-only"
+    } else {
+        "High-Speed"
+    });
+    line.push_str(" bulk-in-mps=");
+    line.push_u32(mass_storage.bulk_in_mps() as u32);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UsbSoakRead {
+    Match,
+    Mismatch,
+    TransportFailed,
+}
+
+/// Makes setup deterministic when boot-time hub enumeration missed the MSC.
+/// `UsbHost::rescan` is synchronous, so success means the registry contains a
+/// newly enumerated and TEST UNIT READY device before `mix` starts its timer.
+fn ensure_usb_mass_storage_ready(
+    usb_host: &mut usb::UsbHost,
+    max_rescan_attempts: u32,
+    rescans: &mut u32,
+    power_cycles: &mut u32,
+) -> bool {
+    let initially_ready = match usb_host.mass_storage_mut() {
+        Some(mass_storage) => mass_storage.wait_until_ready(10),
+        None => false,
+    };
+    if initially_ready {
+        return true;
+    }
+
+    uart::log(b"mix: USB MSC missing/not ready; resetting and rescanning root port\r\n");
+    for _ in 0..max_rescan_attempts {
+        *rescans = rescans.wrapping_add(1);
+        usb_host.rescan();
+        let ready = match usb_host.mass_storage_mut() {
+            Some(mass_storage) => mass_storage.wait_until_ready(10),
+            None => false,
+        };
+        if ready {
+            uart::log_hex(b"mix: USB MSC ready after rescan count=", *rescans);
+            return true;
+        }
+        delay::delay_ms(200);
+    }
+
+    if *power_cycles != 0 {
+        return false;
+    }
+    uart::log(b"mix: root rescans exhausted; power-cycling USB-A VBUS\r\n");
+    *power_cycles = power_cycles.wrapping_add(1);
+    if !usb_host.power_cycle_and_rescan() {
+        return false;
+    }
+    *rescans = rescans.wrapping_add(1);
+    if let Some(mass_storage) = usb_host.mass_storage_mut()
+        && mass_storage.wait_until_ready(10)
+    {
+        uart::log(b"mix: USB MSC ready after VBUS power cycle\r\n");
+        true
+    } else {
+        false
+    }
+}
+
+/// Captures the immutable comparison block used by the soak. A transient
+/// transport failure here is handled exactly like one during the timed run:
+/// rebuild the USB bus and retry before declaring setup failed.
+fn read_initial_usb_block(
+    usb_host: &mut usb::UsbHost,
+    buffer: &mut [u8],
+    rescans: &mut u32,
+    power_cycles: &mut u32,
+    max_rescan_attempts: u32,
+) -> bool {
+    if let Some(mass_storage) = usb_host.mass_storage_mut()
+        && mass_storage.read_blocks(0, buffer)
+    {
+        return true;
+    }
+
+    uart::log(b"mix: initial USB read failed; resetting and rescanning root port\r\n");
+    for _ in 0..max_rescan_attempts {
+        *rescans = rescans.wrapping_add(1);
+        usb_host.rescan();
+        let read_ok = match usb_host.mass_storage_mut() {
+            Some(mass_storage) => {
+                mass_storage.wait_until_ready(10) && mass_storage.read_blocks(0, buffer)
+            }
+            None => false,
+        };
+        if read_ok {
+            uart::log(b"mix: initial USB read recovered after rescan\r\n");
+            return true;
+        }
+        delay::delay_ms(200);
+    }
+
+    if *power_cycles != 0 {
+        return false;
+    }
+    uart::log(b"mix: initial USB read still failed; power-cycling USB-A VBUS\r\n");
+    *power_cycles = power_cycles.wrapping_add(1);
+    if !usb_host.power_cycle_and_rescan() {
+        return false;
+    }
+    *rescans = rescans.wrapping_add(1);
+    match usb_host.mass_storage_mut() {
+        Some(mass_storage) => {
+            mass_storage.wait_until_ready(10) && mass_storage.read_blocks(0, buffer)
+        }
+        None => false,
+    }
+}
+
+/// Reads the fixed read-only acceptance block. A failed BOT Reset Recovery
+/// means the device address, endpoint toggles, and EP0 session are no longer
+/// trustworthy, so the only safe next step is a root-port reset and complete
+/// registry rebuild. Continue only after the newly enumerated device returns
+/// the exact bytes captured before the soak began.
+fn read_usb_soak_block(
+    usb_host: &mut usb::UsbHost,
+    reference: &[u8],
+    current: &mut [u8],
+    packet_retries: &mut u32,
+    command_retries: &mut u32,
+    rescans: &mut u32,
+    power_cycles: &mut u32,
+    max_rescan_attempts: u32,
+) -> UsbSoakRead {
+    if read_usb_counted(usb_host, current, packet_retries, command_retries) {
+        return if current == reference {
+            UsbSoakRead::Match
+        } else {
+            UsbSoakRead::Mismatch
+        };
+    }
+
+    uart::log(b"mix: USB BOT recovery exhausted; resetting and rescanning root port\r\n");
+    for _ in 0..max_rescan_attempts {
+        *rescans = rescans.wrapping_add(1);
+        usb_host.rescan();
+        let Some(mass_storage) = usb_host.mass_storage_mut() else {
+            delay::delay_ms(200);
+            continue;
+        };
+        let packet_before = mass_storage.packet_retry_count();
+        let command_before = mass_storage.read_retry_count();
+        let ready = mass_storage.wait_until_ready(10);
+        let read_ok = ready && mass_storage.read_blocks(0, current);
+        *packet_retries = packet_retries.wrapping_add(
+            mass_storage
+                .packet_retry_count()
+                .wrapping_sub(packet_before),
+        );
+        *command_retries = command_retries
+            .wrapping_add(mass_storage.read_retry_count().wrapping_sub(command_before));
+        if !read_ok {
+            delay::delay_ms(200);
+            continue;
+        }
+        return if current == reference {
+            uart::log(b"mix: USB rescan recovered matching read-only data\r\n");
+            UsbSoakRead::Match
+        } else {
+            UsbSoakRead::Mismatch
+        };
+    }
+
+    if *power_cycles != 0 {
+        return UsbSoakRead::TransportFailed;
+    }
+    uart::log(b"mix: root rescans exhausted; power-cycling USB-A VBUS\r\n");
+    *power_cycles = power_cycles.wrapping_add(1);
+    if !usb_host.power_cycle_and_rescan() {
+        return UsbSoakRead::TransportFailed;
+    }
+    *rescans = rescans.wrapping_add(1);
+    let read_ok = match usb_host.mass_storage_mut() {
+        Some(mass_storage) => {
+            let packet_before = mass_storage.packet_retry_count();
+            let command_before = mass_storage.read_retry_count();
+            let ready = mass_storage.wait_until_ready(10);
+            let result = ready && mass_storage.read_blocks(0, current);
+            *packet_retries = packet_retries.wrapping_add(
+                mass_storage
+                    .packet_retry_count()
+                    .wrapping_sub(packet_before),
+            );
+            *command_retries = command_retries
+                .wrapping_add(mass_storage.read_retry_count().wrapping_sub(command_before));
+            result
+        }
+        None => false,
+    };
+    if !read_ok {
+        return UsbSoakRead::TransportFailed;
+    }
+    if current == reference {
+        uart::log(b"mix: USB VBUS power cycle recovered matching read-only data\r\n");
+        UsbSoakRead::Match
+    } else {
+        UsbSoakRead::Mismatch
+    }
+}
+
+fn read_usb_counted(
+    usb_host: &mut usb::UsbHost,
+    buffer: &mut [u8],
+    packet_retries: &mut u32,
+    command_retries: &mut u32,
+) -> bool {
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        return false;
+    };
+    let packet_before = mass_storage.packet_retry_count();
+    let command_before = mass_storage.read_retry_count();
+    let result = mass_storage.read_blocks(0, buffer);
+    *packet_retries = packet_retries.wrapping_add(
+        mass_storage
+            .packet_retry_count()
+            .wrapping_sub(packet_before),
+    );
+    *command_retries =
+        command_retries.wrapping_add(mass_storage.read_retry_count().wrapping_sub(command_before));
+    result
+}
+
+fn exercise_heap_stripe(heap: &mut [u8], iteration: u32, stripe_bytes: usize) -> bool {
+    if heap.len() < stripe_bytes || stripe_bytes == 0 {
+        return false;
+    }
+    let stripes = heap.len() / stripe_bytes;
+    let offset = iteration as usize % stripes * stripe_bytes;
+    let pointer = unsafe { heap.as_mut_ptr().add(offset) };
+    for index in 0..stripe_bytes {
+        let value = (index as u8).wrapping_mul(37).wrapping_add(iteration as u8);
+        unsafe { pointer.add(index).write_volatile(value) };
+    }
+    psram::writeback_invalidate(pointer as usize, stripe_bytes);
+    for index in 0..stripe_bytes {
+        let expected = (index as u8).wrapping_mul(37).wrapping_add(iteration as u8);
+        if unsafe { pointer.add(index).read_volatile() } != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_bench_count(
+    argument: &[u8],
+    usage: &str,
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+) -> Option<u32> {
+    if trim(argument).is_empty() {
+        return Some(100);
+    }
+    match parse_u32(trim(argument)) {
+        Some(value) if value > 0 && value <= 1000 => Some(value),
+        _ => {
+            console.write_output_line(framebuffer, usage);
+            None
+        }
+    }
+}
+
+fn report_display_bench_compact(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    result: &DisplayBenchResult,
+) {
+    const MODE_COLUMNS: usize = 11;
+    let mut line = Line::new();
+    line.push_str(result.mode.name());
+    pad_to(&mut line, MODE_COLUMNS);
+    line.push_u32(result.phase_ms);
+    line.push_str("ms  b");
+    line.push_u32(result.burst);
+    line.push_str("  ");
+    line.push_u32(result.mean_us);
+    line.push_str("us  ");
+    line.push_u32(result.underruns);
+    line.push_str("/");
+    line.push_u32(result.completed);
+    line.push_str("  f");
+    line.push_u32(result.frames);
+    if result.completed != result.count {
+        line.push_str(" FAILED");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Waits for the display DMA's next full-frame completion while a shell
+/// command temporarily owns the foreground loop.
+fn wait_for_next_display_frame() -> bool {
+    let initial = interrupts::frame_sequence();
+    loop {
+        if interrupts::dma_error() != 0 {
+            return false;
+        }
+        if interrupts::frame_sequence() != initial {
+            return true;
+        }
+        interrupts::wait_for_interrupt();
+    }
 }
 
 /// Measures CPU-side memory cost and prints it.
@@ -2652,7 +3856,7 @@ fn cmd_icm(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]
 /// and it has to be measured rather than assumed -- a DMA that has to be set
 /// up, started and waited for loses to a store loop below some size.
 fn cmd_ppafill(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
-    const USAGE: &str = "usage: ppafill <x> <y> <w> <h> <color> | ppafill sweep";
+    const USAGE: &str = "usage: ppafill <x> <y> <w> <h> <color> [cpu] | ppafill sweep";
     if trim(argument) == b"sweep" {
         cmd_ppafill_sweep(console, framebuffer);
         return;
@@ -2690,8 +3894,8 @@ fn cmd_ppafill(console: &mut Console, framebuffer: &mut Framebuffer, argument: &
 
     let start = membench::cycles();
     let filled = if use_cpu {
-        framebuffer.fill_rect(x, y, width, height, color);
-        framebuffer.flush_rect(x, y, width, height)
+        framebuffer.diagnostic_fill_rect_with_cpu(x, y, width, height, color)
+            && framebuffer.flush_rect(x, y, width, height)
     } else {
         framebuffer.ppa_fill_rect(x, y, width, height, color)
     };
@@ -2832,8 +4036,9 @@ fn time_fills(
             crate::framebuffer::BLUE
         };
         if use_cpu {
-            framebuffer.fill_rect(0, 0, width, height, color);
-            if !framebuffer.flush_rect(0, 0, width, height) {
+            if !framebuffer.diagnostic_fill_rect_with_cpu(0, 0, width, height, color)
+                || !framebuffer.flush_rect(0, 0, width, height)
+            {
                 return None;
             }
         } else if !framebuffer.ppa_fill_rect(0, 0, width, height, color) {

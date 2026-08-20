@@ -11,6 +11,14 @@ const ROOT_CLK_CTRL2: usize = HP_SYS_CLKRST + 0x0C;
 const LP_CLKRST: usize = 0x5011_1000;
 const HP_CLK_CTRL: usize = LP_CLKRST + 0x40;
 
+// LP_SYS STORE13/14 survive the HP-core-only reset used by `reboot()`.  They
+// therefore carry the bounded reboot diagnostic across boots without putting
+// state in PSRAM, whose controller is deliberately reset on every boot.
+const LP_STORE13: usize = 0x5011_0060;
+const LP_STORE14: usize = 0x5011_0064;
+const REBOOT_TEST_MAGIC: u32 = 0x5254_5354;
+const REBOOT_TEST_MAX: u32 = 100;
+
 /// Clock the CPU is actually running at. The bootloader hands over at 90 MHz
 /// and `raise_cpu_clock` moves to 360 MHz only if it recognises that state, so
 /// anything converting cycles to time has to ask rather than assume.
@@ -19,6 +27,73 @@ static CPU_HZ: AtomicU32 = AtomicU32::new(90_000_000);
 /// Current CPU clock in hertz.
 pub fn cpu_hz() -> u32 {
     CPU_HZ.load(Ordering::Relaxed)
+}
+
+/// Result of consuming one successful application boot in the reboot test.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RebootTestBoot {
+    Inactive,
+    Reboot { completed: u32, remaining: u32 },
+    Complete { total: u32 },
+    Failed { completed: u32, total: u32 },
+}
+
+/// Arms a bounded reboot test. The caller performs the first reboot.
+pub fn request_reboot_test(count: u32) -> bool {
+    if count == 0 || count > REBOOT_TEST_MAX {
+        return false;
+    }
+    unsafe {
+        // Write the payload first so a reset between these writes cannot make
+        // a stale count look armed.
+        write(LP_STORE14, (count << 16) | count);
+        write(LP_STORE13, REBOOT_TEST_MAGIC);
+    }
+    true
+}
+
+/// Counts a boot only after PSRAM, the post-PSRAM XIP probe, heap setup and
+/// display scanout have all succeeded. Intermediate successes request another
+/// reset; the final success clears both scratch registers.
+pub fn complete_reboot_test_boot(psram_200mhz: bool) -> RebootTestBoot {
+    unsafe {
+        if read(LP_STORE13) != REBOOT_TEST_MAGIC {
+            return RebootTestBoot::Inactive;
+        }
+
+        let state = read(LP_STORE14);
+        let total = state >> 16;
+        let remaining = state & 0xFFFF;
+        if total == 0 || total > REBOOT_TEST_MAX || remaining == 0 || remaining > total {
+            write(LP_STORE13, 0);
+            write(LP_STORE14, 0);
+            return RebootTestBoot::Inactive;
+        }
+
+        let completed_before_this_boot = total - remaining;
+        if !psram_200mhz {
+            write(LP_STORE13, 0);
+            write(LP_STORE14, 0);
+            return RebootTestBoot::Failed {
+                completed: completed_before_this_boot,
+                total,
+            };
+        }
+
+        let completed = completed_before_this_boot + 1;
+        if remaining == 1 {
+            write(LP_STORE13, 0);
+            write(LP_STORE14, 0);
+            RebootTestBoot::Complete { total }
+        } else {
+            let next_remaining = remaining - 1;
+            write(LP_STORE14, (total << 16) | next_remaining);
+            RebootTestBoot::Reboot {
+                completed,
+                remaining: next_remaining,
+            }
+        }
+    }
 }
 
 /// Stops the RTC watchdog inherited from the ESP-IDF bootloader.

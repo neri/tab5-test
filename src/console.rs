@@ -184,7 +184,21 @@ impl Console {
     pub fn write_output_line(&mut self, framebuffer: &mut Framebuffer, text: &str) {
         uart::log(text.as_bytes());
         uart::log(b"\r\n");
+        self.write_output_line_pixels(framebuffer, text);
+    }
 
+    /// Writes a diagnostic line without mirroring it to UART. Long automated
+    /// scroll tests use this to exercise the exact console pixel path without
+    /// making serial-output backpressure part of the display workload.
+    pub(crate) fn diagnostic_write_output_line(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        text: &str,
+    ) {
+        self.write_output_line_pixels(framebuffer, text);
+    }
+
+    fn write_output_line_pixels(&mut self, framebuffer: &mut Framebuffer, text: &str) {
         let first_row = self.row;
         self.column = 0;
         let mut scrolled_rows = 0;

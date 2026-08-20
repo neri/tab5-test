@@ -47,6 +47,7 @@ const PORT_STATUS_RESET: u16 = 1 << 4;
 const PORT_STATUS_POWER: u16 = 1 << 8;
 const PORT_STATUS_LOW_SPEED: u16 = 1 << 9;
 const PORT_STATUS_HIGH_SPEED: u16 = 1 << 10;
+const PORT_CHANGE_CONNECTION: u16 = 1 << 0;
 const PORT_CHANGE_RESET: u16 = 1 << 4;
 
 /// Extra settling time on top of the hub's own `bPwrOn2PwrGood`, in the
@@ -235,6 +236,10 @@ impl PortStatus {
     pub fn reset_changed(&self) -> bool {
         self.change & PORT_CHANGE_RESET != 0
     }
+
+    pub fn connection_changed(&self) -> bool {
+        self.change & PORT_CHANGE_CONNECTION != 0
+    }
 }
 
 pub struct Hub {
@@ -314,7 +319,7 @@ impl Hub {
     /// Quiet form of [`Self::port_status`] for the periodic empty-port scan.
     /// A failed scan must not reset devices that are already working, so its
     /// caller emits a single summary and pauses future background scans.
-    fn port_status_quiet(&self, port: u8) -> Option<PortStatus> {
+    pub(crate) fn port_status_quiet(&self, port: u8) -> Option<PortStatus> {
         self.port_status_with_diagnostics(port, false)
     }
 

@@ -141,6 +141,7 @@ impl InputManager {
         }
 
         let mut usb_host = usb::UsbHost::new();
+        uart::log(b"USB ENUM: bounded retry v9\r\n");
         usb_host.rescan();
         uart::log(b"USB: initial scan complete\r\n");
 

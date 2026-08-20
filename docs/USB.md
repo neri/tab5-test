@@ -53,6 +53,11 @@ SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再�
 - ルートポートが空のときの再スキャン: 300フレームごと（ブロッキングの
   リセット・デバウンスを伴うため粗い間隔にしてある）
 
+増分スキャンで列挙に失敗したポート、または対応class driverが無いポートは、その物理接続を
+保留状態として記録します。以後は約1秒ごとにHubの接続／change bitだけをquietに読み、同じdeviceを
+reset・再列挙し続けません。抜き差しを検出した場合、または`usbrescan`／`mix`が明示的にfull rescan
+した場合だけ列挙を再試行します。これにより列挙失敗ログがconsole操作を妨げる連続出力になりません。
+
 ## 転送方式の現状
 
 - HID BootのInterrupt INは、対象routeで空きがあればchannel 1〜4のいずれかを確保し、
@@ -73,6 +78,18 @@ SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再�
   MSCとLS keyboard列挙controlのWFI完了待ちは実機確認済みです。通常のunsplit転送は
   世代付き固定`Channel0Transfer`へsubmitし、IRQ後に同じtokenでreapします。この内部構造の
   HID／MSC実機回帰も確認済みです。
+- MSCのBulk QTDはCPU周波数から約1秒で区切って最大4回再投入し、合計約5秒、control packetは
+  約1秒になるよう算出します。CPU 360 MHz化後も固定iteration値の実時間が短縮されないための設定です。BOT commandが
+  transport途中で失敗した場合は、チャネル0をidleへ戻した後、Mass Storage Reset、
+  Bulk IN／OUT両endpointのhalt解除、DATA0へのtoggle同期からなるBOT Reset Recoveryを
+  実行します。安全に再送できるREAD(10)だけはRecovery後に1回再試行し、再試行数を
+  session内で計数します。WRITE系commandの自動再送は行いません。
+  descriptor DMAのQTD status 1はpacket errorとして扱います。1 packet QTDならtoggleを
+  進めず同一DATA PIDを50 ms間隔・最大20回の範囲で再送します。複数packetのBulk IN QTDは
+  descriptor残量が示す完全MPS packetを保持し、そのpacket数から次のDATA PIDを復元して未受信
+  suffixだけを再投入します。MPS境界でない進捗はReset Recoveryへ進みます。MSCの4 KiB Bulk INは
+  MPS 64 byteごとにchannelを再起動せず1 QTDへまとめ、descriptor DMAにpacket分割を任せます。
+  13/36/8 byteの短いIN応答は、QTD長をMPS倍数に保つ内蔵SRAM staging経由で受信します。
 - rootへ直接接続したHID Boot keyboardは、attach時にstaticな512-byte aligned
   32-entry frame list／QTD bankを割り当て、`HCCHAR.eptype=INTR`で常時待機します。report完了IRQを
   前景がtakeして次QTDをrearmするため、idle中にchannel 0をpollしません。この常設経路は
@@ -93,6 +110,9 @@ SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再�
   同じexpanderは電源断や充電制御とも共用するため、書き換えはビット単位の
   read-modify-write（`hcd::set_pi4ioe2_output_bit`）で行います
   （[`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)の「全体電源断」も参照）。
+  `mix`はroot resetを3回使い切ってもMSCを取得できない場合に限り、このbitを1秒offにして
+  Hubとdownstream deviceを完全resetします。registryの全sessionを先に破棄し、再投入後にfull
+  rescanするため、電源断前のdevice addressやtoggleを再利用しません。1試験中の自動実行は最大1回です。
 
 ## Split Transaction
 
@@ -120,6 +140,7 @@ Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_
 | `usbperiodic` | 常設periodicが無効な最初のHIDでchannel 1＋frame listを1転送だけ試験（旧Go/No-Go診断） |
 | `usbvbus <0-7> on\|off` | PI4IOE2（`0x44`）の出力ビット直接操作（bit 3がVBUS）。診断用 |
 | `usbmsc`／`usbread`／`usbmbr` | USB Mass Storage（[`STORAGE.md`](STORAGE.md)） |
+| `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数を表示） |
 
 未対応デバイスが列挙まで成功した場合、UARTには各interfaceの
 `number/class/subclass/protocol`（上位byteから順）を16進で出す。これは対応する

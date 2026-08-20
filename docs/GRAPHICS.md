@@ -20,6 +20,12 @@ PPA/2D-DMAへ移す」）。`scroll_up`は2D-DMAのブロックコピーで画�
 場合はキャッシュの整合を自分で取るため、呼び出し側の`flush`／`flush_rect`は
 どちらの経路でも正しいままです。
 
+診断用にはproductionの自動選択を通さない`diagnostic_fill_rect_with_cpu`と、cache同期を
+含まない`diagnostic_ppa_fill_rect_raw`をcrate内だけへ公開します。前者は呼び出し側が
+`flush_rect`を行うまでdirty cacheを残し、後者は呼び出し前に対象のcache所有権を解消する
+必要があります。通常の描画コードからは使わず、`ppafill`と`displaybench`が特定経路を
+強制して比較するためだけのAPIです。
+
 `read_rect`は`blit_rgb565`の逆方向で、論理矩形をフレームバッファから読み出します。
 右端・下端のクリップ方法と`pixels`側の行ストライド（`image_width`）が`blit_rgb565`と
 同一なので、`read_rect`で退避した矩形を`blit_rgb565`で書き戻せば、矩形が画面外へ

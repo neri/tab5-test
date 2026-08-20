@@ -136,10 +136,11 @@ pub struct UsbHost {
     /// each delivered key prevents a low-numbered USB keyboard from starving
     /// another one that is also producing input.
     next_keyboard_slot: usize,
-    /// Slots at which an enumerated device had no usable class driver. The
-    /// background scanner must keep probing those slots for future support,
-    /// but reports each unsupported physical attachment only once rather
-    /// than filling the UART log every scan interval.
+    /// Slots whose current physical attachment could not be driven, either
+    /// because enumeration failed or no class driver matched. Background
+    /// discovery checks only the hub connection/change bits for these ports;
+    /// it must not reset and enumerate the same failing device every second.
+    /// A disconnect/reconnect edge or an explicit full `rescan` retries it.
     unhandled_slots: u16,
     slots: [Option<Slot>; SLOT_COUNT],
 }
@@ -378,6 +379,21 @@ impl UsbHost {
         let _ = hcd::take_root_connection_change();
     }
 
+    /// Drops every live address/session, removes USB-A VBUS long enough to
+    /// reset the hub and all downstream devices, restores power, then builds
+    /// the registry from scratch. This is deliberately separate from normal
+    /// `rescan`: a port reset is the cheap first-line recovery, while a power
+    /// cycle is reserved for an explicitly exhausted recovery sequence.
+    pub fn power_cycle_and_rescan(&mut self) -> bool {
+        self.clear();
+        if !hcd::power_cycle_vbus() {
+            uart::log(b"USB: VBUS power cycle failed at PI4IOE2\r\n");
+            return false;
+        }
+        self.rescan();
+        true
+    }
+
     fn rescan_inner(&mut self) {
         self.clear_registry();
 
@@ -502,6 +518,30 @@ impl UsbHost {
             if self.slots[port as usize].is_some() {
                 continue; // already driving something here
             }
+            let slot_bit = 1u16 << port;
+            if self.unhandled_slots & slot_bit != 0 {
+                match hub.port_status_quiet(port) {
+                    Some(status) if status.connected() && !status.connection_changed() => {
+                        // Same attachment that already failed. Leave its
+                        // address-0 state and every working peer untouched.
+                        continue;
+                    }
+                    Some(status) if !status.connected() => {
+                        self.clear_unhandled_slot(port as usize);
+                        continue;
+                    }
+                    Some(_) => {
+                        // A connection-change edge while currently connected
+                        // means the port was unplugged/replugged between polls.
+                        // Debounce and enumerate the new attachment below.
+                        self.clear_unhandled_slot(port as usize);
+                    }
+                    None => {
+                        pause_hub_scan = true;
+                        break;
+                    }
+                }
+            }
             match hub.debounce_connected_port_quiet(port) {
                 Some(true) => {}
                 Some(false) => {
@@ -565,6 +605,7 @@ impl UsbHost {
                 b"USB: enumeration failed for device on hub port ",
                 port as u32,
             );
+            self.mark_unhandled_slot(port as usize);
             return;
         };
 
@@ -602,7 +643,7 @@ impl UsbHost {
         if self.unhandled_slots & bit != 0 {
             return;
         }
-        self.unhandled_slots |= bit;
+        self.mark_unhandled_slot(slot_index);
         if slot_index == 0 {
             uart::log(b"USB: no class driver for the device on USB-A\r\n");
         } else {
@@ -616,6 +657,10 @@ impl UsbHost {
 
     fn clear_unhandled_slot(&mut self, slot_index: usize) {
         self.unhandled_slots &= ALL_SLOT_BITS ^ (1u16 << slot_index);
+    }
+
+    fn mark_unhandled_slot(&mut self, slot_index: usize) {
+        self.unhandled_slots |= 1u16 << slot_index;
     }
 }
 

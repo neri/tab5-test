@@ -66,6 +66,75 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 `help <name>`で個別コマンドの使用法と説明を表示する二段構成にしています
 （`src/app/shell.rs`の`HELP_ENTRIES`）。
 
+表示帯域の診断には`displaybench <mode> [count] [phase_ms] [burst]`を使います。`mode`は
+`idle`、`sync`、`cpu`、`ppa-raw`、`ppa-safe`、`production`のいずれかです。描画系の
+各操作はframe境界の0/3/8/12 ms後から開始でき、DMA2D burstは8/16/32/64/128 byteを
+一時指定できます。コマンドは終了時にproductionのburstへ戻し、操作ごとにBridgeの
+sticky underrun bitを消費します。`ppa-raw`だけは開始前に全走査面を一度
+writeback-invalidateし、測定中はCPUが画素へ触れないことでcache整合を保ちます。
+出力は指定回数、完了回数、経過frame、1操作の平均µs、underrunした操作数です。
+
+標準比較は短い別名`db [count]`だけで実行できます。省略時は100回で、ICMを15/15へ設定し、
+上記6 mode、PPAの4開始位相、DMA2Dの5 burst（重複する基準caseは1回）からなる13 caseを
+画面再描画を挟まず連続実行し、最後に一覧表示します。個別条件を再測定するときだけ長い
+`displaybench`形式を使います。全画面の試験色はBLACKとREDを交互に使います。以前はBLUEを
+使っていたため、正常な濃青frameとBridge underrunの水色を混同しやすい状態でした。
+
+production既定値だけを受入試験するときは`dp [count]`を使います。省略時は100回で、
+phase 0 ms、DMA2D burst 128 byte、ICM 15/15だけを実行します。`db`に含まれる意図的に
+厳しいshort-burst caseを省くため、通常構成の合否だけを短時間で確認できます。
+
+30分のidle走査受入試験は`di [minutes]`で実行します。省略時は30分で、実測57.3 Hzを
+切り上げた1分3,440 frame、合計103,200 frameを待ち、各frameでsticky underrunを回収します。
+開始時にICMを15/15へ設定し、終了時に完了frame数とunderrun数を表示します。任意時間を
+指定する場合は1〜120分です。
+
+画面遷移の受入試験は`ui`だけで開始します。最初に通常のconsole cell配列を使って画面を
+埋め、実際のDMA2D scroll＋露出行再描画を100回繰り返し、各操作後のunderrunを回収します。
+試験用行はUARTへmirrorせず、serial出力のbackpressureを表示負荷へ混ぜません。その後、
+coordinate chart、paint、multi-touch、axis、desktopを順に開きます。各画面で指示された
+操作を行い、任意キーを押すと次へ進みます。各画面の初期描画とconsoleへの復帰後にsticky
+underrunを回収し、最後にvisual全体のunderrun数とDMA errorを表示します。
+
+最終複合試験はmicroSDとUSB Mass Storageを挿した状態で`mix [minutes]`を実行します。
+省略時は120分です。走査を継続しながら約1秒ごとにBLACK/REDのproduction全画面fill、
+microSDとUSB MSCのLBA 0から各4 KiB readと初回内容との比較を行います。それとは別に毎loop、
+PSRAM heapへ確保した4 MiB内の4 KiB stripeを順に書き、writeback-invalidate後に全byteを
+再検証します。外部mediaへのwrite commandは発行しません。終了時は経過frame、storage I/O
+回数、heap検査回数、USB QTD／READ(10)のRecovery再送数、root-port再列挙数、underrun、
+DMA errorとPASS/FAILを表示します。BOT Reset Recoveryまで失敗した場合はUSBバスを最大3回
+再列挙し、新しいsessionでLBA 0を読み直します。試験開始時の4 KiBと完全一致した場合だけ継続し、
+違うmediaまたはdata corruptionは`USB data mismatch`で即時FAILにします。起動時のHub列挙でMSCを
+取得できなかった場合も、`mix`自身がroot portを最大3回同期的に再列挙します。MSCのready確認と
+基準4 KiBの読出しが成功するまでは計測を開始しません。通常再列挙を使い切った場合はUSB-A VBUSを
+1秒offにしてHubと全downstream deviceを一度だけpower-cycleし、再列挙します。同じ試験中の2回目の
+power-cycleが必要になった場合は不安定と判定してFAILにします。結果の`power_cycles`で回数を確認できます。
+
+USBだけを先に短く確認するときは`ut [count]`を使います。省略時は100回で、LBA 0の同じ
+4 KiBを初回内容と比較します。外部mediaへは書き込みません。`packet_retries`はstatus 1または
+約1秒のtimeout後に、同一packetまたは複数packet QTDの未受信suffixを再投入した回数、
+`command_retries`はBOT Reset Recovery後に
+READ(10)を再送した回数です。`failures`は再送しても失敗した回数、`mismatch`は読出し自体は完了したが
+内容が変わった回数です。4 KiBのデータフェーズ自体は1 QTDへまとめて実行します。開始時の
+`host=... bulk-in-mps=...`で、速度切替後に実際のendpoint MPSで再列挙されたことも確認できます。
+
+`pf`は次の1 bootだけ、200 MHzの有効なDQS選定後に診断用失敗を注入します。200 MHzで
+mode registerとDQSまで設定した状態から、MSPI resetと80 MHz profileの再設定で復旧できる
+ことを確認するコマンドです。markerは起動時に消費するため、その次の通常`reboot`では再び
+200 MHzを試します。
+
+`rt [count]`は再起動耐久試験を1回の入力で実行します。既定は20回、上限は100回です。
+LP scratch registerのSTORE13/14にmagic、総数、残数を保持し、各bootで200 MHz PSRAM初期化、
+post-PSRAM DROM/IROM probe、heap初期化、display scanout開始まで到達して初めて1回を合格として
+減算します。途中bootはUARTへcompleted/remainingを出して自動再起動し、最終bootはscratchを
+消去して画面とUARTに`REBOOT TEST PASS: count/count`を出し、通常のプロンプトで停止します。
+途中で80 MHzへfallbackした場合はそのbootを数えず、scratchを消去して`FAIL`で停止します。
+電源断はLP scratchを消去するため、試験中止手段にもなります。
+
+`ppafill ... cpu`と`ppafill sweep`のCPU側は診断専用のraw CPU経路を直接呼びます。
+productionの`fill_rect`は768画素以上をPPAへ自動転送するため、診断がこの公開APIを
+通ると大矩形のCPU測定にならないためです。
+
 `shell::execute`の戻り値は`shell::Outcome`（`Continue`／`Reboot`／`Shutdown`／`Paint`／
 `TouchTest`／`CoordTest`／`AxisTest`／`Battery`／`Win`）で、全画面サブアプリはコンソール本体ではなく
 `app::run`側の分岐で処理します。各サブアプリが戻った後は`Console::clear`で

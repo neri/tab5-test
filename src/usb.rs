@@ -51,4 +51,5 @@ pub use hcd::{
 };
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
+pub use msc::UsbMassStorage;
 pub use registry::{DeviceKind, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost};

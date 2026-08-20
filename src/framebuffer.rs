@@ -22,19 +22,18 @@ const WRITEBACK_CHUNK_BYTES: usize = 64 * 1024;
 /// microseconds per fill on this hardware:
 ///
 /// ```text
-///   12x16 (one console cell)      14 ppa     15 cpu
-///   24x32                         21 ppa     41 cpu
-///   48x64                         51 ppa    133 cpu
-///   96x128                       314 ppa   1503 cpu
-///   1280x720 (full screen)     12879 ppa  94408 cpu
+///   12x16 (one console cell)      19 ppa     36 cpu
+///   24x32                         22 ppa     44 cpu
+///   48x64                         52 ppa    273 cpu
+///   96x128                       334 ppa   1351 cpu
+///   1280x720 (full screen)     13267 ppa  93548 cpu
 /// ```
 ///
-/// At a console cell the two are the same to within noise, and the gap opens
-/// from there. 24x32 is the smallest size measured to be clearly ahead, so
-/// that is the threshold: the console's per-cell repaints -- by far the most
-/// frequent fills, and the ones on the cursor-blink path -- stay on the CPU
-/// where they gain nothing, and everything the full-screen modes repaint goes
-/// to the DMA.
+/// PPA is faster even for one cell in this run, but the absolute saving there
+/// is only 17 us and every DMA write competes with scanout. 24x32 is therefore
+/// kept as the conservative threshold: the console's per-cell repaints -- by
+/// far the most frequent fills, and the ones on the cursor-blink path -- stay
+/// on the CPU, while larger repaints take the increasingly decisive DMA gain.
 ///
 /// Area is the test rather than width or height, which is an approximation: a
 /// wide, short rectangle covers a large native span for few pixels, because
@@ -90,15 +89,15 @@ impl Framebuffer {
         if self.ppa_fill_rect(0, 0, WIDTH, HEIGHT, color) {
             return;
         }
-        self.fill_with_cpu(color);
+        let _ = self.fill_with_cpu(color);
     }
 
     /// The store-loop clear, used when the PPA is unavailable or refused the
     /// transfer. Keeping it means a failed PPA bring-up costs speed and
     /// nothing else.
-    fn fill_with_cpu(&mut self, color: u16) {
+    fn fill_with_cpu(&mut self, color: u16) -> bool {
         let Some(pointer) = self.memory.framebuffer() else {
-            return;
+            return false;
         };
         // A framebuffer starts on a 64 KiB MMU page and holds an even number
         // of pixels, so it can be cleared as 32-bit words. Halving the store
@@ -110,6 +109,7 @@ impl Framebuffer {
         for offset in 0..NATIVE_WIDTH * NATIVE_HEIGHT / 2 {
             unsafe { words.add(offset).write_volatile(pair) };
         }
+        true
     }
 
     pub fn draw_pixel(&mut self, x: usize, y: usize, color: u16) {
@@ -163,11 +163,48 @@ impl Framebuffer {
         {
             return;
         }
+        let _ = self.fill_rect_with_cpu(x, y, width, height, color);
+    }
+
+    /// Forces the CPU store path for display diagnostics.
+    ///
+    /// Production code must use `fill_rect`, whose job is to select the best
+    /// available path. The benchmark needs the opposite contract: a named
+    /// path that cannot silently route a large rectangle back through the
+    /// PPA. This writes pixels only; the caller times cache synchronisation
+    /// separately or follows it with `flush_rect`.
+    pub(crate) fn diagnostic_fill_rect_with_cpu(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: u16,
+    ) -> bool {
+        if x == 0 && y == 0 && width >= WIDTH && height >= HEIGHT {
+            return self.fill_with_cpu(color);
+        }
+        self.fill_rect_with_cpu(x, y, width, height, color)
+    }
+
+    /// CPU-only rectangle implementation shared by production fallback and
+    /// the diagnostic path above.
+    fn fill_rect_with_cpu(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: u16,
+    ) -> bool {
         let Some(pointer) = self.memory.framebuffer() else {
-            return;
+            return false;
         };
         let x_end = x.saturating_add(width).min(WIDTH);
         let y_end = y.saturating_add(height).min(HEIGHT);
+        if x.min(WIDTH) >= x_end || y.min(HEIGHT) >= y_end {
+            return false;
+        }
         // Keep logical X outermost so each inner Y run is contiguous. Iterate
         // X backwards because CW rotation maps increasing logical X to
         // decreasing native rows; this keeps the PSRAM write stream forward.
@@ -180,6 +217,7 @@ impl Framebuffer {
                 };
             }
         }
+        true
     }
 
     pub fn stroke_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: u16) {
@@ -455,9 +493,6 @@ impl Framebuffer {
         height: usize,
         color: u16,
     ) -> bool {
-        let Some(pointer) = self.memory.framebuffer() else {
-            return false;
-        };
         let x_start = x.min(WIDTH);
         let y_start = y.min(HEIGHT);
         let x_end = x.saturating_add(width).min(WIDTH);
@@ -471,19 +506,61 @@ impl Framebuffer {
         if !self.flush_rect(x_start, y_start, width, height) {
             return false;
         }
+        let filled = self.ppa_fill_rect_raw(x_start, y_start, width, height, color);
+        // Invalidate even on failure: a partial fill still leaves the cache
+        // disagreeing with PSRAM.
+        self.flush_rect(x_start, y_start, width, height);
+        filled
+    }
+
+    /// Forces a PPA transfer without performing cache maintenance.
+    ///
+    /// This is intentionally diagnostic-only. The caller must first ensure
+    /// that no dirty or clean framebuffer cache line can outlive the DMA, and
+    /// must not let the CPU touch the destination until coherency has been
+    /// restored. `displaybench ppa-raw` invalidates the whole framebuffer once
+    /// before its loop and then keeps the CPU away from it until the loop is
+    /// complete. Production callers must use `ppa_fill_rect` instead.
+    pub(crate) fn diagnostic_ppa_fill_rect_raw(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: u16,
+    ) -> bool {
+        let x_start = x.min(WIDTH);
+        let y_start = y.min(HEIGHT);
+        let x_end = x.saturating_add(width).min(WIDTH);
+        let y_end = y.saturating_add(height).min(HEIGHT);
+        if x_start >= x_end || y_start >= y_end {
+            return false;
+        }
+        self.ppa_fill_rect_raw(x_start, y_start, x_end - x_start, y_end - y_start, color)
+    }
+
+    /// Starts the PPA for a rectangle already clipped to the logical screen.
+    /// Cache ownership is deliberately absent from this primitive.
+    fn ppa_fill_rect_raw(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        color: u16,
+    ) -> bool {
+        let Some(pointer) = self.memory.framebuffer() else {
+            return false;
+        };
         // Native row `NATIVE_HEIGHT - 1 - x` holds logical column x, so the
         // block's top row is the one belonging to the rectangle's right edge.
         let picture = native_picture(pointer);
         let destination = dma2d::Block {
             picture: &picture,
-            x: y_start,
-            y: NATIVE_HEIGHT - x_end,
+            x: y,
+            y: NATIVE_HEIGHT - x - width,
         };
-        let filled = ppa::fill_rgb565(&destination, height, width, color);
-        // Invalidate even on failure: a partial fill still leaves the cache
-        // disagreeing with PSRAM.
-        self.flush_rect(x_start, y_start, width, height);
-        filled
+        ppa::fill_rgb565(&destination, height, width, color)
     }
 
     /// Moves a band of the screen up by `distance` logical Y pixels, by DMA.
@@ -568,70 +645,6 @@ impl Framebuffer {
             offset += bytes;
         }
         true
-    }
-
-    /// Paints the bring-up quadrant pattern and confirms it reached PSRAM.
-    ///
-    /// `draw_coordinate_chart` is the other bring-up screen; this one is kept
-    /// alongside it so either can be dropped in while checking rotation or
-    /// clipping.
-    pub fn draw_test_images(&mut self) -> bool {
-        self.draw_quadrants();
-        if !self.flush() {
-            return false;
-        }
-
-        // Cache invalidation above makes this read come back from external
-        // PSRAM. The same first word is consumed by DW-GDMA, so this detects
-        // a failed cache-to-memory synchronization before scanout starts.
-        let Some(framebuffer) = self.memory.framebuffer() else {
-            return false;
-        };
-        unsafe { framebuffer.read_volatile() == GREEN }
-    }
-
-    fn draw_quadrants(&mut self) {
-        let Some(pointer) = self.memory.framebuffer() else {
-            return;
-        };
-
-        // Generate the rotated quadrants directly in panel-native row order.
-        // The former logical-coordinate loop walked native rows backwards;
-        // forward linear writes are substantially friendlier to the cache and
-        // also make it possible to pinpoint a large-write stall by row.
-        let mut offset = 0;
-        for native_y in 0..NATIVE_HEIGHT {
-            let logical_right = native_y < NATIVE_HEIGHT / 2;
-            for native_x in 0..NATIVE_WIDTH {
-                let logical_bottom = native_x >= NATIVE_WIDTH / 2;
-                let color = match (logical_right, logical_bottom) {
-                    (false, false) => RED,
-                    (true, false) => GREEN,
-                    (false, true) => BLUE,
-                    (true, true) => WHITE,
-                };
-                unsafe { pointer.add(offset).write_volatile(color) };
-                offset += 1;
-            }
-        }
-
-        for y in 0..HEIGHT {
-            self.draw_pixel(WIDTH / 2, y, BLACK);
-            self.draw_pixel(WIDTH / 2 + 1, y, BLACK);
-        }
-        for x in 0..WIDTH {
-            self.draw_pixel(x, HEIGHT / 2, BLACK);
-            self.draw_pixel(x, HEIGHT / 2 + 1, BLACK);
-        }
-
-        self.fill_rect(120, 48, 1040, 112, BLACK);
-        self.stroke_rect(112, 40, 1056, 128, YELLOW);
-        self.draw_text(448, 80, "RUST NO_STD  FB0", 4, WHITE, None);
-
-        self.fill_circle(220, 560, 72, YELLOW);
-        self.draw_circle(1060, 560, 72, CYAN);
-
-        self.draw_line(80, 660, 1200, 400, MAGENTA);
     }
 
     /// Paints the coordinate calibration chart: a 100-pixel grid, the exact

@@ -1,0 +1,28 @@
+[tasks.run]
+description = "Run the application"
+run = "cargo run --release"
+
+[tasks.clean]
+confirm = "Are you sure?"
+description = "Clean the build artifacts"
+run = "cargo clean"
+
+[tasks.update]
+description = "Update the dependencies"
+run = "cargo update"
+
+[tasks.test]
+description = "Run the tests"
+run = "cargo test"
+
+# [tasks.doc]
+# description = "Generate documentation"
+# run = "cargo doc"
+
+[tasks.build]
+description = "Build the application"
+run = "cargo build --release"
+
+[tasks.monitor]
+description = "Run a monitor for the application"
+run = "python3 tools/monitor.py"

@@ -20,7 +20,7 @@
 //! `esp_lcd/src/esp_async_fbcpy.c`, which is the only in-tree user of the
 //! memory-to-memory mode. No ESP-IDF code is linked in.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::psram;
 use crate::uart;
@@ -65,12 +65,17 @@ pub const PERI_SEL_PPA_BLEND: u32 = 2;
 const PERI_SEL_M2M_RX: u32 = 3;
 const PERI_SEL_M2M_TX: u32 = 4;
 
-/// Common `CONF0` fields: data moves in 128-byte bursts (bits 8:6 = 4, the
-/// largest offered and so the fewest PSRAM transactions), writes stay inside
-/// that burst's address boundary (bit 12), and no macro-block reordering
+/// Production uses the largest offered burst. A display diagnostic can
+/// temporarily lower this field to learn whether shorter DMA2D ownership
+/// intervals improve the scanout DMA's worst-case read latency; it restores
+/// 128 bytes before returning.
+static BURST_CODE: AtomicU32 = AtomicU32::new(4);
+
+/// `CONF0` fields independent of burst size: writes stay inside the selected
+/// burst's address boundary (bit 12), and macro-block reordering is disabled
 /// (bits 10:9 = 3 = none). Owner checking (bit 4), descriptor-from-peripheral
 /// (bit 11) and reorder (bit 16) stay off.
-const CONF0_COMMON: u32 = (4 << 6) | (3 << 9) | (1 << 12);
+const CONF0_FIXED: u32 = (3 << 9) | (1 << 12);
 /// RX bit 0 turns on memory-to-memory, which is what makes the channel take
 /// its data from its sibling TX rather than from a peripheral.
 const IN_MEM_TRANS_EN: u32 = 1 << 0;
@@ -260,6 +265,29 @@ pub fn is_available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
 }
 
+/// Returns the DMA2D data burst selected for the next transfer.
+pub(crate) fn diagnostic_burst_bytes() -> u32 {
+    8 << BURST_CODE.load(Ordering::Relaxed)
+}
+
+/// Selects a DMA2D data burst for a bounded diagnostic run.
+///
+/// This does not touch an active channel; the value is consumed when the next
+/// transfer configures RX/TX. Callers must restore the returned previous value
+/// before resuming normal rendering.
+pub(crate) fn diagnostic_set_burst_bytes(bytes: u32) -> Option<u32> {
+    let code = match bytes {
+        8 => 0,
+        16 => 1,
+        32 => 2,
+        64 => 3,
+        128 => 4,
+        _ => return None,
+    };
+    let previous = BURST_CODE.swap(code, Ordering::Relaxed);
+    Some(8 << previous)
+}
+
 /// Arms RX channel 0 to receive into `descriptor` from `peripheral`, and
 /// starts it.
 ///
@@ -351,7 +379,8 @@ pub fn wait_for_rx() -> bool {
 /// # Safety
 /// The block must be clocked and out of reset.
 unsafe fn configure_rx(peripheral: u32, memory_to_memory: bool) {
-    let conf0 = CONF0_COMMON | INDSCR_BURST_EN | if memory_to_memory { IN_MEM_TRANS_EN } else { 0 };
+    let conf0 =
+        common_conf0() | INDSCR_BURST_EN | if memory_to_memory { IN_MEM_TRANS_EN } else { 0 };
     unsafe {
         write(RX_CHANNEL + LINK_CONF, INLINK_STOP);
         reset_channel(RX_CHANNEL, conf0);
@@ -363,13 +392,17 @@ unsafe fn configure_rx(peripheral: u32, memory_to_memory: bool) {
 /// # Safety
 /// The block must be clocked and out of reset.
 unsafe fn configure_tx(peripheral: u32) {
-    let conf0 = CONF0_COMMON | OUT_EOF_MODE;
+    let conf0 = common_conf0() | OUT_EOF_MODE;
     unsafe {
         write(TX_CHANNEL + LINK_CONF, OUTLINK_STOP);
         reset_channel(TX_CHANNEL, conf0);
         write(TX_CHANNEL + TX_PERI_SEL, peripheral);
         write(TX_CHANNEL + TX_COLOR_CONVERT, COLOR_CONVERT_NONE);
     }
+}
+
+fn common_conf0() -> u32 {
+    CONF0_FIXED | (BURST_CODE.load(Ordering::Relaxed) << 6)
 }
 
 /// Pulses a channel's reset with command-disable held, then leaves `conf0` in

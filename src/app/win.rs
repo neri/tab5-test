@@ -9,11 +9,12 @@
 //! desktop underneath, so it stays correct over the window and icons and
 //! not just over flat background.
 //!
-//! The window can be dragged by its title bar, the way Windows 95 itself
-//! did it with "show window contents while dragging" off: a dithered
-//! outline follows the pointer and the window jumps to it on release. That
-//! is not nostalgia for its own sake -- see `Outline` for why drawing the
-//! window itself every frame is the expensive option here.
+//! The window can be dragged by its title bar with its contents showing,
+//! the way Windows 95 did it with "show window contents while dragging"
+//! turned on: the window itself follows the pointer rather than an outline
+//! standing in for it. Each step repaints the window at its new origin and
+//! the desktop strip it uncovered -- see `redraw_moved_window` for why that
+//! is a redraw rather than a copy.
 //!
 //! Everything else is decoration with no behaviour behind it: the Start
 //! button does not open, the close box does not close, and the desktop
@@ -55,6 +56,19 @@ const TRAY_LEFT: usize = WIDTH - 6 - TRAY_WIDTH;
 const CLOCK_TEXT_WIDTH: usize = 5 * 6 * 3;
 const CLOCK_LEFT: usize = TRAY_LEFT + (TRAY_WIDTH - CLOCK_TEXT_WIDTH) / 2;
 const CLOCK_TOP: usize = BUTTON_TOP + (BUTTON_HEIGHT - 7 * 3) / 2;
+
+/// The two desktop icons. Their captions are wider than the 48-pixel icons
+/// themselves and so are what set the box a repaint has to test the window
+/// against; both are 11 characters at text scale 2, which
+/// `draw_icon_label` asserts.
+const ICON_LEFT: usize = 44;
+const COMPUTER_ICON_TOP: usize = 44;
+const BIN_ICON_TOP: usize = 176;
+const ICON_WIDTH: usize = 48;
+const ICON_LABEL_WIDTH: usize = 11 * 6 * 2;
+const ICON_LABEL_OFFSET_Y: usize = 54;
+const ICON_BOUNDS_LEFT: usize = ICON_LEFT + ICON_WIDTH / 2 - ICON_LABEL_WIDTH / 2;
+const ICON_BOUNDS_HEIGHT: usize = ICON_LABEL_OFFSET_Y + 7 * 2;
 
 const WINDOW_INITIAL_LEFT: usize = 340;
 const WINDOW_INITIAL_TOP: usize = 210;
@@ -121,12 +135,6 @@ XX..XOOX....\
 X....XOOX...\
 .....XOOX...\
 ......XXX...";
-/// Thickness of the drag outline's edges, and the size of the four backing
-/// stores that hold what each one covers.
-const OUTLINE_THICKNESS: usize = 3;
-const OUTLINE_HORIZONTAL_PIXELS: usize = WINDOW_WIDTH * OUTLINE_THICKNESS;
-const OUTLINE_VERTICAL_PIXELS: usize = OUTLINE_THICKNESS * (WINDOW_HEIGHT - 2 * OUTLINE_THICKNESS);
-
 /// Pointer gain, as a fraction applied to the mouse's raw counts: at 1/1 one
 /// count moves the pointer one pixel, which is slow going across 1280
 /// pixels. Kept as a fraction rather than a whole multiplier so it can be
@@ -161,7 +169,6 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     draw_desktop(framebuffer, window, clock, mouse_present);
 
     let mut cursor = Cursor::new(WIDTH / 2, HEIGHT / 2);
-    let mut outline = Outline::new();
     let mut drag: Option<Drag> = None;
     // A previous screen may have been left while a finger was down. Its
     // contact must not become a synthetic move in this fresh desktop; the
@@ -215,7 +222,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         // this frame, not where it started: press and motion can arrive in
         // the same report, and grabbing at the old position would offset
         // the window by one frame's travel.
-        let mut commit_drag = false;
+        let mut release_drag = false;
         match touch {
             // The first finger is the only one `InputManager` reports here.
             // A title-bar touch is therefore a left-button press; its later
@@ -227,7 +234,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             }
             PrimaryTouch::Released if matches!(drag, Some(active) if active.source == DragSource::Touch) =>
             {
-                commit_drag = true;
+                release_drag = true;
             }
             _ => {}
         }
@@ -247,7 +254,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
                 if update.released & MOUSE_BUTTON_LEFT != 0
                     && matches!(drag, Some(active) if active.source == DragSource::Mouse)
                 {
-                    commit_drag = true;
+                    release_drag = true;
                 }
             }
         }
@@ -262,52 +269,43 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             clock = next_clock;
             mouse_present = next_mouse_present;
             // A mouse unplugged mid-drag never sends the button release
-            // that would end it, which would otherwise leave the outline
-            // stuck on screen following a pointer that cannot move.
+            // that would end it, which would otherwise leave the window
+            // following a pointer that cannot move. It stays where it was
+            // last drawn.
             if !mouse_present && matches!(drag, Some(active) if active.source == DragSource::Mouse)
             {
                 drag = None;
-                commit_drag = true;
             }
         }
 
-        let outline_target = drag.map(|active| active.window_origin(target_x, target_y));
-        let outline_dirty = match outline_target {
-            Some(position) => !outline.visible || (outline.x, outline.y) != position,
-            None => outline.visible && !commit_drag,
-        };
-        if !pointer_moved && !scene_dirty && !outline_dirty && !commit_drag {
+        // Where the drag puts the window this frame, if that is anywhere
+        // other than where it already is. Read before the release below
+        // clears the drag, so the last position a release carries with it
+        // is still applied.
+        let moved_to = drag.and_then(|active| {
+            let position = active.window_origin(target_x, target_y);
+            (position != (window.x, window.y)).then_some(position)
+        });
+        if release_drag {
+            drag = None;
+        }
+        if !pointer_moved && !scene_dirty && moved_to.is_none() {
             continue;
         }
 
-        // Every repaint happens with the pointer lifted off, and the
-        // outline lifted off under that. The saved pixels of each are only
-        // valid until something else writes into that region, so both have
-        // to come off before anything below repaints, or putting them back
-        // would stamp a stale copy over the new drawing. The pointer is
-        // topmost, so it comes off first and goes back on last.
+        // Every repaint happens with the pointer lifted off. Its saved
+        // pixels are only valid until something else writes into that
+        // region, so it has to come off before anything below repaints, or
+        // putting it back would stamp a stale copy over the new drawing.
+        // The pointer is topmost, so it comes off first and goes back on
+        // last.
         let (previous_x, previous_y) = (cursor.x, cursor.y);
         cursor.hide(framebuffer);
 
-        if commit_drag {
-            // The window jumps to where the outline was left. Repainting
-            // the whole desktop is the simple way to get the vacated
-            // background back without every element needing to redraw
-            // itself clipped, and it happens once per drag rather than
-            // once per frame.
-            if let Some(position) = outline_target {
-                (window.x, window.y) = position;
-            }
-            drag = None;
-            outline.forget();
-            draw_desktop(framebuffer, window, clock, mouse_present);
-            cursor.move_to(target_x, target_y);
-            cursor.show(framebuffer);
-            if !framebuffer.flush() {
-                uart::log(b"Win: flush after window move failed\r\n");
-                return;
-            }
-            continue;
+        if let Some(position) = moved_to {
+            let vacated = window;
+            (window.x, window.y) = position;
+            redraw_moved_window(framebuffer, vacated, window, mouse_present);
         }
 
         if scene_dirty {
@@ -328,45 +326,6 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
                 WINDOW_WIDTH - 2 * STATUS_OFFSET_X,
                 STATUS_LINE_HEIGHT,
             );
-        }
-
-        if outline_dirty {
-            let vacated = (outline.x, outline.y);
-            let was_visible = outline.visible;
-            outline.hide(framebuffer);
-            match outline_target {
-                Some(position) => {
-                    outline.show(framebuffer, position.0, position.1);
-                    // One rectangle covering both positions, for the reason
-                    // given on `Outline`: the writeback's cost is set by its
-                    // logical-X extent, so flushing the four edges
-                    // separately would pay that extent four times over for
-                    // no benefit.
-                    if was_visible {
-                        flush_union(framebuffer, vacated, position, WINDOW_WIDTH, WINDOW_HEIGHT);
-                    } else {
-                        flush(
-                            framebuffer,
-                            position.0,
-                            position.1,
-                            WINDOW_WIDTH,
-                            WINDOW_HEIGHT,
-                        );
-                    }
-                }
-                // The drag ended without a commit. Nothing puts the
-                // registry in this state today, but leaving the outline on
-                // screen would also leave `outline_dirty` true forever and
-                // repaint every frame, so it is cleared rather than
-                // ignored.
-                None => flush(
-                    framebuffer,
-                    vacated.0,
-                    vacated.1,
-                    WINDOW_WIDTH,
-                    WINDOW_HEIGHT,
-                ),
-            }
         }
 
         cursor.move_to(target_x, target_y);
@@ -501,138 +460,138 @@ impl Drag {
     }
 }
 
-/// The dragging outline: a dithered rectangle the size of the window, drawn
-/// over whatever is underneath and taken back off the same way `Cursor` is.
+/// A logical rectangle, as `(x, y, width, height)`.
+type Rect = (usize, usize, usize, usize);
+
+/// Redraws the window at its new origin and repaints the desktop its old
+/// one uncovered.
 ///
-/// Windows 95 dragged an outline rather than the window because redrawing
-/// the window was too expensive; on this hardware the reason is different
-/// but points the same way. Repainting the window itself every frame means
-/// re-filling 600x250 pixels and redrawing its text, and also repainting
-/// whatever background the window uncovered -- which would need every
-/// element on the desktop to be redrawable clipped to an arbitrary
-/// rectangle, exactly the problem `Cursor`'s save-and-restore exists to
-/// avoid. The outline is about 3,400 pixels and needs none of that.
+/// Nothing is copied. `dma2d::copy_rgb565` could move the window's 300 KiB
+/// of pixels in a single transfer, but it only orders its reads safely when
+/// the destination lies at a lower address than the source, and a window is
+/// dragged in every direction; half of them would overwrite source pixels
+/// the engine had not reached yet. So the window is drawn again from its
+/// primitives, all of them at a fixed origin -- which is what keeps every
+/// element on this screen free of having to clip itself. The face and the
+/// title bar are large enough to take `fill_rect`'s PPA path; only the
+/// border and the text are CPU work.
 ///
-/// What it does *not* save is the writeback. `flush_rect`'s cost is set by
-/// the logical-X extent, because CW rotation makes logical X stride across
-/// native rows: a 600-wide rectangle spans 600 native rows whatever its
-/// height, so one drag frame writes back about 860 KiB either way -- just
-/// under half of a full-screen flush. That is the real cost of dragging
-/// something this wide, and it is why the outline is flushed as one
-/// rectangle covering both positions rather than as four separate strips,
-/// which would pay that X extent twice.
-struct Outline {
-    x: usize,
-    y: usize,
-    /// The four edges' backing stores. Split by edge rather than kept as
-    /// one window-sized buffer because the interior is never touched --
-    /// a whole 600x250 copy would be 300 KiB.
-    top: [u16; OUTLINE_HORIZONTAL_PIXELS],
-    bottom: [u16; OUTLINE_HORIZONTAL_PIXELS],
-    left: [u16; OUTLINE_VERTICAL_PIXELS],
-    right: [u16; OUTLINE_VERTICAL_PIXELS],
-    visible: bool,
-}
-
-impl Outline {
-    fn new() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            top: [0; OUTLINE_HORIZONTAL_PIXELS],
-            bottom: [0; OUTLINE_HORIZONTAL_PIXELS],
-            left: [0; OUTLINE_VERTICAL_PIXELS],
-            right: [0; OUTLINE_VERTICAL_PIXELS],
-            visible: false,
-        }
-    }
-
-    /// The four edge rectangles at a given origin, in the order the backing
-    /// stores are declared.
-    fn edges(x: usize, y: usize) -> [(usize, usize, usize, usize); 4] {
-        let inner_height = WINDOW_HEIGHT - 2 * OUTLINE_THICKNESS;
-        [
-            (x, y, WINDOW_WIDTH, OUTLINE_THICKNESS),
-            (
-                x,
-                y + WINDOW_HEIGHT - OUTLINE_THICKNESS,
-                WINDOW_WIDTH,
-                OUTLINE_THICKNESS,
-            ),
-            (x, y + OUTLINE_THICKNESS, OUTLINE_THICKNESS, inner_height),
-            (
-                x + WINDOW_WIDTH - OUTLINE_THICKNESS,
-                y + OUTLINE_THICKNESS,
-                OUTLINE_THICKNESS,
-                inner_height,
-            ),
-        ]
-    }
-
-    #[inline(never)]
-    fn hide(&mut self, framebuffer: &mut Framebuffer) {
-        if !self.visible {
-            return;
-        }
-        let edges = Self::edges(self.x, self.y);
-        let saved: [&[u16]; 4] = [&self.top, &self.bottom, &self.left, &self.right];
-        for (&(x, y, width, height), pixels) in edges.iter().zip(saved) {
-            framebuffer.blit_rgb565(x, y, width, height, pixels);
-        }
-        self.visible = false;
-    }
-
-    #[inline(never)]
-    fn show(&mut self, framebuffer: &mut Framebuffer, x: usize, y: usize) {
-        if self.visible {
-            return;
-        }
-        self.x = x;
-        self.y = y;
-        let edges = Self::edges(x, y);
-        let mut saved: [&mut [u16]; 4] = [
-            &mut self.top,
-            &mut self.bottom,
-            &mut self.left,
-            &mut self.right,
-        ];
-        for (&(x, y, width, height), pixels) in edges.iter().zip(saved.iter_mut()) {
-            framebuffer.read_rect(x, y, width, height, pixels);
-            draw_dither_rect(framebuffer, x, y, width, height);
-        }
-        self.visible = true;
-    }
-
-    /// Drops the backing store without restoring it, for the one case where
-    /// the caller is about to repaint the whole screen anyway. Restoring
-    /// first would be correct but pointless work.
-    fn forget(&mut self) {
-        self.visible = false;
-    }
-}
-
-/// The 50% black-and-white dither Windows 95 drew its drag outline in,
-/// which reads as grey and stays visible over both the teal desktop and the
-/// grey window. The pattern is keyed to absolute coordinates so it does not
-/// crawl as the outline moves.
+/// What the uncovered desktop needs in return is the one thing the outline
+/// this replaced was avoiding: something that can repaint bare background
+/// under an arbitrary rectangle. `draw_desktop_patch` is that, and it is
+/// only tractable because the desktop underneath is teal plus two icons.
+///
+/// The writeback is one rectangle covering both positions rather than two.
+/// Its cost is set by the logical-X extent, because CW rotation makes
+/// logical X stride across native rows: a 600-wide rectangle spans 600
+/// native rows whatever its height, about 860 KiB. The two positions
+/// overlap for anything but a large jump, so writing them back separately
+/// would pay most of that extent twice.
+///
+/// A drag frame can still be caught half-drawn. The PPA writes to PSRAM
+/// directly while the CPU's pixels wait in the cache for the writeback
+/// below, so the face reaches the panel before the text over it does, and
+/// with one framebuffer there is no way to make a repaint atomic.
 #[inline(never)]
-fn draw_dither_rect(
+fn redraw_moved_window(
     framebuffer: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
+    vacated: Window,
+    window: Window,
+    mouse_present: bool,
 ) {
-    for row in 0..height {
-        for column in 0..width {
-            let color = if (x + column + y + row) % 2 == 0 {
-                WHITE
-            } else {
-                BLACK
-            };
-            framebuffer.draw_pixel(x + column, y + row, color);
-        }
+    for strip in uncovered_strips(vacated, window).into_iter().flatten() {
+        draw_desktop_patch(framebuffer, strip);
     }
+    draw_window(framebuffer, window, mouse_present);
+    flush_union(
+        framebuffer,
+        (vacated.x, vacated.y),
+        (window.x, window.y),
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+    );
+}
+
+/// The parts of `vacated`'s rectangle that the window at `window` no longer
+/// covers.
+///
+/// Both rectangles are the same size, so what is left behind is at most an
+/// L: one strip the width of the horizontal travel, one the height of the
+/// vertical travel. The second is cut back to the columns the first did not
+/// already take, so no pixel is filled twice.
+fn uncovered_strips(vacated: Window, window: Window) -> [Option<Rect>; 2] {
+    let (old_x, old_y) = (vacated.x, vacated.y);
+    let (new_x, new_y) = (window.x, window.y);
+    let travel_x = old_x.abs_diff(new_x);
+    let travel_y = old_y.abs_diff(new_y);
+    if travel_x >= WINDOW_WIDTH || travel_y >= WINDOW_HEIGHT {
+        // A jump clear of the old position, which a fast mouse or a touch
+        // landing far from the last one can produce: none of it survives.
+        return [Some((old_x, old_y, WINDOW_WIDTH, WINDOW_HEIGHT)), None];
+    }
+    let vertical = if new_x > old_x {
+        Some((old_x, old_y, travel_x, WINDOW_HEIGHT))
+    } else if new_x < old_x {
+        Some((new_x + WINDOW_WIDTH, old_y, travel_x, WINDOW_HEIGHT))
+    } else {
+        None
+    };
+    let shared_left = old_x.max(new_x);
+    let shared_width = WINDOW_WIDTH - travel_x;
+    let horizontal = if new_y > old_y {
+        Some((shared_left, old_y, shared_width, travel_y))
+    } else if new_y < old_y {
+        Some((shared_left, new_y + WINDOW_HEIGHT, shared_width, travel_y))
+    } else {
+        None
+    };
+    [vertical, horizontal]
+}
+
+/// Repaints one rectangle of bare desktop: the teal background, and any
+/// icon that reaches into it.
+///
+/// The icon is redrawn whole rather than clipped to `rect`. The parts of it
+/// that fall outside only get painted with what they already held, except
+/// where the window is about to cover them -- so this has to run before
+/// `draw_window`, never after it.
+///
+/// Those outside parts are also why the icon is written back here instead
+/// of being left to the caller's rectangle: a caption reaches further left
+/// than any strip the window vacates, and pixels the CPU has drawn but not
+/// written back would otherwise sit in the cache until an eviction put them
+/// on screen at a time of the cache's choosing.
+#[inline(never)]
+fn draw_desktop_patch(framebuffer: &mut Framebuffer, rect: Rect) {
+    let (x, y, width, height) = rect;
+    fill(framebuffer, x, y, width, height, DESKTOP);
+    if overlaps(rect, icon_bounds(COMPUTER_ICON_TOP)) {
+        draw_computer_icon(framebuffer, ICON_LEFT, COMPUTER_ICON_TOP);
+        flush_icon(framebuffer, COMPUTER_ICON_TOP);
+    }
+    if overlaps(rect, icon_bounds(BIN_ICON_TOP)) {
+        draw_bin_icon(framebuffer, ICON_LEFT, BIN_ICON_TOP);
+        flush_icon(framebuffer, BIN_ICON_TOP);
+    }
+}
+
+/// The box an icon and its caption together occupy, for an icon drawn at
+/// `top`.
+fn icon_bounds(top: usize) -> Rect {
+    (ICON_BOUNDS_LEFT, top, ICON_LABEL_WIDTH, ICON_BOUNDS_HEIGHT)
+}
+
+#[inline(never)]
+fn flush_icon(framebuffer: &Framebuffer, top: usize) {
+    let (x, y, width, height) = icon_bounds(top);
+    flush(framebuffer, x, y, width, height);
+}
+
+fn overlaps(first: Rect, second: Rect) -> bool {
+    first.0 < second.0 + second.2
+        && second.0 < first.0 + first.2
+        && first.1 < second.1 + second.3
+        && second.1 < first.1 + first.3
 }
 
 /// The pointer sprite plus the pixels it is currently covering.
@@ -755,8 +714,8 @@ fn scale_motion(delta: i32, remainder: &mut i32) -> i32 {
     moved
 }
 
-/// Writes back one rectangle covering both positions of a sprite that just
-/// moved.
+/// Writes back one rectangle covering both positions of something that just
+/// moved -- the pointer sprite, or the window.
 #[inline(never)]
 fn flush_union(
     framebuffer: &Framebuffer,
@@ -782,8 +741,8 @@ fn draw_desktop(
     mouse_present: bool,
 ) {
     framebuffer.fill(DESKTOP);
-    draw_computer_icon(framebuffer, 44, 44);
-    draw_bin_icon(framebuffer, 44, 176);
+    draw_computer_icon(framebuffer, ICON_LEFT, COMPUTER_ICON_TOP);
+    draw_bin_icon(framebuffer, ICON_LEFT, BIN_ICON_TOP);
     draw_window(framebuffer, window, mouse_present);
     draw_taskbar(framebuffer, clock);
 }
@@ -1003,7 +962,7 @@ fn draw_computer_icon(framebuffer: &mut Framebuffer, x: usize, y: usize) {
     draw_border(framebuffer, x + 8, y + 4, 32, 24, SHADOW, HILIGHT);
     draw_raised(framebuffer, x + 12, y + 32, 24, 6);
     draw_raised(framebuffer, x, y + 38, 48, 10);
-    draw_icon_label(framebuffer, x, y + 54, "My Computer");
+    draw_icon_label(framebuffer, x, y + ICON_LABEL_OFFSET_Y, "My Computer");
 }
 
 /// "Recycle Bin": a tapered bin with a lid and a couple of ribs.
@@ -1014,7 +973,7 @@ fn draw_bin_icon(framebuffer: &mut Framebuffer, x: usize, y: usize) {
     for offset in [8usize, 16] {
         fill(framebuffer, x + 12 + offset, y + 12, 2, 32, SHADOW);
     }
-    draw_icon_label(framebuffer, x, y + 54, "Recycle Bin");
+    draw_icon_label(framebuffer, x, y + ICON_LABEL_OFFSET_Y, "Recycle Bin");
 }
 
 /// Desktop icon captions: white on the teal desktop, centred under a
@@ -1022,6 +981,9 @@ fn draw_bin_icon(framebuffer: &mut Framebuffer, x: usize, y: usize) {
 #[inline(never)]
 fn draw_icon_label(framebuffer: &mut Framebuffer, icon_x: usize, y: usize, text: &str) {
     let width = text.len() * 6 * 2;
+    // `ICON_LABEL_WIDTH` is the box `draw_desktop_patch` tests the window
+    // against, and a caption wider than it would be left unrepainted.
+    debug_assert!(width <= ICON_LABEL_WIDTH);
     let left = (icon_x + 24).saturating_sub(width / 2);
     draw_string(framebuffer, left, y, text, 2, WHITE, None);
 }
