@@ -1,28 +1,31 @@
-//! Unified keyboard input, pointer input, and input-source lifecycle
-//! management.
+//! Unified keyboard, pointer, and touch input-source lifecycle management.
 //!
 //! This module is the application-level owner of all sources that can emit
 //! console keys.  It deliberately does not replace `usb::UsbHost`: that type
 //! remains the sole owner of USB-A enumeration, hub state, and non-keyboard
 //! USB devices such as Mass Storage.
 //!
-//! Pointer input is forwarded rather than normalized the way keys are.  A
+//! USB pointer input is forwarded rather than normalized the way keys are.  A
 //! key is meaningful on its own, so `Key` hides which keyboard produced it;
 //! mouse motion is relative and only becomes a position once something
 //! decides what it is moving across, so `poll_mouse` hands `usb::MouseUpdate`
 //! straight through and leaves the cursor position to the screen that draws
-//! one (`app::win`).  That also keeps this module free of any dependency on
-//! the framebuffer's geometry.
+//! one (`app::win`). Touch is different: it reports absolute framebuffer
+//! coordinates, so this module owns the controller lifecycle and exposes
+//! contacts and a single-contact stream without exposing its I2C driver.
 
 use crate::cardkb::CardKb;
 use crate::tab5_keyboard::Tab5Keyboard;
+use crate::touch::{Touch, TouchPoint as DriverTouchPoint};
 use crate::{interrupts, uart, usb};
 
 const CARDKB_RECONNECT_FRAMES: u32 = 60;
 const TAB5_KEYBOARD_RECONNECT_FRAMES: u32 = 60;
 const TAB5_KEYBOARD_HEALTH_CHECK_FRAMES: u32 = 60;
+const TOUCH_RECONNECT_FRAMES: u32 = 60;
 const HUB_PORT_SCAN_FRAMES: u32 = 60;
 const ROOT_RESCAN_FRAMES: u32 = 300;
+const MAX_TOUCH_POINTS: usize = 10;
 
 /// A normalized key understood by application-level input consumers.
 ///
@@ -61,6 +64,30 @@ pub struct KeyEvent {
     pub key: Key,
 }
 
+/// One active touch contact in framebuffer logical (landscape) coordinates.
+///
+/// Contact identity belongs to the controller driver: callers receive just
+/// the stable display-space coordinates needed for drawing and hit testing.
+#[derive(Clone, Copy)]
+pub struct TouchPoint {
+    pub x: usize,
+    pub y: usize,
+}
+
+/// The first finger in a touch sequence, represented as pointer-like phases.
+///
+/// Once a `Pressed` event is returned, contacts added later are deliberately
+/// ignored until that original contact goes away. This lets a consumer use a
+/// touch drag like a left-button mouse drag without accidentally switching to
+/// another finger.
+#[derive(Clone, Copy)]
+pub enum PrimaryTouch {
+    Idle,
+    Pressed(TouchPoint),
+    Moved(TouchPoint),
+    Released,
+}
+
 /// Owns every keyboard input source and maintains their connection state.
 ///
 /// `service` performs periodic connection maintenance and `poll_key` only
@@ -71,6 +98,9 @@ pub struct InputManager {
     tab5_keyboard: Option<Tab5Keyboard>,
     tab5_keyboard_reconnect_frames: u32,
     tab5_keyboard_health_check_frames: u32,
+    touch: Option<Touch>,
+    touch_reconnect_frames: u32,
+    primary_touch_id: Option<u8>,
     usb_host: usb::UsbHost,
     usb_reconnect_frames: u32,
     next_source: KeySource,
@@ -101,6 +131,15 @@ impl InputManager {
             uart::log(b"Tab5 Keyboard: absent\r\n");
         }
 
+        let touch = Touch::init();
+        if let Some(panel) = touch.as_ref() {
+            uart::log(b"Touch: ready (");
+            uart::log(panel.controller_name().as_bytes());
+            uart::log(b")\r\n");
+        } else {
+            uart::log(b"Touch: absent\r\n");
+        }
+
         let mut usb_host = usb::UsbHost::new();
         usb_host.rescan();
         uart::log(b"USB: initial scan complete\r\n");
@@ -111,6 +150,9 @@ impl InputManager {
             tab5_keyboard,
             tab5_keyboard_reconnect_frames: 0,
             tab5_keyboard_health_check_frames: 0,
+            touch,
+            touch_reconnect_frames: 0,
+            primary_touch_id: None,
             usb_host,
             usb_reconnect_frames: 0,
             next_source: KeySource::CardKb,
@@ -151,6 +193,19 @@ impl InputManager {
                     self.tab5_keyboard = None;
                     self.tab5_keyboard_reconnect_frames = 0;
                     uart::log(b"Tab5 Keyboard: disconnected\r\n");
+                }
+            }
+        }
+
+        if self.touch.is_none() {
+            self.touch_reconnect_frames += 1;
+            if self.touch_reconnect_frames == TOUCH_RECONNECT_FRAMES {
+                self.touch_reconnect_frames = 0;
+                self.touch = Touch::init();
+                if let Some(panel) = self.touch.as_ref() {
+                    uart::log(b"Touch: connected (");
+                    uart::log(panel.controller_name().as_bytes());
+                    uart::log(b")\r\n");
                 }
             }
         }
@@ -266,6 +321,77 @@ impl InputManager {
     /// can say up front that there is nothing to move the cursor with.
     pub fn has_mouse(&self) -> bool {
         self.usb_host.has_mouse()
+    }
+
+    /// Short controller name for a touch diagnostic, if a panel is present.
+    pub fn touch_controller_name(&self) -> Option<&'static str> {
+        self.touch.as_ref().map(Touch::controller_name)
+    }
+
+    /// Number of contacts the active touch controller is configured to report.
+    pub fn touch_max_points(&self) -> Option<usize> {
+        self.touch.as_ref().map(Touch::max_touches)
+    }
+
+    /// Reads all currently active touch contacts into `points`.
+    ///
+    /// The hardware-specific tracking identifier stays inside the driver. Use
+    /// this for multi-touch views such as `touchtest`; consumers that need a
+    /// one-finger pointer gesture should use `poll_primary_touch` instead.
+    pub fn poll_touch_points(&mut self, points: &mut [TouchPoint]) -> usize {
+        let mut driver_points = [DriverTouchPoint::EMPTY; MAX_TOUCH_POINTS];
+        let Some(touch) = self.touch.as_ref() else {
+            return 0;
+        };
+        let count = touch.poll_points(&mut driver_points).min(points.len());
+        for index in 0..count {
+            points[index] = TouchPoint {
+                x: driver_points[index].x,
+                y: driver_points[index].y,
+            };
+        }
+        count
+    }
+
+    /// Converts the first contact of a touch sequence into pointer phases.
+    ///
+    /// Contact IDs (GT911) or fixed report slots (ST7121/ST7123) keep the
+    /// original finger selected. A second finger never replaces it; when the
+    /// selected finger lifts this returns `Released` even if other fingers
+    /// remain down.
+    pub fn poll_primary_touch(&mut self) -> PrimaryTouch {
+        let mut points = [DriverTouchPoint::EMPTY; MAX_TOUCH_POINTS];
+        let count = self
+            .touch
+            .as_ref()
+            .map(|touch| touch.poll_points(&mut points))
+            .unwrap_or(0);
+
+        if let Some(id) = self.primary_touch_id {
+            if let Some(point) = points[..count].iter().find(|point| point.id == id) {
+                return PrimaryTouch::Moved(TouchPoint {
+                    x: point.x,
+                    y: point.y,
+                });
+            }
+            self.primary_touch_id = None;
+            return PrimaryTouch::Released;
+        }
+
+        let Some(point) = points.first().filter(|_| count != 0) else {
+            return PrimaryTouch::Idle;
+        };
+        self.primary_touch_id = Some(point.id);
+        PrimaryTouch::Pressed(TouchPoint {
+            x: point.x,
+            y: point.y,
+        })
+    }
+
+    /// Discards a saved primary-contact selection before starting a new
+    /// pointer gesture consumer. The next active contact becomes `Pressed`.
+    pub fn reset_primary_touch(&mut self) {
+        self.primary_touch_id = None;
     }
 
     /// Mutable USB bus registry for commands such as `usbrescan` and MSC I/O.

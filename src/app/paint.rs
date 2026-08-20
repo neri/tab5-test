@@ -1,8 +1,7 @@
 //! Full-screen touch drawing mode entered via the shell's `paint` command.
 
 use crate::framebuffer::{BLACK, CYAN, Framebuffer, HEIGHT, WHITE, WIDTH};
-use crate::input::InputManager;
-use crate::touch::Touch;
+use crate::input::{InputManager, TouchPoint};
 use crate::{interrupts, uart};
 
 const BRUSH_RADIUS: usize = 5;
@@ -13,8 +12,7 @@ const HINT: &str = "PAINT - TOUCH TO DRAW, ANY KEY TO EXIT";
 /// straight over it (e.g. a cleared console) without needing to know paint's
 /// internals.
 pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
-    let touch_panel = Touch::init();
-    if touch_panel.is_none() {
+    if input.touch_controller_name().is_none() {
         uart::log(b"Paint: no touch controller found, no drawing input available\r\n");
     }
 
@@ -45,11 +43,11 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             return;
         }
 
-        let Some(panel) = touch_panel.as_ref() else {
-            continue;
-        };
-        match panel.poll() {
-            Some(point) => {
+        let mut points = [TouchPoint { x: 0, y: 0 }; 1];
+        match input.poll_touch_points(&mut points) {
+            0 => last_point = None,
+            _ => {
+                let point = (points[0].x, points[0].y);
                 if !logged_first_touch {
                     logged_first_touch = true;
                     uart::log_hex(b"Paint: first touch x=", point.0 as u32);
@@ -60,7 +58,6 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
                 let _ = flush_stroke(framebuffer, from, point, BRUSH_RADIUS);
                 last_point = Some(point);
             }
-            None => last_point = None,
         }
     }
 }

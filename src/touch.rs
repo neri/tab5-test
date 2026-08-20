@@ -13,24 +13,33 @@
 use crate::i2c::{self, SoftI2c};
 use crate::psram::{HEIGHT as NATIVE_HEIGHT, WIDTH as NATIVE_WIDTH};
 
-/// Either touch controller Tab5 has shipped with, behind one `poll` API.
-pub enum Touch {
+/// Either touch controller Tab5 has shipped with, behind one driver API.
+pub(crate) enum Touch {
     Gt911(Gt911),
     St7123(St7123),
 }
 
 /// One active contact in framebuffer logical (landscape) coordinates.
+///
+/// `id` is a GT911 contact ID or an ST7121/ST7123 report-table slot. It is
+/// deliberately driver-facing: `InputManager` uses it to retain one finger
+/// across a multi-touch sequence, while applications receive only coordinates.
 #[derive(Clone, Copy)]
-pub struct TouchPoint {
+pub(crate) struct TouchPoint {
+    pub(crate) id: u8,
     pub x: usize,
     pub y: usize,
+}
+
+impl TouchPoint {
+    pub(crate) const EMPTY: Self = Self { id: 0, x: 0, y: 0 };
 }
 
 impl Touch {
     /// Probes the older standalone GT911 first, then the newer integrated
     /// ST7121/ST7123 display-touch controller. Returns `None` if neither
     /// answers.
-    pub fn init() -> Option<Self> {
+    pub(crate) fn init() -> Option<Self> {
         if let Some(panel) = Gt911::init() {
             return Some(Touch::Gt911(panel));
         }
@@ -40,27 +49,15 @@ impl Touch {
     /// Fills `points` with every active contact in `framebuffer.rs`'s logical
     /// (landscape) coordinates and returns how many fit.  A caller can pass
     /// a shorter slice when it only needs the first few contacts.
-    pub fn poll_points(&self, points: &mut [TouchPoint]) -> usize {
+    pub(crate) fn poll_points(&self, points: &mut [TouchPoint]) -> usize {
         match self {
             Touch::Gt911(panel) => panel.poll_points(points),
             Touch::St7123(panel) => panel.poll_points(points),
         }
     }
 
-    /// Returns the first active touch point, or `None` if the panel is idle.
-    /// This keeps the paint screen's single-stroke interface while the
-    /// `touchtest` command can inspect every contact through `poll_points`.
-    pub fn poll(&self) -> Option<(usize, usize)> {
-        let mut point = [TouchPoint { x: 0, y: 0 }; 1];
-        if self.poll_points(&mut point) == 0 {
-            None
-        } else {
-            Some((point[0].x, point[0].y))
-        }
-    }
-
     /// A short controller name for the interactive diagnostic.
-    pub fn controller_name(&self) -> &'static str {
+    pub(crate) fn controller_name(&self) -> &'static str {
         match self {
             Touch::Gt911(_) => "GT911",
             Touch::St7123(_) => "ST7121/ST7123",
@@ -68,7 +65,7 @@ impl Touch {
     }
 
     /// Number of contacts the controller is configured to report.
-    pub fn max_touches(&self) -> usize {
+    pub(crate) fn max_touches(&self) -> usize {
         match self {
             Touch::Gt911(_) => GT911_MAX_TOUCH_POINTS,
             Touch::St7123(panel) => panel.max_touches,
@@ -153,7 +150,11 @@ impl Gt911 {
                         scale(raw_x, self.x_max, NATIVE_WIDTH),
                         scale(raw_y, self.y_max, NATIVE_HEIGHT),
                     );
-                    points[found] = TouchPoint { x, y };
+                    points[found] = TouchPoint {
+                        id: point[0] & 0x0F,
+                        x,
+                        y,
+                    };
                     found += 1;
                 }
             }
@@ -261,7 +262,10 @@ impl St7123 {
             return 0;
         }
         let mut found = 0;
-        for point in data[ST7123_HEADER_BYTES..len].chunks_exact(ST7123_TOUCH_STRIDE) {
+        for (slot, point) in data[ST7123_HEADER_BYTES..len]
+            .chunks_exact(ST7123_TOUCH_STRIDE)
+            .enumerate()
+        {
             if point[0] & ST7123_TOUCH_VALID == 0 {
                 continue;
             }
@@ -274,7 +278,11 @@ impl St7123 {
                 scale(raw_x, self.x_max, NATIVE_WIDTH),
                 scale(raw_y, self.y_max, NATIVE_HEIGHT),
             );
-            points[found] = TouchPoint { x, y };
+            points[found] = TouchPoint {
+                id: slot as u8,
+                x,
+                y,
+            };
             found += 1;
         }
         found

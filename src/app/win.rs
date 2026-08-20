@@ -1,5 +1,5 @@
 //! Full-screen Windows 95 desktop mock-up entered through the shell's
-//! `win` command, and the exercise for `usb::hid_mouse`.
+//! `win` command, and the exercise for mouse and touch pointer input.
 //!
 //! Its reason for existing is the mouse: a pointer is the only input this
 //! project has that needs a *position* rather than an event, so it is also
@@ -21,7 +21,7 @@
 //! `rtc`. The rest is deliberately TBD.
 
 use crate::framebuffer::{BLACK, Framebuffer, HEIGHT, WHITE, WIDTH};
-use crate::input::InputManager;
+use crate::input::{InputManager, PrimaryTouch};
 use crate::usb::MOUSE_BUTTON_LEFT;
 use crate::{interrupts, rtc, uart};
 
@@ -149,8 +149,10 @@ const CURSOR_SAVED_PIXELS: usize = CURSOR_DRAWN_WIDTH * CURSOR_DRAWN_HEIGHT;
 /// screen on return for the caller to draw straight over.
 #[inline(never)]
 pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
-    if !input.has_mouse() {
+    if !input.has_mouse() && input.touch_controller_name().is_none() {
         uart::log(b"Win: no USB mouse attached; the pointer will not move\r\n");
+    } else if !input.has_mouse() {
+        uart::log(b"Win: no USB mouse attached; use the touch panel\r\n");
     }
 
     let mut clock = read_clock();
@@ -161,6 +163,10 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let mut cursor = Cursor::new(WIDTH / 2, HEIGHT / 2);
     let mut outline = Outline::new();
     let mut drag: Option<Drag> = None;
+    // A previous screen may have been left while a finger was down. Its
+    // contact must not become a synthetic move in this fresh desktop; the
+    // next observed contact starts a new gesture instead.
+    input.reset_primary_touch();
     cursor.show(framebuffer);
     if !framebuffer.flush() {
         uart::log(b"Win: initial flush failed\r\n");
@@ -186,10 +192,22 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             return;
         }
 
+        let touch = input.poll_primary_touch();
         let motion = input.poll_mouse();
-        let (target_x, target_y) = match motion {
-            Some(update) => cursor.moved_to(update.dx, update.dy),
-            None => (cursor.x, cursor.y),
+        let (target_x, target_y) = if matches!(drag, Some(active) if active.source == DragSource::Mouse)
+        {
+            match motion {
+                Some(update) => cursor.moved_to(update.dx, update.dy),
+                None => (cursor.x, cursor.y),
+            }
+        } else {
+            match touch {
+                PrimaryTouch::Pressed(point) | PrimaryTouch::Moved(point) => (point.x, point.y),
+                PrimaryTouch::Idle | PrimaryTouch::Released => match motion {
+                    Some(update) => cursor.moved_to(update.dx, update.dy),
+                    None => (cursor.x, cursor.y),
+                },
+            }
         };
         let pointer_moved = (target_x, target_y) != (cursor.x, cursor.y);
 
@@ -198,18 +216,39 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         // the same report, and grabbing at the old position would offset
         // the window by one frame's travel.
         let mut commit_drag = false;
-        if let Some(update) = motion {
-            if update.pressed & MOUSE_BUTTON_LEFT != 0
-                && drag.is_none()
-                && window.title_bar_hit(target_x, target_y)
+        match touch {
+            // The first finger is the only one `InputManager` reports here.
+            // A title-bar touch is therefore a left-button press; its later
+            // absolute positions move the same cursor used by a USB mouse.
+            PrimaryTouch::Pressed(_)
+                if drag.is_none() && window.title_bar_hit(target_x, target_y) =>
             {
-                drag = Some(Drag {
-                    grab_x: target_x - window.x,
-                    grab_y: target_y - window.y,
-                });
+                drag = Some(Drag::new(DragSource::Touch, window, target_x, target_y));
             }
-            if update.released & MOUSE_BUTTON_LEFT != 0 && drag.is_some() {
+            PrimaryTouch::Released if matches!(drag, Some(active) if active.source == DragSource::Touch) =>
+            {
                 commit_drag = true;
+            }
+            _ => {}
+        }
+        if !matches!(touch, PrimaryTouch::Pressed(_) | PrimaryTouch::Moved(_))
+            && let Some(update) = motion
+        {
+            // Do not let a physical mouse alter or release a touch-owned
+            // drag. Touch itself owns that synthetic left button until its
+            // selected finger leaves the panel.
+            if !matches!(drag, Some(active) if active.source == DragSource::Touch) {
+                if update.pressed & MOUSE_BUTTON_LEFT != 0
+                    && drag.is_none()
+                    && window.title_bar_hit(target_x, target_y)
+                {
+                    drag = Some(Drag::new(DragSource::Mouse, window, target_x, target_y));
+                }
+                if update.released & MOUSE_BUTTON_LEFT != 0
+                    && matches!(drag, Some(active) if active.source == DragSource::Mouse)
+                {
+                    commit_drag = true;
+                }
             }
         }
 
@@ -225,7 +264,8 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             // A mouse unplugged mid-drag never sends the button release
             // that would end it, which would otherwise leave the outline
             // stuck on screen following a pointer that cannot move.
-            if !mouse_present && drag.is_some() {
+            if !mouse_present && matches!(drag, Some(active) if active.source == DragSource::Mouse)
+            {
                 drag = None;
                 commit_drag = true;
             }
@@ -428,11 +468,29 @@ impl Window {
 /// travels.
 #[derive(Clone, Copy)]
 struct Drag {
+    source: DragSource,
     grab_x: usize,
     grab_y: usize,
 }
 
+/// A drag is owned by the input that started its left-button equivalent. The
+/// source is retained so unplugging a mouse cannot terminate an active touch
+/// drag, and mouse button reports cannot release a touch-owned drag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragSource {
+    Mouse,
+    Touch,
+}
+
 impl Drag {
+    fn new(source: DragSource, window: Window, x: usize, y: usize) -> Self {
+        Self {
+            source,
+            grab_x: x - window.x,
+            grab_y: y - window.y,
+        }
+    }
+
     /// Where the window origin would land for a pointer at `(x, y)`,
     /// clamped to the desktop.
     fn window_origin(&self, x: usize, y: usize) -> (usize, usize) {
