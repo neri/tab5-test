@@ -31,6 +31,7 @@ mod psram;
 mod rtc;
 mod sdmmc;
 mod startup;
+mod tab5_keyboard;
 mod touch;
 mod uart;
 mod usb;

@@ -13,6 +13,8 @@
   RX8130CEが共用します。起動時に一度だけ初期化とバス復旧を行います。
 - CardKBコネクタのバス（GPIO53/54）: PORT.A専用で、入力の初期化時に一度だけ
   初期化します。
+- Tab5 Keyboardのバス（GPIO0/1）: Ext.Port1専用で、入力の初期化時に一度だけ
+  初期化します。
 
 ビット当たりの遅延（`delay_us`）とSCLストレッチ待ちの上限
 （`scl_wait_iterations`）はバスごとに`SoftI2c::new`で与えます。
@@ -28,12 +30,18 @@
   返します。カーソルキーはCardKB固有の非ASCIIバイト（`0xB5`=↑、`0xB6`=↓、
   `0xB4`=←、`0xB7`=→）です。バスの両線がアイドルhighのときだけ初期化に成功
   するので、未接続でも無害です。
+- Tab5 Keyboard（`src/tab5_keyboard.rs`）: Ext.Port1のGPIO0（SDA）／GPIO1（SCL）
+  に接続する70キー専用キーボードです。I2Cアドレス`0x6D`でファームウェア版を
+  プローブしてからHIDモードへ切り替え、HID modifier／usage IDのイベントキューを
+  読みます。キーリリース（usage ID 0）と未対応usageはドライバ内で消費します。
+  GPIO50のactive-low INTは使わず、フレームごとのポーリングでキューを読みます。
 - USB HID Bootキーボード（`src/usb/hid_keyboard.rs`）: 詳細は
   [`USB.md`](USB.md)。
 
-どちらも`src/input.rs`の`Key`へ正規化します。`Key`は`Ascii(u8)`と、Escape、
+3種とも`src/input.rs`の`Key`へ正規化します。Tab5 KeyboardとUSBは同じHID usage
+ID変換を共有します。`Key`は`Ascii(u8)`と、Escape、
 カーソル4方向、Home/End、PageUp/PageDown、Insert、Delete、`Function(u8)`を
-持ちます。入力を受け取る側は、キーがCardKBとUSBのどちらから来たかを知る必要が
+持ちます。入力を受け取る側は、キーがどのキーボードから来たかを知る必要が
 ありません（`KeyEvent`の`source`で区別できますが、コンソールは使いません）。
 コンソールがどのキーに何を割り当てているかは
 [`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)を参照してください。
@@ -45,7 +53,11 @@
 `usb::UsbHost`のままで、`InputManager`はそれを内側に持ちます。
 
 フレーム境界ごとに`service`（接続状態の保守）と`poll_key`（キーの読み出し）を
-それぞれ1回呼びます。CardKBが不在のときは60フレームごとに再初期化を試みます。
+それぞれ1回呼びます。CardKBとTab5 Keyboardが不在のときは各60フレームごとに
+再初期化を試みます。Tab5 KeyboardはI2C読み出し失敗を切断として扱って保持中の
+ドライバを破棄するため、抜去後の再接続でも再プローブとHIDモード設定が行われます。
+短時間の抜き差しでI2Cエラーを観測できずキーボードだけがリセットされた場合にも、
+60フレームごとのHIDモード確認が復帰させます。
 USB側のスキャン周期は[`USB.md`](USB.md)を参照してください。全画面アプリが
 共通で使うキー待ちは`wait_for_key`です。USB root-portの物理接続変化はISRが記録し、
 `service`がフレーム境界でtakeして即時再列挙します。割り込みを取り逃した場合に備え、

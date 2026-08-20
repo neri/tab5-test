@@ -20,6 +20,11 @@ static BOARD_BUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static CARDKB_BUS: SoftI2c = SoftI2c::new(Pin::CardKbSda, Pin::CardKbScl, 5, 40_000);
 static CARDKB_BUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// The I2C bus exposed by Tab5 Ext.Port1 (GPIO0/1) for the dedicated keyboard.
+static TAB5_KEYBOARD_BUS: SoftI2c =
+    SoftI2c::new(Pin::Tab5KeyboardSda, Pin::Tab5KeyboardScl, 2, 40_000);
+static TAB5_KEYBOARD_BUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Returns the shared board I2C bus after [`initialize_board_bus`] has run.
 pub fn board_bus() -> &'static SoftI2c {
     &BOARD_BUS
@@ -38,6 +43,16 @@ pub fn cardkb_bus() -> &'static SoftI2c {
 /// Configures and recovers the CardKB I2C bus once during input initialization.
 pub fn initialize_cardkb_bus() -> Result<(), I2cError> {
     initialize_once(&CARDKB_BUS, &CARDKB_BUS_INITIALIZED)
+}
+
+/// Returns the Tab5 Keyboard I2C bus after [`initialize_tab5_keyboard_bus`] has run.
+pub fn tab5_keyboard_bus() -> &'static SoftI2c {
+    &TAB5_KEYBOARD_BUS
+}
+
+/// Configures and recovers the dedicated Tab5 Keyboard bus once during input initialization.
+pub fn initialize_tab5_keyboard_bus() -> Result<(), I2cError> {
+    initialize_once(&TAB5_KEYBOARD_BUS, &TAB5_KEYBOARD_BUS_INITIALIZED)
 }
 
 /// Failure while driving an I2C transaction.

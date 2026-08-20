@@ -36,7 +36,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
 | [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかったDW-GDMA／SDHOSTの制約 |
 
-作業計画（実装済みの機能について、段階分けと実機で踏んだ罠を残したもの）:
+作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）:
+[DISPLAY_UNDERRUN_REFACTOR_PLAN.md](docs/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)、
 [FLASH_XIP_MIGRATION_PLAN.md](docs/FLASH_XIP_MIGRATION_PLAN.md)、
 [INPUT_MANAGER_PLAN.md](docs/INPUT_MANAGER_PLAN.md)、
 [PPA_FILL_PLAN.md](docs/PPA_FILL_PLAN.md)、

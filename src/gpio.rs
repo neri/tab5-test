@@ -22,6 +22,8 @@ const IO_MUX: usize = 0x500E_1000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Pin {
+    Tab5KeyboardSda = 0,
+    Tab5KeyboardScl = 1,
     Backlight = 22,
     BoardI2cSda = 31,
     BoardI2cScl = 32,

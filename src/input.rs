@@ -15,17 +15,20 @@
 //! the framebuffer's geometry.
 
 use crate::cardkb::CardKb;
+use crate::tab5_keyboard::Tab5Keyboard;
 use crate::{interrupts, uart, usb};
 
 const CARDKB_RECONNECT_FRAMES: u32 = 60;
+const TAB5_KEYBOARD_RECONNECT_FRAMES: u32 = 60;
+const TAB5_KEYBOARD_HEALTH_CHECK_FRAMES: u32 = 60;
 const HUB_PORT_SCAN_FRAMES: u32 = 60;
 const ROOT_RESCAN_FRAMES: u32 = 300;
 
 /// A normalized key understood by application-level input consumers.
 ///
 /// Text and non-text keys share one fixed-size representation, so input
-/// consumers never need to know whether a key came from CardKB, USB HID, or a
-/// future keyboard driver.
+/// consumers never need to know whether a key came from CardKB, the dedicated
+/// Tab5 Keyboard, or USB HID.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Key {
     Ascii(u8),
@@ -47,6 +50,7 @@ pub enum Key {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum KeySource {
     CardKb,
+    Tab5Keyboard,
     Usb,
 }
 
@@ -64,13 +68,16 @@ pub struct KeyEvent {
 pub struct InputManager {
     cardkb: Option<CardKb>,
     cardkb_reconnect_frames: u32,
+    tab5_keyboard: Option<Tab5Keyboard>,
+    tab5_keyboard_reconnect_frames: u32,
+    tab5_keyboard_health_check_frames: u32,
     usb_host: usb::UsbHost,
     usb_reconnect_frames: u32,
     next_source: KeySource,
 }
 
 impl InputManager {
-    /// Initializes the directly connected CardKB and the USB-A host.
+    /// Initializes both I2C keyboards and the USB-A host.
     pub fn new() -> Self {
         let cardkb = if crate::i2c::initialize_cardkb_bus().is_ok() {
             CardKb::init()
@@ -83,6 +90,17 @@ impl InputManager {
             uart::log(b"CardKB: absent\r\n");
         }
 
+        let tab5_keyboard = if crate::i2c::initialize_tab5_keyboard_bus().is_ok() {
+            Tab5Keyboard::init()
+        } else {
+            None
+        };
+        if tab5_keyboard.is_some() {
+            uart::log(b"Tab5 Keyboard: ready\r\n");
+        } else {
+            uart::log(b"Tab5 Keyboard: absent\r\n");
+        }
+
         let mut usb_host = usb::UsbHost::new();
         usb_host.rescan();
         uart::log(b"USB: initial scan complete\r\n");
@@ -90,13 +108,16 @@ impl InputManager {
         Self {
             cardkb,
             cardkb_reconnect_frames: 0,
+            tab5_keyboard,
+            tab5_keyboard_reconnect_frames: 0,
+            tab5_keyboard_health_check_frames: 0,
             usb_host,
             usb_reconnect_frames: 0,
             next_source: KeySource::CardKb,
         }
     }
 
-    /// Advances CardKB reconnection and USB device-discovery state.
+    /// Advances I2C-keyboard reconnection and USB device-discovery state.
     pub fn service(&mut self) {
         if self.cardkb.is_none() {
             self.cardkb_reconnect_frames += 1;
@@ -105,6 +126,31 @@ impl InputManager {
                 self.cardkb = CardKb::init();
                 if self.cardkb.is_some() {
                     uart::log(b"CardKB: connected\r\n");
+                }
+            }
+        }
+
+        if self.tab5_keyboard.is_none() {
+            self.tab5_keyboard_reconnect_frames += 1;
+            if self.tab5_keyboard_reconnect_frames == TAB5_KEYBOARD_RECONNECT_FRAMES {
+                self.tab5_keyboard_reconnect_frames = 0;
+                self.tab5_keyboard = Tab5Keyboard::init();
+                if self.tab5_keyboard.is_some() {
+                    uart::log(b"Tab5 Keyboard: connected\r\n");
+                }
+            }
+        } else {
+            self.tab5_keyboard_health_check_frames += 1;
+            if self.tab5_keyboard_health_check_frames == TAB5_KEYBOARD_HEALTH_CHECK_FRAMES {
+                self.tab5_keyboard_health_check_frames = 0;
+                let result = self
+                    .tab5_keyboard
+                    .as_mut()
+                    .map(Tab5Keyboard::ensure_hid_mode);
+                if matches!(result, Some(Err(_))) {
+                    self.tab5_keyboard = None;
+                    self.tab5_keyboard_reconnect_frames = 0;
+                    uart::log(b"Tab5 Keyboard: disconnected\r\n");
                 }
             }
         }
@@ -145,22 +191,36 @@ impl InputManager {
         }
     }
 
-    /// Returns at most one key, alternating the source checked first after
-    /// every delivered key so a continuously active source cannot starve the
-    /// other one.
+    /// Returns at most one key, rotating the source checked first after every
+    /// delivered key so a continuously active source cannot starve the others.
     pub fn poll_key(&mut self) -> Option<KeyEvent> {
         let first = self.next_source;
-        for source in [first, other_source(first)] {
+        let second = source_after(first);
+        for source in [first, second, source_after(second)] {
             let key = match source {
                 KeySource::CardKb => self
                     .cardkb
                     .as_mut()
                     .and_then(CardKb::poll)
                     .map(key_from_ascii),
+                KeySource::Tab5Keyboard => {
+                    let result = self.tab5_keyboard.as_mut().map(Tab5Keyboard::poll);
+                    match result {
+                        Some(Ok(key)) => key,
+                        Some(Err(_)) => {
+                            self.tab5_keyboard = None;
+                            self.tab5_keyboard_reconnect_frames = 0;
+                            self.tab5_keyboard_health_check_frames = 0;
+                            uart::log(b"Tab5 Keyboard: disconnected\r\n");
+                            None
+                        }
+                        None => None,
+                    }
+                }
                 KeySource::Usb => self.usb_host.poll_keyboards(),
             };
             if let Some(key) = key {
-                self.next_source = other_source(source);
+                self.next_source = source_after(source);
                 return Some(KeyEvent { source, key });
             }
         }
@@ -214,9 +274,10 @@ impl InputManager {
     }
 }
 
-const fn other_source(source: KeySource) -> KeySource {
+const fn source_after(source: KeySource) -> KeySource {
     match source {
-        KeySource::CardKb => KeySource::Usb,
+        KeySource::CardKb => KeySource::Tab5Keyboard,
+        KeySource::Tab5Keyboard => KeySource::Usb,
         KeySource::Usb => KeySource::CardKb,
     }
 }
@@ -231,5 +292,60 @@ const fn key_from_ascii(byte: u8) -> Key {
         0xB6 => Key::ArrowDown,
         0xB7 => Key::ArrowRight,
         _ => Key::Ascii(byte),
+    }
+}
+
+/// Translates an HID Keyboard/Keypad usage ID and modifier byte into the
+/// application-wide key representation.  USB HID and the Tab5 Keyboard use
+/// this one conversion so their printable and navigation keys stay identical.
+pub(crate) fn key_from_hid_usage(keycode: u8, modifiers: u8) -> Option<Key> {
+    let shift = modifiers & ((1 << 1) | (1 << 5)) != 0;
+    match keycode {
+        0x04..=0x1D => {
+            let letter = b'a' + (keycode - 0x04);
+            Some(Key::Ascii(if shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter
+            }))
+        }
+        0x1E..=0x27 => {
+            const UNSHIFTED: &[u8; 10] = b"1234567890";
+            const SHIFTED: &[u8; 10] = b"!@#$%^&*()";
+            let index = (keycode - 0x1E) as usize;
+            Some(Key::Ascii(if shift {
+                SHIFTED[index]
+            } else {
+                UNSHIFTED[index]
+            }))
+        }
+        0x28 => Some(Key::Ascii(b'\r')),
+        0x29 => Some(Key::Escape),
+        0x2A => Some(Key::Ascii(0x08)),
+        0x2B => Some(Key::Ascii(b'\t')),
+        0x2C => Some(Key::Ascii(b' ')),
+        0x2D => Some(Key::Ascii(if shift { b'_' } else { b'-' })),
+        0x2E => Some(Key::Ascii(if shift { b'+' } else { b'=' })),
+        0x2F => Some(Key::Ascii(if shift { b'{' } else { b'[' })),
+        0x30 => Some(Key::Ascii(if shift { b'}' } else { b']' })),
+        0x31 => Some(Key::Ascii(if shift { b'|' } else { b'\\' })),
+        0x33 => Some(Key::Ascii(if shift { b':' } else { b';' })),
+        0x34 => Some(Key::Ascii(if shift { b'"' } else { b'\'' })),
+        0x35 => Some(Key::Ascii(if shift { b'~' } else { b'`' })),
+        0x36 => Some(Key::Ascii(if shift { b'<' } else { b',' })),
+        0x37 => Some(Key::Ascii(if shift { b'>' } else { b'.' })),
+        0x38 => Some(Key::Ascii(if shift { b'?' } else { b'/' })),
+        0x3A..=0x45 => Some(Key::Function(keycode - 0x39)),
+        0x49 => Some(Key::Insert),
+        0x4A => Some(Key::Home),
+        0x4B => Some(Key::PageUp),
+        0x4C => Some(Key::Delete),
+        0x4D => Some(Key::End),
+        0x4E => Some(Key::PageDown),
+        0x4F => Some(Key::ArrowRight),
+        0x50 => Some(Key::ArrowLeft),
+        0x51 => Some(Key::ArrowDown),
+        0x52 => Some(Key::ArrowUp),
+        _ => None,
     }
 }

@@ -13,13 +13,11 @@
 
 use super::hid::{self, InterruptIn};
 use super::protocol::EnumeratedDevice;
-use crate::input::Key;
+use crate::input::{Key, key_from_hid_usage};
 
 // HID Boot Protocol keyboard report (HID 1.11 appendix B.1): modifier byte,
 // one reserved byte, then up to 6 simultaneous keycodes.
 const REPORT_BYTES: usize = 8;
-const MODIFIER_LEFT_SHIFT: u8 = 1 << 1;
-const MODIFIER_RIGHT_SHIFT: u8 = 1 << 5;
 const KEYCODE_ROLLOVER_ERROR: u8 = 0x01;
 
 pub struct UsbKeyboard {
@@ -117,15 +115,13 @@ impl UsbKeyboard {
             // rather than this phantom one.
             return;
         }
-        let shift = modifiers & (MODIFIER_LEFT_SHIFT | MODIFIER_RIGHT_SHIFT) != 0;
-
         self.pending_len = 0;
         self.pending_pos = 0;
         for &keycode in &keys {
             if keycode == 0 || self.previous_keys.contains(&keycode) {
                 continue; // empty slot, or already held from the last report
             }
-            if let Some(key) = translate_keycode(keycode, shift)
+            if let Some(key) = key_from_hid_usage(keycode, modifiers)
                 && (self.pending_len as usize) < self.pending.len()
             {
                 self.pending[self.pending_len as usize] = key;
@@ -133,60 +129,5 @@ impl UsbKeyboard {
             }
         }
         self.previous_keys = keys;
-    }
-}
-
-/// Translates one HID Keyboard/Keypad usage ID (HID Usage Tables 1.4,
-/// page 0x07) into the application-wide key representation. Covers ASCII,
-/// editing/navigation keys, and F1 through F12. Modifier keys by themselves
-/// still have no event; their Shift state modifies printable ASCII only.
-fn translate_keycode(keycode: u8, shift: bool) -> Option<Key> {
-    match keycode {
-        0x04..=0x1D => {
-            let letter = b'a' + (keycode - 0x04);
-            Some(Key::Ascii(if shift {
-                letter.to_ascii_uppercase()
-            } else {
-                letter
-            }))
-        }
-        0x1E..=0x27 => {
-            const UNSHIFTED: &[u8; 10] = b"1234567890";
-            const SHIFTED: &[u8; 10] = b"!@#$%^&*()";
-            let index = (keycode - 0x1E) as usize;
-            Some(Key::Ascii(if shift {
-                SHIFTED[index]
-            } else {
-                UNSHIFTED[index]
-            }))
-        }
-        0x28 => Some(Key::Ascii(b'\r')), // Enter
-        0x29 => Some(Key::Escape),
-        0x2A => Some(Key::Ascii(0x08)),  // Backspace
-        0x2B => Some(Key::Ascii(b'\t')), // Tab
-        0x2C => Some(Key::Ascii(b' ')),  // Space
-        0x2D => Some(Key::Ascii(if shift { b'_' } else { b'-' })),
-        0x2E => Some(Key::Ascii(if shift { b'+' } else { b'=' })),
-        0x2F => Some(Key::Ascii(if shift { b'{' } else { b'[' })),
-        0x30 => Some(Key::Ascii(if shift { b'}' } else { b']' })),
-        0x31 => Some(Key::Ascii(if shift { b'|' } else { b'\\' })),
-        0x33 => Some(Key::Ascii(if shift { b':' } else { b';' })),
-        0x34 => Some(Key::Ascii(if shift { b'"' } else { b'\'' })),
-        0x35 => Some(Key::Ascii(if shift { b'~' } else { b'`' })),
-        0x36 => Some(Key::Ascii(if shift { b'<' } else { b',' })),
-        0x37 => Some(Key::Ascii(if shift { b'>' } else { b'.' })),
-        0x38 => Some(Key::Ascii(if shift { b'?' } else { b'/' })),
-        0x3A..=0x45 => Some(Key::Function(keycode - 0x39)),
-        0x49 => Some(Key::Insert),
-        0x4A => Some(Key::Home),
-        0x4B => Some(Key::PageUp),
-        0x4C => Some(Key::Delete),
-        0x4D => Some(Key::End),
-        0x4E => Some(Key::PageDown),
-        0x4F => Some(Key::ArrowRight),
-        0x50 => Some(Key::ArrowLeft),
-        0x51 => Some(Key::ArrowDown),
-        0x52 => Some(Key::ArrowUp),
-        _ => None,
     }
 }

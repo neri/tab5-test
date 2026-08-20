@@ -29,7 +29,8 @@
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
-- `src/input.rs`: CardKBとUSBキーボードを統合する`InputManager`、再接続管理、キーイベント、全画面モードが共通で使うキー待ち（`wait_for_key`）、およびUSBマウスの移動量の受け渡し（`poll_mouse`）。キーは`Key`へ正規化するがポインタは正規化せず`usb::MouseUpdate`をそのまま渡す。相対移動量が位置になるのは「何の上を動くか」を決めた側なので、カーソル位置は描画側（`app::win`）が持つ
+- `src/tab5_keyboard.rs`: Ext.Port1（GPIO0/1）のTab5 KeyboardをHIDモードで読むI2Cドライバ。HID usage IDを`input.rs`の共通変換へ渡す
+- `src/input.rs`: CardKB、Tab5 Keyboard、USBキーボードを統合する`InputManager`、再接続管理、キーイベント、全画面モードが共通で使うキー待ち（`wait_for_key`）、およびUSBマウスの移動量の受け渡し（`poll_mouse`）。キーは`Key`へ正規化するがポインタは正規化せず`usb::MouseUpdate`をそのまま渡す。相対移動量が位置になるのは「何の上を動くか」を決めた側なので、カーソル位置は描画側（`app::win`）が持つ
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用、[`INPUT.md`](INPUT.md)）
 - `src/power.rs`: E2 P4（`PWROFF_PULSE`）を用いたTab5全体の電源断要求
 - `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
