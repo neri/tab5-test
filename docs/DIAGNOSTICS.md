@@ -36,6 +36,14 @@ LCD: DMA 3/3 full-frame interrupt installed
 LCD: RGB565 framebuffer DMA active
 ```
 
+ログはUSB Serial/JTAG（GPIO24/25）のCDCシリアルへ出ます。ホストが接続されていない間は
+SOF（1 msごとのフレーム開始パケット）が来ないので、`uart.rs`はTX FIFOが埋まった時点で
+それを検出し、以降の出力を捨てます。起動時にUSBを繋いでいなくてもファームは待たされず、
+後からケーブルを挿せばSOFの再開を検出して次の行から出力が戻ります。ただしFIFOに残った
+最大64バイトは破棄できないため、接続直後の1行目が切断中の古い断片になることがあります。
+ホスト側は`tools/monitor.py`を使うと再列挙をまたいで追従できます（DTR/RTSを操作しないので
+チップをリセットしません）。
+
 `ICM: master priority`と`ICM: master arqos`は、DW-GDMAの2ポート分
 （bit 12〜19）が`F`になっていれば書き込みが効いています。ここが`0`のままなら、
 レジスタ自体が書けていません。`ICM: master awqos`は書き込み側の診断値です。

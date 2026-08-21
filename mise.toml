@@ -26,3 +26,7 @@ run = "cargo build --release"
 [tasks.monitor]
 description = "Run a monitor for the application"
 run = "python3 tools/monitor.py"
+
+[tasks.dev]
+description = "Run the application in development mode"
+run = "mise run run && mise run monitor"

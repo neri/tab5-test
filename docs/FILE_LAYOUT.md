@@ -7,7 +7,8 @@
 - `src/main.rs`: 起動順の定義、グローバルアロケータ（`linked_list_allocator`の
   `LockedHeap`）の宣言とPSRAMヒープでの初期化
 - `src/startup.rs`: watchdog停止、CPUクロック引き上げ、L2キャッシュ分割とRAM上限の確認
-- `src/uart.rs`: USB Serial/JTAG出力
+- `src/uart.rs`: USB Serial/JTAG出力。SOF割り込みのraw bitでホストの接続を判定し、
+  未接続の間は出力を捨てて待たない
 - `src/delay.rs`: `rdcycle`を基準にしたビジーウェイト（`delay_ms`・`delay_us`）
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。フレームバッファと
   ヒープ用領域（`Psram::heap`）の両方を提供
