@@ -25,6 +25,7 @@ mod input;
 mod interrupts;
 mod lcd;
 mod pma;
+mod pmp;
 mod power;
 mod ppa;
 mod psram;

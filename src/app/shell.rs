@@ -15,7 +15,7 @@ use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use crate::{
-    delay, dma2d, icm, interrupts, lcd, pma, power, psram, rtc, sdmmc, startup, uart, usb,
+    delay, dma2d, icm, interrupts, lcd, pma, pmp, power, psram, rtc, sdmmc, startup, uart, usb,
 };
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -66,6 +66,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "map. ranges are [start,end); show mode, R/W/X, enable/lock, and",
             "cache attributes (WB, WT, NC, WNA, RNA). OFF entries supply a",
             "following TOR entry's lower bound and therefore have no range.",
+        ],
+    },
+    HelpEntry {
+        name: "pmp",
+        usage: "pmp",
+        lines: &[
+            "decode all RISC-V Physical Memory Protection entries as a memory",
+            "map. ranges are [start,end); show mode, R/W/X and the lock bit.",
+            "entries are priority-ordered, so the lowest matching one decides",
+            "an access; machine mode obeys only the locked (L) entries. OFF",
+            "entries supply a following TOR entry's lower bound.",
         ],
     },
     HelpEntry {
@@ -453,6 +464,7 @@ pub fn execute(
         b"about" | b"version" => console.write_output_line(framebuffer, "Tab5 Shell 0.1"),
         b"cpuinfo" => cmd_cpuinfo(console, framebuffer),
         b"pma" => cmd_pma(console, framebuffer),
+        b"pmp" => cmd_pmp(console, framebuffer),
         b"mem" => cmd_mem(console, framebuffer),
         b"alloctest" => cmd_alloctest(console, framebuffer, argument),
         b"uptime" => cmd_uptime(console, framebuffer),
@@ -663,7 +675,7 @@ fn cmd_pma(console: &mut Console, framebuffer: &mut Framebuffer) {
     console.write_output_line(framebuffer, "PMA map (ranges are [start,end)):");
     console.write_output_line(
         framebuffer,
-        "# range                 mode  rwx E L cache       cfg",
+        "# range               mode  rwx E L cache          cfg",
     );
 
     for entry in pma::entries() {
@@ -696,7 +708,8 @@ fn cmd_pma(console: &mut Console, framebuffer: &mut Framebuffer) {
     }
 }
 
-/// Appends an address without a `0x` prefix so PMA map rows stay compact.
+/// Appends an address without a `0x` prefix so PMA and PMP map rows stay
+/// compact.
 /// Eight digits cover the ESP32-P4 address space; a ninth digit appears only
 /// for a half-open range ending one byte past it.
 fn push_address(line: &mut Line, address: u64) {
@@ -730,6 +743,62 @@ fn push_cache_attributes(line: &mut Line, entry: pma::Entry) {
     if entry.read_miss_no_alloc() {
         line.push_str(" RNA");
     }
+}
+
+/// Decodes the bootloader-installed PMP CSRs into the ranges they match.
+///
+/// PMP answers a different question from `pma`: what may be read, written or
+/// executed where, rather than how the memory behaves.  Two properties make
+/// the table easy to misread, so the output states both.  Entries are
+/// priority-ordered -- the lowest-numbered matching entry decides an access
+/// and any overlap by a later entry is dead -- and machine mode, which is the
+/// only mode this firmware ever runs in, ignores entries whose lock bit is
+/// clear as well as addresses that match no entry at all.
+fn cmd_pmp(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "PMP map (ranges are [start,end)):");
+    console.write_output_line(framebuffer, "# range               mode  rwx L cfg");
+
+    for entry in pmp::entries() {
+        let mut line = Line::new();
+        line.push_u32(entry.index as u32);
+        line.push_str(" ");
+        match entry.range {
+            Some(range) => {
+                push_address(&mut line, range.start);
+                line.push_str("..");
+                push_address(&mut line, range.end);
+            }
+            None => {
+                line.push_str("off@ ");
+                push_address(&mut line, entry.address_bytes());
+            }
+        }
+        // A space before each padded column keeps the row readable even when
+        // a range runs one digit past the end of the 32-bit address space and
+        // leaves no room for padding.
+        line.push_str(" ");
+        pad_to(&mut line, 22);
+        line.push_str(entry.mode_name());
+        line.push_str(" ");
+        pad_to(&mut line, 28);
+        line.push_str(if entry.readable() { "R" } else { "-" });
+        line.push_str(if entry.writable() { "W" } else { "-" });
+        line.push_str(if entry.executable() { "X" } else { "-" });
+        line.push_str(if entry.locked() { " L " } else { " - " });
+        line.push_hex(entry.config as u32, 2);
+        // A TOR bound at or below the previous entry's bound matches nothing,
+        // which the range column alone would not make obvious.
+        if entry.range.is_some_and(pmp::Range::is_empty) {
+            line.push_str(" empty");
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    let mut line = Line::new();
+    line.push_str("granularity ");
+    line.push_u32(pmp::GRANULARITY);
+    line.push_str(" B; machine mode obeys locked entries only");
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 /// Appends the ISA name derivable from `misa`.
