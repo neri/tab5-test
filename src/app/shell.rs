@@ -722,15 +722,43 @@ pub fn execute(
 
 /// Reboots the board. The caller must have already flushed the "rebooting..."
 /// output to the panel; this never returns.
-pub fn reboot() -> ! {
-    // Only the HP CPU core is reset, so scanout would otherwise keep reading
-    // PSRAM -- at the raised interconnect priority this firmware gave it --
-    // right through the bootloader's flash reads and the next boot's PSRAM
-    // bring-up. The boot path quiesces it too, for resets that never reach
-    // here, but that is too late to help the bootloader.
+/// Restarts the board, stopping first whatever a reset on its own would
+/// leave running.
+///
+/// `startup::reboot` resets only the HP CPU core, so everything outside it
+/// keeps the state this boot gave it. Each such thing is stopped here
+/// rather than at the next boot, because the next boot is already too late:
+/// the bootloader runs before any of this firmware does.
+pub fn reboot(session: Option<&mut wifi::Rpc>) -> ! {
+    // The C6 is not reset at all, so it stays associated to the access
+    // point across the reboot and then vanishes mid-association when the
+    // next `sdio::init` pulses its reset line. The access point is left
+    // holding an entry for a station that stopped answering, and its
+    // inactivity timeout for that entry lands on the *next* association --
+    // which is why the first `wificonnect` after a reboot fails with
+    // reason 4 while the second succeeds. Leaving properly costs one frame.
+    if let Some(rpc) = session
+        && let Some(0) = wifi::station::disconnect(rpc)
+    {
+        // Only long enough for the slave to report the frame went out; the
+        // console is about to disappear, so the outcome is not worth
+        // showing.
+        let _ = wifi::station::wait_for_connection(rpc, REBOOT_DISCONNECT_TIMEOUT_MS);
+    }
+
+    // Scanout would otherwise keep reading PSRAM -- at the raised
+    // interconnect priority this firmware gave it -- right through the
+    // bootloader's flash reads and the next boot's PSRAM bring-up. The boot
+    // path quiesces it too, for resets that never reach here, but that is
+    // too late to help the bootloader.
     lcd::quiesce_dma();
     startup::reboot()
 }
+
+/// How long [`reboot`] waits for the C6 to confirm it has left the access
+/// point. Shorter than `DISCONNECT_TIMEOUT_MS`: this is not a command whose
+/// result anyone reads, and the deauthentication is a single frame.
+const REBOOT_DISCONNECT_TIMEOUT_MS: u32 = 1_000;
 
 /// Sends the board power controller's hardware shutdown request.
 ///

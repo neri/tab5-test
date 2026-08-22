@@ -251,6 +251,17 @@ fn main() -> ! {
     if !ppa::init() {
         uart::log(b"PPA: unavailable, fills stay on the CPU\r\n");
     }
+    // The ESP32-C6 is the third thing a CPU-only reset leaves running, and
+    // unlike the two above it holds a link to the outside world: without
+    // this it carries an access-point association across the reboot and
+    // only loses it when the next `sdio::init` pulses its reset line.
+    //
+    // After the DMA quiescing rather than before it, even though the C6
+    // would rather stop early: this talks to the expander over I2C, and that
+    // is time the scanout would spend still reading PSRAM the bootloader and
+    // `psram::init` are about to work on. Milliseconds either way for the
+    // C6, an already-narrow window for the display.
+    sdio::power_down_c6();
     let pre_input = 0x1020_3040u32;
     run_xip_probe(
         b"pre-PSRAM",

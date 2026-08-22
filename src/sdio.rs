@@ -129,6 +129,34 @@ impl SdioCard {
     }
 }
 
+/// Cuts the ESP32-C6's power, leaving it stopped rather than merely idle.
+///
+/// `startup::reboot` resets only the HP CPU core, so the C6 keeps its power
+/// rail (the expander that gates it is a separate chip on I2C) and carries
+/// its firmware state -- including an association with an access point --
+/// straight across a reboot. It then disappears mid-association when the
+/// next [`init`] pulses its reset line, which leaves the access point
+/// holding an entry for a station that has silently gone away.
+///
+/// Called early in boot, this makes a warm start begin from the same
+/// stopped co-processor a cold one does. It does not remove that stale
+/// entry -- only a proper disconnect before the reset does -- but it starts
+/// the access point's inactivity timer running at boot rather than at the
+/// moment the operator asks to connect.
+///
+/// The reset line goes low before the rail does. A pin left driving high
+/// into an unpowered chip feeds it through its protection diodes; low is
+/// the same potential as the rail being removed, so nothing flows. It also
+/// means the C6 is held in reset while its rail comes back up, which is the
+/// order a power-on wants anyway.
+pub fn power_down_c6() {
+    gpio::configure_push_pull_output(Pin::C6Reset);
+    gpio::set_low(Pin::C6Reset);
+    if !usb::set_pi4ioe2_output_bit(C6_POWER_BIT, false) {
+        uart::log(b"SDIO: could not remove ESP32-C6 power at boot\r\n");
+    }
+}
+
 /// Powers, resets and activates the ESP32-C6 as an SDIO card, logging
 /// progress and any failure reason over USB serial.
 pub fn init() -> Option<SdioCard> {

@@ -77,7 +77,9 @@ pub fn run(psram: Psram) {
             // next HP-core reset, then quiesce display DMA through the normal
             // reboot path.
             delay_ms(100);
-            shell::reboot();
+            // No session exists this early, and the reboot test never gets
+            // as far as bringing the C6 up.
+            shell::reboot(None);
         }
         RebootTestBoot::Complete { total } => {
             uart::log_hex(b"REBOOT TEST: PASS total=", total);
@@ -197,7 +199,7 @@ pub fn run(psram: Psram) {
                 // The "rebooting..." line is already in PSRAM; give the panel
                 // one scan-out interval to actually show it before the reset.
                 delay_ms(300);
-                shell::reboot();
+                shell::reboot(wifi_session.as_mut());
             }
             shell::Outcome::Shutdown => {
                 // As with reboot, let the acknowledgement reach the panel
