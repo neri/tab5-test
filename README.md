@@ -42,6 +42,7 @@
 | USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
 | USBストレージ | `usbmsc` `usbread` `usbmbr` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式） |
 | Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
+| ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
 
 `sdzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`も復元失敗時は
@@ -108,6 +109,8 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - 日本語フォント
 - FAT/exFATファイルシステムの解釈
 - USB Mass Storageへの書き込み、多段USBハブ
-- TCP/IPスタック（Wi-FiはAPへのアソシエートまでで、IPアドレスは取得しません）
+- IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみで、受信したデータの
+  保存先はメモリだけです）。名前解決はAレコードだけで、キャッシュ・逆引き・
+  mDNSはありません
 - Wi-FiのSoftAPとBLE。5 GHz帯はESP32-C6が2.4 GHz専用のため使えません
 - ESP32-P4 revision v3以降での動作確認

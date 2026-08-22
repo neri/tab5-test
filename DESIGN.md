@@ -32,7 +32,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、MBR、シェルコマンド |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
-| [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／ping／TFTP／HTTP |
+| [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP |
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
 | [FILE_LAYOUT.md](docs/FILE_LAYOUT.md) | モジュールごとの責務一覧、コーディング方針（コメントの言語、`unsafe`の粒度） |
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
@@ -51,7 +51,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [USB_MSC_PLAN.md](docs/USB_MSC_PLAN.md)、
 [USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)、
 [WIFI_C6_PLAN.md](docs/WIFI_C6_PLAN.md)、
-[TCPIP_PLAN.md](docs/TCPIP_PLAN.md)。
+[TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
+[DNS_PLAN.md](docs/DNS_PLAN.md)。
 
 ## 制約
 
@@ -67,8 +68,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
   （[WIFI.md](docs/WIFI.md)）。
-- TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、ping、TFTP読み出し、
-  最小のHTTP GETまでで、**DNS解決とIPv6、サーバ機能、TLSはありません**。
+- TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、名前解決、ping、
+  TFTP読み出し、最小のHTTP GETまでで、**IPv6、サーバ機能、TLSはありません**。
+  名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
   受信データの保存先はメモリだけです（[NETWORK.md](docs/NETWORK.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
   読み出しまで実機確認済みです。文字列記述子の取得、periodic scheduler基盤、

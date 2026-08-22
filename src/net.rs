@@ -18,11 +18,13 @@
 //! - [`device`] is smoltcp's `phy::Device` over that queue
 //! - [`stack`] owns the interface, the socket set and the DHCP client, and
 //!   is what a shell command drives
-//! - [`ping`], [`tftp`] and [`http`] are the clients that run on that
-//!   stack's sockets, one file each in the same way `usb/` splits its
-//!   class drivers
+//! - [`dns`], [`ping`], [`tftp`] and [`http`] are the clients that run on
+//!   that stack's sockets, one file each in the same way `usb/` splits its
+//!   class drivers. [`dns`] is the odd one: its socket belongs to
+//!   [`stack`], because a resolver setting outlives any one command
 
 pub mod device;
+pub mod dns;
 pub mod http;
 pub mod ping;
 pub mod stack;

@@ -466,16 +466,27 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ipconfig",
-        usage: "ipconfig [dhcp|release|<a.b.c.d[/len]> [gateway]]",
+        usage: "ipconfig [dhcp|release|dns <a.b.c.d>...|<a.b.c.d[/len]> [gw]]",
         lines: &[
             "show the IPv4 settings, or change where they come from. 'dhcp'",
             "starts the client and waits for a lease; an address sets one by",
-            "hand (a bare address means /24). with no argument, only reports",
+            "hand (a bare address means /24). 'dns' replaces the resolvers",
+            "without touching the address, and with no address after it",
+            "removes them. with no argument, only reports",
+        ],
+    },
+    HelpEntry {
+        name: "nslookup",
+        usage: "nslookup <name>",
+        lines: &[
+            "resolve a name to its A records. unlike the commands below,",
+            "this always asks the resolver, even for something that would",
+            "read as an address -- it is the way to test the resolver alone",
         ],
     },
     HelpEntry {
         name: "ping",
-        usage: "ping <a.b.c.d> [count]",
+        usage: "ping <host|a.b.c.d> [count]",
         lines: &[
             "send ICMP echo requests and time the replies; default 4. echo",
             "requests aimed at this board are answered whenever an address",
@@ -484,7 +495,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "tftpget",
-        usage: "tftpget <a.b.c.d> <file>",
+        usage: "tftpget <host|a.b.c.d> <file>",
         lines: &[
             "read a file over TFTP (RFC 1350, 512-byte blocks, no options)",
             "and report its size and CRC-32. there is no filesystem, so the",
@@ -493,11 +504,12 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "httpget",
-        usage: "httpget <a.b.c.d>[:port] [path]",
+        usage: "httpget <host|a.b.c.d>[:port] [path]",
         lines: &[
             "issue a minimal HTTP/1.0 GET and show the start of the reply.",
             "a TCP smoke test rather than an HTTP client: no redirects, no",
-            "chunked decoding, no TLS and no name resolution",
+            "chunked decoding and no TLS. a name given here is also what",
+            "goes in the Host: header, so virtual hosts resolve correctly",
         ],
     },
     HelpEntry {
@@ -668,6 +680,10 @@ pub fn execute(
         }
         b"ipconfig" => {
             cmd_ipconfig(console, framebuffer, argument, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"nslookup" => {
+            cmd_nslookup(console, framebuffer, argument, wifi_session, net_stack);
             drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"ping" => {
@@ -3508,7 +3524,10 @@ fn net_session<'a>(
 /// With no argument this only reports. `dhcp` starts the client and waits
 /// for a lease; an address in CIDR form sets one by hand, which is what
 /// Stage 3 of `docs/TCPIP_PLAN.md` used before DHCP existed and what still
-/// works on a network without a server.
+/// works on a network without a server. `dns` replaces the resolvers
+/// without touching the address, which works on a lease as well as a
+/// static address -- the way to aim the stack at a resolver that is known
+/// not to answer and watch it fall through to the next one.
 fn cmd_ipconfig(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -3524,8 +3543,28 @@ fn cmd_ipconfig(
     match verb {
         b"" => {}
         b"release" => {
-            stack.clear_addresses();
-            console.write_output_line(framebuffer, "address released");
+            stack.release();
+            console.write_output_line(framebuffer, "address released, DHCP stopped");
+        }
+        b"dns" => {
+            let mut servers = Vec::new();
+            let mut remaining = trim(rest);
+            while !remaining.is_empty() {
+                let (word, next) = split_first_word(remaining);
+                let Some(server) = parse_ipv4(word) else {
+                    console.write_output_line(framebuffer, "each resolver must be an IPv4 address");
+                    return;
+                };
+                servers.push(server);
+                remaining = trim(next);
+            }
+            // Not "no resolvers to remove": with no address there is no
+            // configuration to hang them on, and one installed now would be
+            // thrown away by the next lease anyway.
+            if !stack.set_dns_servers(servers) {
+                console.write_output_line(framebuffer, "no address; set one before the resolvers");
+                return;
+            }
         }
         b"dhcp" => {
             stack.start_dhcp();
@@ -3545,7 +3584,7 @@ fn cmd_ipconfig(
             let Some((address, prefix)) = parse_ipv4_cidr(verb) else {
                 console.write_output_line(
                     framebuffer,
-                    "usage: ipconfig [dhcp|release|<a.b.c.d/len> [gateway]]",
+                    "usage: ipconfig [dhcp|release|dns <a.b.c.d>...|<a.b.c.d/len> [gw]]",
                 );
                 return;
             };
@@ -3562,7 +3601,11 @@ fn cmd_ipconfig(
                     }
                 }
             };
-            stack.set_static(Ipv4Cidr::new(address, prefix), gateway);
+            // No resolvers: a hand-set address comes with no way to learn
+            // them, so `ipconfig dns` is the next command if names are
+            // wanted. Carrying the previous lease's resolvers over would
+            // point at servers this configuration never promised.
+            stack.set_static(Ipv4Cidr::new(address, prefix), gateway, Vec::new());
         }
     }
 
@@ -3638,7 +3681,7 @@ fn write_ipconfig(
     console.write_output_line(framebuffer, line.as_str());
 
     if config.dns_servers.is_empty() {
-        console.write_output_line(framebuffer, "dns (none; there is no resolver anyway)");
+        console.write_output_line(framebuffer, "dns (none; only numeric addresses will work)");
     } else {
         for server in &config.dns_servers {
             let mut line = Line::new();
@@ -3702,6 +3745,133 @@ fn write_frame_stats(
     console.write_output_line(framebuffer, line.as_str());
 }
 
+/// `nslookup` -- resolve a name and show what came back.
+///
+/// The one command that always sends a query, even for an argument that
+/// would parse as an address: everything else short-circuits numeric
+/// addresses, so without this there is no way to ask the resolver a
+/// question and see only its answer.
+fn cmd_nslookup(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let name = trim(argument);
+    if name.is_empty() || !split_first_word(name).1.is_empty() {
+        console.write_output_line(framebuffer, "usage: nslookup <name>");
+        return;
+    }
+
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+
+    if let Some(server) = stack.dns_servers().first() {
+        let mut line = Line::new();
+        line.push_str("server ");
+        push_ipv4(&mut line, *server);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    match net::dns::resolve(stack, rpc, name) {
+        Ok(answer) => {
+            for address in &answer.addresses {
+                let mut line = Line::new();
+                line.push_ascii(name);
+                line.push_str(" has address ");
+                push_ipv4(&mut line, *address);
+                console.write_output_line(framebuffer, line.as_str());
+            }
+            let mut line = Line::new();
+            line.push_str("in ");
+            line.push_u32(answer.elapsed_ms as u32);
+            line.push_str(" ms");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => write_dns_error(console, framebuffer, name, error),
+    }
+}
+
+/// Reports a failed lookup. Shared by `nslookup` and by every command that
+/// takes a destination, so the same failure always reads the same way.
+fn write_dns_error(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    name: &[u8],
+    error: net::dns::Error,
+) {
+    // The name is worth repeating for this one: it is the answer to the
+    // question, not a report about the machinery.
+    if let net::dns::Error::NotFound = error {
+        let mut line = Line::new();
+        line.push_ascii(name);
+        line.push_str(": no such name");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+
+    console.write_output_line(
+        framebuffer,
+        match error {
+            net::dns::Error::NoServers => "no resolver configured; try 'ipconfig dns <a.b.c.d>'",
+            net::dns::Error::InvalidName => "that is not a usable host name",
+            net::dns::Error::TimedOut => "the resolver did not answer",
+            net::dns::Error::LinkLost => "the C6 link was lost during the lookup",
+            net::dns::Error::NotFound | net::dns::Error::Local => {
+                "the lookup failed locally, see UART log"
+            }
+        },
+    );
+}
+
+/// Turns a destination argument into an address.
+///
+/// A literal `a.b.c.d` is taken as it stands and **no query is sent**:
+/// numeric destinations have to keep working on a network with no
+/// resolver, because that is the state every bring-up starts in and the
+/// one worth being able to ping from.
+///
+/// Reports its own failure, so a caller only has to stop.
+fn resolve_target(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    rpc: &mut wifi::Rpc,
+    stack: &mut net::Stack,
+    text: &[u8],
+) -> Option<Ipv4Address> {
+    if let Some(address) = parse_ipv4(text) {
+        return Some(address);
+    }
+
+    match net::dns::resolve(stack, rpc, text) {
+        Ok(answer) => {
+            // `resolve` never returns an empty answer, but going quiet is
+            // the one way a shell command must not fail: say the same thing
+            // an empty answer means rather than returning with no output.
+            let Some(&address) = answer.addresses.first() else {
+                write_dns_error(console, framebuffer, text, net::dns::Error::NotFound);
+                return None;
+            };
+            let mut line = Line::new();
+            line.push_ascii(text);
+            line.push_str(" is ");
+            push_ipv4(&mut line, address);
+            console.write_output_line(framebuffer, line.as_str());
+            Some(address)
+        }
+        Err(error) => {
+            write_dns_error(console, framebuffer, text, error);
+            None
+        }
+    }
+}
+
 fn cmd_ping(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -3709,11 +3879,15 @@ fn cmd_ping(
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
+    // Only the shape of the arguments is checked here. Resolving the
+    // destination needs the stack, so it has to wait until the link is up
+    // -- but a mistyped count is a usage error, and bringing up the C6 to
+    // report one would be a slow way to say so.
     let (target, rest) = split_first_word(trim(argument));
-    let Some(address) = parse_ipv4(target) else {
-        console.write_output_line(framebuffer, "usage: ping <a.b.c.d> [count]");
+    if target.is_empty() {
+        console.write_output_line(framebuffer, "usage: ping <host|a.b.c.d> [count]");
         return;
-    };
+    }
     let count = match trim(rest) {
         b"" => DEFAULT_PING_COUNT,
         text => match parse_u32(text) {
@@ -3732,6 +3906,9 @@ fn cmd_ping(
         console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
         return;
     }
+    let Some(address) = resolve_target(console, framebuffer, rpc, stack, target) else {
+        return;
+    };
 
     let mut line = Line::new();
     line.push_str("pinging ");
@@ -3792,14 +3969,10 @@ fn cmd_tftpget(
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
-    let (server, rest) = split_first_word(trim(argument));
+    let (target, rest) = split_first_word(trim(argument));
     let filename = trim(rest);
-    let Some(server) = parse_ipv4(server) else {
-        console.write_output_line(framebuffer, "usage: tftpget <a.b.c.d> <file>");
-        return;
-    };
-    if filename.is_empty() {
-        console.write_output_line(framebuffer, "usage: tftpget <a.b.c.d> <file>");
+    if target.is_empty() || filename.is_empty() {
+        console.write_output_line(framebuffer, "usage: tftpget <host|a.b.c.d> <file>");
         return;
     }
 
@@ -3810,6 +3983,9 @@ fn cmd_tftpget(
         console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
         return;
     }
+    let Some(server) = resolve_target(console, framebuffer, rpc, stack, target) else {
+        return;
+    };
 
     console.write_output_line(framebuffer, "requesting the file...");
     let started = tick::now_ms();
@@ -3881,8 +4057,10 @@ fn cmd_httpget(
         b"" => b"/".as_slice(),
         path => path,
     };
-    let Some((address, port)) = parse_ipv4_port(target) else {
-        console.write_output_line(framebuffer, "usage: httpget <a.b.c.d>[:port] [path]");
+    // The port has to come off before anything else: whatever is left is
+    // the host, and it is a name as often as an address.
+    let Some((host, port)) = split_host_port(target) else {
+        console.write_output_line(framebuffer, "usage: httpget <host|a.b.c.d>[:port] [path]");
         return;
     };
 
@@ -3893,9 +4071,15 @@ fn cmd_httpget(
         console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
         return;
     }
+    let Some(address) = resolve_target(console, framebuffer, rpc, stack, host) else {
+        return;
+    };
 
     console.write_output_line(framebuffer, "connecting...");
-    match net::http::get(stack, rpc, address, port, path) {
+    // `host` rather than `address`: a server sharing one address between
+    // several sites picks the site from this header, so sending the
+    // resolved address would ask for whichever one is the default.
+    match net::http::get(stack, rpc, address, port, host, path) {
         Ok(response) => {
             let mut line = Line::new();
             line.push_u32(response.received as u32);
@@ -4280,18 +4464,26 @@ fn parse_ipv4_cidr(bytes: &[u8]) -> Option<(Ipv4Address, u8)> {
     }
 }
 
-/// `a.b.c.d` or `a.b.c.d:port`.
-fn parse_ipv4_port(bytes: &[u8]) -> Option<(Ipv4Address, u16)> {
-    match bytes.iter().position(|&byte| byte == b':') {
-        None => Some((parse_ipv4(bytes)?, 80)),
+/// `<host>` or `<host>:port`, where the host may be a name.
+///
+/// Only the port is interpreted. The host is handed back as it was typed,
+/// because it is not this function's business whether it is an address --
+/// and because the text is what the `Host:` header wants either way.
+fn split_host_port(bytes: &[u8]) -> Option<(&[u8], u16)> {
+    let (host, port) = match bytes.iter().position(|&byte| byte == b':') {
+        None => (bytes, 80),
         Some(colon) => {
             let port = parse_u32(&bytes[colon + 1..])?;
             if port == 0 || port > 65535 {
                 return None;
             }
-            Some((parse_ipv4(&bytes[..colon])?, port as u16))
+            (&bytes[..colon], port as u16)
         }
+    };
+    if host.is_empty() {
+        return None;
     }
+    Some((host, port))
 }
 
 fn cmd_sdread(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {

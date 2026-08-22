@@ -13,10 +13,14 @@
 
 use alloc::vec::Vec;
 
+use smoltcp::config::DNS_MAX_SERVER_COUNT;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, tcp};
+use smoltcp::socket::{dhcpv4, dns, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    Ipv4Cidr,
+};
 
 use crate::net::device::StationDevice;
 use crate::wifi::Rpc;
@@ -26,6 +30,10 @@ use crate::{delay, tick, uart};
 pub struct Ipv4Config {
     pub address: Ipv4Cidr,
     pub router: Option<Ipv4Address>,
+    /// The resolvers in effect. Truncated to what the DNS socket can hold,
+    /// so what is reported is what is actually asked -- a list longer than
+    /// the socket's capacity would otherwise be shown in full while only
+    /// its head was ever queried.
     pub dns_servers: Vec<Ipv4Address>,
     /// The DHCP server that granted this, if it came from DHCP.
     pub server: Option<Ipv4Address>,
@@ -49,6 +57,14 @@ pub struct Stack {
     sockets: SocketSet<'static>,
     /// Present exactly while [`AddressSource::Dhcp`] is selected.
     dhcp: Option<SocketHandle>,
+    /// The DNS client, which unlike every other client here is permanent.
+    ///
+    /// `Interface::poll` only retransmits and delivers for sockets that are
+    /// in the set, so a socket created when a query starts would miss
+    /// answers that arrive while nobody is pumping. The other clients are
+    /// conversations that exist only while their command runs; a resolver
+    /// setting has the same lifetime as the lease it came from.
+    dns: SocketHandle,
     source: AddressSource,
     config: Option<Ipv4Config>,
     mac: [u8; 6],
@@ -71,10 +87,16 @@ impl Stack {
             ((delay::cycle_count() as u64) << 16) ^ ((mac[4] as u64) << 8) ^ mac[5] as u64;
 
         let interface = Interface::new(config, &mut device, now());
+        let mut sockets = SocketSet::new(Vec::new());
+        // No resolvers yet: there is no address either, and a query needs a
+        // source address to go out from. `alloc` lets the query slots grow
+        // on demand, so the socket costs nothing until a name is asked for.
+        let dns = sockets.add(dns::Socket::new(&[], Vec::new()));
         Stack {
             interface,
-            sockets: SocketSet::new(Vec::new()),
+            sockets,
             dhcp: None,
+            dns,
             source: AddressSource::None,
             config: None,
             mac,
@@ -96,6 +118,20 @@ impl Stack {
 
     pub fn deconfigured_count(&self) -> u32 {
         self.deconfigured
+    }
+
+    /// The resolvers the DNS socket will ask, in order.
+    ///
+    /// Empty is not the same as "the query will fail": it is the reason a
+    /// query must not be started at all. smoltcp reads an empty server list
+    /// as "every server has already been tried", so the query fails on the
+    /// first dispatch without a packet leaving the board -- which looks
+    /// exactly like the name not existing.
+    pub fn dns_servers(&self) -> &[Ipv4Address] {
+        match &self.config {
+            Some(config) => &config.dns_servers,
+            None => &[],
+        }
     }
 
     /// Whether there is an address to send from. Every command above ARP
@@ -124,19 +160,54 @@ impl Stack {
         socket.connect(self.interface.context(), remote, local_port)
     }
 
-    /// Starts the DHCP client, discarding any address currently set.
+    /// Starts the DHCP client from scratch, discarding any address
+    /// currently set.
     pub fn start_dhcp(&mut self) {
         self.clear_addresses();
-        if self.dhcp.is_none() {
-            self.dhcp = Some(self.sockets.add(dhcpv4::Socket::new()));
-        }
+        let handle = match self.dhcp {
+            Some(handle) => handle,
+            None => {
+                let handle = self.sockets.add(dhcpv4::Socket::new());
+                self.dhcp = Some(handle);
+                handle
+            }
+        };
+        // A socket that has already held a lease sits in its renewing
+        // state, and taking the address off the interface tells it
+        // nothing -- it still believes the lease is good. Without this
+        // reset it sends no discover at all and waits for its own renew
+        // timer, which is minutes or hours away, while this command times
+        // out and blames the access point.
+        //
+        // Resetting a socket that never held a lease does nothing, so this
+        // is unconditional rather than a special case for the reused one.
+        self.sockets.get_mut::<dhcpv4::Socket>(handle).reset();
         self.source = AddressSource::Dhcp;
+    }
+
+    /// Gives up the address and stops asking for another.
+    ///
+    /// Stopping the client is the part that is easy to leave out and hard
+    /// to notice: a socket left renewing quietly reinstalls the address
+    /// some minutes later, and whoever typed `release` has no reason to be
+    /// watching for it to come back.
+    pub fn release(&mut self) {
+        if let Some(handle) = self.dhcp.take() {
+            self.sockets.remove(handle);
+        }
+        self.clear_addresses();
+        self.source = AddressSource::None;
     }
 
     /// Stops the DHCP client and installs an address by hand. This is what
     /// the first bring-up on a new network uses, and what stays available
     /// when a DHCP server is not to be trusted with the answer.
-    pub fn set_static(&mut self, address: Ipv4Cidr, router: Option<Ipv4Address>) {
+    pub fn set_static(
+        &mut self,
+        address: Ipv4Cidr,
+        router: Option<Ipv4Address>,
+        dns_servers: Vec<Ipv4Address>,
+    ) {
         if let Some(handle) = self.dhcp.take() {
             self.sockets.remove(handle);
         }
@@ -145,18 +216,28 @@ impl Stack {
         self.apply_config(Ipv4Config {
             address,
             router,
-            dns_servers: Vec::new(),
+            dns_servers,
             server: None,
             acquired_ms: tick::now_ms(),
         });
     }
 
-    /// Drops the address and the default route, leaving the interface up.
+    /// Drops the address, the default route and the resolvers, leaving the
+    /// interface up.
+    ///
+    /// The resolvers go with the address deliberately. They were learned
+    /// over a configuration that no longer holds, and keeping them would be
+    /// the same kind of lie as keeping an address obtained over a link that
+    /// is gone -- with the added trap that a query against a stale resolver
+    /// fails by timing out rather than by saying anything useful.
     pub fn clear_addresses(&mut self) {
         self.interface
             .update_ip_addrs(|addresses| addresses.clear());
         let _ = self.interface.routes_mut().remove_default_ipv4_route();
         self.config = None;
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns)
+            .update_servers(&[]);
     }
 
     /// One turn of the crank: read whatever the C6 has queued, let smoltcp
@@ -228,9 +309,13 @@ impl Stack {
         }
     }
 
-    /// Installs an address and default route on the interface and records
-    /// them as the current configuration.
-    fn apply_config(&mut self, config: Ipv4Config) {
+    /// Installs an address, default route and resolvers on the interface
+    /// and records them as the current configuration.
+    fn apply_config(&mut self, mut config: Ipv4Config) {
+        // Cut the resolver list down here rather than at each caller, so
+        // the configuration never claims a server the socket will not ask.
+        config.dns_servers.truncate(DNS_MAX_SERVER_COUNT);
+
         let mut installed = false;
         self.interface.update_ip_addrs(|addresses| {
             addresses.clear();
@@ -253,6 +338,67 @@ impl Stack {
             uart::log(b"NET: could not install the default route\r\n");
         }
         self.config = Some(config);
+        self.install_dns_servers();
+    }
+
+    /// Replaces the resolvers by hand, leaving the address alone.
+    ///
+    /// Returns whether there was a configuration to change. This works on a
+    /// DHCP lease as well as a static address, which is what makes it
+    /// possible to point the stack at a deliberately unreachable resolver
+    /// and watch the fallback to the next one happen.
+    pub fn set_dns_servers(&mut self, servers: Vec<Ipv4Address>) -> bool {
+        let Some(config) = &mut self.config else {
+            return false;
+        };
+        config.dns_servers = servers;
+        config.dns_servers.truncate(DNS_MAX_SERVER_COUNT);
+        self.install_dns_servers();
+        true
+    }
+
+    /// Copies the current configuration's resolvers into the DNS socket.
+    ///
+    /// smoltcp keeps the list privately with no way to read it back, so the
+    /// configuration stays the single source of truth and this is the only
+    /// place the two are allowed to diverge -- for the length of this
+    /// function.
+    fn install_dns_servers(&mut self) {
+        let mut servers = [IpAddress::Ipv4(Ipv4Address::UNSPECIFIED); DNS_MAX_SERVER_COUNT];
+        let mut count = 0;
+        if let Some(config) = &self.config {
+            // `apply_config` and `set_dns_servers` already truncate, so this
+            // never actually drops one. It is here so the bound on the array
+            // is enforced where the array is written, not two functions away.
+            for server in config.dns_servers.iter().take(DNS_MAX_SERVER_COUNT) {
+                servers[count] = IpAddress::Ipv4(*server);
+                count += 1;
+            }
+        }
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns)
+            .update_servers(&servers[..count]);
+    }
+
+    /// Starts a query for `name`'s A records.
+    ///
+    /// Like [`connect_tcp`](Self::connect_tcp) this cannot live outside the
+    /// struct: starting a query needs the interface's context for the
+    /// transaction id and source port as well as the socket itself, and a
+    /// caller holding one `&mut Stack` cannot borrow both halves at once.
+    pub fn start_dns_query(
+        &mut self,
+        name: &str,
+    ) -> Result<dns::QueryHandle, dns::StartQueryError> {
+        let context = self.interface.context();
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns)
+            .start_query(context, name, DnsQueryType::A)
+    }
+
+    /// The DNS socket, for collecting or cancelling a started query.
+    pub fn dns_socket_mut(&mut self) -> &mut dns::Socket<'static> {
+        self.sockets.get_mut::<dns::Socket>(self.dns)
     }
 
     /// Polls until `predicate` is satisfied or `timeout_ms` of real time

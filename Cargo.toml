@@ -23,6 +23,14 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "socket-udp",
     "socket-icmp",
     "socket-tcp",
+    "socket-dns",
+    # smoltcp's `build.rs` reads these as configuration, not as code switches,
+    # and both default to 1. Three servers is what DHCP can hand over
+    # (`MAX_DNS_SERVER_COUNT`), so a smaller list would silently throw away the
+    # redundancy the network offered; four results let a round-robin name show
+    # more than its first address.
+    "dns-max-server-count-3",
+    "dns-max-result-count-4",
     "auto-icmp-echo-reply",
 ] }
 

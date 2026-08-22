@@ -1,10 +1,13 @@
 //! A minimal HTTP/1.0 GET, present because TCP came with smoltcp.
 //!
 //! This is a TCP smoke test wearing a familiar shape, not an HTTP client:
-//! there is no redirect handling, no chunked decoding, no TLS and no name
-//! resolution. What it proves is that a connection opens, data flows in
-//! both directions and the close is seen -- which is the part of TCP that
-//! is hard to get right and easy to check.
+//! there is no redirect handling, no chunked decoding and no TLS. What it
+//! proves is that a connection opens, data flows in both directions and
+//! the close is seen -- which is the part of TCP that is hard to get right
+//! and easy to check.
+//!
+//! Names are resolved before they get here: the caller passes both the
+//! address to connect to and the text to put in `Host:`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -46,11 +49,17 @@ pub struct Response {
 
 /// Issues `GET <path>` against `address:port` and returns the start of the
 /// response, headers included.
+///
+/// `host` is what goes in the `Host:` header, and is not always `address`
+/// written out: when the destination was given as a name, the name is what
+/// the server needs to pick a virtual host, and the address it resolved to
+/// tells it nothing.
 pub fn get(
     stack: &mut Stack,
     rpc: &mut Rpc,
     address: Ipv4Address,
     port: u16,
+    host: &[u8],
     path: &[u8],
 ) -> Result<Response, Error> {
     let handle = stack.sockets_mut().add(tcp::Socket::new(
@@ -58,7 +67,7 @@ pub fn get(
         tcp::SocketBuffer::new(vec![0u8; BUFFER_BYTES]),
     ));
 
-    let result = exchange(stack, rpc, handle, address, port, path);
+    let result = exchange(stack, rpc, handle, address, port, host, path);
 
     // `abort` rather than `close`: the socket is going away with the
     // handle, so there is nobody left to finish a graceful shutdown.
@@ -74,6 +83,7 @@ fn exchange(
     handle: smoltcp::iface::SocketHandle,
     address: Ipv4Address,
     port: u16,
+    host: &[u8],
     path: &[u8],
 ) -> Result<Response, Error> {
     let started = tick::now_ms();
@@ -96,7 +106,7 @@ fn exchange(
         });
     }
 
-    let request = build_request(address, port, path);
+    let request = build_request(host, port, path);
     if stack
         .sockets_mut()
         .get_mut::<tcp::Socket>(handle)
@@ -157,17 +167,12 @@ fn exchange(
 /// HTTP/1.0 with an explicit `Host`, which every virtual host needs and
 /// costs nothing to send. 1.0 rather than 1.1 so the server closes the
 /// connection at the end of the body instead of leaving it open.
-fn build_request(address: Ipv4Address, port: u16, path: &[u8]) -> Vec<u8> {
-    let mut request = Vec::with_capacity(path.len() + 64);
+fn build_request(host: &[u8], port: u16, path: &[u8]) -> Vec<u8> {
+    let mut request = Vec::with_capacity(path.len() + host.len() + 64);
     request.extend_from_slice(b"GET ");
     request.extend_from_slice(path);
     request.extend_from_slice(b" HTTP/1.0\r\nHost: ");
-    for (index, octet) in address.octets().iter().enumerate() {
-        if index != 0 {
-            request.push(b'.');
-        }
-        push_decimal(&mut request, *octet as u32);
-    }
+    request.extend_from_slice(host);
     if port != 80 {
         request.push(b':');
         push_decimal(&mut request, port as u32);

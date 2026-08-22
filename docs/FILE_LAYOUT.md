@@ -97,9 +97,12 @@
     - `src/net/device.rs`: smoltcpの`phy::Device`実装。`wifi::Rpc`の受信キューから
       1フレーム取る`RxToken`（フレームを所有するので送信トークンと同時に返せる）と、
       `Rpc::send_station_frame`へ流す`TxToken`。medium・MTUの申告もここ
-    - `src/net/stack.rs`: `Interface`・`SocketSet`・DHCPソケットの保持、
-      アドレスと既定経路の適用、リンクを読んでインタフェースに捌かせるポンプ
+    - `src/net/stack.rs`: `Interface`・`SocketSet`・DHCPソケット・DNSソケットの保持、
+      アドレス・既定経路・リゾルバの適用、リンクを読んでインタフェースに捌かせるポンプ
       （`poll`／`pump_until`）。C6のリンクは所有せず、呼び出しごとに`&mut Rpc`を借りる
+    - `src/net/dns.rs`: 名前解決（Aレコード）。ソケットは`stack.rs`が常設で持つので、
+      ここにあるのは「問い合わせを始めて、settleするまでポンプして、答えを1回だけ
+      取り出す」駆動だけ
     - `src/net/ping.rs`: ICMP echoの送信と往復時間の測定。こちら宛のechoへの応答は
       smoltcpの`auto-icmp-echo-reply`が行うのでここにはない
     - `src/net/tftp.rs`: TFTP読み出しクライアント（RFC 1350、512 byteロックステップ、
