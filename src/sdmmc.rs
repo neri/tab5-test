@@ -39,6 +39,7 @@
 //! hardware auto-stop instead of a manual CMD12).
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::delay::delay_us;
 use crate::gpio;
@@ -72,6 +73,16 @@ const PERI_CLK_CTRL01: usize = HP_SYS_CLKRST + 0x34;
 const PERI_CLK_CTRL02: usize = HP_SYS_CLKRST + 0x38;
 const HP_SDMMC_EMAC_RST_CTRL: usize = LP_CLKRST + 0x4C;
 
+/// Card (slot) numbers on the single SDHOST controller. Card 0 is the
+/// microSD socket, card 1 is the ESP32-C6's SDIO bus (`docs/WIFI_C6_PLAN.md`).
+/// The controller multiplexes both through one CIU, so activating one card
+/// resets the state of the other.
+pub const CARD_SD: u32 = 0;
+pub const CARD_C6: u32 = 1;
+
+/// `SDHOST_CMD_REG.CARD_NUM`, bits [20:16].
+const CMD_CARD_NUMBER_SHIFT: u32 = 16;
+
 const CMD_RESPONSE_EXPECT: u32 = 1 << 6;
 const CMD_RESPONSE_LONG: u32 = 1 << 7;
 const CMD_CHECK_RESPONSE_CRC: u32 = 1 << 8;
@@ -84,6 +95,13 @@ const CMD_UPDATE_CLOCK_REGISTERS_ONLY: u32 = 1 << 21;
 const CMD_USE_HOLD_REG: u32 = 1 << 29;
 const CMD_START: u32 = 1 << 31;
 
+/// Command flag combinations `sdio.rs` needs. R1/R5/R6 responses carry a
+/// valid CRC7 and echo the command index, so they are checked; R4 (CMD5's
+/// SDIO operation-conditions response) carries neither and must not be.
+pub const RESPONSE_SHORT: u32 = CMD_RESPONSE_EXPECT | CMD_CHECK_RESPONSE_CRC;
+pub const RESPONSE_SHORT_NO_CRC: u32 = CMD_RESPONSE_EXPECT;
+pub const RESPONSE_NONE_WITH_INIT: u32 = CMD_SEND_INITIALIZATION;
+
 const RINT_RESPONSE_ERROR: u32 = 1 << 1;
 const RINT_COMMAND_DONE: u32 = 1 << 2;
 const RINT_DATA_TRANSFER_OVER: u32 = 1 << 3;
@@ -95,6 +113,18 @@ const RINT_FIFO_ERROR: u32 = 1 << 11;
 const RINT_HARDWARE_LOCKED_ERROR: u32 = 1 << 12;
 const RINT_START_BIT_ERROR: u32 = 1 << 13;
 const RINT_ALL: u32 = 0xFFFF;
+/// Bits the command phase raises, cleared by `send_command_on` alone.
+const RINT_COMMAND_PHASE: u32 = RINT_COMMAND_DONE
+    | RINT_RESPONSE_ERROR
+    | RINT_RESPONSE_CRC_ERROR
+    | RINT_RESPONSE_TIMEOUT
+    | RINT_HARDWARE_LOCKED_ERROR;
+/// Bits the data phase raises, cleared before arming a transfer.
+const RINT_DATA_PHASE: u32 = RINT_DATA_TRANSFER_OVER
+    | RINT_DATA_CRC_ERROR
+    | RINT_DATA_READ_TIMEOUT
+    | RINT_FIFO_ERROR
+    | RINT_START_BIT_ERROR;
 
 const BLOCK_BYTES: usize = 512;
 
@@ -181,25 +211,83 @@ pub struct SdCard {
     pub clock_khz: u32,
 }
 
+/// Brings the shared SDHOST controller up and leaves `card`'s clock at the
+/// 400 kHz identification frequency. Pad routing is the caller's job (it
+/// differs per card: IOMUX for the microSD, GPIO matrix for the C6).
+///
+/// This resets the whole controller, so calling it for one card drops the
+/// other card's activation. Callers therefore re-activate their card from
+/// scratch rather than assuming a previous `init` still holds.
+pub fn init_host(card: u32) -> bool {
+    // The controller is shared, so it is only brought up once. Resetting it
+    // per activation would drop the *other* card's host-side setup -- its
+    // clock enable, divider and bus width -- while that card is still
+    // activated and expecting to be talked to.
+    if !CONTROLLER_READY.load(Ordering::Relaxed) {
+        enable_bus_clock();
+        reset_peripheral();
+        set_low_speed_clock_source(2);
+        if !reset_controller() {
+            uart::log(b"SDMMC: controller reset timed out\r\n");
+            return false;
+        }
+        init_dma();
+        unsafe { write(TMOUT, (0xFFFFFFu32 << 8) | 0xFF) };
+        CONTROLLER_READY.store(true, Ordering::Relaxed);
+    }
+
+    // 160 MHz / 10 / (2*20) = 400 kHz identification clock. This lowers the
+    // shared input clock, so the other card slows down too until whoever
+    // is being activated raises it again; nothing is in flight on that card
+    // while a command is being issued on this one.
+    if !set_card_clock(card, 10, 20) {
+        uart::log(b"SDMMC: card clock setup failed (clock-update command not accepted)\r\n");
+        dump_diagnostics();
+        return false;
+    }
+    true
+}
+
+/// Whether the shared controller has been brought up since boot.
+static CONTROLLER_READY: AtomicBool = AtomicBool::new(false);
+
+/// Whether the ESP32-C6 on card 1 has been activated.
+static SECOND_CARD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Records that card 1 is in use, which caps the shared clock (see
+/// [`set_high_speed`]). `sdio.rs` calls this once the C6 is activated.
+pub fn note_second_card_active() {
+    SECOND_CARD_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Reprograms one card's clock. Exposed for `sdio.rs`, which steps the C6
+/// from the identification clock up to the operating frequency once the card
+/// is selected.
+pub fn set_clock(card: u32, host_div: u32, card_div: u32) -> bool {
+    set_card_clock(card, host_div, card_div)
+}
+
+/// Sets one card's host-side bus width to 4-bit (`SDHOST_CTYPE_REG`'s
+/// `card_width` bit for that card). The card-side switch is protocol
+/// specific -- ACMD6 for SD memory, a CCCR write for SDIO -- and stays with
+/// the caller.
+pub fn set_host_bus_width_4bit(card: u32) {
+    unsafe { modify(CTYPE, 1 << card, 1 << card) };
+}
+
+/// Dumps the controller's clock/status registers to the UART log. Used by
+/// both this module and `sdio.rs` when a bring-up step fails.
+pub fn log_diagnostics() {
+    dump_diagnostics();
+}
+
 /// Resets, clocks and activates the card in the Tab5's microSD slot,
 /// logging progress and any failure reason over USB serial.
 pub fn init() -> Option<SdCard> {
-    enable_bus_clock();
-    reset_peripheral();
     gpio::configure_sdmmc_4bit_pins();
-    set_low_speed_clock_source(2);
-    if !reset_controller() {
-        uart::log(b"SDMMC: controller reset timed out\r\n");
+    if !init_host(CARD_SD) {
         return None;
     }
-    init_dma();
-    // 160 MHz / 10 / (2*20) = 400 kHz identification clock.
-    if !set_card_clock(10, 20) {
-        uart::log(b"SDMMC: card clock setup failed (clock-update command not accepted)\r\n");
-        dump_diagnostics();
-        return None;
-    }
-    unsafe { write(TMOUT, (0xFFFFFFu32 << 8) | 0xFF) };
 
     if send_command(0, 0, CMD_SEND_INITIALIZATION).is_err() {
         uart::log(b"SDMMC: CMD0 (GO_IDLE_STATE) failed\r\n");
@@ -299,13 +387,13 @@ pub fn init() -> Option<SdCard> {
     // Unlike the bus-width switch, a failure here is not safely recoverable:
     // `set_card_clock` disables the card clock before reprogramming it, so a
     // failure partway can leave the clock off rather than merely unchanged.
-    if !set_card_clock(8, 0) {
+    if !set_card_clock(CARD_SD, 8, 0) {
         uart::log(b"SDMMC: switch to 20 MHz Default Speed failed\r\n");
         dump_diagnostics();
         return None;
     }
 
-    let high_speed = match set_high_speed() {
+    let high_speed = match set_high_speed_if_alone() {
         Ok(enabled) => enabled,
         Err(()) => {
             // The card already accepted the switch to High Speed by this
@@ -360,7 +448,7 @@ fn set_bus_width_4bit(rca_arg: u32) -> bool {
         uart::log(b"SDMMC: ACMD6 (SET_BUS_WIDTH) failed; staying 1-bit\r\n");
         return false;
     }
-    unsafe { modify(CTYPE, 0x3, 0x1) }; // card 0 -> 4-bit
+    set_host_bus_width_4bit(CARD_SD);
     uart::log(b"SDMMC: switched to 4-bit bus width\r\n");
     true
 }
@@ -474,6 +562,22 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
 /// accept the switch but the following host clock reprogram failed, which
 /// (like `set_card_clock`'s other call sites) can leave the clock disabled
 /// rather than merely unchanged -- callers should treat that as fatal.
+/// Skips the High Speed switch while the C6 is activated.
+///
+/// High Speed doubles `sdhost_cclk_in`, which both cards share. Card 1's
+/// divider is chosen for the 20 MHz input, so raising it would run the C6 at
+/// 40 MHz without its own High Speed mode ever having been enabled. Keeping
+/// the microSD at Default Speed is the cheap way to stay correct; giving
+/// each card a divider that tracks the shared input would be the thorough
+/// one.
+fn set_high_speed_if_alone() -> Result<bool, ()> {
+    if SECOND_CARD_ACTIVE.load(Ordering::Relaxed) {
+        uart::log(b"SDMMC: staying at Default Speed, the C6 shares this clock\r\n");
+        return Ok(false);
+    }
+    set_high_speed()
+}
+
 fn set_high_speed() -> Result<bool, ()> {
     let Some(status) = switch_func(false, 0) else {
         uart::log(b"SDMMC: CMD6 check (SWITCH_FUNC) failed; staying at Default Speed\r\n");
@@ -501,7 +605,7 @@ fn set_high_speed() -> Result<bool, ()> {
 
     // 160 MHz / 4 = 40 MHz (ESP-IDF's SDMMC_FREQ_HIGHSPEED divider choice;
     // SD spec allows up to 50 MHz).
-    if !set_card_clock(4, 0) {
+    if !set_card_clock(CARD_SD, 4, 0) {
         return Err(());
     }
     uart::log(b"SDMMC: switched to High Speed (40 MHz)\r\n");
@@ -627,6 +731,41 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
     } else {
         lba.wrapping_mul(BLOCK_BYTES as u32)
     };
+    let index = if is_write { 25 } else { 18 };
+    data_transfer_on(
+        CARD_SD,
+        index,
+        address,
+        BLOCK_BYTES as u32,
+        buffer,
+        is_write,
+        true,
+        b"SDMMC: multi-block transfer",
+    )
+}
+
+/// Runs one command that has a data phase, moving `buffer` between RAM and
+/// the card through the IDMAC. Shared by the SD multi-block path
+/// (CMD18/CMD25, which want `auto_stop`) and by `sdio.rs`'s CMD53, which has
+/// no stop command of its own.
+///
+/// `block_size` goes into `SDHOST_BLKSIZ_REG`; `buffer.len()` becomes the
+/// byte count, so a byte-mode CMD53 passes its length as the block size too.
+/// `label` prefixes any error logged here.
+#[allow(clippy::too_many_arguments)]
+pub fn data_transfer_on(
+    card: u32,
+    index: u32,
+    arg: u32,
+    block_size: u32,
+    buffer: &mut [u8],
+    is_write: bool,
+    auto_stop: bool,
+    label: &[u8],
+) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
 
     // For a write this flushes the source data out to RAM before DMA reads
     // it; for a read it drops any stale dirty lines that could otherwise
@@ -646,7 +785,10 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
     );
 
     unsafe {
-        write(BLKSIZ, BLOCK_BYTES as u32);
+        // Nothing may be left over from an earlier transfer: the wait below
+        // treats these bits as belonging to this one.
+        write(RINTSTS, RINT_DATA_PHASE);
+        write(BLKSIZ, block_size);
         write(BYTCNT, buffer.len() as u32);
         // The card-read-threshold trick `read_block` needed to make IDMAC's
         // FIFO-to-RAM burst engine start; `CARDWRTHREN` (bit 2) is
@@ -656,7 +798,7 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
             if is_write {
                 0
             } else {
-                (BLOCK_BYTES as u32) << 16 | CARDTHRCTL_CARDRDTHREN
+                block_size << 16 | CARDTHRCTL_CARDRDTHREN
             },
         );
         modify(CTRL, CTRL_USE_INTERNAL_DMA, CTRL_USE_INTERNAL_DMA);
@@ -665,17 +807,20 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
         write(PLDMND, 1);
     }
 
-    let index = if is_write { 25 } else { 18 };
     let mut flags = CMD_RESPONSE_EXPECT
         | CMD_CHECK_RESPONSE_CRC
         | CMD_DATA_EXPECTED
-        | CMD_WAIT_PRVDATA_COMPLETE
-        | CMD_SEND_AUTO_STOP;
+        | CMD_WAIT_PRVDATA_COMPLETE;
+    if auto_stop {
+        flags |= CMD_SEND_AUTO_STOP;
+    }
     if is_write {
         flags |= CMD_READ_WRITE;
     }
-    if send_command(index, address, flags).is_err() {
-        uart::log(b"SDMMC: CMD18/CMD25 (multi-block transfer) failed\r\n");
+    if send_command_on(card, index, arg, flags).is_err() {
+        uart::log(label);
+        uart::log(b": command failed\r\n");
+        unsafe { modify(CTRL, CTRL_USE_INTERNAL_DMA, 0) };
         return false;
     }
 
@@ -694,14 +839,23 @@ fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -
                     | RINT_FIFO_ERROR
                     | RINT_START_BIT_ERROR);
             if failed != 0 {
-                uart::log_hex(b"SDMMC: multi-block transfer error, RINTSTS=", raw);
+                uart::log(label);
+                uart::log_hex(b" error, RINTSTS=", raw);
                 break false;
             }
             break true;
         }
         if timeout == 0 {
-            uart::log_hex(b"SDMMC: multi-block transfer timed out, RINTSTS=", raw);
-            unsafe { write(RINTSTS, RINT_ALL) };
+            uart::log(label);
+            uart::log_hex(b" timed out, RINTSTS=", raw);
+            unsafe {
+                // FIFO_COUNT (bits 29:17) and DATA_BUSY (bit 9) say whether
+                // the card sent anything at all, which separates "no data on
+                // the bus" from "data arrived but the DMA never drained it".
+                uart::log_hex(b" timed out, STATUS=", read(STATUS));
+                uart::log_hex(b" timed out, IDSTS=", read(IDSTS));
+                write(RINTSTS, RINT_ALL);
+            }
             break false;
         }
         timeout -= 1;
@@ -918,27 +1072,35 @@ fn cache_writeback_invalidate(address: usize, length: usize) {
     crate::psram::writeback_invalidate(address, length);
 }
 
-/// Programs slot 0's card clock divider (`SDHOST_CLKDIV_REG`'s divisor is
+/// Programs one card's clock divider (`SDHOST_CLKDIV_REG`'s divisor is
 /// `2*card_div`) and propagates it into the CIU via the clock-update
 /// pseudo-command, matching `sdmmc_host_set_card_clk`'s disable/update,
 /// configure/update, enable/update sequence.
-fn set_card_clock(host_div: u32, card_div: u32) -> bool {
-    unsafe { modify(CLKENA, 0x3 | (0x3 << 16), 0) };
-    if !update_clock_registers() {
+///
+/// Each card has its own divider and enable bits (card 0 uses divider 0,
+/// card 1 uses divider 1, as in `sdmmc_ll_set_card_clock_div`), so only the
+/// target card's bits are touched here. `host_div` however feeds the shared
+/// `sdhost_cclk_in` generator and therefore affects both cards; running the
+/// microSD and the C6 at the same time will need a common value (see
+/// `docs/WIFI_C6_PLAN.md` Stage 6).
+fn set_card_clock(card: u32, host_div: u32, card_div: u32) -> bool {
+    let enable_bits = (1 << card) | (1 << (16 + card));
+    unsafe { modify(CLKENA, enable_bits, 0) };
+    if !update_clock_registers(card) {
         return false;
     }
 
     set_low_speed_clock_source(host_div);
     unsafe {
-        modify(CLKSRC, 0x3, 0); // card0 uses clock divider 0
-        modify(CLKDIV, 0xFF, card_div);
+        modify(CLKSRC, 0x3 << (2 * card), card << (2 * card));
+        modify(CLKDIV, 0xFF << (8 * card), card_div << (8 * card));
     }
-    if !update_clock_registers() {
+    if !update_clock_registers(card) {
         return false;
     }
 
-    unsafe { modify(CLKENA, 0x3 | (0x3 << 16), 0x1 | (0x1 << 16)) };
-    update_clock_registers()
+    unsafe { modify(CLKENA, enable_bits, enable_bits) };
+    update_clock_registers(card)
 }
 
 /// The register comment on `SDHOST_UPDATE_CLOCK_REGISTERS_ONLY` is explicit
@@ -947,22 +1109,29 @@ fn set_card_clock(host_div: u32, card_div: u32) -> bool {
 /// `sdmmc_host_clock_update_command` correspondingly only waits for the CIU
 /// to accept it (`sdmmc_host_start_command`), never for completion. Using
 /// `send_command`'s response wait here would time out on every call.
-fn update_clock_registers() -> bool {
+fn update_clock_registers(card: u32) -> bool {
     let flags = CMD_UPDATE_CLOCK_REGISTERS_ONLY | CMD_WAIT_PRVDATA_COMPLETE;
-    start_command(0, 0, flags)
+    start_command(card, 0, 0, flags)
 }
 
 /// Writes the command into the CIU and waits for it to be accepted (i.e.
 /// `START_CMD` self-clears). This alone is enough for the clock-update
 /// pseudo-command; real SD commands additionally need `send_command`'s wait
 /// for the completion event and response.
-fn start_command(index: u32, arg: u32, flags: u32) -> bool {
+fn start_command(card: u32, index: u32, arg: u32, flags: u32) -> bool {
     if !wait_command_taken(10_000) {
         return false;
     }
     unsafe {
         write(CMDARG, arg);
-        write(CMD, (index & 0x3F) | flags | CMD_USE_HOLD_REG | CMD_START);
+        write(
+            CMD,
+            (index & 0x3F)
+                | ((card & 0x1F) << CMD_CARD_NUMBER_SHIFT)
+                | flags
+                | CMD_USE_HOLD_REG
+                | CMD_START,
+        );
     }
     wait_command_taken(10_000)
 }
@@ -973,7 +1142,14 @@ fn start_command(index: u32, arg: u32, flags: u32) -> bool {
 /// responses (CID/CSD, R2) still carry a valid CRC7 and should set it,
 /// while ACMD41's R3 response has no CRC and must not.
 fn send_command(index: u32, arg: u32, flags: u32) -> Result<[u32; 4], ()> {
-    if !start_command(index, arg, flags) {
+    send_command_on(CARD_SD, index, arg, flags)
+}
+
+/// Same as [`send_command`], but for an explicit card (slot) number. `sdio.rs`
+/// uses this for the ESP32-C6 on card 1; everything in this module works on
+/// the microSD card 0.
+pub fn send_command_on(card: u32, index: u32, arg: u32, flags: u32) -> Result<[u32; 4], ()> {
+    if !start_command(card, index, arg, flags) {
         return Err(());
     }
 
@@ -981,7 +1157,11 @@ fn send_command(index: u32, arg: u32, flags: u32) -> Result<[u32; 4], ()> {
     loop {
         let raw = unsafe { read(RINTSTS) };
         if raw & RINT_COMMAND_DONE != 0 {
-            unsafe { write(RINTSTS, RINT_ALL) };
+            // Clear only what the command phase owns. Writing every bit here
+            // would also clear `DATA_TRANSFER_OVER`, which for a short data
+            // phase can already have latched by the time this runs -- the
+            // caller waiting on it would then wait forever.
+            unsafe { write(RINTSTS, RINT_COMMAND_PHASE) };
             let failed = raw
                 & (RINT_RESPONSE_ERROR
                     | RINT_RESPONSE_CRC_ERROR
@@ -1002,7 +1182,7 @@ fn send_command(index: u32, arg: u32, flags: u32) -> Result<[u32; 4], ()> {
         }
         if timeout == 0 {
             uart::log_hex(b"SDMMC: command hard timeout, RINTSTS=", raw);
-            unsafe { write(RINTSTS, RINT_ALL) };
+            unsafe { write(RINTSTS, RINT_COMMAND_PHASE) };
             return Err(());
         }
         timeout -= 1;

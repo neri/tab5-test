@@ -38,9 +38,10 @@
 | 画面の座標確認 | `coordtest` | 100ピクセルグリッド、論理中心軸、四隅の座標、1ピクセルずつ内側へ入った4本の枠を出す全画面チャート。CW回転とクリッピングを定規で突き合わせて確認する |
 | センサー・RTC | `axistest` `battery` `rtc` | BMI270の傾きでボールを転がす、INA226でバッテリーパックの電圧・電流・電力をライブ表示、RX8130CE RTCの時刻表示・設定・レジスタダンプ・機能検査 |
 | USBマウス・画面 | `win` | Windows 95風デスクトップを表示。USB HID Bootマウスでカーソル移動とタイトルバーのドラッグを確認し、タスクバーにRTC時刻を表示 |
-| SDカード | `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` | 4bit/High Speedモード（実クロック40 MHz）での生ブロックI/O。CID/CSD要約、MBR表示、1ブロック読み出し、DMAでnブロック読み出し、PSRAM宛DMA読み出しと検証、書き込み+検証+復元、ゼロ埋め |
+| SDカード | `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` | 4bit/High Speedモード（実クロック40 MHz。ESP32-C6を使っている間は同じコントローラの入力クロックを共有するためDefault Speedの20 MHz）での生ブロックI/O。CID/CSD要約、MBR表示、1ブロック読み出し、DMAでnブロック読み出し、PSRAM宛DMA読み出しと検証、書き込み+検証+復元、ゼロ埋め |
 | USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
 | USBストレージ | `usbmsc` `usbread` `usbmbr` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式） |
+| Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
 
 `sdzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`も復元失敗時は
@@ -107,4 +108,6 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - 日本語フォント
 - FAT/exFATファイルシステムの解釈
 - USB Mass Storageへの書き込み、多段USBハブ
+- TCP/IPスタック（Wi-FiはAPへのアソシエートまでで、IPアドレスは取得しません）
+- Wi-FiのSoftAPとBLE。5 GHz帯はESP32-C6が2.4 GHz専用のため使えません
 - ESP32-P4 revision v3以降での動作確認

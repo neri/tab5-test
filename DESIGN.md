@@ -31,6 +31,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、`win`デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、MBR、シェルコマンド |
+| [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
 | [FILE_LAYOUT.md](docs/FILE_LAYOUT.md) | モジュールごとの責務一覧、コーディング方針（コメントの言語、`unsafe`の粒度） |
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
@@ -47,7 +48,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [USB_HOST_PLAN.md](docs/USB_HOST_PLAN.md)、
 [USB_INTERRUPT_REFACTOR_PLAN.md](docs/USB_INTERRUPT_REFACTOR_PLAN.md)、
 [USB_MSC_PLAN.md](docs/USB_MSC_PLAN.md)、
-[USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)。
+[USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)、
+[WIFI_C6_PLAN.md](docs/WIFI_C6_PLAN.md)。
 
 ## 制約
 
@@ -60,6 +62,10 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
 - ストレージはブロック単位の読み書きとMBR表示までです。FAT/exFATの解析、
   USB MSCの書き込み、SDのUHS-Iモードは未実装です（[STORAGE.md](docs/STORAGE.md)）。
+- Wi-FiはESP32-C6のESP-Hostedファームウェアを経由し、スキャンとAPへの接続まで
+  です。**TCP/IPスタックは実装していないためIPアドレスは取得できません**。
+  C6は2.4 GHz専用で5 GHzのAPは見えません。SoftAP、BLE、OpenThreadも未対応です
+  （[WIFI.md](docs/WIFI.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
   読み出しまで実機確認済みです。文字列記述子の取得、periodic scheduler基盤、
   多段ハブは未実装です（[USB.md](docs/USB.md)）。

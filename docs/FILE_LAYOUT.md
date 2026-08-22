@@ -27,7 +27,7 @@
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
     - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（内容を表示したまま移動）だけが動く
-- `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、low/release/level）
+- `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、プッシュプル出力設定、low/release/level）とGPIO Matrixの入出力ルーティング（`configure_c6_sdio_pins`はSDMMCスロット1をGPIO8..13へ配線する）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
 - `src/tab5_keyboard.rs`: Ext.Port1（GPIO0/1）のTab5 KeyboardをHIDモードで読むI2Cドライバ。HID usage IDを`input.rs`の共通変換へ渡す
@@ -55,7 +55,34 @@
 - `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
   経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
   同じ構成。現状は[`STORAGE.md`](STORAGE.md)、実機で踏んだ罠は
-  [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照
+  [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照。コントローラーは1つでカード
+  （スロット）が2つあり、カード0がmicroSD、カード1がESP32-C6。カード番号を取る
+  低レベルAPI（`init_host`／`send_command_on`／`set_clock`／
+  `set_host_bus_width_4bit`）を`sdio.rs`へ公開する
+- `src/sdio.rs`: SDMMCカード1に載るESP32-C6のSDIOカードとしての活性化
+  （電源E2.P0、GPIO15リセット、CMD52／CMD5／CMD3／CMD7、CCCR設定、CIS読み出し）と、
+  CMD52の1バイトアクセス・CMD53のブロック／バイトモード転送。ピンはGPIO Matrix
+  経由なので`gpio.rs`の`configure_c6_sdio_pins`を使う。計画と実機での判断は
+  [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)を参照
+- `src/wifi.rs`・`src/wifi/`: ESP32-C6経由のWi-Fi。`usb.rs`と同じく親ファイルは
+  サブモジュール宣言と再エクスポートだけを持つ
+    - `src/wifi/hosted.rs`: ESP-Hostedのトランスポート層。12 byteペイロード
+      ヘッダの組み立てと検査、スレーブレジスタ（受信長・送信バッファトークン・
+      割り込み）、CMD53による1フレームの送受信、スレーブ初期化イベントの受信と
+      ホスト設定の返送。1回の読み出しに複数フレームが載るため、バッファを
+      使い切るまでバスに触らずフレームを取り出す
+    - `src/wifi/proto.rs`: RPCメッセージに必要な範囲だけのprotobuf。varint、
+      length-delimited、入れ子だけを扱う`Writer`と`Reader`で、未知のフィールドは
+      wire typeを見て読み飛ばす
+    - `src/wifi/rpc.rs`: SERIALインターフェース上のRPC。TLVエンベロープ
+      （`RPCRsp`／`RPCEvt`）と`Rpc`メッセージ（msg_type／msg_id／uid＋
+      msg_id番のフィールドに入るペイロード）の組み立てと解析、
+      フレーム長を超えるメッセージの分割と再結合、応答待ちの間に届いた
+      イベントの保持
+    - `src/wifi/station.rs`: RPCの上に載るWi-Fi操作。`esp_wifi_init`／
+      モード設定／開始、スキャンの実行とAPレコードの解析、STA設定と接続・
+      切断、接続結果イベントの待ち受け。スレーブが返す`esp_err_t`は
+      握りつぶさずそのまま返す
 - `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
   「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
   親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート

@@ -105,6 +105,26 @@ UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値�
 対応範囲は[`STORAGE.md`](STORAGE.md)、失敗パターンの詳細は
 [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
 
+Wi-Fi（ESP32-C6）も起動シーケンスには含まれず、`wifi`系コマンド実行時のみ
+UARTへ出ます。層ごとに接頭辞が分かれており、どこで止まったかがそのまま分かります。
+
+- `SDIO: ...` — C6をSDIOカードとして活性化する層。正常時は
+  `SDIO: C6 activated`とRCA・CIS識別子が続きます。E2の各レジスタと
+  6本のパッドレベルも毎回出るので、C6が給電されバスがプルアップされているかを
+  ここで確認できます
+- `HOSTED: ...` — ESP-Hostedのフレーム層。正常時は
+  `HOSTED: opening the data path`のあと`HOSTED: link is up`です。
+  `HOSTED: the C6 stopped answering, link lost`が出た場合は直後の
+  `SDIO: C6 still answers CMD5`／`does not answer CMD5 either`が
+  「C6がリセットされた」か「バスごと固まった」かを切り分けます
+- `RPC: ...` — TLVとprotobufの層。応答が来ない場合は
+  `RPC: timed out waiting for response id=...`が出ます
+- `WIFI: ...` — `esp_wifi_*`に対応する層。スレーブがエラーを返したときに
+  リクエストIDとステータスを出します
+
+対応範囲は[`WIFI.md`](WIFI.md)、実機で踏んだ罠は
+[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)を参照してください。
+
 USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::rescan`を実行します。
 そのため、起動時にも列挙結果や`USB: initial scan complete`がUARTへ出ます。その後も、
 ルートポートの切断・再接続、空いているハブポートの増分スキャン、トランザクションエラーからの

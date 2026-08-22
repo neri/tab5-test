@@ -392,6 +392,13 @@ fn pi4ioe2_write(register: u8, value: u8) -> bool {
         .is_ok()
 }
 
+/// Reads one PI4IOE2 register. Exposed so `sdio.rs` can log the expander's
+/// direction/high-impedance/output state when the ESP32-C6 does not answer
+/// on the SDIO bus (its power line is E2's P0).
+pub fn pi4ioe2_register(register: u8) -> Option<u8> {
+    pi4ioe2_read(register)
+}
+
 fn pi4ioe2_read(register: u8) -> Option<u8> {
     let mut value = [0u8; 1];
     i2c::board_bus()

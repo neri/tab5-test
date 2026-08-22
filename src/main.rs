@@ -30,12 +30,14 @@ mod power;
 mod ppa;
 mod psram;
 mod rtc;
+mod sdio;
 mod sdmmc;
 mod startup;
 mod tab5_keyboard;
 mod touch;
 mod uart;
 mod usb;
+mod wifi;
 
 // ESP-IDF 2nd-stage bootloaders and espflash require this descriptor. The
 // linker rule in `memory.x` keeps it immediately after the 32-byte image

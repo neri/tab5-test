@@ -19,7 +19,10 @@ Tab5のmicroSDスロットはSDIO1にIOMUX経由（GPIOマトリクスを通さ�
 
 - 4bitバスモード
 - カード対応時はHigh Speedモード（CMD6 SWITCH_FUNC、規格上限50 MHz、
-  ホスト実クロック40 MHz）。複数枚のカードでHigh Speed対応と読み込み成功を確認
+  ホスト実クロック40 MHz）。複数枚のカードでHigh Speed対応と読み込み成功を確認。
+  ただしESP32-C6（同じコントローラのカード1）が活性化済みの間は
+  Default Speedの20 MHzに留めます。入力クロックが共有で、倍にするとC6を
+  High Speed無効のまま40 MHzで駆動してしまうためです（[WIFI.md](WIFI.md)）
 - カード活性化（CID/CSD取得）
 - IDMAC（内蔵DMA）経由の単一・複数ブロック読み書き（CMD18/CMD25はハードウェア
   auto-stopを使い、手動のCMD12は使わない）

@@ -15,7 +15,8 @@ use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use crate::{
-    delay, dma2d, icm, interrupts, lcd, pma, pmp, power, psram, rtc, sdmmc, startup, uart, usb,
+    delay, dma2d, icm, interrupts, lcd, pma, pmp, power, psram, rtc, sdio, sdmmc, startup, uart,
+    usb, wifi,
 };
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -398,6 +399,56 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
     },
     HelpEntry {
+        name: "wifiinfo",
+        usage: "wifiinfo",
+        lines: &[
+            "power and activate the ESP32-C6 as an SDIO card, show its",
+            "CIS identifiers and bus setup",
+        ],
+    },
+    HelpEntry {
+        name: "wifiup",
+        usage: "wifiup",
+        lines: &[
+            "bring up the ESP-Hosted link to the ESP32-C6 and show what the",
+            "slave firmware reports about itself",
+        ],
+    },
+    HelpEntry {
+        name: "wifimac",
+        usage: "wifimac",
+        lines: &[
+            "bring up the link and ask the C6 for its station MAC address",
+            "over RPC (one request/response round trip)",
+        ],
+    },
+    HelpEntry {
+        name: "wifiscan",
+        usage: "wifiscan",
+        lines: &[
+            "bring up the C6, start Wi-Fi in station mode and list the",
+            "access points it can see",
+        ],
+    },
+    HelpEntry {
+        name: "wificonnect",
+        usage: "wificonnect <ssid> [password]",
+        lines: &[
+            "join an access point and report the result. there is no TCP/IP",
+            "stack, so this associates only -- no IP address is obtained",
+        ],
+    },
+    HelpEntry {
+        name: "wifistatus",
+        usage: "wifistatus",
+        lines: &["show the access point the C6 is associated with"],
+    },
+    HelpEntry {
+        name: "wifidisconnect",
+        usage: "wifidisconnect",
+        lines: &["leave the current access point"],
+    },
+    HelpEntry {
         name: "reboot",
         usage: "reboot",
         lines: &["restart the board"],
@@ -443,6 +494,7 @@ pub fn execute(
     framebuffer: &mut Framebuffer,
     line: &[u8],
     usb_host: &mut usb::UsbHost,
+    wifi_session: &mut Option<wifi::Rpc>,
 ) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
@@ -530,6 +582,31 @@ pub fn execute(
         b"usbmsc" => cmd_usbmsc(console, framebuffer, usb_host),
         b"usbread" => cmd_usbread(console, framebuffer, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
+        b"wifiinfo" => {
+            *wifi_session = None;
+            cmd_wifiinfo(console, framebuffer);
+        }
+        b"wifiup" => {
+            *wifi_session = None;
+            cmd_wifiup(console, framebuffer);
+        }
+        b"wifimac" => cmd_wifimac(console, framebuffer),
+        b"wifiscan" => {
+            cmd_wifiscan(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session);
+        }
+        b"wificonnect" => {
+            cmd_wificonnect(console, framebuffer, argument, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session);
+        }
+        b"wifistatus" => {
+            cmd_wifistatus(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session);
+        }
+        b"wifidisconnect" => {
+            cmd_wifidisconnect(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session);
+        }
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
         b"coordtest" => return Outcome::CoordTest,
@@ -2715,6 +2792,527 @@ fn cmd_sdinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
     line.push_str(")");
     console.write_output_line(framebuffer, line.as_str());
     console.write_output_line(framebuffer, "full CID/CSD dump: see UART log");
+}
+
+fn cmd_wifiinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "activating ESP32-C6 (SDIO card 1)...");
+    let Some(card) = sdio::init() else {
+        console.write_output_line(framebuffer, "C6 activation failed, see UART log");
+        return;
+    };
+    console.write_output_line(framebuffer, "C6 activated as an SDIO card");
+
+    let mut line = Line::new();
+    line.push_str("RCA: 0x");
+    line.push_hex(card.rca as u32, 4);
+    line.push_str("  I/O functions: ");
+    line.push_u32(card.io_functions as u32);
+    line.push_str(if card.memory_present {
+        "  memory: yes"
+    } else {
+        "  memory: no"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("CIS manufacturer: 0x");
+    line.push_hex(card.manufacturer as u32, 4);
+    line.push_str("  product: 0x");
+    line.push_hex(card.product as u32, 4);
+    line.push_str(if card.is_esp_slave() {
+        "  (ESP)"
+    } else {
+        "  (unrecognized, raw CIS in UART log)"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+
+    console.write_output_line(
+        framebuffer,
+        if card.bus_width_4bit {
+            "bus width: 4-bit"
+        } else {
+            "bus width: 1-bit (CCCR write failed or skipped)"
+        },
+    );
+
+    let mut line = Line::new();
+    line.push_str("clock: ");
+    line.push_u32(card.clock_khz);
+    line.push_str(" kHz  High Speed: ");
+    line.push_str(if card.high_speed_supported {
+        "supported (not enabled)"
+    } else {
+        "not supported"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn cmd_wifiup(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "bringing up the ESP-Hosted link...");
+    let Some((transport, info)) = wifi::bring_up() else {
+        console.write_output_line(framebuffer, "link bring-up failed, see UART log");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("chip id: 0x");
+    line.push_hex(info.chip_id as u32, 2);
+    line.push_str(if info.chip_id == wifi::hosted::CHIP_ID_ESP32C6 {
+        " (ESP32-C6)"
+    } else {
+        " (unexpected)"
+    });
+    line.push_str("  firmware: ");
+    line.push_u32(info.firmware_major());
+    line.push_str(".");
+    line.push_u32(info.firmware_minor());
+    line.push_str(".");
+    line.push_u32(info.firmware_patch());
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("capabilities: 0x");
+    line.push_hex(info.capabilities as u32, 2);
+    line.push_str("  extended: 0x");
+    line.push_hex(info.extended_capabilities, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("slave queues: rx ");
+    line.push_u32(info.rx_queue_size as u32);
+    line.push_str(", tx ");
+    line.push_u32(info.tx_queue_size as u32);
+    line.push_str("  mode: ");
+    line.push_str(if info.streaming_mode {
+        "streaming"
+    } else {
+        "packet"
+    });
+    line.push_str(if transport.is_throttled() {
+        "  throttled"
+    } else {
+        ""
+    });
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("bus: ");
+    line.push_u32(transport.card.clock_khz);
+    line.push_str(" kHz, ");
+    line.push_str(if transport.card.bus_width_4bit {
+        "4-bit"
+    } else {
+        "1-bit"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(framebuffer, "RPC (scan/connect) is the next stage");
+}
+
+fn cmd_wifimac(console: &mut Console, framebuffer: &mut Framebuffer) {
+    console.write_output_line(framebuffer, "bringing up the ESP-Hosted link...");
+    let Some((transport, _)) = wifi::bring_up() else {
+        console.write_output_line(framebuffer, "link bring-up failed, see UART log");
+        return;
+    };
+
+    let mut rpc = wifi::Rpc::new(transport);
+    console.write_output_line(framebuffer, "calling GetMacAddress...");
+    let Some((status, mac)) = wifi::rpc::get_mac_address(&mut rpc, wifi::rpc::WIFI_MODE_STA) else {
+        console.write_output_line(framebuffer, "RPC call failed, see UART log");
+        return;
+    };
+
+    console.write_output_line(framebuffer, "RPC round trip completed");
+
+    let mut line = Line::new();
+    line.push_str("slave status: ");
+    line.push_u32(status as u32);
+    if status != 0 {
+        line.push_str(" (Wi-Fi is not initialized yet)");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("station MAC: ");
+    for (index, byte) in mac.iter().enumerate() {
+        if index != 0 {
+            line.push_str(":");
+        }
+        line.push_hex(*byte as u32, 2);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    // The slave pushes its own events over the same channel; showing them
+    // here is what proves the event path decodes as well as the response one.
+    for event in rpc.take_events() {
+        let mut line = Line::new();
+        line.push_str("event ");
+        line.push_u32(event.msg_id);
+        line.push_str(" (");
+        line.push_u32(event.payload.len() as u32);
+        line.push_str(" bytes)");
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    let dropped = rpc.dropped_data_frames();
+    if dropped != 0 {
+        let mut line = Line::new();
+        line.push_str("station frames dropped: ");
+        line.push_u32(dropped);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+/// Forgets a session whose link died, so the next command starts over
+/// instead of talking to a bus that no longer answers.
+fn drop_dead_session(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &mut Option<wifi::Rpc>,
+) {
+    // Whatever the slave pushed while the command ran has to go somewhere,
+    // and the next command should not find a backlog waiting for it.
+    if let Some(rpc) = session.as_mut() {
+        rpc.drain();
+    }
+    let died = session.as_ref().is_some_and(|rpc| !rpc.is_alive());
+    if died {
+        *session = None;
+        console.write_output_line(
+            framebuffer,
+            "the C6 link was lost; it will be rebuilt next time",
+        );
+    }
+}
+
+/// Returns the open C6 session, establishing it first if there is none.
+///
+/// Bringing the link up resets the co-processor, so it is done once and then
+/// reused: a connection made by `wificonnect` has to survive until
+/// `wifistatus` asks about it.
+fn wifi_session<'a>(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &'a mut Option<wifi::Rpc>,
+) -> Option<&'a mut wifi::Rpc> {
+    if session.is_none() {
+        console.write_output_line(framebuffer, "bringing up the ESP-Hosted link...");
+        let Some((transport, _)) = wifi::bring_up() else {
+            console.write_output_line(framebuffer, "link bring-up failed, see UART log");
+            return None;
+        };
+        let mut rpc = wifi::Rpc::new(transport);
+
+        console.write_output_line(framebuffer, "starting Wi-Fi in station mode...");
+        match wifi::station::start(&mut rpc) {
+            Some(0) => {}
+            Some(status) => {
+                write_slave_status(console, framebuffer, "Wi-Fi start failed", status);
+                return None;
+            }
+            None => {
+                console.write_output_line(framebuffer, "Wi-Fi start: RPC failed, see UART log");
+                return None;
+            }
+        }
+        *session = Some(rpc);
+    }
+    session.as_mut()
+}
+
+fn cmd_wifiscan(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &mut Option<wifi::Rpc>,
+) {
+    let Some(rpc) = wifi_session(console, framebuffer, session) else {
+        return;
+    };
+
+    console.write_output_line(framebuffer, "scanning (this takes a few seconds)...");
+    let Some((status, access_points)) = wifi::station::scan(rpc) else {
+        console.write_output_line(framebuffer, "scan: RPC failed, see UART log");
+        return;
+    };
+    if status != 0 {
+        write_slave_status(console, framebuffer, "scan failed", status);
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_u32(access_points.len() as u32);
+    line.push_str(" access points");
+    console.write_output_line(framebuffer, line.as_str());
+
+    for access_point in &access_points {
+        let mut line = Line::new();
+        // Right-align the RSSI so the list reads as columns.
+        if access_point.rssi > -100 {
+            line.push_str(" ");
+        }
+        if access_point.rssi < 0 {
+            line.push_str("-");
+        }
+        line.push_u32(access_point.rssi.unsigned_abs());
+        line.push_str("dBm ch");
+        line.push_u32(access_point.channel);
+        if access_point.channel < 10 {
+            line.push_str(" ");
+        }
+        line.push_str(" ");
+        match wifi::station::auth_mode_name(access_point.auth_mode) {
+            Some(name) => line.push_str(name),
+            None => {
+                line.push_str("auth");
+                line.push_u32(access_point.auth_mode as u32);
+            }
+        }
+        line.push_str(" ");
+        if access_point.ssid_length == 0 {
+            line.push_str("(hidden)");
+        } else {
+            // Sanitize first: an SSID is arbitrary bytes, and the console
+            // font only has ASCII.
+            let ssid = access_point.ssid();
+            let mut text = [0u8; wifi::station::SSID_MAX_BYTES];
+            for (slot, &byte) in text.iter_mut().zip(ssid) {
+                *slot = if byte.is_ascii_graphic() || byte == b' ' {
+                    byte
+                } else {
+                    b'.'
+                };
+            }
+            line.push_str(core::str::from_utf8(&text[..ssid.len()]).unwrap_or("?"));
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+fn cmd_wificonnect(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+) {
+    // The password keeps everything after the first gap, spaces included.
+    let (ssid, password) = split_first_word(trim(argument));
+    let password = trim(password);
+    if ssid.is_empty() {
+        console.write_output_line(framebuffer, "usage: wificonnect <ssid> [password]");
+        return;
+    }
+    if ssid.len() > wifi::station::SSID_MAX_BYTES
+        || password.len() > wifi::station::PASSWORD_MAX_BYTES
+    {
+        console.write_output_line(framebuffer, "SSID or password is too long");
+        return;
+    }
+
+    let Some(rpc) = wifi_session(console, framebuffer, session) else {
+        return;
+    };
+
+    console.write_output_line(framebuffer, "connecting...");
+    match wifi::station::connect(rpc, ssid, password) {
+        Some(0) => {}
+        Some(status) => {
+            write_slave_status(console, framebuffer, "connect refused", status);
+            return;
+        }
+        None => {
+            console.write_output_line(framebuffer, "connect: RPC failed, see UART log");
+            return;
+        }
+    }
+
+    match wifi::station::wait_for_connection(rpc, CONNECT_TIMEOUT_MS) {
+        wifi::station::Outcome::Connected {
+            ssid,
+            ssid_length,
+            bssid,
+            channel,
+            auth_mode,
+        } => {
+            let mut line = Line::new();
+            line.push_str("connected to ");
+            push_ssid(&mut line, &ssid[..ssid_length]);
+            console.write_output_line(framebuffer, line.as_str());
+
+            // Which AP of the network answered matters wherever several
+            // share one SSID.
+            let mut line = Line::new();
+            line.push_str("bssid ");
+            for (index, byte) in bssid.iter().enumerate() {
+                if index != 0 {
+                    line.push_str(":");
+                }
+                line.push_hex(*byte as u32, 2);
+            }
+            console.write_output_line(framebuffer, line.as_str());
+
+            let mut line = Line::new();
+            line.push_str("channel ");
+            line.push_u32(channel);
+            line.push_str(", ");
+            match wifi::station::auth_mode_name(auth_mode) {
+                Some(name) => line.push_str(name),
+                None => {
+                    line.push_str("auth");
+                    line.push_u32(auth_mode as u32);
+                }
+            }
+            console.write_output_line(framebuffer, line.as_str());
+            console.write_output_line(framebuffer, "no IP address: there is no TCP/IP stack");
+        }
+        wifi::station::Outcome::Disconnected { reason } => {
+            let mut line = Line::new();
+            line.push_str("disconnected, reason ");
+            line.push_u32(reason);
+            if let Some(name) = wifi::station::disconnect_reason_name(reason) {
+                line.push_str(" ");
+                line.push_str(name);
+            }
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        wifi::station::Outcome::TimedOut => {
+            console.write_output_line(framebuffer, "no answer from the slave in time");
+        }
+    }
+}
+
+fn cmd_wifistatus(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &mut Option<wifi::Rpc>,
+) {
+    let Some(rpc) = session.as_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "no C6 link (run wifiscan or wificonnect first)",
+        );
+        return;
+    };
+
+    let Some((status, access_point)) = wifi::station::connected_access_point(rpc) else {
+        console.write_output_line(framebuffer, "status: RPC failed, see UART log");
+        return;
+    };
+
+    match access_point {
+        Some(access_point) if status == 0 => {
+            let mut line = Line::new();
+            line.push_str("connected to ");
+            push_ssid(&mut line, access_point.ssid());
+            console.write_output_line(framebuffer, line.as_str());
+
+            let mut line = Line::new();
+            line.push_str("bssid ");
+            for (index, byte) in access_point.bssid.iter().enumerate() {
+                if index != 0 {
+                    line.push_str(":");
+                }
+                line.push_hex(*byte as u32, 2);
+            }
+            console.write_output_line(framebuffer, line.as_str());
+
+            let mut line = Line::new();
+            line.push_str("channel ");
+            line.push_u32(access_point.channel);
+            line.push_str(", ");
+            if access_point.rssi < 0 {
+                line.push_str("-");
+            }
+            line.push_u32(access_point.rssi.unsigned_abs());
+            line.push_str(" dBm");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        _ => write_slave_status(console, framebuffer, "not connected", status),
+    }
+
+    let dropped = rpc.dropped_data_frames();
+    if dropped != 0 {
+        let mut line = Line::new();
+        line.push_str("station frames received and dropped: ");
+        line.push_u32(dropped);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    for event in rpc.take_events() {
+        let mut line = Line::new();
+        line.push_str("pending event ");
+        line.push_u32(event.msg_id);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+fn cmd_wifidisconnect(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &mut Option<wifi::Rpc>,
+) {
+    let Some(rpc) = session.as_mut() else {
+        console.write_output_line(framebuffer, "no C6 link (nothing to disconnect)");
+        return;
+    };
+
+    match wifi::station::disconnect(rpc) {
+        Some(0) => {
+            // The slave reports the actual teardown as an event.
+            match wifi::station::wait_for_connection(rpc, DISCONNECT_TIMEOUT_MS) {
+                wifi::station::Outcome::Disconnected { reason } => {
+                    let mut line = Line::new();
+                    line.push_str("disconnected, reason ");
+                    line.push_u32(reason);
+                    console.write_output_line(framebuffer, line.as_str());
+                }
+                _ => console.write_output_line(framebuffer, "disconnect requested"),
+            }
+        }
+        Some(status) => write_slave_status(console, framebuffer, "disconnect refused", status),
+        None => console.write_output_line(framebuffer, "disconnect: RPC failed, see UART log"),
+    }
+}
+
+/// How long a connection attempt may take before the shell stops waiting.
+/// A slow AP plus a WPA handshake can take several seconds; the slave gives
+/// up on its own well before this.
+const CONNECT_TIMEOUT_MS: u32 = 20_000;
+/// Tearing an association down is local to the radio and quick.
+const DISCONNECT_TIMEOUT_MS: u32 = 3_000;
+
+/// Writes an SSID, replacing anything the console font cannot draw.
+fn push_ssid(line: &mut Line, ssid: &[u8]) {
+    if ssid.is_empty() {
+        line.push_str("(hidden)");
+        return;
+    }
+    let mut text = [0u8; wifi::station::SSID_MAX_BYTES];
+    for (slot, &byte) in text.iter_mut().zip(ssid) {
+        *slot = if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'.'
+        };
+    }
+    line.push_str(core::str::from_utf8(&text[..ssid.len()]).unwrap_or("?"));
+}
+
+/// Reports a request that reached the slave and came back refused. The code
+/// is the slave's own `esp_err_t`, so it is shown as-is rather than mapped.
+fn write_slave_status(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    what: &str,
+    status: i32,
+) {
+    let mut line = Line::new();
+    line.push_str(what);
+    line.push_str(": slave status ");
+    line.push_u32(status as u32);
+    line.push_str(" (0x");
+    line.push_hex(status as u32, 4);
+    line.push_str(")");
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 fn cmd_sdread(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {

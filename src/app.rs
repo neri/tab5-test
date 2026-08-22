@@ -25,7 +25,7 @@ use crate::input::InputManager;
 use crate::lcd::Display;
 use crate::psram::Psram;
 use crate::startup::RebootTestBoot;
-use crate::{startup, uart};
+use crate::{startup, uart, wifi};
 
 /// Roughly half a second of cursor blink at the panel's fixed 57.3 Hz.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
@@ -101,6 +101,10 @@ pub fn run(psram: Psram) {
     console.write_prompt(display.framebuffer_mut());
 
     let mut input = InputManager::new();
+    // The C6 link outlives a single command: connecting and then asking for
+    // the connection's status are separate commands, and re-establishing the
+    // link resets the co-processor.
+    let mut wifi_session: Option<wifi::Rpc> = None;
     let mut blink_frames = 0u32;
     loop {
         if display.wait_for_frame().is_none() {
@@ -136,6 +140,7 @@ pub fn run(psram: Psram) {
             framebuffer,
             submission.as_bytes(),
             input.usb_host_mut(),
+            &mut wifi_session,
         );
         match outcome {
             // Each of these blocks until a key is pressed and leaves its own
