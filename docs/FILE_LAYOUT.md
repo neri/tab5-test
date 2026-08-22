@@ -9,7 +9,14 @@
 - `src/startup.rs`: watchdog停止、CPUクロック引き上げ、L2キャッシュ分割とRAM上限の確認
 - `src/uart.rs`: USB Serial/JTAG出力。SOF割り込みのraw bitでホストの接続を判定し、
   未接続の間は出力を捨てて待たない
-- `src/delay.rs`: `rdcycle`を基準にしたビジーウェイト（`delay_ms`・`delay_us`）
+- `src/delay.rs`: `rdcycle`を基準にしたビジーウェイト（`delay_ms`・`delay_us`）。
+  下位32 bitしか読まないため360 MHzで約11.9秒で一周する。周辺回路の短い待ちには
+  十分だが秒単位の計測やプロトコルタイマの基準には使えないので、そちらは`tick.rs`
+- `src/tick.rs`: SYSTIMER comparator 0の周期割り込みによる1 kHzのティックと、
+  そこから作る単調な64 bitミリ秒時刻（`now_ms`）。ネットワーク専用ではなく汎用の
+  時刻源で、`uptime`とsmoltcpの再送・リースタイマが利用者。ISRは「カウンタを進めて
+  `INT_CLR`を書く」だけで、表示の走査に割り込まない優先度に置く
+  （[`NETWORK.md`](NETWORK.md)）
 - `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。フレームバッファと
   ヒープ用領域（`Psram::heap`）の両方を提供
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
@@ -40,7 +47,8 @@
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: 共通CLICトラップ入口、表示用DW-GDMA ISR、USB-A High-Speed DWC
-  割り込みのディスパッチ。表示を高い優先度、USBを低い優先度の別CLIC lineへ割り当てる
+  とSYSTIMERティックの割り込みディスパッチ。CPU外部線は「遅れたときの痛さ」順で、
+  線1が表示、線2がUSB、線3が`tick.rs`
 - `src/icm.rs`: システムAXIインターコネクトの調停優先度。表示DMAのPSRAM読み出しを最優先にしてDSI BridgeのFIFOアンダーラン（水色フラッシュ）を防ぐ。2D-DMAマスターは逆に最低優先度へ明示的に固定する
 - `src/dma2d.rs`: 2D-DMA。矩形ブロックを単位に転送するエンジンで、ディスクリプタが
   「画像の中のブロック」を表すためCW回転した配置をそのまま扱える。クロック投入、
@@ -83,6 +91,20 @@
       モード設定／開始、スキャンの実行とAPレコードの解析、STA設定と接続・
       切断、接続結果イベントの待ち受け。スレーブが返す`esp_err_t`は
       握りつぶさずそのまま返す
+- `src/net.rs`・`src/net/`: smoltcpによるIPv4。`usb.rs`・`wifi.rs`と同じく親ファイルは
+  サブモジュール宣言と再エクスポートだけ。プロトコル層を自前実装しない唯一の層で、
+  理由と対応範囲は[`NETWORK.md`](NETWORK.md)
+    - `src/net/device.rs`: smoltcpの`phy::Device`実装。`wifi::Rpc`の受信キューから
+      1フレーム取る`RxToken`（フレームを所有するので送信トークンと同時に返せる）と、
+      `Rpc::send_station_frame`へ流す`TxToken`。medium・MTUの申告もここ
+    - `src/net/stack.rs`: `Interface`・`SocketSet`・DHCPソケットの保持、
+      アドレスと既定経路の適用、リンクを読んでインタフェースに捌かせるポンプ
+      （`poll`／`pump_until`）。C6のリンクは所有せず、呼び出しごとに`&mut Rpc`を借りる
+    - `src/net/ping.rs`: ICMP echoの送信と往復時間の測定。こちら宛のechoへの応答は
+      smoltcpの`auto-icmp-echo-reply`が行うのでここにはない
+    - `src/net/tftp.rs`: TFTP読み出しクライアント（RFC 1350、512 byteロックステップ、
+      オプション拡張なし）とCRC-32
+    - `src/net/http.rs`: TCP確認用の最小HTTP/1.0 GET
 - `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
   「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
   親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート

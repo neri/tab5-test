@@ -14,9 +14,11 @@ use alloc::vec::Vec;
 use super::{mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
+
 use crate::{
-    delay, dma2d, icm, interrupts, lcd, pma, pmp, power, psram, rtc, sdio, sdmmc, startup, uart,
-    usb, wifi,
+    delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc, startup,
+    tick, uart, usb, wifi,
 };
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -434,8 +436,8 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "wificonnect",
         usage: "wificonnect <ssid> [password]",
         lines: &[
-            "join an access point and report the result. there is no TCP/IP",
-            "stack, so this associates only -- no IP address is obtained",
+            "join an access point and report the result. this associates",
+            "only; run 'ipconfig dhcp' afterwards to get an address",
         ],
     },
     HelpEntry {
@@ -447,6 +449,56 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "wifidisconnect",
         usage: "wifidisconnect",
         lines: &["leave the current access point"],
+    },
+    HelpEntry {
+        name: "netdump",
+        usage: "netdump [tx|count]",
+        lines: &[
+            "show the ethernet header of each frame the C6 pushes at the",
+            "host: destination MAC, source MAC and ethertype, each marked",
+            "as addressed to us, broadcast or multicast. the check that the",
+            "station interface really carries 802.3 frames. before an",
+            "address is configured, nothing is addressed to us: with no IP,",
+            "nothing on the network has a reason to talk to this station.",
+            "'netdump tx' instead shows the last frames handed to the C6,",
+            "which is the only way to see what this board actually sent",
+        ],
+    },
+    HelpEntry {
+        name: "ipconfig",
+        usage: "ipconfig [dhcp|release|<a.b.c.d[/len]> [gateway]]",
+        lines: &[
+            "show the IPv4 settings, or change where they come from. 'dhcp'",
+            "starts the client and waits for a lease; an address sets one by",
+            "hand (a bare address means /24). with no argument, only reports",
+        ],
+    },
+    HelpEntry {
+        name: "ping",
+        usage: "ping <a.b.c.d> [count]",
+        lines: &[
+            "send ICMP echo requests and time the replies; default 4. echo",
+            "requests aimed at this board are answered whenever an address",
+            "is configured, whether or not this command is running",
+        ],
+    },
+    HelpEntry {
+        name: "tftpget",
+        usage: "tftpget <a.b.c.d> <file>",
+        lines: &[
+            "read a file over TFTP (RFC 1350, 512-byte blocks, no options)",
+            "and report its size and CRC-32. there is no filesystem, so the",
+            "contents are discarded once the checksum is printed",
+        ],
+    },
+    HelpEntry {
+        name: "httpget",
+        usage: "httpget <a.b.c.d>[:port] [path]",
+        lines: &[
+            "issue a minimal HTTP/1.0 GET and show the start of the reply.",
+            "a TCP smoke test rather than an HTTP client: no redirects, no",
+            "chunked decoding, no TLS and no name resolution",
+        ],
     },
     HelpEntry {
         name: "reboot",
@@ -495,6 +547,7 @@ pub fn execute(
     line: &[u8],
     usb_host: &mut usb::UsbHost,
     wifi_session: &mut Option<wifi::Rpc>,
+    net_stack: &mut Option<net::Stack>,
 ) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
@@ -584,28 +637,50 @@ pub fn execute(
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
         b"wifiinfo" => {
             *wifi_session = None;
+            *net_stack = None;
             cmd_wifiinfo(console, framebuffer);
         }
         b"wifiup" => {
             *wifi_session = None;
+            *net_stack = None;
             cmd_wifiup(console, framebuffer);
         }
         b"wifimac" => cmd_wifimac(console, framebuffer),
         b"wifiscan" => {
             cmd_wifiscan(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"wificonnect" => {
             cmd_wificonnect(console, framebuffer, argument, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"wifistatus" => {
             cmd_wifistatus(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"wifidisconnect" => {
             cmd_wifidisconnect(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"netdump" => {
+            cmd_netdump(console, framebuffer, argument, wifi_session);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"ipconfig" => {
+            cmd_ipconfig(console, framebuffer, argument, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"ping" => {
+            cmd_ping(console, framebuffer, argument, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"tftpget" => {
+            cmd_tftpget(console, framebuffer, argument, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"httpget" => {
+            cmd_httpget(console, framebuffer, argument, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
@@ -2282,12 +2357,43 @@ fn latency_line(
     console.write_output_line(framebuffer, line.as_str());
 }
 
+/// Reports uptime from `tick`'s millisecond counter, falling back to the
+/// frame counter if the tick never started.
+///
+/// The frame count is only ever an estimate: it assumes every frame
+/// completed and that the panel runs at exactly its nominal rate. The
+/// SYSTIMER tick assumes neither, so it is also the number to compare
+/// against a stopwatch when checking that no ticks are being lost.
 fn cmd_uptime(console: &mut Console, framebuffer: &mut Framebuffer) {
-    let seconds = interrupts::frame_sequence() / FRAMES_PER_SECOND;
     let mut line = Line::new();
-    line.push_str("uptime: ~");
-    line.push_u32(seconds);
-    line.push_str(" s (frame-counted)");
+    line.push_str("uptime: ");
+    if !tick::is_running() {
+        line.push_str("~");
+        line.push_u32(interrupts::frame_sequence() / FRAMES_PER_SECOND);
+        line.push_str(" s (frame-counted; the tick is not running)");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+
+    let milliseconds = tick::now_ms();
+    line.push_u32((milliseconds / 1000) as u32);
+    line.push_str(".");
+    line.push_u32(((milliseconds % 1000) / 100) as u32);
+    line.push_str(" s (systimer tick)");
+    console.write_output_line(framebuffer, line.as_str());
+
+    // Two independent counts of the same elapsed time. They drift apart
+    // only if ticks are being lost or frames are being missed, so printing
+    // both is what turns "the clock looks about right" into a measurement.
+    let mut line = Line::new();
+    line.push_str("frames say ~");
+    line.push_u32(interrupts::frame_sequence() / FRAMES_PER_SECOND);
+    line.push_str(" s; tick irq pending ");
+    line.push_str(if tick::interrupt_pending() {
+        "yes"
+    } else {
+        "no"
+    });
     console.write_output_line(framebuffer, line.as_str());
 }
 
@@ -2917,7 +3023,7 @@ fn cmd_wifimac(console: &mut Console, framebuffer: &mut Framebuffer) {
 
     let mut rpc = wifi::Rpc::new(transport);
     console.write_output_line(framebuffer, "calling GetMacAddress...");
-    let Some((status, mac)) = wifi::rpc::get_mac_address(&mut rpc, wifi::rpc::WIFI_MODE_STA) else {
+    let Some((status, mac)) = wifi::rpc::get_mac_address(&mut rpc, wifi::rpc::WIFI_IF_STA) else {
         console.write_output_line(framebuffer, "RPC call failed, see UART log");
         return;
     };
@@ -2969,15 +3075,54 @@ fn drop_dead_session(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
 ) {
     // Whatever the slave pushed while the command ran has to go somewhere,
-    // and the next command should not find a backlog waiting for it.
-    if let Some(rpc) = session.as_mut() {
-        rpc.drain();
+    // and the next command should not find a backlog waiting for it. With
+    // a stack present that means one more poll, so received frames are
+    // consumed by the interface rather than piling up in the queue.
+    match (session.as_mut(), stack.as_mut()) {
+        (Some(rpc), Some(stack)) => {
+            stack.poll(rpc);
+        }
+        (Some(rpc), None) => rpc.discard_station_frames(),
+        _ => {}
     }
+    // A disconnection that happened while the command ran is otherwise
+    // invisible: the slave drops station traffic silently when it is not
+    // associated, so from up here it looks like a network that has stopped
+    // answering. Report it before the command's own result is judged.
+    if let Some(rpc) = session.as_mut() {
+        for event in rpc.take_events() {
+            match event.msg_id {
+                wifi::station::EVENT_STA_DISCONNECTED => {
+                    let reason = wifi::station::disconnect_reason(&event.payload);
+                    let mut line = Line::new();
+                    line.push_str("the station was disconnected, reason ");
+                    line.push_u32(reason);
+                    if let Some(name) = wifi::station::disconnect_reason_name(reason) {
+                        line.push_str(" ");
+                        line.push_str(name);
+                    }
+                    console.write_output_line(framebuffer, line.as_str());
+                    console.write_output_line(
+                        framebuffer,
+                        "nothing can be sent until it associates again",
+                    );
+                }
+                wifi::station::EVENT_STA_CONNECTED => {
+                    console.write_output_line(framebuffer, "the station (re)associated")
+                }
+                _ => {}
+            }
+        }
+    }
+
     let died = session.as_ref().is_some_and(|rpc| !rpc.is_alive());
     if died {
         *session = None;
+        // The address belonged to a link that no longer exists.
+        *stack = None;
         console.write_output_line(
             framebuffer,
             "the C6 link was lost; it will be rebuilt next time",
@@ -3162,7 +3307,7 @@ fn cmd_wificonnect(
                 }
             }
             console.write_output_line(framebuffer, line.as_str());
-            console.write_output_line(framebuffer, "no IP address: there is no TCP/IP stack");
+            console.write_output_line(framebuffer, "run 'ipconfig dhcp' to get an address");
         }
         wifi::station::Outcome::Disconnected { reason } => {
             let mut line = Line::new();
@@ -3313,6 +3458,840 @@ fn write_slave_status(
     line.push_hex(status as u32, 4);
     line.push_str(")");
     console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Returns the open C6 session together with its IP stack, building the
+/// stack the first time round.
+///
+/// The stack is kept beside the session rather than inside it because the
+/// two have different lifetimes: `wifiinfo` and `wifiup` deliberately throw
+/// the session away, and an interface holding an address obtained over a
+/// link that no longer exists would be a lie.
+fn net_session<'a>(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &'a mut Option<wifi::Rpc>,
+    stack: &'a mut Option<net::Stack>,
+) -> Option<(&'a mut wifi::Rpc, &'a mut net::Stack)> {
+    let rpc = wifi_session(console, framebuffer, session)?;
+
+    if stack.is_none() {
+        if !tick::is_running() {
+            console.write_output_line(framebuffer, "no millisecond tick; the IP stack needs one");
+            return None;
+        }
+
+        // The interface answers ARP for the radio's own address, so the
+        // hardware address has to be the one the C6 transmits with.
+        let Some((status, mac)) = wifi::rpc::get_mac_address(rpc, wifi::rpc::WIFI_IF_STA) else {
+            console.write_output_line(framebuffer, "station MAC: RPC failed, see UART log");
+            return None;
+        };
+        if status != 0 {
+            write_slave_status(console, framebuffer, "station MAC", status);
+            return None;
+        }
+
+        let mut line = Line::new();
+        line.push_str("interface up, mac ");
+        push_mac(&mut line, &mac);
+        console.write_output_line(framebuffer, line.as_str());
+        *stack = Some(net::Stack::new(rpc, mac));
+    }
+
+    Some((rpc, stack.as_mut()?))
+}
+
+/// `ipconfig` -- show the current IPv4 settings, or change where they come
+/// from.
+///
+/// With no argument this only reports. `dhcp` starts the client and waits
+/// for a lease; an address in CIDR form sets one by hand, which is what
+/// Stage 3 of `docs/TCPIP_PLAN.md` used before DHCP existed and what still
+/// works on a network without a server.
+fn cmd_ipconfig(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+
+    let (verb, rest) = split_first_word(trim(argument));
+    match verb {
+        b"" => {}
+        b"release" => {
+            stack.clear_addresses();
+            console.write_output_line(framebuffer, "address released");
+        }
+        b"dhcp" => {
+            stack.start_dhcp();
+            console.write_output_line(framebuffer, "requesting a lease...");
+            let acquired = stack.pump_until(rpc, DHCP_TIMEOUT_MS, |stack| stack.has_address());
+            if !acquired {
+                let reason = if rpc.is_alive() {
+                    "no DHCP answer; is the station associated?"
+                } else {
+                    "the C6 link was lost while waiting for DHCP"
+                };
+                console.write_output_line(framebuffer, reason);
+                return;
+            }
+        }
+        _ => {
+            let Some((address, prefix)) = parse_ipv4_cidr(verb) else {
+                console.write_output_line(
+                    framebuffer,
+                    "usage: ipconfig [dhcp|release|<a.b.c.d/len> [gateway]]",
+                );
+                return;
+            };
+            let gateway = trim(rest);
+            let gateway = if gateway.is_empty() {
+                None
+            } else {
+                match parse_ipv4(gateway) {
+                    Some(gateway) => Some(gateway),
+                    None => {
+                        console
+                            .write_output_line(framebuffer, "the gateway is not an IPv4 address");
+                        return;
+                    }
+                }
+            };
+            stack.set_static(Ipv4Cidr::new(address, prefix), gateway);
+        }
+    }
+
+    write_ipconfig(console, framebuffer, rpc, stack);
+}
+
+/// Reports whether the radio is still associated.
+///
+/// Nothing else in this path can tell. smoltcp keeps building frames, the
+/// transport keeps accepting them, and the co-processor silently discards
+/// station traffic while it is not connected -- so a lost association and a
+/// network that ignores us produce identical symptoms, right down to the
+/// transmit counter going up.
+fn write_association(console: &mut Console, framebuffer: &mut Framebuffer, rpc: &mut wifi::Rpc) {
+    match wifi::station::connected_access_point(rpc) {
+        Some((0, Some(access_point))) => {
+            let mut line = Line::new();
+            line.push_str("associated to ");
+            push_ssid(&mut line, access_point.ssid());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Some((status, _)) => {
+            write_slave_status(
+                console,
+                framebuffer,
+                "NOT associated, so nothing can be sent",
+                status,
+            );
+            console.write_output_line(framebuffer, "run wificonnect before expecting traffic");
+        }
+        None => console.write_output_line(framebuffer, "association: RPC failed, see UART log"),
+    }
+}
+
+fn write_ipconfig(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    rpc: &mut wifi::Rpc,
+    stack: &net::Stack,
+) {
+    write_association(console, framebuffer, rpc);
+
+    let mut line = Line::new();
+    line.push_str("mac ");
+    push_mac(&mut line, &stack.mac());
+    line.push_str(", ");
+    line.push_str(match stack.source() {
+        net::AddressSource::None => "unconfigured",
+        net::AddressSource::Dhcp => "dhcp",
+        net::AddressSource::Static => "static",
+    });
+    console.write_output_line(framebuffer, line.as_str());
+
+    let Some(config) = stack.config() else {
+        console.write_output_line(framebuffer, "no address");
+        write_frame_stats(console, framebuffer, rpc, stack);
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_str("address ");
+    push_ipv4(&mut line, config.address.address());
+    line.push_str("/");
+    line.push_u32(config.address.prefix_len() as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("gateway ");
+    match config.router {
+        Some(router) => push_ipv4(&mut line, router),
+        None => line.push_str("(none)"),
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    if config.dns_servers.is_empty() {
+        console.write_output_line(framebuffer, "dns (none; there is no resolver anyway)");
+    } else {
+        for server in &config.dns_servers {
+            let mut line = Line::new();
+            line.push_str("dns ");
+            push_ipv4(&mut line, *server);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+
+    if let Some(server) = config.server {
+        let mut line = Line::new();
+        line.push_str("leased by ");
+        push_ipv4(&mut line, server);
+        line.push_str(", held ");
+        line.push_u32(((tick::now_ms().saturating_sub(config.acquired_ms)) / 1000) as u32);
+        line.push_str(" s");
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    write_frame_stats(console, framebuffer, rpc, stack);
+}
+
+/// Reports what has become of station traffic in both directions.
+///
+/// The transmit side is the half that cannot be seen from anywhere else: a
+/// frame the co-processor never sent looks, from the other end of the
+/// network, exactly like a frame that was never generated. `sent` moving
+/// while a peer sees nothing puts the fault past this board; `sent` stuck
+/// at zero puts it here.
+fn write_frame_stats(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    rpc: &wifi::Rpc,
+    stack: &net::Stack,
+) {
+    let stats = rpc.data_frame_stats();
+
+    let mut line = Line::new();
+    line.push_str("rx queued ");
+    line.push_u32(stats.queued as u32);
+    line.push_str(", delivered ");
+    line.push_u32(stats.delivered);
+    line.push_str(", dropped ");
+    line.push_u32(stats.dropped);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("tx sent ");
+    line.push_u32(stats.sent);
+    line.push_str(", throttled ");
+    line.push_u32(stats.throttled);
+    line.push_str(", failed ");
+    line.push_u32(stats.failed);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("slave throttling: ");
+    line.push_str(if stats.throttling { "yes" } else { "no" });
+    line.push_str(", leases lost ");
+    line.push_u32(stack.deconfigured_count());
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn cmd_ping(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let (target, rest) = split_first_word(trim(argument));
+    let Some(address) = parse_ipv4(target) else {
+        console.write_output_line(framebuffer, "usage: ping <a.b.c.d> [count]");
+        return;
+    };
+    let count = match trim(rest) {
+        b"" => DEFAULT_PING_COUNT,
+        text => match parse_u32(text) {
+            Some(count) if (1..=64).contains(&count) => count,
+            _ => {
+                console.write_output_line(framebuffer, "count must be 1..64");
+                return;
+            }
+        },
+    };
+
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("pinging ");
+    push_ipv4(&mut line, address);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut report = |reply: net::ping::Reply| {
+        let mut line = Line::new();
+        match reply {
+            net::ping::Reply::Received {
+                sequence,
+                elapsed_ms,
+            } => {
+                line.push_str("seq ");
+                line.push_u32(sequence as u32);
+                line.push_str(": ");
+                line.push_u32(elapsed_ms as u32);
+                line.push_str(" ms");
+            }
+            net::ping::Reply::TimedOut { sequence } => {
+                line.push_str("seq ");
+                line.push_u32(sequence as u32);
+                line.push_str(": no reply");
+            }
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    };
+
+    let Some(summary) = net::ping::run(stack, rpc, address, count, &mut report) else {
+        console.write_output_line(framebuffer, "ping: could not open an ICMP socket");
+        return;
+    };
+
+    let mut line = Line::new();
+    line.push_u32(summary.sent);
+    line.push_str(" sent, ");
+    line.push_u32(summary.received);
+    line.push_str(" received");
+    console.write_output_line(framebuffer, line.as_str());
+
+    if summary.received != 0 {
+        let mut line = Line::new();
+        line.push_str("min/avg/max ");
+        line.push_u32(summary.min_ms as u32);
+        line.push_str("/");
+        line.push_u32(summary.average_ms() as u32);
+        line.push_str("/");
+        line.push_u32(summary.max_ms as u32);
+        line.push_str(" ms");
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+fn cmd_tftpget(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let (server, rest) = split_first_word(trim(argument));
+    let filename = trim(rest);
+    let Some(server) = parse_ipv4(server) else {
+        console.write_output_line(framebuffer, "usage: tftpget <a.b.c.d> <file>");
+        return;
+    };
+    if filename.is_empty() {
+        console.write_output_line(framebuffer, "usage: tftpget <a.b.c.d> <file>");
+        return;
+    }
+
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+
+    console.write_output_line(framebuffer, "requesting the file...");
+    let started = tick::now_ms();
+    // Progress is reported by tenths of a MiB so a long transfer shows
+    // movement without one console line per 512-byte block.
+    let mut next_report = PROGRESS_STEP_BYTES;
+    let mut progress = |received: usize| {
+        if received < next_report {
+            return;
+        }
+        next_report = received + PROGRESS_STEP_BYTES;
+        let mut line = Line::new();
+        line.push_u32(received as u32);
+        line.push_str(" bytes...");
+        console.write_output_line(framebuffer, line.as_str());
+    };
+
+    let outcome = net::tftp::get(stack, rpc, server, filename, &mut progress);
+    match outcome {
+        Ok(file) => {
+            let mut line = Line::new();
+            line.push_str("got ");
+            line.push_u32(file.len() as u32);
+            line.push_str(" bytes, crc32 0x");
+            line.push_hex(net::tftp::crc32(&file), 8);
+            console.write_output_line(framebuffer, line.as_str());
+
+            let mut line = Line::new();
+            line.push_str("in ");
+            line.push_u32((tick::now_ms().saturating_sub(started)) as u32);
+            line.push_str(" ms, ");
+            line.push_u32(net::tftp::throughput(file.len(), started) / 1024);
+            line.push_str(" KiB/s (memory only; there is no filesystem)");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(net::tftp::Error::Server { code, message }) => {
+            let mut line = Line::new();
+            line.push_str("server error ");
+            line.push_u32(code as u32);
+            line.push_str(": ");
+            line.push_ascii(&message);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(net::tftp::Error::TimedOut) => {
+            console.write_output_line(framebuffer, "no answer from the TFTP server")
+        }
+        Err(net::tftp::Error::LinkLost) => {
+            console.write_output_line(framebuffer, "the C6 link was lost during the transfer")
+        }
+        Err(net::tftp::Error::TooLarge) => console.write_output_line(
+            framebuffer,
+            "the file is larger than this command will hold",
+        ),
+        Err(net::tftp::Error::Local) => {
+            console.write_output_line(framebuffer, "tftpget: a local socket operation failed")
+        }
+    }
+}
+
+fn cmd_httpget(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let (target, rest) = split_first_word(trim(argument));
+    let path = match trim(rest) {
+        b"" => b"/".as_slice(),
+        path => path,
+    };
+    let Some((address, port)) = parse_ipv4_port(target) else {
+        console.write_output_line(framebuffer, "usage: httpget <a.b.c.d>[:port] [path]");
+        return;
+    };
+
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+
+    console.write_output_line(framebuffer, "connecting...");
+    match net::http::get(stack, rpc, address, port, path) {
+        Ok(response) => {
+            let mut line = Line::new();
+            line.push_u32(response.received as u32);
+            line.push_str(" bytes in ");
+            line.push_u32(response.elapsed_ms as u32);
+            line.push_str(" ms");
+            console.write_output_line(framebuffer, line.as_str());
+            write_response_head(console, framebuffer, &response.body);
+        }
+        Err(net::http::Error::NotConnected) => {
+            console.write_output_line(framebuffer, "the connection was refused or timed out")
+        }
+        Err(net::http::Error::TimedOut) => {
+            console.write_output_line(framebuffer, "the server stopped responding")
+        }
+        Err(net::http::Error::LinkLost) => {
+            console.write_output_line(framebuffer, "the C6 link was lost during the transfer")
+        }
+        Err(net::http::Error::Local) => {
+            console.write_output_line(framebuffer, "httpget: a local socket operation failed")
+        }
+    }
+}
+
+/// Prints the response's first few lines, stopping at the blank line that
+/// ends the headers. Anything past that is a body this shell has nothing
+/// useful to do with.
+fn write_response_head(console: &mut Console, framebuffer: &mut Framebuffer, body: &[u8]) {
+    let mut start = 0usize;
+    for _ in 0..HTTP_HEAD_LINES {
+        let end = body[start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|offset| start + offset)
+            .unwrap_or(body.len());
+        let text = &body[start..end];
+        let text = match text.strip_suffix(b"\r") {
+            Some(text) => text,
+            None => text,
+        };
+        if text.is_empty() {
+            return;
+        }
+        let mut line = Line::new();
+        line.push_ascii(text);
+        console.write_output_line(framebuffer, line.as_str());
+        if end >= body.len() {
+            return;
+        }
+        start = end + 1;
+    }
+}
+
+/// `netdump` -- show the head of each 802.3 frame the C6 pushes at the host.
+///
+/// This is the check Stage 0 of `docs/TCPIP_PLAN.md` calls for, kept as a
+/// command rather than thrown away: it is the one place that shows what is
+/// actually on the wire when the stack above it does not answer. Destination
+/// MAC, source MAC and ethertype are exactly the first fourteen bytes.
+fn cmd_netdump(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+) {
+    let argument = trim(argument);
+    let transmit_side = argument == b"tx";
+    let count = match argument {
+        b"" | b"tx" => DEFAULT_DUMP_FRAMES,
+        text => match parse_u32(text) {
+            Some(count) if (1..=32).contains(&count) => count,
+            _ => {
+                console.write_output_line(framebuffer, "usage: netdump [tx|1..32]");
+                return;
+            }
+        },
+    };
+
+    let Some(rpc) = wifi_session(console, framebuffer, session) else {
+        return;
+    };
+
+    // Which frames are this station's own is the question the command
+    // exists to answer, and that cannot be read off a frame without
+    // knowing the radio's address. A slave that refuses to say is not
+    // fatal here -- the dump is still worth having, just without the
+    // "(us)" mark -- so this reports and carries on.
+    let station_mac = match wifi::rpc::get_mac_address(rpc, wifi::rpc::WIFI_IF_STA) {
+        Some((0, mac)) => {
+            let mut line = Line::new();
+            line.push_str("station mac ");
+            push_mac(&mut line, &mac);
+            console.write_output_line(framebuffer, line.as_str());
+            Some(mac)
+        }
+        Some((status, _)) => {
+            write_slave_status(console, framebuffer, "station MAC", status);
+            None
+        }
+        None => {
+            console.write_output_line(framebuffer, "station MAC: RPC failed, see UART log");
+            None
+        }
+    };
+
+    if transmit_side {
+        dump_transmitted(console, framebuffer, rpc, station_mac);
+        return;
+    }
+
+    console.write_output_line(framebuffer, "waiting for station frames...");
+
+    let deadline = tick::now_ms() + DUMP_TIMEOUT_MS;
+    let mut shown = 0;
+    let mut counts = DestinationCounts::default();
+    while shown < count && tick::now_ms() < deadline {
+        rpc.service();
+        let Some(frame) = rpc.take_station_frame() else {
+            continue;
+        };
+        shown += 1;
+
+        let destination = frame.get(..6).unwrap_or(&[]);
+        let kind = destination_kind(destination, station_mac);
+        counts.add(kind);
+
+        let mut line = Line::new();
+        line.push_str("to ");
+        push_mac(&mut line, destination);
+        line.push_str(kind.label());
+        line.push_str(" from ");
+        push_mac(&mut line, frame.get(6..12).unwrap_or(&[]));
+        console.write_output_line(framebuffer, line.as_str());
+
+        write_ethertype(console, framebuffer, &frame, frame.len());
+    }
+
+    if shown == 0 {
+        console.write_output_line(
+            framebuffer,
+            "no frames; the station has to be associated first",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_u32(shown);
+    line.push_str(" frames: ");
+    line.push_u32(counts.to_us);
+    line.push_str(" to us, ");
+    line.push_u32(counts.broadcast);
+    line.push_str(" broadcast, ");
+    line.push_u32(counts.multicast);
+    line.push_str(" multicast, ");
+    line.push_u32(counts.other);
+    line.push_str(" other");
+    console.write_output_line(framebuffer, line.as_str());
+
+    if counts.to_us == 0 {
+        // Expected until this station has an address: with no IP, nothing
+        // on the network has a reason to address it directly. Say so, so
+        // the absence does not read as a fault.
+        console.write_output_line(
+            framebuffer,
+            "nothing addressed to us, which is normal without an address",
+        );
+    }
+}
+
+/// `netdump tx` -- the heads of the frames this host most recently handed
+/// to the co-processor.
+///
+/// A frame the C6 never put on the air is indistinguishable, from the far
+/// end, from one this firmware never built. This is the only place that
+/// tells the two apart. The source address is checked against the radio's
+/// own: a frame sent with somebody else's source MAC is accepted by the
+/// SDIO link and then dropped by the Wi-Fi driver or the access point,
+/// which looks exactly like silence.
+fn dump_transmitted(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    rpc: &wifi::Rpc,
+    station_mac: Option<[u8; 6]>,
+) {
+    let mut shown = 0u32;
+    let mut wrong_source = 0u32;
+    // Collected first: the iterator borrows `rpc`, and writing output does
+    // not, but keeping both alive across the loop reads worse than this.
+    let frames: Vec<wifi::rpc::TransmittedFrame> = rpc.transmitted_frames().copied().collect();
+
+    for frame in &frames {
+        shown += 1;
+        let source = &frame.head[6..12];
+        let source_is_ours = station_mac.is_some_and(|station| source == station);
+        if !source_is_ours {
+            wrong_source += 1;
+        }
+
+        let mut line = Line::new();
+        line.push_str("to ");
+        push_mac(&mut line, &frame.head[..6]);
+        line.push_str(" from ");
+        push_mac(&mut line, source);
+        line.push_str(if source_is_ours { "" } else { " (NOT US)" });
+        console.write_output_line(framebuffer, line.as_str());
+
+        write_ethertype(console, framebuffer, &frame.head, frame.length);
+    }
+
+    if shown == 0 {
+        console.write_output_line(
+            framebuffer,
+            "nothing sent yet; configure an address, then make the peer talk",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("last ");
+    line.push_u32(shown);
+    line.push_str(" sent, newest last");
+    console.write_output_line(framebuffer, line.as_str());
+
+    if wrong_source != 0 {
+        console.write_output_line(
+            framebuffer,
+            "source MAC is not this station's; the AP will drop these",
+        );
+    }
+}
+
+/// Writes the ethertype and length line shared by both dump directions.
+fn write_ethertype(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    frame: &[u8],
+    length: usize,
+) {
+    let ethertype = match frame.get(12..14) {
+        Some(bytes) => u16::from_be_bytes([bytes[0], bytes[1]]),
+        None => 0,
+    };
+    let mut line = Line::new();
+    line.push_str("  ethertype 0x");
+    line.push_hex(ethertype as u32, 4);
+    line.push_str(match ethertype {
+        0x0800 => " (IPv4)",
+        0x0806 => " (ARP)",
+        0x86DD => " (IPv6)",
+        _ => "",
+    });
+    line.push_str(", ");
+    line.push_u32(length as u32);
+    line.push_str(" bytes");
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Where a received frame was addressed. Which of these turn up is the
+/// point of the command: a link showing only broadcast and multicast is
+/// working, it just has nobody talking to it yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Destination {
+    Us,
+    Broadcast,
+    Multicast,
+    /// A unicast frame for somebody else, or a frame too short to tell.
+    /// Neither should happen on a station interface.
+    Other,
+}
+
+impl Destination {
+    fn label(self) -> &'static str {
+        match self {
+            Destination::Us => " (us)",
+            Destination::Broadcast => " (broadcast)",
+            Destination::Multicast => " (multicast)",
+            Destination::Other => " (not us)",
+        }
+    }
+}
+
+#[derive(Default)]
+struct DestinationCounts {
+    to_us: u32,
+    broadcast: u32,
+    multicast: u32,
+    other: u32,
+}
+
+impl DestinationCounts {
+    fn add(&mut self, destination: Destination) {
+        let slot = match destination {
+            Destination::Us => &mut self.to_us,
+            Destination::Broadcast => &mut self.broadcast,
+            Destination::Multicast => &mut self.multicast,
+            Destination::Other => &mut self.other,
+        };
+        *slot += 1;
+    }
+}
+
+fn destination_kind(destination: &[u8], station: Option<[u8; 6]>) -> Destination {
+    if destination.len() != 6 {
+        return Destination::Other;
+    }
+    if destination == [0xFF; 6] {
+        return Destination::Broadcast;
+    }
+    if station.is_some_and(|station| destination == station) {
+        return Destination::Us;
+    }
+    // Bit 0 of the first octet is the group bit.
+    if destination[0] & 1 != 0 {
+        return Destination::Multicast;
+    }
+    Destination::Other
+}
+
+/// How long `ipconfig dhcp` waits for a lease. Discover/offer/request/ack
+/// is four packets, but a server that is asleep or a station that is not
+/// associated yet costs the whole window.
+const DHCP_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_PING_COUNT: u32 = 4;
+const DEFAULT_DUMP_FRAMES: u32 = 8;
+const DUMP_TIMEOUT_MS: u64 = 10_000;
+/// One progress line per this many bytes received over TFTP.
+const PROGRESS_STEP_BYTES: usize = 64 * 1024;
+/// How many response lines `httpget` prints before stopping.
+const HTTP_HEAD_LINES: u32 = 8;
+
+fn push_mac(line: &mut Line, mac: &[u8]) {
+    for (index, byte) in mac.iter().enumerate() {
+        if index != 0 {
+            line.push_str(":");
+        }
+        line.push_hex(*byte as u32, 2);
+    }
+}
+
+fn push_ipv4(line: &mut Line, address: Ipv4Address) {
+    for (index, octet) in address.octets().iter().enumerate() {
+        if index != 0 {
+            line.push_str(".");
+        }
+        line.push_u32(*octet as u32);
+    }
+}
+
+/// `a.b.c.d`, decimal, no leading-zero or shorthand forms.
+fn parse_ipv4(bytes: &[u8]) -> Option<Ipv4Address> {
+    let mut octets = [0u8; 4];
+    let mut index = 0;
+    for part in bytes.split(|&byte| byte == b'.') {
+        if index == 4 {
+            return None;
+        }
+        let value = parse_u32(part)?;
+        if value > 255 {
+            return None;
+        }
+        octets[index] = value as u8;
+        index += 1;
+    }
+    if index != 4 {
+        return None;
+    }
+    Some(Ipv4Address::from(octets))
+}
+
+/// `a.b.c.d/len`; a bare address is taken as /24, which is what a home
+/// network almost always is and saves typing it every time.
+fn parse_ipv4_cidr(bytes: &[u8]) -> Option<(Ipv4Address, u8)> {
+    match bytes.iter().position(|&byte| byte == b'/') {
+        None => Some((parse_ipv4(bytes)?, 24)),
+        Some(slash) => {
+            let prefix = parse_u32(&bytes[slash + 1..])?;
+            if prefix > 32 {
+                return None;
+            }
+            Some((parse_ipv4(&bytes[..slash])?, prefix as u8))
+        }
+    }
+}
+
+/// `a.b.c.d` or `a.b.c.d:port`.
+fn parse_ipv4_port(bytes: &[u8]) -> Option<(Ipv4Address, u16)> {
+    match bytes.iter().position(|&byte| byte == b':') {
+        None => Some((parse_ipv4(bytes)?, 80)),
+        Some(colon) => {
+            let port = parse_u32(&bytes[colon + 1..])?;
+            if port == 0 || port > 65535 {
+                return None;
+            }
+            Some((parse_ipv4(&bytes[..colon])?, port as u16))
+        }
+    }
 }
 
 fn cmd_sdread(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {

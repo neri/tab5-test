@@ -1,4 +1,5 @@
-//! ESP32-P4 ECO2 CLIC interrupt glue for the display DMA and USB-A host.
+//! ESP32-P4 ECO2 CLIC interrupt glue for the display DMA, the USB-A host
+//! and the SYSTIMER tick.
 //!
 //! ECO2 does not expose the DSI Bridge VSYNC event. ESP-IDF therefore treats
 //! the full-frame DW-GDMA completion as a synthetic VSYNC and immediately
@@ -8,6 +9,12 @@
 //! Scanout is single-buffered: the ISR re-arms the same address every frame,
 //! so there is no page flip to sequence and the foreground loop can draw at
 //! any point in the frame.
+//!
+//! Three CPU external lines are used: line 1 for the display (a missed
+//! frame shows on the panel), line 2 for USB, line 3 for `tick.rs`'s 1 kHz
+//! clock. All three run at CLIC level 1, the only level the threshold lets
+//! through, so none of them preempts another; the display simply carries
+//! the highest priority *within* that level.
 
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -21,6 +28,9 @@ const DW_GDMA_SOURCE: usize = 24;
 /// Controller 0 is the High-Speed DWC wired to Tab5's USB-A connector;
 /// controller 1 is the unrelated Full-Speed block on GPIO26/27.
 pub const USB_OTG_HS_INTERRUPT_SOURCE: usize = 93;
+/// `ETS_SYSTIMER_TARGET0_INTR_SOURCE` in the same table. Comparator 0 of
+/// SYSTIMER, which `tick.rs` runs at 1 kHz.
+pub const SYSTIMER_TARGET0_INTERRUPT_SOURCE: usize = 53;
 
 const CLIC_CONFIG: usize = 0x2080_0000;
 const CLIC_THRESHOLD: usize = 0x2080_0008;
@@ -32,6 +42,8 @@ const DISPLAY_CPU_INTERRUPT_LINE: u32 = 1;
 const DISPLAY_CLIC_INTERRUPT: u32 = DISPLAY_CPU_INTERRUPT_LINE + 16;
 const USB_CPU_INTERRUPT_LINE: u32 = 2;
 const USB_CLIC_INTERRUPT: u32 = USB_CPU_INTERRUPT_LINE + 16;
+const TICK_CPU_INTERRUPT_LINE: u32 = 3;
+const TICK_CLIC_INTERRUPT: u32 = TICK_CPU_INTERRUPT_LINE + 16;
 
 const DMA_FULL_DONE: u32 = 1 << 1;
 const DMA_ERROR_MASK: u32 = 0x0000_3FE0;
@@ -197,6 +209,32 @@ pub fn install_usb() {
     }
 }
 
+/// Routes SYSTIMER comparator 0 alongside the display DMA and USB.
+///
+/// `cliccfg.nlbits` is 3, so the top three bits of each `clicintctl` byte
+/// are the interrupt's *level* and the remaining five are its priority
+/// within that level. The threshold is 0x1F, meaning level 0 is masked, so
+/// every source that has to fire at all sits at level 1: 0x3F for the
+/// display (top priority within the level), 0x20 for USB, and 0x20 here.
+/// A smaller value would drop this into level 0 and the tick would simply
+/// never be taken -- which is why the ISR being trivially short matters
+/// more than where it sits in the ordering: nothing preempts anything
+/// inside one level.
+pub fn install_tick() {
+    unsafe {
+        write(
+            INTERRUPT_CORE0 + SYSTIMER_TARGET0_INTERRUPT_SOURCE * 4,
+            TICK_CLIC_INTERRUPT,
+        );
+        modify(
+            CLIC_CTRL + TICK_CLIC_INTERRUPT as usize * 4,
+            (0xFF << 24) | (0x3 << 17) | (1 << 16) | (1 << 8),
+            (0x20 << 24) | (1 << 8),
+        );
+        asm!("fence iorw, iorw", options(nostack));
+    }
+}
+
 pub fn frame_sequence() -> u32 {
     FRAME_SEQUENCE.load(Ordering::Acquire)
 }
@@ -268,6 +306,7 @@ extern "C" fn esp32p4_interrupt(cause: u32) {
                 }
             }
             USB_CLIC_INTERRUPT => crate::usb::handle_interrupt(),
+            TICK_CLIC_INTERRUPT => crate::tick::handle_interrupt(),
             _ => {
                 // An enabled level interrupt with no owner would immediately
                 // retrigger after `mret`. Latch it for foreground diagnostics

@@ -171,6 +171,17 @@ pub struct Frame {
 #[repr(C, align(64))]
 struct DmaBuffer([u8; STAGING_BYTES]);
 
+/// One outgoing frame, aligned for the same reason.
+///
+/// Separate from the receive staging buffer, and it has to be: a frame can
+/// be sent while frames already read from the slave are still waiting to be
+/// parsed out of that buffer -- which is exactly what happens when smoltcp
+/// answers an ARP request with the transmit token it was handed alongside
+/// the received one. Sharing the buffer overwrites the unparsed remainder,
+/// and the reader has no way to tell that it happened.
+#[repr(C, align(64))]
+struct TxBuffer([u8; MAX_FRAME_BYTES]);
+
 /// The host side of the ESP-Hosted link. Owns the counters that have to stay
 /// in step with the slave, so there is exactly one of these per activated
 /// C6.
@@ -188,6 +199,7 @@ pub struct Transport {
     /// The slave asked the host to stop sending station traffic.
     throttled: bool,
     buffer: DmaBuffer,
+    tx_buffer: TxBuffer,
     /// How much of `buffer` has already been handed out as frames, and how
     /// much of it is still waiting to be parsed.
     parsed: usize,
@@ -214,6 +226,7 @@ pub fn bring_up() -> Option<(Transport, SlaveInfo)> {
         checksum_enabled: true,
         throttled: false,
         buffer: DmaBuffer([0; STAGING_BYTES]),
+        tx_buffer: TxBuffer([0; MAX_FRAME_BYTES]),
         parsed: 0,
         unparsed: 0,
         register_failures: 0,
@@ -281,7 +294,7 @@ impl Transport {
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
 
-        let frame = &mut self.buffer.0;
+        let frame = &mut self.tx_buffer.0;
         frame[..HEADER_BYTES].fill(0);
         frame[0] = (if_type & 0x0F) | (if_num << 4);
         frame[1] = flags;

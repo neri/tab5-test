@@ -22,6 +22,7 @@
 //! (the envelope), `host/drivers/serial/serial_ll_if.c` (fragmentation) and
 //! `host/drivers/rpc/core/` (the message layout).
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::delay::delay_ms;
@@ -63,14 +64,78 @@ pub type Status = i32;
 /// small; the big messages are all responses, which are read into a `Vec`.
 const REQUEST_BUFFER_BYTES: usize = 1024;
 
-/// How many frames one [`Rpc::drain`] will read before giving up on
+/// How many frames one [`Rpc::service`] will read before giving up on
 /// catching the slave. Bounded so a busy network cannot pin the shell.
 const DRAIN_FRAME_LIMIT: u32 = 64;
+
+/// How many received station frames are held for the IP stack.
+///
+/// Deep enough for a burst of back-to-back frames between two polls of the
+/// foreground loop, shallow enough that a stack which stops collecting them
+/// cannot eat the heap (32 frames is under 48 KiB of a ~30 MiB heap).
+///
+/// [`Rpc::service`] stops reading rather than overflowing this, leaving the
+/// rest where it is. The paths that cannot stop -- waiting for an RPC
+/// response, which must not deadlock behind a queue nobody is draining --
+/// drop the *oldest* frame instead: with a retransmitting peer the newest
+/// one is the one worth keeping.
+const STATION_QUEUE_FRAMES: usize = 32;
+
+/// How many unclaimed events are kept. The link is now serviced from the
+/// frame loop rather than only while a command is running, so an AP that
+/// keeps associating and dropping would otherwise grow this without end.
+const EVENT_QUEUE_LIMIT: usize = 16;
+
+/// How many fill-and-empty rounds [`Rpc::discard_station_frames`] runs
+/// before returning, whatever the slave still has waiting.
+const DISCARD_ROUNDS: u32 = 4;
 
 /// How long to wait for a response before giving up. Scans block the slave
 /// for seconds, so this is generous.
 const RESPONSE_TIMEOUT_MS: u32 = 15_000;
 const RESPONSE_POLL_MS: u32 = 5;
+
+/// The head of one frame this host handed to the co-processor.
+///
+/// Kept because the transmit side is the one half of the link that cannot
+/// be observed from anywhere else: if the far end sees nothing, only a
+/// record made *here* separates "we never built the frame" from "we built
+/// it and something downstream swallowed it".
+#[derive(Clone, Copy)]
+pub struct TransmittedFrame {
+    /// The first 14 bytes, which for an 802.3 frame is the whole header.
+    pub head: [u8; TRANSMITTED_HEAD_BYTES],
+    pub length: usize,
+}
+
+pub const TRANSMITTED_HEAD_BYTES: usize = 14;
+
+/// How many transmitted frame heads are remembered.
+const TRANSMITTED_HISTORY: usize = 8;
+
+/// How station traffic has fared since the link came up.
+///
+/// Every field here answers a question that otherwise needs a packet
+/// capture on the far side: whether frames are arriving, whether they are
+/// reaching the IP stack, and -- the one that is invisible from outside --
+/// whether replies are actually leaving.
+#[derive(Clone, Copy, Default)]
+pub struct DataFrameStats {
+    /// Received frames waiting to be collected right now.
+    pub queued: usize,
+    /// Received frames handed to the IP stack.
+    pub delivered: u32,
+    /// Received frames that never reached it.
+    pub dropped: u32,
+    /// Frames handed to the transport for sending.
+    pub sent: u32,
+    /// Frames not sent because the slave asked for quiet.
+    pub throttled: u32,
+    /// Frames the transport itself refused.
+    pub failed: u32,
+    /// Whether the slave is asking for quiet at this moment.
+    pub throttling: bool,
+}
 
 /// An event the slave pushed while a response was being waited for.
 pub struct Event {
@@ -91,9 +156,17 @@ pub struct Rpc {
     /// Events that arrived while waiting for a response. Later stages read
     /// these; nothing here interprets them.
     events: Vec<Event>,
-    /// Station frames the slave pushed at the host, counted and dropped:
-    /// there is no IP stack to hand them to.
+    /// Received station frames waiting for the IP stack, oldest first.
+    station_frames: VecDeque<Vec<u8>>,
+    /// Station frames that never reached an IP stack: dropped because the
+    /// queue was full, or read and thrown away because there was no stack.
     dropped_data_frames: u32,
+    delivered_data_frames: u32,
+    sent_data_frames: u32,
+    /// Heads of the most recently sent station frames, oldest first.
+    transmitted: VecDeque<TransmittedFrame>,
+    throttled_data_frames: u32,
+    failed_data_frames: u32,
 }
 
 impl Rpc {
@@ -106,7 +179,13 @@ impl Rpc {
             frame_payload: alloc::vec![0; MAX_PAYLOAD_BYTES],
             reassembly: Vec::new(),
             events: Vec::new(),
+            station_frames: VecDeque::new(),
             dropped_data_frames: 0,
+            delivered_data_frames: 0,
+            sent_data_frames: 0,
+            transmitted: VecDeque::new(),
+            throttled_data_frames: 0,
+            failed_data_frames: 0,
         }
     }
 
@@ -120,19 +199,111 @@ impl Rpc {
         self.dropped_data_frames
     }
 
-    /// Reads and discards whatever the slave has queued, up to a bounded
-    /// number of frames.
+    pub fn data_frame_stats(&self) -> DataFrameStats {
+        DataFrameStats {
+            queued: self.station_frames.len(),
+            delivered: self.delivered_data_frames,
+            dropped: self.dropped_data_frames,
+            sent: self.sent_data_frames,
+            throttled: self.throttled_data_frames,
+            failed: self.failed_data_frames,
+            throttling: self.transport.is_throttled(),
+        }
+    }
+
+    /// Takes the oldest received station frame, if there is one. This is
+    /// what `net::device` hands to smoltcp.
+    pub fn take_station_frame(&mut self) -> Option<Vec<u8>> {
+        let frame = self.station_frames.pop_front();
+        if frame.is_some() {
+            self.delivered_data_frames = self.delivered_data_frames.saturating_add(1);
+        }
+        frame
+    }
+
+    /// Reads what the slave has waiting and throws the station frames away.
     ///
-    /// Once a station is associated the co-processor keeps pushing received
-    /// frames at the host, and nothing here has an IP stack to give them to.
-    /// Left alone they pile up until one read is larger than the staging
-    /// buffer, so every command drains the link on its way out.
-    pub fn drain(&mut self) {
-        for _ in 0..DRAIN_FRAME_LIMIT {
-            if self.next_message().is_none() {
+    /// This is for the state the board spends most of its time in: an
+    /// association with no IP stack built yet. The frames have nowhere to
+    /// go, and *not* reading them is what eventually kills the link -- the
+    /// slave holds them until the pending total no longer fits the
+    /// transport's staging buffer, and from there the byte counters cannot
+    /// be resynchronized.
+    pub fn discard_station_frames(&mut self) {
+        for _ in 0..DISCARD_ROUNDS {
+            let held_back = self.service();
+            let discarded = self.station_frames.len() as u32;
+            self.station_frames.clear();
+            self.dropped_data_frames = self.dropped_data_frames.saturating_add(discarded);
+            if !held_back {
                 return;
             }
         }
+    }
+
+    /// Sends one 802.3 frame on the station interface.
+    ///
+    /// Frames are dropped while the slave is throttling: it asked for the
+    /// host to hold back, and a dropped frame is a retransmission, whereas
+    /// forcing it through is a wedged data path.
+    pub fn send_station_frame(&mut self, frame: &[u8]) -> bool {
+        if self.transport.is_throttled() {
+            self.throttled_data_frames = self.throttled_data_frames.saturating_add(1);
+            return false;
+        }
+        if !self.transport.send(IF_STA, 0, 0, frame) {
+            self.failed_data_frames = self.failed_data_frames.saturating_add(1);
+            return false;
+        }
+        self.sent_data_frames = self.sent_data_frames.saturating_add(1);
+        self.remember_transmitted(frame);
+        true
+    }
+
+    /// The most recently sent station frames, oldest first.
+    pub fn transmitted_frames(&self) -> impl Iterator<Item = &TransmittedFrame> {
+        self.transmitted.iter()
+    }
+
+    fn remember_transmitted(&mut self, frame: &[u8]) {
+        if self.transmitted.len() >= TRANSMITTED_HISTORY {
+            self.transmitted.pop_front();
+        }
+        let mut head = [0u8; TRANSMITTED_HEAD_BYTES];
+        let copied = frame.len().min(TRANSMITTED_HEAD_BYTES);
+        head[..copied].copy_from_slice(&frame[..copied]);
+        self.transmitted.push_back(TransmittedFrame {
+            head,
+            length: frame.len(),
+        });
+    }
+
+    /// Reads whatever the slave has queued, up to a bounded number of
+    /// frames, sorting station traffic into the receive queue and events
+    /// into [`Rpc::take_events`].
+    ///
+    /// Once a station is associated the co-processor keeps pushing received
+    /// frames at the host. Left alone they pile up until one read is larger
+    /// than the staging buffer, so the link has to be serviced regularly
+    /// whether or not anything is waiting for an answer.
+    ///
+    /// Returns true if it stopped with the receive queue full, meaning the
+    /// caller should drain the queue and call again rather than assume the
+    /// slave has nothing left.
+    pub fn service(&mut self) -> bool {
+        for _ in 0..DRAIN_FRAME_LIMIT {
+            match self.next_message(true) {
+                None => break,
+                Some(message) if message.msg_type == MSG_TYPE_EVENT => self.push_event(Event {
+                    msg_id: message.msg_id,
+                    payload: message.payload,
+                }),
+                Some(message) => {
+                    uart::log_hex(b"RPC: dropping an unclaimed message, id=", message.msg_id);
+                }
+            }
+        }
+        self.station_frames.len() >= STATION_QUEUE_FRAMES
     }
 
     /// Takes the events collected so far, in arrival order.
@@ -187,7 +358,7 @@ impl Rpc {
             if !self.transport.is_alive() {
                 return None;
             }
-            while let Some(message) = self.next_message() {
+            while let Some(message) = self.next_message(false) {
                 match message {
                     Decoded {
                         msg_type: MSG_TYPE_RESPONSE,
@@ -215,7 +386,7 @@ impl Rpc {
                         msg_id,
                         payload,
                         ..
-                    } => self.events.push(Event { msg_id, payload }),
+                    } => self.push_event(Event { msg_id, payload }),
                     other => uart::log_hex(b"RPC: unexpected message type=", other.msg_type as u32),
                 }
             }
@@ -238,7 +409,7 @@ impl Rpc {
             if !self.transport.is_alive() {
                 return None;
             }
-            while let Some(message) = self.next_message() {
+            while let Some(message) = self.next_message(false) {
                 if message.msg_type != MSG_TYPE_EVENT {
                     uart::log_hex(b"RPC: dropping a late message, id=", message.msg_id);
                     continue;
@@ -250,7 +421,7 @@ impl Rpc {
                 if wanted.contains(&event.msg_id) {
                     return Some(event);
                 }
-                self.events.push(event);
+                self.push_event(event);
             }
             delay_ms(RESPONSE_POLL_MS);
         }
@@ -259,8 +430,19 @@ impl Rpc {
 
     /// Returns the next complete message the link has ready, or `None` when
     /// nothing more can be read right now.
-    fn next_message(&mut self) -> Option<Decoded> {
-        while let Some(frame) = self.transport.receive(&mut self.frame_payload) {
+    ///
+    /// With `hold_when_full` the transport is left alone once the station
+    /// queue is full: whatever remains stays in the transport's staging
+    /// buffer, which is the only way to *not* lose it, since a frame that
+    /// has been read cannot be put back. Callers waiting for an RPC answer
+    /// pass false -- for them, stopping here would mean waiting forever on
+    /// a queue nobody is draining.
+    fn next_message(&mut self, hold_when_full: bool) -> Option<Decoded> {
+        loop {
+            if hold_when_full && self.station_frames.len() >= STATION_QUEUE_FRAMES {
+                return None;
+            }
+            let frame = self.transport.receive(&mut self.frame_payload)?;
             let Some(message) = self.collect(&frame) else {
                 continue;
             };
@@ -269,7 +451,6 @@ impl Rpc {
                 None => uart::log(b"RPC: could not decode a message\r\n"),
             }
         }
-        None
     }
 
     /// Feeds one received frame into the reassembly buffer, returning the
@@ -277,7 +458,7 @@ impl Rpc {
     fn collect(&mut self, frame: &Frame) -> Option<Vec<u8>> {
         if frame.if_type != IF_SERIAL {
             if frame.if_type == IF_STA {
-                self.dropped_data_frames = self.dropped_data_frames.saturating_add(1);
+                self.queue_station_frame(frame.length);
             } else {
                 uart::log_hex(b"RPC: ignoring frame, if_type=", frame.if_type as u32);
             }
@@ -290,6 +471,25 @@ impl Rpc {
             return None;
         }
         Some(core::mem::take(&mut self.reassembly))
+    }
+
+    /// Keeps one event for [`Rpc::take_events`], discarding the oldest
+    /// once the queue is full.
+    fn push_event(&mut self, event: Event) {
+        if self.events.len() >= EVENT_QUEUE_LIMIT {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+    }
+
+    /// Copies the station frame just received into the receive queue.
+    fn queue_station_frame(&mut self, length: usize) {
+        if self.station_frames.len() >= STATION_QUEUE_FRAMES {
+            self.station_frames.pop_front();
+            self.dropped_data_frames = self.dropped_data_frames.saturating_add(1);
+        }
+        self.station_frames
+            .push_back(self.frame_payload[..length].to_vec());
     }
 }
 
@@ -411,19 +611,21 @@ fn unwrap_envelope(message: &[u8]) -> Option<&[u8]> {
     Some(&message[ENVELOPE_BYTES..ENVELOPE_BYTES + data_length])
 }
 
-/// `Rpc_Req_GetMacAddress { int32 mode = 1 }` / `Rpc_Resp_GetMacAddress
+/// `Rpc_Req_GetMacAddress { int32 mode = 0 }` / `Rpc_Resp_GetMacAddress
 /// { bytes mac = 1, int32 resp = 2 }`.
 ///
-/// `mode` is `WIFI_MODE_STA`, matching what ESP-Hosted's own host passes.
-pub const WIFI_MODE_STA: i32 = 1;
+/// Despite the protobuf field name, the slave passes this value to
+/// `esp_wifi_get_mac` as a `wifi_interface_t`. Station is therefore 0;
+/// `WIFI_MODE_STA` (1) would select the SoftAP interface instead.
+pub const WIFI_IF_STA: i32 = 0;
 
 /// Asks the slave for one interface's MAC address. Returns the slave's own
 /// status code and the address; a nonzero status means the slave refused,
 /// most likely because Wi-Fi has not been initialized yet.
-pub fn get_mac_address(rpc: &mut Rpc, mode: i32) -> Option<(i32, [u8; 6])> {
+pub fn get_mac_address(rpc: &mut Rpc, interface: i32) -> Option<(i32, [u8; 6])> {
     let mut body = [0u8; 16];
     let mut writer = Writer::new(&mut body);
-    writer.int32_field(1, mode);
+    writer.int32_field(1, interface);
     let length = writer.finish()?;
 
     let payload = rpc.call(REQ_GET_MAC_ADDRESS, &body[..length])?;

@@ -121,9 +121,23 @@ UARTへ出ます。層ごとに接頭辞が分かれており、どこで止ま�
   `RPC: timed out waiting for response id=...`が出ます
 - `WIFI: ...` — `esp_wifi_*`に対応する層。スレーブがエラーを返したときに
   リクエストIDとステータスを出します
+- `NET: ...` — smoltcpによるIPv4の層。正常時は`NET: DHCP configured`だけで、
+  それ以外は失敗の報告です。`NET: dropped an outgoing frame`はスレーブが
+  スロットルを要求している間に送ろうとしたフレーム、`NET: DHCP lease lost`は
+  保持していたリースが失効したことを示します
 
-対応範囲は[`WIFI.md`](WIFI.md)、実機で踏んだ罠は
-[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)を参照してください。
+対応範囲は[`WIFI.md`](WIFI.md)と[`NETWORK.md`](NETWORK.md)、実機で踏んだ罠は
+[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)と[`TCPIP_PLAN.md`](TCPIP_PLAN.md)を
+参照してください。
+
+IP層が答えない場合の切り分けはUARTログよりコマンドの出力を見ます。
+`netdump`が何も出さなければフレームがそもそも届いておらず（APへアソシエート
+できていない）、宛先・送信元MACとethertypeが出るならリンク層までは動いています。
+`ipconfig`の`rx queued`／`dropped`は受信キューの深さと、キューが溢れて捨てた
+フレーム数です。`dropped`が増え続ける場合はポンプが追いついていません。
+`uptime`はSYSTIMERティック秒とフレーム数からの概算秒を並べて出すので、
+2つが離れていればティックを取りこぼしています（smoltcpのタイマの基準が
+狂うので、ネットワークの不調がここに出ることがあります）。
 
 USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::rescan`を実行します。
 そのため、起動時にも列挙結果や`USB: initial scan complete`がUARTへ出ます。その後も、

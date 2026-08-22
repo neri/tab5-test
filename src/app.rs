@@ -25,7 +25,7 @@ use crate::input::InputManager;
 use crate::lcd::Display;
 use crate::psram::Psram;
 use crate::startup::RebootTestBoot;
-use crate::{startup, uart, wifi};
+use crate::{net, startup, tick, uart, wifi};
 
 /// Roughly half a second of cursor blink at the panel's fixed 57.3 Hz.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
@@ -60,6 +60,9 @@ pub fn run(psram: Psram) {
     if !display.start() {
         return;
     }
+    // The trap entry and machine interrupts are in place now, which is what
+    // the tick's CLIC line needs; `uptime` and the IP stack both read it.
+    tick::init();
 
     match startup::complete_reboot_test_boot(psram_frequency_mhz == 200) {
         RebootTestBoot::Inactive => {}
@@ -105,6 +108,9 @@ pub fn run(psram: Psram) {
     // the connection's status are separate commands, and re-establishing the
     // link resets the co-processor.
     let mut wifi_session: Option<wifi::Rpc> = None;
+    // The IP stack lives beside the session rather than inside it: dropping
+    // the link has to drop the address with it.
+    let mut net_stack: Option<net::Stack> = None;
     let mut blink_frames = 0u32;
     loop {
         if display.wait_for_frame().is_none() {
@@ -114,6 +120,19 @@ pub fn run(psram: Psram) {
         let framebuffer = display.framebuffer_mut();
 
         input.service();
+        // Frames the C6 has received are held there until the host reads
+        // them, and a backlog larger than the transport's staging buffer
+        // cannot be resynchronized -- so the link is serviced every frame,
+        // not only while a network command is running.
+        match (wifi_session.as_mut(), net_stack.as_mut()) {
+            (Some(rpc), Some(stack)) => {
+                stack.poll(rpc);
+            }
+            // Associated with no IP stack yet: the frames have nowhere to
+            // go, but they still have to be read off the co-processor.
+            (Some(rpc), None) => rpc.discard_station_frames(),
+            _ => {}
+        }
 
         let Some(event) = input.poll_key() else {
             // No key this frame: advance the idle blink timer and, on phase
@@ -141,6 +160,7 @@ pub fn run(psram: Psram) {
             submission.as_bytes(),
             input.usb_host_mut(),
             &mut wifi_session,
+            &mut net_stack,
         );
         match outcome {
             // Each of these blocks until a key is pressed and leaves its own

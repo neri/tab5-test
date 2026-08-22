@@ -23,8 +23,11 @@ pub fn delay_us(microseconds: u32) {
     }
 }
 
+/// The HP core's cycle counter, low 32 bits. Wraps every ~11.9 s at
+/// 360 MHz, so it measures short intervals and seeds randomness; anything
+/// that needs a clock uses `tick::now_ms`.
 #[inline(always)]
-fn cycle_count() -> u32 {
+pub fn cycle_count() -> u32 {
     let value: u32;
     unsafe {
         core::arch::asm!("rdcycle {value}", value = out(reg) value, options(nomem, nostack));

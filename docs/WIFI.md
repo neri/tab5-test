@@ -8,9 +8,10 @@ Espressifの**ESP-Hosted（esp-hosted-mcu）のslaveファームウェア**が�
 P4から見るとC6は「SDIOバスにぶら下がったWi-Fiコプロセッサ」です。P4は
 SDIO上でRPC（protobufメッセージ）を送り、C6上の`esp_wifi_*`を遠隔実行させます。
 
-**TCP/IPスタックは実装していません。** 到達点はリンク層としてAPへ
-アソシエートし、その状態を表示するところまでで、IPアドレスの取得や通信は
-できません。C6から流れてくる受信フレームは数えて破棄します。
+この文書はリンク層までです。**IPは[`NETWORK.md`](NETWORK.md)側**で、
+C6から流れてくる`IF_STA`の受信フレームは`rpc.rs`のキューへ積まれ、
+smoltcpのインタフェースが取り出します。ここまでの到達点はAPへ
+アソシエートし、その状態を表示するところまでです。
 
 ## 接続とハードウェア
 
@@ -44,12 +45,19 @@ C6は**2.4 GHz専用**です（Wi-Fi 6 = 2.4 GHzの802.11ax）。5 GHzのAPは�
 | `src/sdio.rs` | C6をSDIOカードとして活性化（CMD5/CMD3/CMD7、CCCR、CIS）し、CMD52とCMD53を提供 |
 | `src/wifi/hosted.rs` | ESP-Hostedのフレーム層。12 byteヘッダ、スレーブレジスタ、送受信、初期化ハンドシェイク |
 | `src/wifi/proto.rs` | RPCに必要な範囲だけのprotobuf |
-| `src/wifi/rpc.rs` | TLVエンベロープと`Rpc`メッセージ、分割と再結合、イベントの保持 |
+| `src/wifi/rpc.rs` | TLVエンベロープと`Rpc`メッセージ、分割と再結合、イベントの保持、`IF_STA`受信フレームのキュー |
 | `src/wifi/station.rs` | `esp_wifi_*`に対応する操作（初期化、スキャン、接続、状態、切断） |
 
 C6のリンクは`src/app.rs`が`Option<wifi::Rpc>`として保持し、シェルコマンドを
 またいで生かします。リンクを張り直すとC6がリセットされ接続が失われるため、
 `wificonnect`の結果を`wifistatus`で見るには同じセッションが必要です。
+IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リンクが切れたときは
+一緒に捨てます。
+
+**受信フレームは読まないと溜まります。** アソシエート後のC6はホストが読むまで
+フレームを保持し、総量がステージングバッファを超えるとリンクは復帰できません。
+`app.rs`のフレームループが毎フレーム`Stack::poll`を呼ぶのはこのためで、
+背圧の扱いは[`NETWORK.md`](NETWORK.md)にあります。
 
 ## シェルコマンド
 
@@ -63,6 +71,9 @@ C6のリンクは`src/app.rs`が`Option<wifi::Rpc>`として保持し、シェ�
 | `wifistatus` | 接続先のSSID・BSSID・チャンネル・RSSI。未接続ならスレーブのステータスコード |
 | `wifidisconnect` | 切断 |
 
+アソシエートした先でIPアドレスを取得して通信するコマンド（`ipconfig`・`ping`・
+`tftpget`・`httpget`・`netdump`）は[`NETWORK.md`](NETWORK.md)にあります。
+
 `wifiscan`以降は必要に応じてリンクを張り、`esp_wifi_init`→station mode→
 `esp_wifi_start`→省電力オフまでを済ませてから本題に入ります。
 `wifiinfo`と`wifiup`は下層の診断なので、実行するとセッションを捨てて
@@ -72,6 +83,9 @@ C6のリンクは`src/app.rs`が`Option<wifi::Rpc>`として保持し、シェ�
 
 ## 実装上の要点
 
+- **MAC取得RPCの`mode`は実際にはインタフェース番号**: C6側は要求値を
+  `wifi_interface_t`として扱います。STAは`WIFI_IF_STA = 0`です。
+  `WIFI_MODE_STA = 1`を渡すとSoftAP側のMACを取得してしまいます
 - **フレームは1回の読み出しに複数載る**: スレーブの`PACKET_LEN`は累積バイト数で、
   差分は複数フレームの合計になり得ます。`hosted.rs`はステージングバッファの
   未解析部分を持ち、使い切るまでバスに触らずフレームを1つずつ返します

@@ -9,6 +9,22 @@ linked_list_allocator = "0.10.6"
 # Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,
 # this does not invoke ECO5-only ROM functions before Rust reaches `main`.
 riscv-rt = "0.18"
+# The protocol stack itself is not hand-written: ARP/IPv4/ICMP/UDP/DHCP/TCP are
+# fully specified by RFCs and observable from outside, which is where this
+# repository's "implement the hardware layer yourself" rule stops applying.
+# `default-features = false` is mandatory: the defaults pull in `std` and the
+# host-only raw-socket/tuntap phy backends.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-dhcpv4",
+    "socket-udp",
+    "socket-icmp",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+] }
 
 [profile.release]
 debug = 2

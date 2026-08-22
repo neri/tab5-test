@@ -412,30 +412,46 @@ pub fn connect(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
 }
 
 /// Waits for the slave to report the outcome of a connection attempt.
+/// Both connection events wrap the part worth reading in field 2.
+fn event_details(payload: &[u8]) -> &[u8] {
+    let mut details: &[u8] = &[];
+    let mut reader = Reader::new(payload);
+    while let Some((field, value)) = reader.next_field() {
+        if field == 2 {
+            details = value.as_bytes();
+        }
+    }
+    details
+}
+
+/// The reason code carried by a `StaDisconnected` event.
+///
+/// Split out because a disconnection is worth reporting wherever it turns
+/// up, not only where one is being waited for: the co-processor drops
+/// station traffic while it is not associated, and it does so silently.
+pub fn disconnect_reason(payload: &[u8]) -> u32 {
+    let mut reason = 0;
+    let mut reader = Reader::new(event_details(payload));
+    while let Some((field, value)) = reader.next_field() {
+        if field == 4 {
+            reason = value.as_u32();
+        }
+    }
+    reason
+}
+
 pub fn wait_for_connection(rpc: &mut Rpc, timeout_ms: u32) -> Outcome {
     let wanted = [EVENT_STA_CONNECTED, EVENT_STA_DISCONNECTED];
     let Some(event) = rpc.wait_for_event(timeout_ms, &wanted) else {
         return Outcome::TimedOut;
     };
 
-    // Both events wrap the interesting part in field 2.
-    let mut details: &[u8] = &[];
-    let mut reader = Reader::new(&event.payload);
-    while let Some((field, value)) = reader.next_field() {
-        if field == 2 {
-            details = value.as_bytes();
-        }
-    }
+    let details = event_details(&event.payload);
 
     if event.msg_id == EVENT_STA_DISCONNECTED {
-        let mut reason = 0;
-        let mut reader = Reader::new(details);
-        while let Some((field, value)) = reader.next_field() {
-            if field == 4 {
-                reason = value.as_u32();
-            }
-        }
-        return Outcome::Disconnected { reason };
+        return Outcome::Disconnected {
+            reason: disconnect_reason(&event.payload),
+        };
     }
 
     let mut ssid = [0u8; SSID_MAX_BYTES];
