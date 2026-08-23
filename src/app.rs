@@ -4,8 +4,8 @@
 //! command dispatch, and application-mode transitions.
 //!
 //! Everything below it exists only to serve a shell command: `shell` itself
-//! dispatches them, `membench` and `mbr` are the two whose output is long
-//! enough to deserve their own file, and the rest are the full-screen modes
+//! dispatches them, `membench`, `mbr` and `lsusb` are the ones whose output
+//! is long enough to deserve their own file, and the rest are the full-screen modes
 //! `run` hands the framebuffer to. None of them is reachable from the
 //! hardware-facing modules at the crate root, which is what keeps that
 //! dependency pointing one way.
@@ -13,6 +13,7 @@
 mod axis_test;
 mod battery;
 mod coord_test;
+mod lsusb;
 mod mbr;
 mod membench;
 mod paint;

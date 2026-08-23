@@ -336,10 +336,88 @@ Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_
 `usbfs off`でHigh-Speedへ戻せます。High-SpeedハブをFull-Speedで列挙し、Splitのない
 複数periodic HID構成を再現するために使います。
 
+## デバイス情報の表示（`lsusb`）
+
+`lsusb`はバスに何が繋がっているかだけを見るコマンドです。周りの`usb*`コマンドが
+このプロジェクトのUSBスタック自体（ポートのレジスタ、Split対応、BOTセッション、
+スキャン所要時間）を診断するためのものであるのに対し、`lsusb`はデバイスが自分に
+ついて何と言っているかしか表示しません。表示処理は`src/app/lsusb.rs`にあり、
+`sdmbr`／`usbmbr`が`src/app/mbr.rs`へ出力整形を渡しているのと同じ形です。
+
+引数なしではハブを介したツリーを表示します。読むのは`UsbHost`が列挙時に保存した
+デバイスレコードだけなので、**バスへの転送は一切発生しません**。したがって表示は
+最後のスキャン時点の状態です（挿したばかりのデバイスは、1秒周期の空きポート
+スキャンが拾うか`usbrescan`後に現れます）。
+
+```
+USB-A: High-Speed
+[1] 05E3:0608 Hub, High-Speed
+    driver: hub, 4 ports; usbhub shows their status
+    if0: 09/00/01 Hub
+  port 1: [2] 046D:C31C per-interface, Low-Speed via split
+          driver: HID Boot keyboard
+          if0: 03/01/01 HID Boot keyboard
+          if1: 03/00/00 HID
+  port 3: [4] 0781:5567 per-interface, High-Speed
+          driver: Mass Storage (Bulk-Only Transport)
+          if0: 08/06/50 Mass Storage SCSI, Bulk-Only
+  port 5: device present, enumeration failed
+3 devices; 'lsusb <address>' for one device's descriptors
+```
+
+複合デバイスは`bDeviceClass`が00（per-interface）で、デバイス記述子だけでは何を
+するデバイスか分かりません。そのため各interfaceを1行ずつ、`class/subclass/protocol`と
+その意味付きで下にぶら下げます。角括弧の番号はUSBアドレス（直結・ハブ自身が1、
+ハブ配下はポート番号+1）で、詳細表示の引数になります。
+
+クラスドライバが無いデバイスも`driver: none for this class`として表示します。
+レジストリはドライバの配列（`slots`）とは別に列挙できた全デバイスのレコード
+（`records`）を持っており、後者にはハブ自身と未対応クラスのデバイスも入ります。
+列挙自体に失敗したポートは`device present, enumeration failed`として、そこに何か
+挿さっている事実だけを出します。
+
+`lsusb <address>`は指定デバイスの主要な記述子を表示します。デバイス記述子、
+コンフィグレーション記述子のヘッダ、各interfaceとそのendpoint、HIDデバイスなら
+HID記述子です。文字列記述子（`iManufacturer`／`iProduct`／`iSerialNumber`／
+`iInterface`）はこのときだけ取得します。**列挙時には取りません**——起動時スキャンは
+ストレージ選択の判断時間に直結しており（[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)）、
+そこへ制御転送を増やさないためです。文字列を持たないデバイスは`(none)`、LANGIDを
+返さないデバイスは`strings: device reports none`と表示します。取得した文字列は
+5×7 ASCIIフォントしか無いのでASCIIへ畳み、非ASCIIは`?`にします。
+
+```
+device 2 on hub port 1, Low-Speed
+  reached by split transactions through the TT of hub 1 port 1, Low-Speed
+  driver: HID Boot keyboard
+Device Descriptor:
+  bcdUSB 1.10  bMaxPacketSize0 8  bNumConfigurations 1
+  idVendor 0x046D  idProduct 0xC31C  bcdDevice 64.00
+  bDeviceClass 00/00/00 per-interface
+  iManufacturer 1: Logitech
+  iProduct 2: USB Keyboard
+  iSerialNumber 0: (none)
+Configuration Descriptor:
+  bConfigurationValue 1  bNumInterfaces 2  wTotalLength 59
+  bmAttributes 0xA0 bus-powered, remote wakeup  bMaxPower 100 mA
+  Interface 0 alt 0: 03/01/01 HID Boot keyboard, 1 endpoint
+    iInterface 4: Keyboard
+    HID Descriptor: bcdHID 1.11  country 0  report descriptor 65 bytes
+    Endpoint 0x81: Interrupt IN, mps 8, interval 10
+  Interface 1 alt 0: 03/00/00 HID, 1 endpoint
+    HID Descriptor: bcdHID 1.11  country 0  report descriptor 159 bytes
+    Endpoint 0x82: Interrupt IN, mps 4, interval 10
+```
+
+コンフィグレーション記述子は1デバイスあたり256 byteまで保存します
+（`protocol::CONFIG_BUFFER_MAX`）。これを超えるデバイスは末尾のinterfaceを読めて
+おらず、`lsusb`はその旨を1行出します。読めていない部分にはクラスドライバも
+アタッチできません。
+
 ## シェルコマンド
 
 | コマンド | 内容 |
 | --- | --- |
+| `lsusb [address]` | デバイス情報の表示（上記）。診断ではなくデバイスを見るためのコマンド |
 | `usbinfo` | 現在USB-Aに繋がっている全デバイス（直結・ハブ配下）の一覧 |
 | `usbrescan` | ポートをリセットして再列挙 |
 | `usbfs on\|off` | FS/LS-only host modeを切替えて即時再列挙（診断用、既定off） |
@@ -365,9 +443,11 @@ Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_
 
 ## 未実装
 
-- 文字列記述子（製品名）の取得
 - 多段ハブ（ハブ配下のハブ）
-- HIDの非Bootレポート解析、複合デバイス
+- HIDの非Bootレポート解析、複合デバイスの複数interface同時ドライブ
+  （1デバイスにつきクラスドライバは1つで、`attach_class_driver`の順に最初に
+  一致したものが担当する。`lsusb`は全interfaceを表示するので、駆動されて
+  いないinterfaceがあることは一覧から分かる）
 - control／bulkの複数channel scheduler（channel 0の固定slotとperiodic HID channel 1〜4は実装済み）
 - High-Speedハブ配下のperiodic HIDとSplit transferのDMA mode調停
 

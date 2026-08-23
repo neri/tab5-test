@@ -26,6 +26,9 @@
   出入りだけを持つ。以下は`app`配下の、シェルコマンドを実行するためだけに存在する
   モジュール群で、クレート直下のハードウェア寄りモジュールからは参照されない
     - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
+    - `src/app/lsusb.rs`: `lsusb`コマンドの表示。ハブを介したツリー（全interfaceを含む）と、
+      指定デバイスの主要な記述子。`UsbHost`のデバイスレコードを読むだけで、
+      文字列記述子の取得以外はバスへ何も出さない
     - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
     - `src/app/membench.rs`: 内蔵SRAMとPSRAMのCPUアクセスコスト測定。`mcycle`を時間基準に、逐次スループットと1キャッシュラインあたりのレイテンシを実測する（`membench`コマンド）
     - `src/app/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
@@ -129,7 +132,9 @@
       USBデバイスや記述子の意味は一切知らない
     - `src/usb/protocol.rs`: 汎用USBプロトコル層（Stage 2相当）。コントロール
       転送（SETUP/DATA/STATUS）の組み立てと標準記述子（USB2.0 chapter 9）に
-      よる列挙。デバイスクラスについては何も知らない
+      よる列挙。デバイスクラスについては何も知らない。記述子チェーンの走査
+      （`descriptors`）とinterface／endpoint記述子の解釈、要求されたときだけ
+      読む文字列記述子（UTF-16LE→ASCII）もここ
     - `src/usb/hid.rs`: HID 1.11 Boot Protocolのうち、どのブートデバイスでも
       共通の部分。`SET_CONFIGURATION`／`SET_PROTOCOL(Boot)`／`SET_IDLE(0)`の
       手順、コンフィグレーション記述子からブートインターフェースを探す走査、
@@ -154,7 +159,10 @@
       CBIの制御転送、固定1.44 MB FAT12メディア認識を実装するが、現在は`usb.rs`から
       読み込まれず、レジストリも選択しない
     - `src/usb/registry.rs`: USBバスの単一オーナーである`UsbHost`とデバイスレジストリ。
-      直結デバイス、または1段のハブの全ポートを列挙し、キーボードとMSCのハンドルを保持
+      直結デバイス、または1段のハブの全ポートを列挙し、キーボードとMSCのハンドルを保持。
+      「バスに何があるか」と「何を駆動できるか」は別の配列で、`records`が列挙できた
+      全デバイス（ハブ自身と未対応クラスを含む、記述子の生バイトつき）、`slots`が
+      クラスドライバ。ポーリングと判断は`slots`、`lsusb`の表示は`records`を読む
   現状は[`USB.md`](USB.md)、段階分けと実装上の判断は
   [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置

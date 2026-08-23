@@ -12,9 +12,13 @@ use crate::delay::{delay_ms, delay_us};
 use crate::startup;
 use crate::uart;
 
+/// Length of a standard device descriptor (USB2.0 table 9-8).
+pub const DEVICE_DESCRIPTOR_LEN: usize = 18;
+
 // Standard USB descriptor type codes (USB2.0 table 9-5).
 pub const DESCRIPTOR_TYPE_DEVICE: u8 = 1;
 pub const DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
+pub const DESCRIPTOR_TYPE_STRING: u8 = 3;
 pub const DESCRIPTOR_TYPE_INTERFACE: u8 = 4;
 pub const DESCRIPTOR_TYPE_ENDPOINT: u8 = 5;
 
@@ -52,10 +56,19 @@ pub struct ControlPipe {
     pub route: Route,
 }
 
-// Generous for a single HID keyboard's configuration (typically config +
-// interface + HID + one endpoint descriptor, ~34 bytes); composite devices
-// with a few extra interfaces still fit comfortably.
-const CONFIG_BUFFER_MAX: usize = 128;
+/// Held per enumerated device, so it bounds both what a class driver can
+/// find and what the `lsusb` display can show. A single HID keyboard's
+/// configuration is ~34 bytes (config + interface + HID + one endpoint);
+/// this is sized for a composite device's complete configuration instead,
+/// since an interface that falls off the end is one the display cannot
+/// list and no class driver can attach to.
+pub const CONFIG_BUFFER_MAX: usize = 256;
+
+/// Longest string descriptor `read_string_ascii` keeps. USB2.0 allows up to
+/// 126 characters; product and vendor names worth showing on a 104-column
+/// console are far shorter, and the descriptor is read into this buffer on
+/// the stack of whoever asks for it.
+const STRING_BUFFER_MAX: usize = 64;
 
 // Control transfers let NAKs retry in hardware until success or a real
 // error. `CompletionWait::Interrupt` assigns eight CPU cycles to one
@@ -125,9 +138,12 @@ pub struct EnumeratedDevice {
     pub device_class: u8,
     pub device_subclass: u8,
     pub device_protocol: u8,
+    /// `wTotalLength` as the device reported it, which may be larger than
+    /// `config_bytes()` -- see `CONFIG_BUFFER_MAX`.
     pub config_total_length: u16,
     pub num_interfaces: u8,
     pub configuration_value: u8,
+    device_descriptor: [u8; DEVICE_DESCRIPTOR_LEN],
     config_descriptor: [u8; CONFIG_BUFFER_MAX],
     config_descriptor_len: usize,
 }
@@ -152,6 +168,191 @@ impl EnumeratedDevice {
     pub fn config_bytes(&self) -> &[u8] {
         &self.config_descriptor[..self.config_descriptor_len]
     }
+
+    /// The raw 18-byte device descriptor (USB2.0 table 9-8). The fields the
+    /// stack itself acts on are parsed out above; this keeps the rest --
+    /// `bcdUSB`, `bcdDevice`, the string indices, `bNumConfigurations` --
+    /// available to a display without a second GET_DESCRIPTOR.
+    pub fn device_bytes(&self) -> &[u8; DEVICE_DESCRIPTOR_LEN] {
+        &self.device_descriptor
+    }
+}
+
+/// One descriptor inside a configuration descriptor: its `bDescriptorType`
+/// and its whole `bLength` bytes, two-byte header included.
+#[derive(Clone, Copy)]
+pub struct RawDescriptor<'a> {
+    pub descriptor_type: u8,
+    pub bytes: &'a [u8],
+}
+
+/// Walks the chain of descriptors a configuration descriptor is made of --
+/// the config header, then every interface/endpoint/class-specific
+/// descriptor that followed it -- and stops at the first malformed
+/// `bLength` rather than guessing past it.
+///
+/// USB2.0 9.5 gives every descriptor the same `bLength`/`bDescriptorType`
+/// header, so a caller can skip the types it does not understand without
+/// knowing anything about them. Both the "no class driver for this device"
+/// log and the `lsusb` display walk the chain this way.
+pub fn descriptors(config: &[u8]) -> impl Iterator<Item = RawDescriptor<'_>> {
+    let mut offset = 0usize;
+    core::iter::from_fn(move || {
+        if offset + 2 > config.len() {
+            return None;
+        }
+        let length = config[offset] as usize;
+        if length < 2 || offset + length > config.len() {
+            return None;
+        }
+        let bytes = &config[offset..offset + length];
+        offset += length;
+        Some(RawDescriptor {
+            descriptor_type: bytes[1],
+            bytes,
+        })
+    })
+}
+
+/// The standard interface descriptor fields (USB2.0 table 9-12).
+#[derive(Clone, Copy)]
+pub struct InterfaceDescriptor {
+    pub number: u8,
+    pub alternate_setting: u8,
+    pub num_endpoints: u8,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub string_index: u8,
+}
+
+impl InterfaceDescriptor {
+    /// Reads one out of the bytes `descriptors` yielded for a
+    /// `DESCRIPTOR_TYPE_INTERFACE` entry, or `None` if the device sent a
+    /// short one.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 9 {
+            return None;
+        }
+        Some(Self {
+            number: bytes[2],
+            alternate_setting: bytes[3],
+            num_endpoints: bytes[4],
+            class: bytes[5],
+            subclass: bytes[6],
+            protocol: bytes[7],
+            string_index: bytes[8],
+        })
+    }
+}
+
+/// The standard endpoint descriptor fields (USB2.0 table 9-13).
+#[derive(Clone, Copy)]
+pub struct EndpointDescriptor {
+    pub address: u8,
+    pub attributes: u8,
+    /// `wMaxPacketSize` bits 0-10 only. Bits 11-12 count the additional
+    /// transactions a High-Speed periodic endpoint asks for per microframe,
+    /// which is not part of the packet size; `hid::find_boot_interface`
+    /// masks them off the same way.
+    pub max_packet_size: u16,
+    pub interval: u8,
+}
+
+impl EndpointDescriptor {
+    /// Reads one out of the bytes `descriptors` yielded for a
+    /// `DESCRIPTOR_TYPE_ENDPOINT` entry, or `None` if the device sent a
+    /// short one.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 7 {
+            return None;
+        }
+        Some(Self {
+            address: bytes[2],
+            attributes: bytes[3],
+            max_packet_size: u16::from_le_bytes([bytes[4], bytes[5]]) & 0x07FF,
+            interval: bytes[6],
+        })
+    }
+
+    pub fn is_in(&self) -> bool {
+        self.address & 0x80 != 0
+    }
+
+    /// `bmAttributes` transfer type: 0 control, 1 isochronous, 2 bulk,
+    /// 3 interrupt.
+    pub fn transfer_type(&self) -> u8 {
+        self.attributes & 0x03
+    }
+}
+
+/// The first LANGID the device supports, needed before any text string can
+/// be asked for: string descriptor 0 is the language list rather than text
+/// (USB2.0 9.6.7), and every other string is requested in one of those
+/// languages.
+///
+/// Runs quietly: a device with no string descriptors at all answers this
+/// with a STALL, which is a fact to display rather than an error to log.
+pub fn read_string_language(pipe: &ControlPipe) -> Option<u16> {
+    let mut buffer = [0u8; 4];
+    let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_STRING, 0, buffer.len() as u16);
+    let received = control_transfer_in_quiet(pipe, &setup, &mut buffer)?;
+    if received < 4 || buffer[1] != DESCRIPTOR_TYPE_STRING {
+        return None;
+    }
+    Some(u16::from_le_bytes([buffer[2], buffer[3]]))
+}
+
+/// Reads string descriptor `index` in `language` and folds its UTF-16LE
+/// text into `out` as ASCII, returning how many bytes were written.
+///
+/// Only ASCII survives: this firmware has a 5x7 ASCII font and no way to
+/// draw anything else, so a non-ASCII code unit becomes `?` rather than
+/// silently disappearing. Text longer than the buffer or than `out` is
+/// truncated -- callers display names, they do not act on them.
+///
+/// Index 0 is rejected: that is the language list above, not a string.
+/// Like it, this runs quietly, since a device is free to refuse.
+pub fn read_string_ascii(
+    pipe: &ControlPipe,
+    index: u8,
+    language: u16,
+    out: &mut [u8],
+) -> Option<usize> {
+    if index == 0 {
+        return None;
+    }
+    let mut buffer = [0u8; STRING_BUFFER_MAX];
+    let setup = build_get_descriptor_setup_indexed(
+        DESCRIPTOR_TYPE_STRING,
+        index,
+        language,
+        STRING_BUFFER_MAX as u16,
+    );
+    let received = control_transfer_in_quiet(pipe, &setup, &mut buffer)?;
+    if received < 2 || buffer[1] != DESCRIPTOR_TYPE_STRING {
+        return None;
+    }
+    // bLength counts the two header bytes as well, and can exceed what the
+    // transfer actually delivered when the string is longer than the buffer.
+    // A device claiming less than the header it just sent would otherwise
+    // produce a backwards range here, so the floor is the header itself.
+    let end = received.min(buffer[0] as usize).max(2);
+    let text = &buffer[2..end];
+    let mut written = 0usize;
+    for unit in text.chunks_exact(2) {
+        if written == out.len() {
+            break;
+        }
+        let code = u16::from_le_bytes([unit[0], unit[1]]);
+        out[written] = if (0x20..0x7F).contains(&code) {
+            code as u8
+        } else {
+            b'?'
+        };
+        written += 1;
+    }
+    Some(written)
 }
 
 /// Enumerates a device whose port has already been reset and enabled --
@@ -205,8 +406,8 @@ pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
     // preference for margin over spec minimums.
     delay_ms(10);
 
-    let mut device_descriptor = [0u8; 18];
-    let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_DEVICE, 0, 18);
+    let mut device_descriptor = [0u8; DEVICE_DESCRIPTOR_LEN];
+    let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_DEVICE, 0, DEVICE_DESCRIPTOR_LEN as u16);
     if control_transfer_in(&pipe, &setup, &mut device_descriptor).is_none() {
         uart::log(b"USB: full device descriptor read failed\r\n");
         return None;
@@ -221,8 +422,11 @@ pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
         uart::log(b"USB: configuration descriptor header read failed\r\n");
         return None;
     }
-    let total_length = (u16::from_le_bytes([config_header[2], config_header[3]]) as usize)
-        .clamp(9, CONFIG_BUFFER_MAX);
+    // What the device says its complete configuration is, which can be more
+    // than fits here. `config_bytes()` reports what was actually read, so a
+    // display can tell the two apart instead of showing a silent truncation.
+    let reported_length = u16::from_le_bytes([config_header[2], config_header[3]]);
+    let total_length = (reported_length as usize).clamp(9, CONFIG_BUFFER_MAX);
 
     let mut config_descriptor = [0u8; CONFIG_BUFFER_MAX];
     let setup = build_get_descriptor_setup(DESCRIPTOR_TYPE_CONFIGURATION, 0, total_length as u16);
@@ -241,23 +445,36 @@ pub fn enumerate_device(address: u8, route: Route) -> Option<EnumeratedDevice> {
         device_class: device_descriptor[4],
         device_subclass: device_descriptor[5],
         device_protocol: device_descriptor[6],
-        config_total_length: total_length as u16,
+        config_total_length: reported_length,
         num_interfaces: config_header[4],
         configuration_value: config_header[5],
+        device_descriptor,
         config_descriptor,
         config_descriptor_len: received,
     })
 }
 
 fn build_get_descriptor_setup(descriptor_type: u8, index: u8, length: u16) -> [u8; 8] {
+    // Every descriptor except a string leaves wIndex zero (USB2.0 9.4.3).
+    build_get_descriptor_setup_indexed(descriptor_type, index, 0, length)
+}
+
+/// The same request with `wIndex` filled in, which for a string descriptor
+/// is the LANGID the text is wanted in.
+fn build_get_descriptor_setup_indexed(
+    descriptor_type: u8,
+    index: u8,
+    language: u16,
+    length: u16,
+) -> [u8; 8] {
     let value = ((descriptor_type as u16) << 8) | index as u16;
     [
         0x80, // bmRequestType: device-to-host, standard, device
         0x06, // bRequest: GET_DESCRIPTOR
         (value & 0xFF) as u8,
         (value >> 8) as u8,
-        0,
-        0,
+        (language & 0xFF) as u8,
+        (language >> 8) as u8,
         (length & 0xFF) as u8,
         (length >> 8) as u8,
     ]

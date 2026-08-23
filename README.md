@@ -39,14 +39,17 @@
 | センサー・RTC | `axistest` `battery` `rtc` | BMI270の傾きでボールを転がす、INA226でバッテリーパックの電圧・電流・電力をライブ表示、RX8130CE RTCの時刻表示・設定・レジスタダンプ・機能検査 |
 | USBマウス・画面 | `win` | Windows 95風デスクトップを表示。USB HID Bootマウスでカーソル移動とタイトルバーのドラッグを確認し、タスクバーにRTC時刻を表示 |
 | SDカード | `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` | 4bit/High Speedモード（実クロック40 MHz。ESP32-C6を使っている間は同じコントローラの入力クロックを共有するためDefault Speedの20 MHz）での生ブロックI/O。CID/CSD要約、MBR表示、1ブロック読み出し、DMAでnブロック読み出し、PSRAM宛DMA読み出しと検証、書き込み+検証+復元、ゼロ埋め |
-| USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
-| USBストレージ | `usbmsc` `usbread` `usbmbr` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式） |
+| USBデバイス情報 | `lsusb` | 接続デバイスをハブ経由のツリーで表示。Composite Deviceは各interfaceを1行ずつ出す。`lsusb <アドレス>`でそのデバイスの主要な記述子（デバイス、コンフィグレーション、interfaceとendpoint、HID記述子）と、製品名・ベンダ名・シリアルの文字列記述子を表示 |
+| USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | USBスタックの診断用。ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
+| USBストレージ | `usbmsc` `usbread` `usbmbr` `usbwritetest` `usbzero` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式）、WRITE(10)での書き込み+照合+復元、ゼロ埋め |
 | Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
 | ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
 
-`sdzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`も復元失敗時は
-データを壊す可能性があるため、テスト用カードの無害なLBAでのみ実行してください。
+`sdzero`と`usbzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`と
+`usbwritetest`も復元失敗時はデータを壊す可能性があるため、テスト用のカードやUSBメモリの
+無害なLBAでのみ実行してください。USB MSCへの書き込みは間欠故障の原因が未特定のままで、
+各WRITEの直前に予防的なBOT再同期を行うことで成立しています。
 
 ## 準備
 
@@ -108,7 +111,7 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 
 - 日本語フォント
 - FAT/exFATファイルシステムの解釈
-- USB Mass Storageへの書き込み、多段USBハブ
+- 多段USBハブ（ハブ配下のハブ）
 - IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみで、受信したデータの
   保存先はメモリだけです）。名前解決はAレコードだけで、キャッシュ・逆引き・
   mDNSはありません

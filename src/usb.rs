@@ -50,7 +50,13 @@ pub use hcd::{
     port_event_history, port_over_current_seen, probe_split_support, set_connect_wait_ms,
     set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit, set_vbus_power,
 };
+pub use hid::{DESCRIPTOR_TYPE_HID, HidDescriptor};
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
 pub use msc::{CacheSync, ReadyOutcome, UsbMassStorage};
-pub use registry::{DeviceKind, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost};
+pub use protocol::{
+    DESCRIPTOR_TYPE_ENDPOINT, DESCRIPTOR_TYPE_INTERFACE, EndpointDescriptor, InterfaceDescriptor,
+};
+pub use registry::{
+    BusDevice, DeviceKind, DeviceRecord, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost,
+};

@@ -14,13 +14,23 @@
 //! `UsbHost` fixes both by being the *only* thing that ever calls
 //! `hcd::probe_port`/`hub::Hub::open`, and by attaching every occupied
 //! port instead of one. See `docs/USB_REFACTOR_PLAN.md` Stages A-D and F.
+//!
+//! What is on the bus and what this project can drive are two different
+//! questions, so they are two arrays: `records` holds every device that
+//! answered enumeration -- hub included, unsupported classes included --
+//! and `slots` holds only the class drivers. Polling, dispatch and every
+//! "is there a keyboard yet" decision read `slots`; the `lsusb` display
+//! reads `records`, which is how a device with no driver can still be
+//! shown as attached instead of silently missing.
 
 use super::hcd::{self, HostPort, Route, Speed, SplitTarget};
 use super::hid_keyboard::UsbKeyboard;
 use super::hid_mouse::{MouseUpdate, UsbMouse};
 use super::hub::{self, Hub};
 use super::msc::UsbMassStorage;
-use super::protocol::{self, EnumeratedDevice};
+use super::protocol::{
+    self, CONFIG_BUFFER_MAX, ControlPipe, DEVICE_DESCRIPTOR_LEN, EnumeratedDevice,
+};
 use crate::input::Key;
 use crate::{tick, uart};
 
@@ -72,8 +82,9 @@ pub enum Location {
 }
 
 /// The class driver actually driving a slot's device. Devices this project
-/// has no driver for are noted in the UART log at attach time and otherwise
-/// left out of the registry -- there is nothing to poll or dispatch to.
+/// has no driver for are noted in the UART log at attach time and get no
+/// entry here -- there is nothing to poll or dispatch to. They are still
+/// listed in `DeviceRecord`, which is what the bus inventory is for.
 pub enum DeviceKind {
     Keyboard(UsbKeyboard),
     Mouse(UsbMouse),
@@ -140,10 +151,189 @@ pub struct ScanTiming {
     pub mass_storage: bool,
 }
 
-struct Slot {
-    location: Location,
-    summary: DeviceSummary,
-    kind: DeviceKind,
+/// Everything the registry keeps about one device that answered
+/// enumeration -- where it is, how to reach it again, and the two standard
+/// descriptors it returned.
+///
+/// This is the registry's inventory of the bus, and it is deliberately
+/// wider than `UsbHost::slots`: a device this project has no class driver for
+/// still gets a record, because "attached, no driver" is a fact worth
+/// showing rather than a device that silently does not exist. Nothing
+/// polls or dispatches to a record; only the display reads them.
+///
+/// The descriptors are kept as the raw bytes the device sent. Enumeration
+/// already paid for them, so a display can show any field without a single
+/// additional transaction, and without this struct having to grow a
+/// mirrored copy of USB2.0 tables 9-8 and 9-12.
+pub struct DeviceRecord {
+    pub location: Location,
+    pub address: u8,
+    /// The speed this device's own link came up at -- the root port's speed
+    /// for a device plugged into USB-A, or the hub port's for one behind a
+    /// hub, which is not necessarily the same as the hub's own.
+    pub speed: Speed,
+    pub summary: DeviceSummary,
+    route: Route,
+    max_packet_size0: u8,
+    device_descriptor: [u8; DEVICE_DESCRIPTOR_LEN],
+    config_descriptor: [u8; CONFIG_BUFFER_MAX],
+    config_descriptor_len: usize,
+}
+
+impl DeviceRecord {
+    fn from(location: Location, speed: Speed, device: &EnumeratedDevice) -> Self {
+        let mut config_descriptor = [0u8; CONFIG_BUFFER_MAX];
+        let config_bytes = device.config_bytes();
+        config_descriptor[..config_bytes.len()].copy_from_slice(config_bytes);
+        Self {
+            location,
+            address: device.device_address,
+            speed,
+            summary: DeviceSummary::from(device),
+            route: device.route,
+            max_packet_size0: device.max_packet_size0,
+            device_descriptor: *device.device_bytes(),
+            config_descriptor,
+            config_descriptor_len: config_bytes.len(),
+        }
+    }
+
+    // The device descriptor fields the display shows but the stack itself
+    // never acts on (USB2.0 table 9-8). Reading them out here keeps the
+    // byte offsets inside the USB layer rather than in a display module.
+
+    /// `bcdUSB`: the specification revision the device claims, BCD-encoded
+    /// (0x0200 = USB 2.0).
+    pub fn usb_version(&self) -> u16 {
+        u16::from_le_bytes([self.device_descriptor[2], self.device_descriptor[3]])
+    }
+
+    /// `bMaxPacketSize0`: endpoint 0's packet size, as re-read after the
+    /// initial 8-byte peek.
+    pub fn max_packet_size0(&self) -> u8 {
+        self.max_packet_size0
+    }
+
+    /// `bcdDevice`: the vendor's own release number for this device.
+    pub fn device_version(&self) -> u16 {
+        u16::from_le_bytes([self.device_descriptor[12], self.device_descriptor[13]])
+    }
+
+    /// `iManufacturer`, `iProduct` and `iSerialNumber`: string descriptor
+    /// indices, 0 where the device has no such string. Pass one to
+    /// `read_string`.
+    pub fn manufacturer_string_index(&self) -> u8 {
+        self.device_descriptor[14]
+    }
+
+    pub fn product_string_index(&self) -> u8 {
+        self.device_descriptor[15]
+    }
+
+    pub fn serial_string_index(&self) -> u8 {
+        self.device_descriptor[16]
+    }
+
+    /// `bNumConfigurations`. This project only ever reads and selects
+    /// configuration 0, so more than one means the rest went unexamined.
+    pub fn num_configurations(&self) -> u8 {
+        self.device_descriptor[17]
+    }
+
+    // The same for the configuration descriptor's own header (USB2.0
+    // table 9-10), which is the first nine bytes of `config_bytes`.
+
+    /// `bConfigurationValue`: what a `SET_CONFIGURATION` selecting this
+    /// configuration carries.
+    pub fn configuration_value(&self) -> u8 {
+        self.config_header_byte(5)
+    }
+
+    /// `bmAttributes`: bit 6 self-powered, bit 5 remote wakeup.
+    pub fn config_attributes(&self) -> u8 {
+        self.config_header_byte(7)
+    }
+
+    /// `bMaxPower`, converted from the descriptor's 2 mA units.
+    pub fn max_power_ma(&self) -> u16 {
+        self.config_header_byte(8) as u16 * 2
+    }
+
+    /// One byte of the configuration descriptor's own nine-byte header,
+    /// or 0 if the device answered with a shorter one than that. The
+    /// backing array is always full length, so this deliberately bounds
+    /// itself by what was actually read rather than by the buffer.
+    fn config_header_byte(&self, offset: usize) -> u8 {
+        self.config_bytes().get(offset).copied().unwrap_or(0)
+    }
+
+    /// Walks this device's configuration descriptor chain, in the order the
+    /// device sent it: the config header, then each interface followed by
+    /// its class-specific and endpoint descriptors.
+    pub fn descriptors(&self) -> impl Iterator<Item = protocol::RawDescriptor<'_>> {
+        protocol::descriptors(self.config_bytes())
+    }
+
+    /// The first LANGID this device supports, or `None` if it has no
+    /// string descriptors at all. Costs one control transfer.
+    pub fn string_language(&self) -> Option<u16> {
+        protocol::read_string_language(&self.control_pipe())
+    }
+
+    /// Reads one of this device's string descriptors as ASCII. Costs one
+    /// control transfer per call, which is why enumeration does not do it
+    /// for every device up front: the boot-time scan is on the critical
+    /// path of the storage decision (`docs/USB_MSC_BOOT_MARGIN_PLAN.md`),
+    /// and nothing but a display has ever needed these.
+    pub fn read_string(&self, index: u8, language: u16, out: &mut [u8]) -> Option<usize> {
+        protocol::read_string_ascii(&self.control_pipe(), index, language, out)
+    }
+
+    /// The configuration descriptor as far as it was read; see
+    /// `config_truncated`.
+    pub fn config_bytes(&self) -> &[u8] {
+        &self.config_descriptor[..self.config_descriptor_len]
+    }
+
+    /// True if the device's configuration descriptor is longer than
+    /// `protocol::CONFIG_BUFFER_MAX`, so the interfaces at its end were
+    /// never read and cannot be shown -- or attached to, for that matter.
+    pub fn config_truncated(&self) -> bool {
+        self.summary.config_total_length as usize > self.config_descriptor_len
+    }
+
+    /// True for a hub, which occupies the root port but is driven by
+    /// `hub::Hub` rather than by anything in `DeviceKind`.
+    pub fn is_hub(&self) -> bool {
+        self.summary.device_class == hub::DEVICE_CLASS_HUB
+    }
+
+    /// The hub address and port whose Transaction Translator relays for
+    /// this device, or `None` when the controller addresses it directly.
+    /// Only a Full/Low-Speed device behind a High-Speed hub is split.
+    pub fn split_route(&self) -> Option<(u8, u8)> {
+        self.route
+            .split
+            .map(|target| (target.hub_address, target.port_number))
+    }
+
+    /// True if transactions to this device are prefixed with PRE tokens,
+    /// i.e. it is a Low-Speed device reached through a hub.
+    pub fn low_speed_via_hub(&self) -> bool {
+        self.route.low_speed_via_hub
+    }
+
+    /// The control pipe this device is still reachable on, for a caller
+    /// that wants a descriptor enumeration did not keep -- string
+    /// descriptors, in practice. Every address stays valid until the next
+    /// `rescan`, so this needs no bus traffic of its own to rebuild.
+    pub fn control_pipe(&self) -> ControlPipe {
+        ControlPipe {
+            device_address: self.address,
+            mps: self.max_packet_size0 as u16,
+            route: self.route,
+        }
+    }
 }
 
 /// A read-only view of one attached device, for shell commands that just
@@ -152,6 +342,13 @@ pub struct AttachedDevice<'a> {
     pub location: Location,
     pub summary: &'a DeviceSummary,
     pub kind: &'a DeviceKind,
+}
+
+/// One device on the bus as the `lsusb` display sees it: its record, plus
+/// the class driver bound to it if this project has one.
+pub struct BusDevice<'a> {
+    pub record: &'a DeviceRecord,
+    pub driver: Option<&'a DeviceKind>,
 }
 
 /// Owns everything this project's USB-A stack can talk to at once: the
@@ -173,11 +370,6 @@ pub struct UsbHost {
     /// cannot re-derive it without another bus reset. `Speed::Unknown`
     /// whenever `hub` is `None`.
     hub_speed: Speed,
-    /// The hub's own VID/PID/class, captured at attach time -- the hub
-    /// occupies the root port but (unlike a direct device) is tracked
-    /// separately from `slots`, since it is not itself something a class
-    /// driver drives.
-    hub_summary: Option<DeviceSummary>,
     /// An empty-port scan reached a hub that did not answer even after the
     /// control-transfer retry budget.  This affects only discovery of *new*
     /// devices; resetting the whole bus here would tear down working
@@ -196,7 +388,17 @@ pub struct UsbHost {
     /// it must not reset and enumerate the same failing device every second.
     /// A disconnect/reconnect edge or an explicit full `rescan` retries it.
     unhandled_slots: u16,
-    slots: [Option<Slot>; SLOT_COUNT],
+    /// The class driver bound to each slot, or `None` where nothing is
+    /// attached *or* nothing here can drive what is. `records` is the
+    /// inventory; this is only what the frame loop and the class-specific
+    /// shell commands can dispatch to.
+    slots: [Option<DeviceKind>; SLOT_COUNT],
+    /// Every device that answered enumeration, in the same slot order --
+    /// including the hub itself (index 0, where a hub leaves `slots`
+    /// empty) and devices no class driver wanted. Whenever a slot holds a
+    /// driver, the matching record is present too; the reverse does not
+    /// hold. Display only: see `DeviceRecord`.
+    records: [Option<DeviceRecord>; SLOT_COUNT],
     /// Timing of the most recent full `rescan`.
     last_scan: Option<ScanTiming>,
     /// Tick milliseconds of the last automatic power cycle, so a device
@@ -212,17 +414,18 @@ pub struct UsbHost {
 
 impl UsbHost {
     pub const fn new() -> Self {
-        const NONE_SLOT: Option<Slot> = None;
+        const NONE_DRIVER: Option<DeviceKind> = None;
+        const NONE_RECORD: Option<DeviceRecord> = None;
         Self {
             last_probe: None,
             hub: None,
             hub_speed: Speed::Unknown,
-            hub_summary: None,
             hub_port_scan_paused: false,
             hub_port_scan_failures: 0,
             next_keyboard_slot: 0,
             unhandled_slots: 0,
-            slots: [NONE_SLOT; SLOT_COUNT],
+            slots: [NONE_DRIVER; SLOT_COUNT],
+            records: [NONE_RECORD; SLOT_COUNT],
             last_scan: None,
             boot_scan: None,
             last_power_recovery_ms: None,
@@ -250,18 +453,60 @@ impl UsbHost {
         self.hub.as_ref()
     }
 
-    /// The hub's own VID/PID/class, if one is attached.
+    /// The hub's own VID/PID/class, if one is attached. A hub occupies the
+    /// root port, so its record is the root one.
     pub fn hub_summary(&self) -> Option<&DeviceSummary> {
-        self.hub_summary.as_ref()
+        if self.hub.is_none() {
+            return None;
+        }
+        self.records[0].as_ref().map(|record| &record.summary)
+    }
+
+    /// Every device the last scan enumerated, driver or not, in slot order
+    /// (the root port first, then hub ports low to high). This is what the
+    /// `lsusb` display walks; `attached_devices` below is the narrower
+    /// "what can this project actually talk to" view.
+    pub fn bus_devices(&self) -> impl Iterator<Item = BusDevice<'_>> {
+        self.records
+            .iter()
+            .zip(self.slots.iter())
+            .filter_map(|(record, driver)| {
+                record.as_ref().map(|record| BusDevice {
+                    record,
+                    driver: driver.as_ref(),
+                })
+            })
+    }
+
+    /// One enumerated device by its USB address, for a command that takes
+    /// the address the display just showed.
+    pub fn bus_device(&self, address: u8) -> Option<BusDevice<'_>> {
+        self.bus_devices()
+            .find(|device| device.record.address == address)
+    }
+
+    /// Hub ports holding a device that could not be enumerated at all, and
+    /// so has no record to show. Worth naming in the display: the
+    /// alternative is a port that looks empty when something is plugged
+    /// into it. Costs no bus traffic -- this is the state the last scan
+    /// left behind, not a fresh port poll.
+    pub fn unenumerated_hub_ports(&self) -> impl Iterator<Item = u8> + '_ {
+        (1..SLOT_COUNT).filter_map(move |index| {
+            let occupied_but_unknown =
+                self.unhandled_slots & (1u16 << index) != 0 && self.records[index].is_none();
+            occupied_but_unknown.then_some(index as u8)
+        })
     }
 
     /// Every currently attached device, root or hub port alike, in slot
     /// order (`Direct` first, then hub ports low to high).
     pub fn attached_devices(&self) -> impl Iterator<Item = AttachedDevice<'_>> {
-        self.slots.iter().flatten().map(|slot| AttachedDevice {
-            location: slot.location,
-            summary: &slot.summary,
-            kind: &slot.kind,
+        self.bus_devices().filter_map(|device| {
+            device.driver.map(|kind| AttachedDevice {
+                location: device.record.location,
+                summary: &device.record.summary,
+                kind,
+            })
         })
     }
 
@@ -270,26 +515,20 @@ impl UsbHost {
     /// every call; they share whatever `rescan` already attached, wherever
     /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find_map(|slot| match &mut slot.kind {
-                DeviceKind::MassStorage(storage) => Some(storage),
-                DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
-            })
+        self.slots.iter_mut().flatten().find_map(|slot| match slot {
+            DeviceKind::MassStorage(storage) => Some(storage),
+            DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
+        })
     }
 
     /// Runs the opt-in periodic-scheduler diagnostic on the first HID slot.
     /// Normal frame polling is paused while the shell owns `&mut UsbHost`.
     pub fn probe_periodic_hid(&mut self) -> Option<(&'static str, hcd::PeriodicProbeResult)> {
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find_map(|slot| match &mut slot.kind {
-                DeviceKind::Keyboard(keyboard) => Some(("keyboard", keyboard.probe_periodic())),
-                DeviceKind::Mouse(mouse) => Some(("mouse", mouse.probe_periodic())),
-                DeviceKind::MassStorage(_) => None,
-            })
+        self.slots.iter_mut().flatten().find_map(|slot| match slot {
+            DeviceKind::Keyboard(keyboard) => Some(("keyboard", keyboard.probe_periodic())),
+            DeviceKind::Mouse(mouse) => Some(("mouse", mouse.probe_periodic())),
+            DeviceKind::MassStorage(_) => None,
+        })
     }
 
     /// True if any attached device is a HID Boot mouse. Lets a pointer-driven
@@ -299,7 +538,7 @@ impl UsbHost {
         self.slots
             .iter()
             .flatten()
-            .any(|slot| matches!(slot.kind, DeviceKind::Mouse(_)))
+            .any(|slot| matches!(slot, DeviceKind::Mouse(_)))
     }
 
     /// Cheap liveness check (one HPRT read, no transaction): true once
@@ -336,12 +575,14 @@ impl UsbHost {
         let _ = hcd::disable_periodic_hid();
         self.hub = None;
         self.hub_speed = Speed::Unknown;
-        self.hub_summary = None;
         self.hub_port_scan_paused = false;
         self.hub_port_scan_failures = 0;
         self.next_keyboard_slot = 0;
         for slot in self.slots.iter_mut() {
             *slot = None;
+        }
+        for record in self.records.iter_mut() {
+            *record = None;
         }
     }
 
@@ -371,7 +612,7 @@ impl UsbHost {
         if hcd::bus_unusable() {
             return true;
         }
-        self.slots.iter().flatten().any(|slot| match &slot.kind {
+        self.slots.iter().flatten().any(|slot| match slot {
             DeviceKind::Keyboard(keyboard) => keyboard.needs_reinit(),
             DeviceKind::Mouse(mouse) => mouse.needs_reinit(),
             DeviceKind::MassStorage(_) => false,
@@ -393,7 +634,7 @@ impl UsbHost {
         let mut stale_ports = 0u16;
         for (index, slot) in self.slots.iter().enumerate().skip(1) {
             let Some(slot) = slot else { continue };
-            let stale_split_hid = match &slot.kind {
+            let stale_split_hid = match slot {
                 DeviceKind::Keyboard(keyboard) => {
                     keyboard.split_poll_interval_ms().is_some() && keyboard.needs_reinit()
                 }
@@ -430,6 +671,7 @@ impl UsbHost {
             };
             if changed_or_gone {
                 self.slots[port as usize] = None;
+                self.records[port as usize] = None;
                 self.clear_unhandled_slot(port as usize);
                 detached |= bit;
                 uart::log_hex(b"USB: HID disconnected from hub port ", port as u32);
@@ -475,7 +717,7 @@ impl UsbHost {
             let Some(slot) = self.slots[index].as_mut() else {
                 continue;
             };
-            if let DeviceKind::Keyboard(keyboard) = &mut slot.kind
+            if let DeviceKind::Keyboard(keyboard) = slot
                 && keyboard.split_poll_interval_ms().is_none()
                 && let Some(byte) = keyboard.poll()
             {
@@ -494,7 +736,7 @@ impl UsbHost {
         self.slots
             .iter()
             .flatten()
-            .filter_map(|slot| match &slot.kind {
+            .filter_map(|slot| match slot {
                 DeviceKind::Keyboard(keyboard) => keyboard.split_poll_interval_ms(),
                 DeviceKind::Mouse(_) | DeviceKind::MassStorage(_) => None,
             })
@@ -509,7 +751,7 @@ impl UsbHost {
             let Some(slot) = self.slots[index].as_mut() else {
                 continue;
             };
-            if let DeviceKind::Keyboard(keyboard) = &mut slot.kind
+            if let DeviceKind::Keyboard(keyboard) = slot
                 && keyboard.split_poll_interval_ms().is_some()
                 && let Some(key) = keyboard.poll()
             {
@@ -531,7 +773,7 @@ impl UsbHost {
     pub fn poll_mice(&mut self) -> Option<MouseUpdate> {
         let mut combined: Option<MouseUpdate> = None;
         for slot in self.slots.iter_mut().flatten() {
-            let DeviceKind::Mouse(mouse) = &mut slot.kind else {
+            let DeviceKind::Mouse(mouse) = slot else {
                 continue;
             };
             let Some(update) = mouse.poll() else { continue };
@@ -656,6 +898,9 @@ impl UsbHost {
             return ScanOutcome::Unreachable;
         };
         timing.enumerated_ms = milliseconds_since(start);
+        // Recorded before any driver decision, so the inventory covers the
+        // hub, the driven device and the unsupported device alike.
+        self.records[0] = Some(DeviceRecord::from(Location::Direct, port.speed, &device));
 
         if device.device_class == hub::DEVICE_CLASS_HUB {
             if !self.attach_hub(&device, port.speed, timing, start) {
@@ -671,11 +916,7 @@ impl UsbHost {
             }
             self.clear_unhandled_slot(0);
             let is_mass_storage = matches!(kind, DeviceKind::MassStorage(_));
-            self.slots[0] = Some(Slot {
-                location: Location::Direct,
-                summary: DeviceSummary::from(&device),
-                kind,
-            });
+            self.slots[0] = Some(kind);
             if is_mass_storage {
                 timing.mass_storage_ms = milliseconds_since(start);
             }
@@ -713,7 +954,6 @@ impl UsbHost {
             // the same dead end as a device that will not enumerate.
             return false;
         };
-        self.hub_summary = Some(DeviceSummary::from(device));
         if hub.descriptor.port_count > MAX_HUB_PORTS {
             uart::log_hex(
                 b"USB: hub reports more ports than this registry tracks, capping at ",
@@ -746,10 +986,7 @@ impl UsbHost {
                 new_slots |= 1u16 << port;
             }
             if timing.mass_storage_ms == 0
-                && matches!(
-                    self.slots[port as usize].as_ref().map(|slot| &slot.kind),
-                    Some(DeviceKind::MassStorage(_))
-                )
+                && matches!(self.slots[port as usize], Some(DeviceKind::MassStorage(_)))
             {
                 timing.mass_storage_ms = milliseconds_since(start);
             }
@@ -868,9 +1105,14 @@ impl UsbHost {
     /// that a device found later is set up identically to one that was
     /// present at rescan time -- routing included.
     fn attach_hub_port(&mut self, hub: &Hub, port: u8, hub_speed: Speed) -> bool {
-        let Some(downstream) = self.enumerate_hub_port(hub, port, hub_speed) else {
+        let Some((downstream, speed)) = self.enumerate_hub_port(hub, port, hub_speed) else {
             return false;
         };
+        self.records[port as usize] = Some(DeviceRecord::from(
+            Location::HubPort(port),
+            speed,
+            &downstream,
+        ));
 
         match attach_class_driver(&downstream) {
             Some(kind) => {
@@ -881,11 +1123,7 @@ impl UsbHost {
                     DeviceKind::MassStorage(_) => b"USB: mass storage attached on hub port ",
                 });
                 uart::log_hex(b"", port as u32);
-                self.slots[port as usize] = Some(Slot {
-                    location: Location::HubPort(port),
-                    summary: DeviceSummary::from(&downstream),
-                    kind,
-                });
+                self.slots[port as usize] = Some(kind);
                 true
             }
             None => {
@@ -910,22 +1148,18 @@ impl UsbHost {
             .slots
             .iter()
             .flatten()
-            .any(|slot| matches!(slot.kind, DeviceKind::MassStorage(_)));
+            .any(|slot| matches!(slot, DeviceKind::MassStorage(_)));
         let has_hid = self
             .slots
             .iter()
             .flatten()
-            .any(|slot| matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
+            .any(|slot| matches!(slot, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
         if hub_speed == Speed::High {
             for (index, slot) in self.slots.iter().enumerate() {
                 if new_slots & (1u16 << index) == 0 {
                     continue;
                 }
-                let Some(Slot {
-                    kind: DeviceKind::Keyboard(keyboard),
-                    ..
-                }) = slot
-                else {
+                let Some(DeviceKind::Keyboard(keyboard)) = slot else {
                     continue;
                 };
                 if let Some(interval_ms) = keyboard.split_poll_interval_ms() {
@@ -953,8 +1187,8 @@ impl UsbHost {
                 continue;
             }
             let Some(slot) = slot else { continue };
-            if matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)) {
-                log_periodic_result(enable_periodic_kind(&mut slot.kind));
+            if matches!(slot, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)) {
+                log_periodic_result(enable_periodic_kind(slot));
             }
         }
     }
@@ -972,7 +1206,7 @@ impl UsbHost {
         hub: &Hub,
         port: u8,
         hub_speed: Speed,
-    ) -> Option<EnumeratedDevice> {
+    ) -> Option<(EnumeratedDevice, Speed)> {
         if let Some(device) = reset_and_enumerate_hub_port(hub, port, hub_speed) {
             return Some(device);
         }
@@ -1035,12 +1269,12 @@ impl UsbHost {
             .slots
             .iter()
             .flatten()
-            .any(|slot| matches!(slot.kind, DeviceKind::MassStorage(_)));
+            .any(|slot| matches!(slot, DeviceKind::MassStorage(_)));
         let has_hid = self
             .slots
             .iter()
             .flatten()
-            .any(|slot| matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
+            .any(|slot| matches!(slot, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
         if !has_mass_storage || !has_hid {
             return;
         }
@@ -1048,7 +1282,7 @@ impl UsbHost {
         uart::log(b"USB: MSC present, serializing HID and bulk on channel 0\r\n");
         let all_halted = hcd::disable_periodic_hid();
         for slot in self.slots.iter_mut().flatten() {
-            match &mut slot.kind {
+            match slot {
                 DeviceKind::Keyboard(keyboard) => keyboard.use_frame_poll(),
                 DeviceKind::Mouse(mouse) => mouse.use_frame_poll(),
                 DeviceKind::MassStorage(_) => {}
@@ -1074,26 +1308,23 @@ impl UsbHost {
 /// subclass/transport than the intended one. Enumeration already fetched the
 /// complete configuration descriptor, so this costs no additional USB traffic.
 fn log_unhandled_interfaces(device: &EnumeratedDevice) {
-    let config = device.config_bytes();
-    let mut offset = 0usize;
-    while offset + 2 <= config.len() {
-        let length = config[offset] as usize;
-        if length < 2 || offset + length > config.len() {
-            break;
+    for raw in protocol::descriptors(device.config_bytes()) {
+        if raw.descriptor_type != protocol::DESCRIPTOR_TYPE_INTERFACE {
+            continue;
         }
-        if config[offset + 1] == protocol::DESCRIPTOR_TYPE_INTERFACE && length >= 9 {
-            let descriptor = u32::from_be_bytes([
-                config[offset + 2],
-                config[offset + 5],
-                config[offset + 6],
-                config[offset + 7],
-            ]);
-            uart::log_hex(
-                b"USB: unhandled interface (number/class/subclass/protocol)=",
-                descriptor,
-            );
-        }
-        offset += length;
+        let Some(interface) = protocol::InterfaceDescriptor::parse(raw.bytes) else {
+            continue;
+        };
+        let packed = u32::from_be_bytes([
+            interface.number,
+            interface.class,
+            interface.subclass,
+            interface.protocol,
+        ]);
+        uart::log_hex(
+            b"USB: unhandled interface (number/class/subclass/protocol)=",
+            packed,
+        );
     }
 }
 
@@ -1176,7 +1407,11 @@ fn milliseconds_since(start: u64) -> u32 {
 
 /// One reset-and-enumerate attempt on a hub port, with no recovery of its
 /// own -- `UsbHost::enumerate_hub_port` owns that decision.
-fn reset_and_enumerate_hub_port(hub: &Hub, port: u8, hub_speed: Speed) -> Option<EnumeratedDevice> {
+fn reset_and_enumerate_hub_port(
+    hub: &Hub,
+    port: u8,
+    hub_speed: Speed,
+) -> Option<(EnumeratedDevice, Speed)> {
     let status = hub.reset_port(port)?;
     let address = protocol::downstream_address(port);
     let route = route_behind_hub(hub.device_address(), port, hub_speed, status.speed());
@@ -1191,5 +1426,5 @@ fn reset_and_enumerate_hub_port(hub: &Hub, port: u8, hub_speed: Speed) -> Option
         });
         uart::log_hex(b", reached with split transactions; hub port ", port as u32);
     }
-    protocol::enumerate_device(address, route)
+    protocol::enumerate_device(address, route).map(|device| (device, status.speed()))
 }

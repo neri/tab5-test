@@ -11,7 +11,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{mbr, membench};
+use super::{lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
@@ -326,6 +326,18 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "sdreadpsram",
         usage: "sdreadpsram <lba> <n>",
         lines: &["DMA n blocks (n<=8) into PSRAM, verify vs SRAM"],
+    },
+    HelpEntry {
+        name: "lsusb",
+        usage: "lsusb [address]",
+        lines: &[
+            "show what is attached to USB-A as a tree through the hub, with",
+            "every interface of a composite device listed under it. with an",
+            "address (the number in brackets), show that device's device,",
+            "configuration, interface and endpoint descriptors instead, plus",
+            "its manufacturer/product/serial strings read on the spot.",
+            "reads the last scan, so run usbrescan after plugging something in",
+        ],
     },
     HelpEntry {
         name: "usbinfo",
@@ -665,6 +677,7 @@ pub fn execute(
         b"sdzero" => cmd_sdzero(console, framebuffer, argument),
         b"sdmbr" => cmd_sdmbr(console, framebuffer),
         b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
+        b"lsusb" => cmd_lsusb(console, framebuffer, argument, usb_host),
         b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
         b"usbrescan" => cmd_usbrescan(console, framebuffer, usb_host),
         b"usbfs" => cmd_usbfs(console, framebuffer, argument, usb_host),
@@ -5072,6 +5085,31 @@ fn speed_text(speed: usb::Speed) -> &'static str {
 
 /// Read-only: shows every device the last scan attached, root or hub port
 /// alike. Run `usbrescan` first if something was just plugged in.
+/// The device-facing view of USB-A, as opposed to the `usb*` commands
+/// around it: `lsusb` alone shows the bus as a tree and one device's
+/// descriptors, and never touches the port, the hub's control endpoint or a
+/// class driver's session. The formatting lives in `app::lsusb`, the same
+/// way `sdmbr`/`usbmbr` hand their output to `app::mbr`.
+fn cmd_lsusb(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &usb::UsbHost,
+) {
+    if argument.is_empty() {
+        lsusb::show_tree(console, framebuffer, usb_host);
+        return;
+    }
+    // Addresses are handed out as 1 (whatever is plugged into USB-A) and
+    // hub port + 1, so the 7-bit USB address space is never approached
+    // here; anything outside it cannot name a device this registry holds.
+    let Some(address) = parse_u32(argument).filter(|address| *address <= 127) else {
+        console.write_output_line(framebuffer, "usage: lsusb [address] (as shown in brackets)");
+        return;
+    };
+    lsusb::show_device(console, framebuffer, usb_host, address as u8);
+}
+
 fn cmd_usbinfo(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &usb::UsbHost) {
     report_usb_state(console, framebuffer, usb_host);
 }
@@ -5176,7 +5214,7 @@ fn device_summary_text(summary: &usb::DeviceSummary) -> Line {
     line.push_hex(summary.device_protocol as u32, 2);
     line.push_str("  interfaces: ");
     line.push_u32(summary.num_interfaces as u32);
-    line.push_str("  config bytes: ");
+    line.push_str("  config wTotalLength: ");
     line.push_u32(summary.config_total_length as u32);
     line
 }

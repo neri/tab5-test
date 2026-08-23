@@ -76,6 +76,40 @@ const POLL_FAILURE_GIVE_UP_THRESHOLD: u32 = 10;
 /// Low-Speed schedule.
 const LOW_SPEED_INTERRUPT_MIN_INTERVAL_MS: u8 = 10;
 
+/// The HID class descriptor that follows a HID interface inside a
+/// configuration descriptor (HID 1.11 section 6.2.1).
+pub const DESCRIPTOR_TYPE_HID: u8 = 0x21;
+
+/// The parts of that descriptor worth showing: which HID revision the
+/// device speaks and how long the report descriptor it would hand over is.
+///
+/// Nothing in this project fetches the report descriptor itself -- the
+/// Boot Protocol exists precisely so a host does not have to parse one --
+/// so this is display-only, and its length is the interesting hint that a
+/// device has a report layout beyond the boot one.
+pub struct HidDescriptor {
+    pub version: u16,
+    pub country_code: u8,
+    pub report_descriptor_len: u16,
+}
+
+impl HidDescriptor {
+    /// Layout: `bcdHID` at 2, `bCountryCode` at 4, `bNumDescriptors` at 5,
+    /// then one (type, length) pair per subordinate descriptor. The first
+    /// pair is the report descriptor on every real device, which is the
+    /// one taken here.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 9 {
+            return None;
+        }
+        Some(Self {
+            version: u16::from_le_bytes([bytes[2], bytes[3]]),
+            country_code: bytes[4],
+            report_descriptor_len: u16::from_le_bytes([bytes[7], bytes[8]]),
+        })
+    }
+}
+
 /// A HID Boot Protocol interface and the Interrupt IN endpoint that
 /// carries its reports, as found in a configuration descriptor.
 pub struct BootInterface {

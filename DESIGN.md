@@ -81,5 +81,6 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   読み書きまで実機確認済みです。High-Speedハブ配下Low-Speed HIDのSplit経路も
   10 ms周期で実機確認済みで、同じハブ上のHigh-Speed MSCとの併用も`ut 100`を
   retry 0で完走しています。
-  文字列記述子の取得と多段ハブは未実装です
+  デバイス情報の表示は`lsusb`（ツリー表示と記述子表示）で、文字列記述子は
+  この詳細表示のときだけ取得します。多段ハブは未実装です
   （[USB.md](docs/USB.md)）。
