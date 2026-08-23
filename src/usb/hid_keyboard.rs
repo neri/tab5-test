@@ -68,6 +68,14 @@ impl UsbKeyboard {
         self.endpoint.enable_periodic()
     }
 
+    pub fn use_frame_poll(&mut self) {
+        self.endpoint.use_frame_poll();
+    }
+
+    pub fn split_poll_interval_ms(&self) -> Option<u64> {
+        self.endpoint.split_poll_interval_ms()
+    }
+
     /// Returns the next newly-pressed key, or `None` if nothing new is
     /// available this frame. ASCII and HID-only keys (Esc, arrows, and so
     /// on) use the same `input::Key` contract that `InputManager` exposes.

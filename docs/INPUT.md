@@ -70,6 +70,54 @@ High-Speedハブ配下（SplitとのDMA mode調停前）は従来のframe poll�
 root直結LS keyboardとroot直結Full-Speed mouseのchannel 1経路です。Full-Speedハブ配下の
 複数slotはHigh-Speedハブを`usbfs on`でFull-Speed列挙する代替試験により、keyboardをchannel 1、
 mouseをchannel 2へ同時登録して確認済みです。
+High-Speedハブ配下のLow-Speed HIDはperiodic channelではなくSplitのframe pollを使います。
+旧ハブ＋keyboard／mouseでは動作実績がありますが、今回のハブ＋Low-Speed HIDでは
+第19版で列挙・attach後、最初のInterrupt INのCSPLITが`HCINT=0x82`になりました。第20版は
+Split tokenのendpoint typeをBulk偽装から実descriptorどおりInterruptへ修正したため文字入力まで
+進みましたが、idle時のCSPLIT NYETをControl／Bulkと同様に最大5000 round追い続け、長いfreezeと
+`giving up mid-split`を繰り返しました。第21版はInterrupt Splitだけを1 High-Speed full frame内の
+SSPLIT＋最大3 CSPLITに制限し、窓切れを通常の「reportなし」として次のframe pollへ戻します。
+実機ではエラーとfreezeが消えて入力可能になりましたが、3906 packet／11761 roundの観測は約57 Hzの
+描画frameごとに1 pollしか行っていないことを示し、LS HIDの`bInterval`より遅いため反応が鈍い状態でした。
+第22版は既存の1 kHz tickによる非描画wakeでSplit keyboardだけを`bInterval` msごとにpollし、受信keyを
+16 eventのqueueへ保存します。描画、I2C input、接続保守は従来どおりframe境界で処理します。
+新しいHigh-Speedハブ＋Low-Speed keyboardの実機で入力遅延とエラーがなく、50,661 packet／
+202,076 round、mode conflict 0、stale token 0、port event 0を確認しました。
+
+第22版でkeyboardを物理的に抜くと、root HPRTはハブが接続されたままなので変化せず、Splitの
+`XACTERR`をstale sessionとしてroot bus全体を再列挙していました。セルフパワーハブの変化中portを
+古い接続状態で再attachし、MSCも巻き込んで認識不能になる場合がありました。第23版はstaleになった
+Split HIDの下流portだけを`GET_PORT_STATUS`とdebounceで確認し、切断／connection changeなら
+該当slotだけを破棄します。root resetは行わず、MSCと他portのsessionを維持します。再挿入は空きportの
+増分スキャンで列挙します。抜去・再挿入動作は第23版で実機確認済みです。
+
+第23版ではエラーログなしでもキーを多く取りこぼしました。`usbhw`は145,394 packet／436,167 roundで、
+ほぼ全pollが3 roundでした。`bInterval=1ms`のSYSTIMER wakeがUSB SOFと固定位相になり、遅い
+microframeから同じSplit scheduleを繰り返していたうえ、CSPLITのNAK（通常のreportなし）後に同じ
+1ms窓で新しいSSPLITを始めていました。第24版はperiodic SSPLITを次のHigh-Speed microframe 0へ
+揃え、CSPLITを同一full frame内に確保します。NAKはTT bufferが解放された安全なidle完了として即座に
+終了し、次のpollまで新しいSSPLITを出しません。またUSB2.0でLow-Speed Interruptの最小intervalは
+10msなので、descriptorの不正な1msを10msへ補正します。毎秒約1000 packet／3000〜4000 IRQ相当の
+過剰pollを毎秒約100 packetへ抑えつつ、旧57Hzより短い10ms samplingを維持します。起動時は
+`invalid Low-Speed bInterval, descriptor=1`と`Split foreground poll interval ms=10`を表示します。
+High-Speedハブ＋Low-Speed keyboardの実機では入力が安定し、エラーログも発生しませんでした。
+キーを押さない10秒間の`IRQ split: packets`増加も約1,000回（約100 packet/秒）で、
+10ms周期どおりに過剰pollが抑えられていることを確認済みです。
+同じHigh-SpeedハブへHigh-Speed MSCを追加した`ut 100`もretry 0で完走し、Split側は
+conflict 0、stale token 0、port event 0のままでした。
+
+ハブ配下のHID periodic channelは、ハブのoccupied portをすべて列挙した後に開始します。
+初回スキャン中に低い番号のHID portから開始すると、まだ残っているportのchannel 0列挙controlと
+競合し、HIDを挿したままハブを接続した場合だけ認識しない実機症状があったためです。HIDを
+後挿しする増分スキャンも同じく、その回の全port走査後に転送方式を選びます。
+
+給電中のセルフパワーハブを接続した場合も、各HID portの新しいreset完了を待ってから列挙します。
+upstream切断中も保持された古いaddress/configurationへaddress 0の要求を送らないためです。
+
+同じbusへMSCも登録された場合は、RX FIFOを共有するpersistent HID DMAとbulk DMAを
+同時稼働させません。registryがperiodic channelを停止して次のDATA PIDを引き継ぎ、HIDを
+channel 0のframe pollへ戻します。device resetや再列挙ではないため接続状態は維持されます。
+MSCが無い構成では上記のperiodic経路をそのまま使用します。
 
 ## ポインタ（USBマウス）
 

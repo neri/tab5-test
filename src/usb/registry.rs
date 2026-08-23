@@ -22,7 +22,7 @@ use super::hub::{self, Hub};
 use super::msc::UsbMassStorage;
 use super::protocol::{self, EnumeratedDevice};
 use crate::input::Key;
-use crate::uart;
+use crate::{tick, uart};
 
 /// Hard cap on hub ports this registry tracks. Real hubs are almost always
 /// 4-7 ports; USB2.0 allows up to 255. Bounds the fixed-size slot array the
@@ -37,6 +37,29 @@ const ALL_SLOT_BITS: u16 = (1u16 << SLOT_COUNT) - 1;
 /// for a one-off hub/host hiccup; pause only after this many consecutive
 /// full scan failures, then emit the existing one-shot diagnostic.
 const HUB_PORT_SCAN_FAILURE_GIVE_UP_THRESHOLD: u8 = 3;
+/// Shortest interval between two automatic power cycles (USB-A's VBUS, or
+/// one hub port's power), in milliseconds.
+///
+/// A power cycle blocks for over a second and drops every device on the bus,
+/// so a device that is simply broken must not have the frame loop cycling
+/// USB-A every few seconds. One escalation, then a long wait before the
+/// next: a device that needs it recovers on the first one.
+const POWER_RECOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// What one pass over the bus found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanOutcome {
+    /// Nothing is plugged into USB-A.
+    Empty,
+    /// The device (or hub) answered enumeration, whether or not this
+    /// project has a driver for it.
+    Answered,
+    /// HPRT reports a connected port, but the device behind it will not
+    /// enumerate -- either the port never enabled, or control transfers to
+    /// it fail outright. A port reset has already been tried by definition:
+    /// `probe_port` performs one. What is left is removing its power.
+    Unreachable,
+}
 
 /// Where an attached device is plugged in, for logging and shell display.
 /// Class drivers do not need this -- it never leaves the registry.
@@ -84,6 +107,37 @@ impl DeviceSummary {
             config_total_length: device.config_total_length,
         }
     }
+}
+
+/// Where the time in one full `rescan` went, in milliseconds from the VBUS
+/// enable at the top of `hcd::probe_port`.
+///
+/// Kept for the boot-time storage decision rather than for its own sake: the
+/// firmware wants USB mass storage to win over the SD card when one is
+/// plugged in, and that only works if boot waits long enough for a device
+/// that is powering up right then. `docs/USB_MSC_BOOT_MARGIN_PLAN.md` turns
+/// these numbers into that budget.
+#[derive(Clone, Copy, Default)]
+pub struct ScanTiming {
+    /// Milliseconds on the system tick when the scan started, i.e. how far
+    /// into boot the initial scan runs.
+    pub started_at_ms: u32,
+    /// `HostPort::connect_ms` for this scan's root-port probe.
+    pub connect_ms: u32,
+    /// `HostPort::enabled_ms` for this scan's root-port probe.
+    pub port_enabled_ms: u32,
+    /// The root device (hub or plain device) finished standard enumeration
+    /// by this point, or 0 if it never did.
+    pub enumerated_ms: u32,
+    /// The first mass-storage class driver was attached by this point, or 0
+    /// if the scan found none.
+    pub mass_storage_ms: u32,
+    /// The whole scan, including every port behind a hub.
+    pub total_ms: u32,
+    /// Whether the root port reported a device at all.
+    pub connected: bool,
+    /// Whether the scan ended with a mass-storage device in the registry.
+    pub mass_storage: bool,
 }
 
 struct Slot {
@@ -143,6 +197,17 @@ pub struct UsbHost {
     /// A disconnect/reconnect edge or an explicit full `rescan` retries it.
     unhandled_slots: u16,
     slots: [Option<Slot>; SLOT_COUNT],
+    /// Timing of the most recent full `rescan`.
+    last_scan: Option<ScanTiming>,
+    /// Tick milliseconds of the last automatic power cycle, so a device
+    /// that never answers cannot make the frame loop cut power on every
+    /// scan.
+    last_power_recovery_ms: Option<u64>,
+    /// Timing of the *first* full `rescan`, which is the one
+    /// `InputManager::new` runs during boot -- the only scan whose duration
+    /// the boot-time storage decision has to live with. Later scans overwrite
+    /// `last_scan` but never this.
+    boot_scan: Option<ScanTiming>,
 }
 
 impl UsbHost {
@@ -158,7 +223,20 @@ impl UsbHost {
             next_keyboard_slot: 0,
             unhandled_slots: 0,
             slots: [NONE_SLOT; SLOT_COUNT],
+            last_scan: None,
+            boot_scan: None,
+            last_power_recovery_ms: None,
         }
+    }
+
+    /// Timing of the most recent full `rescan`.
+    pub fn last_scan_timing(&self) -> Option<&ScanTiming> {
+        self.last_scan.as_ref()
+    }
+
+    /// Timing of the initial scan run during boot.
+    pub fn boot_scan_timing(&self) -> Option<&ScanTiming> {
+        self.boot_scan.as_ref()
     }
 
     /// The most recent root-port probe result (VBUS/core/port state), for
@@ -282,16 +360,91 @@ impl UsbHost {
     /// tears down and rebuilds every slot, not just the stale one) -- there
     /// is no such thing as reinitializing just one.
     ///
-    /// Mass Storage slots have no per-frame polling session to go stale
-    /// between shell commands, so they do not contribute here; a stale MSC
-    /// handle just fails its next command and is only cleared by the next
-    /// `rescan` (see `docs/USB_REFACTOR_PLAN.md`'s notes on this gap).
+    /// Mass Storage slots have no per-frame polling session and deliberately
+    /// do not contribute here. A dead BOT session fails subsequent commands
+    /// quickly and waits for an explicit `usbrescan`; resetting the whole bus
+    /// automatically would interrupt otherwise healthy keyboards and mice.
     pub fn needs_reinit(&self) -> bool {
+        // A bus marked unusable is specifically a controller-level problem:
+        // channel 0 could not be halted. It is safe to rebuild every session
+        // here because no later control or bulk transfer can be trusted.
+        if hcd::bus_unusable() {
+            return true;
+        }
         self.slots.iter().flatten().any(|slot| match &slot.kind {
             DeviceKind::Keyboard(keyboard) => keyboard.needs_reinit(),
             DeviceKind::Mouse(mouse) => mouse.needs_reinit(),
             DeviceKind::MassStorage(_) => false,
         })
+    }
+
+    /// Removes a stale serialized Split HID if its downstream hub port was
+    /// physically disconnected or changed attachment.
+    ///
+    /// A hub-port unplug does not change root HPRT: the High-Speed hub is
+    /// still present. The first evidence is therefore the in-flight Split
+    /// transaction failing. Rebuilding the root bus at that point would
+    /// invalidate an unrelated MSC session and, on a self-powered hub, can
+    /// race a still-changing downstream status. Confirm the owning port and
+    /// drop only that slot instead. A still-connected, unchanged port is a
+    /// genuine stale session and returns `false` so the existing full-rescan
+    /// recovery remains available.
+    pub fn detach_disconnected_stale_split_hid(&mut self) -> bool {
+        let mut stale_ports = 0u16;
+        for (index, slot) in self.slots.iter().enumerate().skip(1) {
+            let Some(slot) = slot else { continue };
+            let stale_split_hid = match &slot.kind {
+                DeviceKind::Keyboard(keyboard) => {
+                    keyboard.split_poll_interval_ms().is_some() && keyboard.needs_reinit()
+                }
+                DeviceKind::Mouse(mouse) => {
+                    mouse.split_poll_interval_ms().is_some() && mouse.needs_reinit()
+                }
+                DeviceKind::MassStorage(_) => false,
+            };
+            if stale_split_hid {
+                stale_ports |= 1u16 << index;
+            }
+        }
+        if stale_ports == 0 {
+            return false;
+        }
+
+        let Some(hub) = self.hub.take() else {
+            return false;
+        };
+        let mut detached = 0u16;
+        for port in 1..=hub.port_count().min(MAX_HUB_PORTS) {
+            let bit = 1u16 << port;
+            if stale_ports & bit == 0 {
+                continue;
+            }
+            let changed_or_gone = match hub.port_status(port) {
+                Some(status) if !status.connected() => true,
+                Some(status) if status.connection_changed() => {
+                    let _ = hub.clear_port_connection_change(port);
+                    true
+                }
+                Some(_) => matches!(hub.debounce_connected_port(port), Some(false)),
+                None => false,
+            };
+            if changed_or_gone {
+                self.slots[port as usize] = None;
+                self.clear_unhandled_slot(port as usize);
+                detached |= bit;
+                uart::log_hex(b"USB: HID disconnected from hub port ", port as u32);
+            }
+        }
+        self.hub = Some(hub);
+
+        if detached != 0 {
+            self.hub_port_scan_paused = false;
+            self.hub_port_scan_failures = 0;
+            self.next_keyboard_slot = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// True if there is room for another device to be picked up by the
@@ -323,10 +476,45 @@ impl UsbHost {
                 continue;
             };
             if let DeviceKind::Keyboard(keyboard) = &mut slot.kind
+                && keyboard.split_poll_interval_ms().is_none()
                 && let Some(byte) = keyboard.poll()
             {
                 self.next_keyboard_slot = (index + 1) % SLOT_COUNT;
                 return Some(byte);
+            }
+        }
+        None
+    }
+
+    /// Fast-path interval requested by serialized keyboards behind a
+    /// High-Speed hub. Direct and Full-Speed-hub devices either use the DWC
+    /// periodic scheduler or retain the display-frame fallback and do not
+    /// participate here.
+    pub fn split_keyboard_poll_interval_ms(&self) -> Option<u64> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| match &slot.kind {
+                DeviceKind::Keyboard(keyboard) => keyboard.split_poll_interval_ms(),
+                DeviceKind::Mouse(_) | DeviceKind::MassStorage(_) => None,
+            })
+            .min()
+    }
+
+    /// Polls only serialized Split keyboards, retaining the normal
+    /// round-robin starting point used by the display-frame path.
+    pub fn poll_split_keyboards(&mut self) -> Option<Key> {
+        for offset in 0..SLOT_COUNT {
+            let index = (self.next_keyboard_slot + offset) % SLOT_COUNT;
+            let Some(slot) = self.slots[index].as_mut() else {
+                continue;
+            };
+            if let DeviceKind::Keyboard(keyboard) = &mut slot.kind
+                && keyboard.split_poll_interval_ms().is_some()
+                && let Some(key) = keyboard.poll()
+            {
+                self.next_keyboard_slot = (index + 1) % SLOT_COUNT;
+                return Some(key);
             }
         }
         None
@@ -390,20 +578,73 @@ impl UsbHost {
             uart::log(b"USB: VBUS power cycle failed at PI4IOE2\r\n");
             return false;
         }
+        // Counts towards the automatic escalation's interval as well: the
+        // rail has just been cycled, so the scan below finding nothing is
+        // not a reason to cycle it again.
+        self.last_power_recovery_ms = Some(tick::now_ms());
         self.rescan();
         true
     }
 
+    /// Wraps the scan itself in the timing the boot-time storage decision is
+    /// sized from. The measurement is three tick reads and costs nothing on
+    /// the paths that do the actual work.
     fn rescan_inner(&mut self) {
+        let start = tick::now_ms();
+        let mut timing = ScanTiming {
+            started_at_ms: start as u32,
+            ..ScanTiming::default()
+        };
+        // One failed channel recovery is worth exactly one escalation. Take
+        // it here so the flag cannot make every later scan escalate too.
+        let recovery_failed = hcd::take_bus_unusable();
+        let outcome = self.rescan_devices(&mut timing, start);
+        // A device that answers nothing after a port reset has one remedy
+        // left that software can reach: taking its power away. The same
+        // applies when a channel could not be recovered, because then it is
+        // this host, not the device, that is in an unknown state.
+        if (outcome == ScanOutcome::Unreachable || recovery_failed) && self.may_power_cycle() {
+            uart::log(b"USB: device unreachable after a port reset; power-cycling USB-A\r\n");
+            self.clear_registry();
+            if hcd::power_cycle_vbus() {
+                self.last_power_recovery_ms = Some(tick::now_ms());
+                self.rescan_devices(&mut timing, start);
+            } else {
+                uart::log(b"USB: VBUS power cycle failed at PI4IOE2\r\n");
+            }
+        }
+        timing.total_ms = milliseconds_since(start);
+        timing.mass_storage = timing.mass_storage_ms != 0;
+        self.last_scan = Some(timing);
+        if self.boot_scan.is_none() {
+            self.boot_scan = Some(timing);
+        }
+    }
+
+    /// True if enough time has passed since the last automatic power cycle.
+    fn may_power_cycle(&self) -> bool {
+        match self.last_power_recovery_ms {
+            None => true,
+            Some(previous) => tick::now_ms().saturating_sub(previous) >= POWER_RECOVERY_INTERVAL_MS,
+        }
+    }
+
+    fn rescan_devices(&mut self, timing: &mut ScanTiming, start: u64) -> ScanOutcome {
         self.clear_registry();
 
         let port = hcd::probe_port();
         self.last_probe = Some(port);
+        timing.connect_ms = port.connect_ms;
+        timing.port_enabled_ms = port.enabled_ms;
+        timing.connected = port.connected;
         if !port.enabled {
             if !port.connected {
                 self.clear_unhandled_slot(0);
+                return ScanOutcome::Empty;
             }
-            return;
+            // Connected but never enabled: the reset pulse in `probe_port`
+            // did not bring the device up.
+            return ScanOutcome::Unreachable;
         }
 
         // Nothing plugged into USB-A directly ever needs preambles or
@@ -412,11 +653,14 @@ impl UsbHost {
             protocol::enumerate_device(protocol::ROOT_DEVICE_ADDRESS, Route::default())
         else {
             uart::log(b"USB: root device enumeration failed\r\n");
-            return;
+            return ScanOutcome::Unreachable;
         };
+        timing.enumerated_ms = milliseconds_since(start);
 
         if device.device_class == hub::DEVICE_CLASS_HUB {
-            self.attach_hub(&device, port.speed);
+            if !self.attach_hub(&device, port.speed, timing, start) {
+                return ScanOutcome::Unreachable;
+            }
         } else if let Some(mut kind) = attach_class_driver(&device) {
             if matches!(kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)) {
                 if port.speed == Speed::High {
@@ -426,14 +670,19 @@ impl UsbHost {
                 }
             }
             self.clear_unhandled_slot(0);
+            let is_mass_storage = matches!(kind, DeviceKind::MassStorage(_));
             self.slots[0] = Some(Slot {
                 location: Location::Direct,
                 summary: DeviceSummary::from(&device),
                 kind,
             });
+            if is_mass_storage {
+                timing.mass_storage_ms = milliseconds_since(start);
+            }
         } else {
             self.report_unhandled_slot(0, &device);
         }
+        ScanOutcome::Answered
     }
 
     /// Opens the hub plugged into USB-A, powers its ports, and attaches
@@ -451,8 +700,19 @@ impl UsbHost {
     /// reached: a High-Speed hub relays traffic for anything slower through
     /// its Transaction Translator, while a hub running at the same speed as
     /// its devices is a plain repeater. See `route_behind_hub`.
-    fn attach_hub(&mut self, device: &EnumeratedDevice, hub_speed: Speed) {
-        let Some(hub) = Hub::open(device) else { return };
+    fn attach_hub(
+        &mut self,
+        device: &EnumeratedDevice,
+        hub_speed: Speed,
+        timing: &mut ScanTiming,
+        start: u64,
+    ) -> bool {
+        let Some(hub) = Hub::open(device) else {
+            // The hub answered its device descriptor but not its class
+            // descriptor: it is on the bus without being usable, which is
+            // the same dead end as a device that will not enumerate.
+            return false;
+        };
         self.hub_summary = Some(DeviceSummary::from(device));
         if hub.descriptor.port_count > MAX_HUB_PORTS {
             uart::log_hex(
@@ -465,10 +725,11 @@ impl UsbHost {
             // anyway: a diagnostic display still has something to show,
             // even with no ports attached.
             self.hub = Some(hub);
-            return;
+            return true;
         }
 
         let port_count = hub.port_count().min(MAX_HUB_PORTS);
+        let mut new_slots = 0u16;
         for port in 1..=port_count {
             match hub.debounce_connected_port(port) {
                 Some(true) => {}
@@ -481,11 +742,29 @@ impl UsbHost {
                     break;
                 }
             }
-            self.attach_hub_port(&hub, port, hub_speed);
+            if self.attach_hub_port(&hub, port, hub_speed) {
+                new_slots |= 1u16 << port;
+            }
+            if timing.mass_storage_ms == 0
+                && matches!(
+                    self.slots[port as usize].as_ref().map(|slot| &slot.kind),
+                    Some(DeviceKind::MassStorage(_))
+                )
+            {
+                timing.mass_storage_ms = milliseconds_since(start);
+            }
         }
+
+        // Do not arm periodic HID DMA while other already-connected ports
+        // are still being reset and enumerated. A HID on a lower-numbered
+        // port used to start channel 1 here, then channel-0 control traffic
+        // to a later port intermittently failed. A HID plugged in after the
+        // hub worked because there was no remaining enumeration traffic.
+        self.configure_new_hub_hid_slots(new_slots, hub_speed);
 
         self.hub = Some(hub);
         self.hub_speed = hub_speed;
+        true
     }
 
     /// Picks up devices plugged into hub ports that were empty last time,
@@ -512,6 +791,7 @@ impl UsbHost {
         let Some(hub) = self.hub.take() else { return };
         let hub_speed = self.hub_speed;
         let mut pause_hub_scan = false;
+        let mut new_slots = 0u16;
 
         let port_count = hub.port_count().min(MAX_HUB_PORTS);
         for port in 1..=port_count {
@@ -559,8 +839,12 @@ impl UsbHost {
                     break;
                 }
             }
-            self.attach_hub_port(&hub, port, hub_speed);
+            if self.attach_hub_port(&hub, port, hub_speed) {
+                new_slots |= 1u16 << port;
+            }
         }
+
+        self.configure_new_hub_hid_slots(new_slots, hub_speed);
 
         self.hub = Some(hub);
         if pause_hub_scan {
@@ -583,44 +867,13 @@ impl UsbHost {
     /// `attach_hub` sweep and the incremental `scan_empty_hub_ports`, so
     /// that a device found later is set up identically to one that was
     /// present at rescan time -- routing included.
-    fn attach_hub_port(&mut self, hub: &Hub, port: u8, hub_speed: Speed) {
-        let Some(status) = hub.reset_port(port) else {
-            return;
-        };
-        let address = protocol::downstream_address(port);
-        let route = route_behind_hub(hub.device_address(), port, hub_speed, status.speed());
-        if route.split.is_some() {
-            // Worth a line: this is the path that was believed impossible
-            // on this chip, and it is the first thing to look at if a
-            // device behind a High-Speed hub misbehaves.
-            uart::log(match status.speed() {
-                Speed::Low => b"USB: Low-Speed device behind a High-Speed hub" as &[u8],
-                Speed::Full => b"USB: Full-Speed device behind a High-Speed hub",
-                _ => b"USB: slower device behind a High-Speed hub",
-            });
-            uart::log_hex(b", reached with split transactions; hub port ", port as u32);
-        }
-        let Some(downstream) = protocol::enumerate_device(address, route) else {
-            uart::log_hex(
-                b"USB: enumeration failed for device on hub port ",
-                port as u32,
-            );
-            self.mark_unhandled_slot(port as usize);
-            return;
+    fn attach_hub_port(&mut self, hub: &Hub, port: u8, hub_speed: Speed) -> bool {
+        let Some(downstream) = self.enumerate_hub_port(hub, port, hub_speed) else {
+            return false;
         };
 
         match attach_class_driver(&downstream) {
-            Some(mut kind) => {
-                // A Full-Speed hub has no Transaction Translator traffic,
-                // so all of its HID endpoints may safely share descriptor
-                // DMA with the periodic scheduler. A High-Speed hub can mix
-                // these with Split transfers, whose controller-wide DMA-mode
-                // arbitration remains Stage 5 work.
-                if hub_speed != Speed::High
-                    && matches!(kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_))
-                {
-                    log_periodic_result(enable_periodic_kind(&mut kind));
-                }
+            Some(kind) => {
                 self.clear_unhandled_slot(port as usize);
                 uart::log(match kind {
                     DeviceKind::Keyboard(_) => b"USB: keyboard attached on hub port " as &[u8],
@@ -633,9 +886,125 @@ impl UsbHost {
                     summary: DeviceSummary::from(&downstream),
                     kind,
                 });
+                true
             }
-            None => self.report_unhandled_slot(port as usize, &downstream),
+            None => {
+                self.report_unhandled_slot(port as usize, &downstream);
+                false
+            }
         }
+    }
+
+    /// Chooses HID's steady-state transfer path only after the current hub
+    /// sweep has finished enumerating every occupied port. Starting a
+    /// persistent periodic channel inside `attach_hub_port` changes the
+    /// controller underneath the channel-0 control transfers still needed
+    /// by later ports. Deferring this also makes initial and hot-plug scans
+    /// use the same ordering.
+    fn configure_new_hub_hid_slots(&mut self, new_slots: u16, hub_speed: Speed) {
+        if new_slots == 0 {
+            return;
+        }
+
+        let has_mass_storage = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| matches!(slot.kind, DeviceKind::MassStorage(_)));
+        let has_hid = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
+        if hub_speed == Speed::High {
+            for (index, slot) in self.slots.iter().enumerate() {
+                if new_slots & (1u16 << index) == 0 {
+                    continue;
+                }
+                let Some(Slot {
+                    kind: DeviceKind::Keyboard(keyboard),
+                    ..
+                }) = slot
+                else {
+                    continue;
+                };
+                if let Some(interval_ms) = keyboard.split_poll_interval_ms() {
+                    uart::log_u32(
+                        b"USB HID: Split foreground poll interval ms=",
+                        interval_ms as u32,
+                    );
+                }
+            }
+        }
+        if has_mass_storage && has_hid {
+            self.serialize_hid_with_mass_storage();
+            return;
+        }
+
+        // A Full-Speed hub has no Transaction Translator traffic, so its
+        // HID endpoints may use descriptor-DMA periodic channels. A
+        // High-Speed hub can mix these with Split transfers, whose
+        // controller-wide DMA-mode arbitration remains Stage 5 work.
+        if hub_speed == Speed::High {
+            return;
+        }
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if new_slots & (1u16 << index) == 0 {
+                continue;
+            }
+            let Some(slot) = slot else { continue };
+            if matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)) {
+                log_periodic_result(enable_periodic_kind(&mut slot.kind));
+            }
+        }
+    }
+
+    /// Resets and enumerates one hub port, escalating to a port power cycle
+    /// if the device does not answer.
+    ///
+    /// The root-level VBUS cycle cannot help here. A self-powered hub keeps
+    /// its downstream ports live when USB-A's 5V goes away, so a device
+    /// wedged behind one survives every root-level recovery with its state
+    /// intact. Removing the hub port's own power is what a user does by
+    /// unplugging the device, and it is the only equivalent software has.
+    fn enumerate_hub_port(
+        &mut self,
+        hub: &Hub,
+        port: u8,
+        hub_speed: Speed,
+    ) -> Option<EnumeratedDevice> {
+        if let Some(device) = reset_and_enumerate_hub_port(hub, port, hub_speed) {
+            return Some(device);
+        }
+        uart::log_hex(
+            b"USB: enumeration failed for device on hub port ",
+            port as u32,
+        );
+
+        if !self.may_power_cycle() || !hub.supports_per_port_power() {
+            self.mark_unhandled_slot(port as usize);
+            return None;
+        }
+        uart::log_hex(b"USB: power-cycling hub port ", port as u32);
+        self.last_power_recovery_ms = Some(tick::now_ms());
+        if !hub.power_cycle_port(port) {
+            uart::log_hex(b"USB: hub port power cycle failed on port ", port as u32);
+            self.mark_unhandled_slot(port as usize);
+            return None;
+        }
+        if hub.debounce_connected_port(port) != Some(true) {
+            self.mark_unhandled_slot(port as usize);
+            return None;
+        }
+        let device = reset_and_enumerate_hub_port(hub, port, hub_speed);
+        if device.is_none() {
+            uart::log_hex(
+                b"USB: still unreachable after a port power cycle; hub port ",
+                port as u32,
+            );
+            self.mark_unhandled_slot(port as usize);
+        }
+        device
     }
 
     fn report_unhandled_slot(&mut self, slot_index: usize, device: &EnumeratedDevice) {
@@ -653,6 +1022,42 @@ impl UsbHost {
             );
         }
         log_unhandled_interfaces(device);
+    }
+
+    /// Persistent HID DMA and MSC bulk DMA share the controller's RX FIFO.
+    /// The real hardware can leave channel 0 timing out after dozens of
+    /// otherwise successful reads while an idle periodic QTD remains armed.
+    /// When both classes are present, keep all traffic serialized through
+    /// the proven channel-0 path. HID state and DATA PID are preserved; this
+    /// is not a device or bus reset.
+    fn serialize_hid_with_mass_storage(&mut self) {
+        let has_mass_storage = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| matches!(slot.kind, DeviceKind::MassStorage(_)));
+        let has_hid = self
+            .slots
+            .iter()
+            .flatten()
+            .any(|slot| matches!(slot.kind, DeviceKind::Keyboard(_) | DeviceKind::Mouse(_)));
+        if !has_mass_storage || !has_hid {
+            return;
+        }
+
+        uart::log(b"USB: MSC present, serializing HID and bulk on channel 0\r\n");
+        let all_halted = hcd::disable_periodic_hid();
+        for slot in self.slots.iter_mut().flatten() {
+            match &mut slot.kind {
+                DeviceKind::Keyboard(keyboard) => keyboard.use_frame_poll(),
+                DeviceKind::Mouse(mouse) => mouse.use_frame_poll(),
+                DeviceKind::MassStorage(_) => {}
+            }
+        }
+        if !all_halted {
+            uart::log(b"USB: periodic channel did not halt; the bus needs re-enumeration\r\n");
+            hcd::note_bus_unusable();
+        }
     }
 
     fn clear_unhandled_slot(&mut self, slot_index: usize) {
@@ -763,4 +1168,28 @@ fn log_periodic_result(channel: Option<u8>) {
     } else {
         uart::log(b"USB HID: periodic unavailable, using frame poll\r\n");
     }
+}
+
+fn milliseconds_since(start: u64) -> u32 {
+    tick::now_ms().saturating_sub(start) as u32
+}
+
+/// One reset-and-enumerate attempt on a hub port, with no recovery of its
+/// own -- `UsbHost::enumerate_hub_port` owns that decision.
+fn reset_and_enumerate_hub_port(hub: &Hub, port: u8, hub_speed: Speed) -> Option<EnumeratedDevice> {
+    let status = hub.reset_port(port)?;
+    let address = protocol::downstream_address(port);
+    let route = route_behind_hub(hub.device_address(), port, hub_speed, status.speed());
+    if route.split.is_some() {
+        // Worth a line: this is the path that was believed impossible
+        // on this chip, and it is the first thing to look at if a
+        // device behind a High-Speed hub misbehaves.
+        uart::log(match status.speed() {
+            Speed::Low => b"USB: Low-Speed device behind a High-Speed hub" as &[u8],
+            Speed::Full => b"USB: Full-Speed device behind a High-Speed hub",
+            _ => b"USB: slower device behind a High-Speed hub",
+        });
+        uart::log_hex(b", reached with split transactions; hub port ", port as u32);
+    }
+    protocol::enumerate_device(address, route)
 }

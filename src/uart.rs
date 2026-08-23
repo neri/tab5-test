@@ -59,6 +59,29 @@ pub fn log_hex(label: &[u8], value: u32) {
     write(&output);
 }
 
+/// Writes a decimal value. Register dumps stay on [`log_hex`]; this is for
+/// the measurements a human has to compare against a millisecond budget,
+/// where hexadecimal only gets in the way.
+#[inline(never)]
+#[unsafe(link_section = ".iram.text.critical.uart")]
+pub fn log_u32(label: &[u8], value: u32) {
+    // 10 digits is the widest `u32`, plus the terminating newline.
+    let mut output = [0u8; 11];
+    let mut index = output.len() - 1;
+    output[index] = b'\n';
+    let mut remaining = value;
+    loop {
+        index -= 1;
+        output[index] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    write(label);
+    write(&output[index..]);
+}
+
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.uart")]
 fn write(bytes: &[u8]) {

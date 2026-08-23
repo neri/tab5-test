@@ -58,6 +58,10 @@ const POWER_GOOD_MARGIN_MS: u16 = 50;
 /// USB2.0 requires it, but powering a bus-powered hub's ports one at a
 /// time with a pause spreads the inrush instead of stacking it.
 const PORT_POWER_INTERVAL_MS: u32 = 20;
+/// How long a port stays unpowered in `power_cycle_port`. The same second
+/// `hcd::power_cycle_vbus` uses, and for the same reason: a device has to
+/// lose its internal state, not merely blink.
+const PORT_POWER_OFF_MS: u32 = 1_000;
 /// USB2.0 TATTDB is 100ms; `hcd.rs` uses 250ms for the root port
 /// (ESP-IDF's default) and there is no reason for a hub port to be less
 /// tolerant.
@@ -436,6 +440,13 @@ impl Hub {
         self.port_feature_request(REQUEST_CLEAR_FEATURE, port, feature)
     }
 
+    /// Acknowledges a downstream connect/disconnect edge after the registry
+    /// has consumed it. Keeping the feature selector private to the hub
+    /// layer prevents registry code from depending on raw USB hub values.
+    pub fn clear_port_connection_change(&self, port: u8) -> bool {
+        self.clear_port_feature(port, FEATURE_C_PORT_CONNECTION)
+    }
+
     fn port_feature_request(&self, request: u8, port: u8, feature: u16) -> bool {
         let setup = [
             REQUEST_TYPE_HOST_TO_DEVICE_CLASS_OTHER,
@@ -476,6 +487,40 @@ impl Hub {
             // one, instead of asking a bus-powered hub to bring all of
             // them up back-to-back.
             delay_ms(PORT_POWER_INTERVAL_MS);
+        }
+        delay_ms((self.descriptor.power_on_to_power_good_ms + POWER_GOOD_MARGIN_MS) as u32);
+        true
+    }
+
+    /// Removes and restores power on one port, resetting whatever is
+    /// plugged into it.
+    ///
+    /// This is the hub-attached counterpart of `hcd::power_cycle_vbus`, and
+    /// on a self-powered hub it is the *only* one that does anything:
+    /// cutting USB-A's VBUS removes power from the hub's upstream port,
+    /// which a self-powered hub does not pass on to its downstream ports.
+    /// A device wedged behind such a hub therefore keeps its power -- and
+    /// its wedged state -- through every root-level recovery.
+    ///
+    /// Only attempted on hubs with per-port switching. A ganged hub would
+    /// take every other port down with this one, including the keyboard
+    /// somebody is typing the recovery command on.
+    /// Whether this hub can switch one port's power without touching the
+    /// others.
+    pub fn supports_per_port_power(&self) -> bool {
+        matches!(self.descriptor.power_switching(), PowerSwitching::PerPort)
+    }
+
+    pub fn power_cycle_port(&self, port: u8) -> bool {
+        if !self.supports_per_port_power() {
+            return false;
+        }
+        if !self.clear_port_feature(port, FEATURE_PORT_POWER) {
+            return false;
+        }
+        delay_ms(PORT_POWER_OFF_MS);
+        if !self.set_port_feature(port, FEATURE_PORT_POWER) {
+            return false;
         }
         delay_ms((self.descriptor.power_on_to_power_good_ms + POWER_GOOD_MARGIN_MS) as u32);
         true
@@ -551,17 +596,32 @@ impl Hub {
     /// High-Speed port the way it did while the bus was pinned to
     /// Full-Speed.
     pub fn reset_port(&self, port: u8) -> Option<PortStatus> {
+        // C_PORT_RESET may still describe a reset from before this hub's
+        // upstream link was disconnected. A self-powered hub and its
+        // downstream devices keep state across that disconnect, so clear
+        // the old completion edge before starting the reset that is meant
+        // to return this device to address 0.
+        if !self.clear_port_feature(port, FEATURE_C_PORT_RESET) {
+            uart::log(b"USB: hub CLEAR_FEATURE(C_PORT_RESET) failed\r\n");
+            return None;
+        }
         if !self.set_port_feature(port, FEATURE_PORT_RESET) {
             uart::log(b"USB: hub SET_FEATURE(PORT_RESET) failed\r\n");
             return None;
         }
 
         let mut waited_ms = 0;
+        let mut saw_reset_asserted = false;
         loop {
             let status = self.port_status(port)?;
-            // The hub signals completion by setting C_PORT_RESET and
-            // dropping PORT_RESET; either alone is enough to stop waiting.
-            if status.reset_changed() || !status.in_reset() {
+            saw_reset_asserted |= status.in_reset();
+            // C_PORT_RESET is the normative completion indication. Also
+            // accept a complete asserted->deasserted transition for hubs
+            // that fail to expose the change bit. Crucially, a first poll
+            // with PORT_RESET still clear is not completion: the hub may
+            // simply not have asserted reset yet after the SET_FEATURE
+            // status stage.
+            if status.reset_changed() || (saw_reset_asserted && !status.in_reset()) {
                 break;
             }
             if waited_ms >= PORT_RESET_TIMEOUT_MS {
@@ -572,7 +632,10 @@ impl Hub {
             waited_ms += PORT_STATUS_POLL_INTERVAL_MS;
         }
 
-        self.clear_port_feature(port, FEATURE_C_PORT_RESET);
+        if !self.clear_port_feature(port, FEATURE_C_PORT_RESET) {
+            uart::log(b"USB: hub CLEAR_FEATURE(C_PORT_RESET) failed after reset\r\n");
+            return None;
+        }
         delay_ms(PORT_RESET_RECOVERY_MS);
 
         // Re-read rather than reusing the status that ended the loop: the

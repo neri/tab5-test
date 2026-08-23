@@ -115,7 +115,10 @@ pub fn run(psram: Psram) {
     let mut net_stack: Option<net::Stack> = None;
     let mut blink_frames = 0u32;
     loop {
-        if display.wait_for_frame().is_none() {
+        if display
+            .wait_for_frame_with(|| input.service_fast())
+            .is_none()
+        {
             return;
         }
 

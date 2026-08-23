@@ -190,6 +190,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         interrupts::wait_for_interrupt();
         let next_sequence = interrupts::frame_sequence();
         if next_sequence == sequence {
+            input.service_fast();
             continue;
         }
         sequence = next_sequence;

@@ -17,7 +17,7 @@
 use crate::cardkb::CardKb;
 use crate::tab5_keyboard::Tab5Keyboard;
 use crate::touch::{Touch, TouchPoint as DriverTouchPoint};
-use crate::{interrupts, uart, usb};
+use crate::{interrupts, tick, uart, usb};
 
 const CARDKB_RECONNECT_FRAMES: u32 = 60;
 const TAB5_KEYBOARD_RECONNECT_FRAMES: u32 = 60;
@@ -25,6 +25,42 @@ const TAB5_KEYBOARD_HEALTH_CHECK_FRAMES: u32 = 60;
 const TOUCH_RECONNECT_FRAMES: u32 = 60;
 const HUB_PORT_SCAN_FRAMES: u32 = 60;
 const ROOT_RESCAN_FRAMES: u32 = 300;
+const PENDING_KEY_EVENTS: usize = 16;
+/// Frame gap enforced between two rescans caused by a stale device session,
+/// multiplied by how many have happened in a row.
+///
+/// A rescan resets the whole bus. A device that fails immediately after
+/// being attached therefore produces a loop -- attach, fail, reset, attach
+/// -- that takes every *other* device on the bus down with it several times
+/// a second, which is how one misbehaving keyboard makes mass storage
+/// unusable. Backing off leaves the working devices alone between attempts.
+const STALE_RESCAN_BACKOFF_FRAMES: u32 = 60;
+/// Upper bound on that gap, about ten seconds at the panel's 57.3 Hz.
+const STALE_RESCAN_BACKOFF_MAX_FRAMES: u32 = 600;
+/// Frames a session must survive before the backoff is considered recovered.
+const STALE_RESCAN_SETTLED_FRAMES: u32 = 600;
+/// Root-port connect wait for the one scan run during boot.
+///
+/// The steady-state limit (`usb::connect_wait_ms`) is short because the frame
+/// loop blocks on every periodic re-probe of an empty port. The initial scan
+/// is different: it decides whether the firmware comes up with USB mass
+/// storage as its filesystem, and a device that had no VBUS until this scan
+/// started may still be powering up.
+///
+/// Measured worst case on this hardware is 246 ms, of which about 80 ms is
+/// `probe_port`'s own fixed VBUS-settle and core bring-up. Four times that
+/// leaves room for a slower device without making the boot that has nothing
+/// plugged in -- the only boot that spends this whole budget -- wait more
+/// than about a second. See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
+const BOOT_CONNECT_WAIT_MS: u32 = 1_000;
+/// TEST UNIT READY budget for the boot-time storage probe.
+///
+/// The slowest device measured answered its first TEST UNIT READY after
+/// 2,564 ms -- in a single command, not by being polled, so this budget is
+/// checked between commands rather than interrupting one. A device that
+/// never becomes ready (a card reader with no card) is what the budget is
+/// actually for: it answers "not ready" every 110 ms indefinitely.
+const BOOT_MASS_STORAGE_READY_MS: u32 = 4_000;
 const MAX_TOUCH_POINTS: usize = 10;
 
 /// A normalized key understood by application-level input consumers.
@@ -103,7 +139,19 @@ pub struct InputManager {
     primary_touch_id: Option<u8>,
     usb_host: usb::UsbHost,
     usb_reconnect_frames: u32,
+    /// Rescans caused by a stale session with no settled interval between
+    /// them, and the frames still to wait before the next one.
+    usb_stale_rescans: u32,
+    usb_stale_backoff_frames: u32,
+    usb_frames_since_stale: u32,
     next_source: KeySource,
+    /// Split HID is serviced from the 1kHz tick between display frames. Its
+    /// events wait here until the application consumes them at its normal
+    /// frame boundary.
+    pending_key_events: [Option<KeyEvent>; PENDING_KEY_EVENTS],
+    pending_key_head: usize,
+    pending_key_len: usize,
+    usb_split_poll_due_ms: u64,
 }
 
 impl InputManager {
@@ -142,8 +190,12 @@ impl InputManager {
 
         let mut usb_host = usb::UsbHost::new();
         uart::log(b"USB ENUM: bounded retry v9\r\n");
+        uart::log(b"USB STABILITY: phase-aligned split HID v24\r\n");
+        let steady_state_connect_wait = usb::set_connect_wait_ms(BOOT_CONNECT_WAIT_MS);
         usb_host.rescan();
+        usb::set_connect_wait_ms(steady_state_connect_wait);
         uart::log(b"USB: initial scan complete\r\n");
+        log_boot_usb_timing(&mut usb_host);
 
         Self {
             cardkb,
@@ -156,12 +208,53 @@ impl InputManager {
             primary_touch_id: None,
             usb_host,
             usb_reconnect_frames: 0,
+            usb_stale_rescans: 0,
+            usb_stale_backoff_frames: 0,
+            usb_frames_since_stale: 0,
             next_source: KeySource::CardKb,
+            pending_key_events: [None; PENDING_KEY_EVENTS],
+            pending_key_head: 0,
+            pending_key_len: 0,
+            usb_split_poll_due_ms: tick::now_ms(),
+        }
+    }
+
+    /// Services serialized Split keyboards at their descriptor's
+    /// `bInterval`, independently of the panel's ~57Hz frame boundary.
+    ///
+    /// The 1kHz SYSTIMER already wakes foreground `wfi` loops. Callers invoke
+    /// this only for non-frame wakeups, so it adds no timer and never performs
+    /// connection scans or I2C work. A received key is queued for the next
+    /// ordinary `poll_key` call.
+    pub fn service_fast(&mut self) {
+        let Some(interval_ms) = self.usb_host.split_keyboard_poll_interval_ms() else {
+            self.usb_split_poll_due_ms = tick::now_ms();
+            return;
+        };
+        let now_ms = tick::now_ms();
+        if now_ms < self.usb_split_poll_due_ms {
+            return;
+        }
+        self.usb_split_poll_due_ms = now_ms.saturating_add(interval_ms.max(1));
+        if let Some(key) = self.usb_host.poll_split_keyboards() {
+            self.push_pending_key(KeyEvent {
+                source: KeySource::Usb,
+                key,
+            });
         }
     }
 
     /// Advances I2C-keyboard reconnection and USB device-discovery state.
     pub fn service(&mut self) {
+        // A bus that has been quiet for a while has recovered, so the next
+        // isolated failure is treated as a first one again rather than
+        // inheriting an old backoff.
+        self.usb_frames_since_stale = self.usb_frames_since_stale.saturating_add(1);
+        if self.usb_frames_since_stale >= STALE_RESCAN_SETTLED_FRAMES && self.usb_stale_rescans != 0
+        {
+            self.usb_stale_rescans = 0;
+            self.usb_stale_backoff_frames = 0;
+        }
         if self.cardkb.is_none() {
             self.cardkb_reconnect_frames += 1;
             if self.cardkb_reconnect_frames == CARDKB_RECONNECT_FRAMES {
@@ -228,9 +321,12 @@ impl InputManager {
             self.usb_host.rescan();
             self.usb_reconnect_frames = 0;
         } else if self.usb_host.needs_reinit() {
-            uart::log(b"USB: a device session went stale, rescanning...\r\n");
-            self.usb_host.rescan();
-            self.usb_reconnect_frames = 0;
+            if self.usb_host.detach_disconnected_stale_split_hid() {
+                self.clear_pending_keys();
+                self.usb_reconnect_frames = 0;
+            } else {
+                self.rescan_stale_session();
+            }
         }
 
         if self.usb_host.has_room() {
@@ -247,9 +343,42 @@ impl InputManager {
         }
     }
 
+    /// Rescans after a device session went stale, backing off when that keeps
+    /// happening.
+    ///
+    /// The first stale session is rescanned at once: that is the ordinary
+    /// case of a device that was unplugged mid-transfer, and waiting would
+    /// only make the keyboard feel broken. Repeats are different -- a device
+    /// that fails again the moment it is attached will do so forever, and
+    /// each attempt resets the bus underneath every working device.
+    fn rescan_stale_session(&mut self) {
+        if self.usb_stale_backoff_frames > 0 {
+            self.usb_stale_backoff_frames -= 1;
+            return;
+        }
+        uart::log(b"USB: a device session went stale, rescanning...\r\n");
+        self.usb_host.rescan();
+        self.usb_reconnect_frames = 0;
+        self.usb_stale_rescans = self.usb_stale_rescans.saturating_add(1);
+        self.usb_frames_since_stale = 0;
+        if self.usb_stale_rescans > 1 {
+            self.usb_stale_backoff_frames = (STALE_RESCAN_BACKOFF_FRAMES
+                * (self.usb_stale_rescans - 1))
+                .min(STALE_RESCAN_BACKOFF_MAX_FRAMES);
+            uart::log_u32(
+                b"USB: repeated stale sessions, next rescan in frames=",
+                self.usb_stale_backoff_frames,
+            );
+        }
+    }
+
     /// Returns at most one key, rotating the source checked first after every
     /// delivered key so a continuously active source cannot starve the others.
     pub fn poll_key(&mut self) -> Option<KeyEvent> {
+        if let Some(event) = self.pop_pending_key() {
+            self.next_source = source_after(event.source);
+            return Some(event);
+        }
         let first = self.next_source;
         let second = source_after(first);
         for source in [first, second, source_after(second)] {
@@ -283,6 +412,31 @@ impl InputManager {
         None
     }
 
+    fn push_pending_key(&mut self, event: KeyEvent) {
+        if self.pending_key_len == PENDING_KEY_EVENTS {
+            return;
+        }
+        let tail = (self.pending_key_head + self.pending_key_len) % PENDING_KEY_EVENTS;
+        self.pending_key_events[tail] = Some(event);
+        self.pending_key_len += 1;
+    }
+
+    fn pop_pending_key(&mut self) -> Option<KeyEvent> {
+        if self.pending_key_len == 0 {
+            return None;
+        }
+        let event = self.pending_key_events[self.pending_key_head].take();
+        self.pending_key_head = (self.pending_key_head + 1) % PENDING_KEY_EVENTS;
+        self.pending_key_len -= 1;
+        event
+    }
+
+    fn clear_pending_keys(&mut self) {
+        self.pending_key_events = [None; PENDING_KEY_EVENTS];
+        self.pending_key_head = 0;
+        self.pending_key_len = 0;
+    }
+
     /// Blocks until any key arrives, servicing input sources once per frame.
     ///
     /// The full-screen modes end this way, so the pairing of `service` and
@@ -297,6 +451,7 @@ impl InputManager {
             interrupts::wait_for_interrupt();
             let next_sequence = interrupts::frame_sequence();
             if next_sequence == sequence {
+                self.service_fast();
                 continue;
             }
             sequence = next_sequence;
@@ -398,6 +553,62 @@ impl InputManager {
     /// Mutable USB bus registry for commands such as `usbrescan` and MSC I/O.
     pub fn usb_host_mut(&mut self) -> &mut usb::UsbHost {
         &mut self.usb_host
+    }
+}
+
+/// Reports how long the boot scan took to reach a mass-storage device that
+/// could actually be read, one UART line per step.
+///
+/// This is the measurement the boot-time filesystem choice is sized from: it
+/// has to wait for USB before falling back to another medium, and the wait is
+/// only defensible if the numbers behind it came from real devices. The three
+/// SCSI commands it ends with are the same ones a filesystem probe issues, so
+/// they cost the boot path nothing it would not spend anyway.
+fn log_boot_usb_timing(usb_host: &mut usb::UsbHost) {
+    let Some(timing) = usb_host.boot_scan_timing().copied() else {
+        return;
+    };
+    uart::log_u32(b"USB BOOT: scan began at uptime ms=", timing.started_at_ms);
+    if !timing.connected {
+        // The connect wait is spent in full here, and this is the only path
+        // that spends it: the cost a boot with nothing plugged into USB-A
+        // pays for the storage decision. It belongs in the log for exactly
+        // the same reason the successful path's total does.
+        uart::log_u32(b"USB BOOT: scan total ms=", timing.total_ms);
+        uart::log(b"USB BOOT: no device on USB-A during the initial scan\r\n");
+        return;
+    }
+    uart::log_u32(b"USB BOOT: root connect ms=", timing.connect_ms);
+    uart::log_u32(b"USB BOOT: port enabled ms=", timing.port_enabled_ms);
+    uart::log_u32(b"USB BOOT: root enumerated ms=", timing.enumerated_ms);
+    uart::log_u32(b"USB BOOT: scan total ms=", timing.total_ms);
+
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        uart::log(b"USB BOOT: initial scan found no mass storage\r\n");
+        return;
+    };
+    uart::log_u32(
+        b"USB BOOT: mass storage attached ms=",
+        timing.mass_storage_ms,
+    );
+    let ready = mass_storage.measure_ready_and_first_read(BOOT_MASS_STORAGE_READY_MS);
+    uart::log_u32(b"USB BOOT: unit ready ms=", ready.ready_ms);
+    uart::log_u32(b"USB BOOT: unit ready attempts=", ready.attempts);
+    uart::log_u32(b"USB BOOT: read capacity ms=", ready.capacity_ms);
+    uart::log_u32(b"USB BOOT: first LBA 0 read ms=", ready.first_read_ms);
+    match ready.outcome {
+        usb::ReadyOutcome::Usable => uart::log_u32(
+            b"USB BOOT: usable from VBUS on, total ms=",
+            timing.total_ms.saturating_add(ready.first_read_ms),
+        ),
+        // Distinct from the timeout below on purpose: this device answered
+        // every command correctly and simply has nothing in it, so a boot
+        // that needs a filesystem should move on to the next medium rather
+        // than treat the USB path as broken.
+        usb::ReadyOutcome::NoMedium => {
+            uart::log(b"USB BOOT: mass storage has no medium, not usable\r\n")
+        }
+        _ => uart::log(b"USB BOOT: mass storage did not become readable\r\n"),
     }
 }
 

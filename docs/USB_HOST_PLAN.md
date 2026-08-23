@@ -671,10 +671,34 @@ Scatter/Gather DMAモードにはperiodic frame listがあり、xHCIと同じく
 - LS＋PRE＋periodicという組み合わせはESP-IDFに前例が無い（Stage 4-4で
   踏んだPHYビットと同種の未知が残っている可能性がある）
 
-## Stage 6: Split Transaction対応（HSハブ配下のFS/LSデバイス）✅ 実機確認済み
+## Stage 6: Split Transaction対応（HSハブ配下のFS/LSデバイス）✅ 新ハブでもHID確認済み
 
 Stage 4で「ハードウェア制限により対応不可能」と結論した項目である。この結論は
 誤りだった。
+
+> 2026-08-23追補: 下記の旧ハブ実績とは別のHigh-Speedハブ＋Low-Speed HIDで、列挙controlが
+> `HCINT=0x82`（XactErr＋ChHltd）になった。旧実装はSSPLITのACK直後にCSPLITを同じmicroframeへ
+> 即再投入していた。第19版はSSPLITをmicroframe 0〜5、最初のCSPLITを2 microframe後、NYET後を
+> 1 microframe後へ配置した。これで列挙とkeyboard attachは成功したが、最初のInterrupt INの
+> CSPLITが同じ`0x82`になった。直結fallback用の`HCCHAR.EPType=BULK`がSplit tokenにも入り、TTへ
+> 実際と異なるendpoint typeを伝えていたため、第20版はSplit HIDだけを`EPType=INTR`へ戻した。
+> これで文字入力は通ったが、idle CSPLITのNYETを非周期転送と同じく最大5000 round追い続け、
+> `giving up mid-split`と長いfreezeを繰り返した。第21版はInterrupt SplitのCSPLITを同一full frame内の
+> 最大3回に制限し、窓切れを通常のidle poll終了として扱う。実機ではエラーとfreezeが消えたが、
+> 描画frameと同じ約57 Hzでしかpollせず反応が鈍かった。第22版は既存1 kHz tickの非描画wakeから
+> descriptorの`bInterval` msごとにSplit keyboardをpollし、key queueをframe側で消費する。
+> 実機では50,661 packet／202,076 roundをエラー、freeze、mode conflict、stale token、port event
+> なしで処理し、文字入力の反応も正常になった。一方、HID抜去時はroot HPRTが変化しないため
+> `XACTERR`からroot rescanへ進み、変化中のportを古い接続状態で再attachして認識不能になった。
+> 第23版はstale Split HIDのport statusを先に確認し、該当slotだけを破棄してMSCを維持する。
+> 抜去／再挿入は実機確認できたが、通常入力は145,394 packet／436,167 round（ほぼ3 round/poll）で
+> 取りこぼしが多かった。1ms tickがUSB SOFと固定位相になり、遅いmicroframeから開始し続けることと、
+> idle CSPLIT NAK後に同じ窓でSSPLITを再開することが原因。第24版はSSPLITを次のmicroframe 0へ揃え、
+> periodic NAKをそのpollの正常終了として扱う。さらにLow-Speed Interruptの規格最小値10msを適用し、
+> このdeviceが返す不正な`bInterval=1`による毎full-frameのTT占有を止める。実機では入力が安定し、
+> エラーログなし、10秒静止時のSplit packet増加が約1,000回（約100 packet/秒）になった。
+> 同じハブへHigh-Speed MSCを追加した`ut 100`も100/100、retry 0、予防再同期6回でPASSし、
+> Split conflict 0、active 0、stale token 0、port eventなしを確認した。
 
 ### 調査: Espressifの資料は全て誤り、シリコンが正しい
 
@@ -729,17 +753,21 @@ HCSPLT ch0: wrote 0xFFFFFFFF -> 0x8001FFFF; wrote 0x12345678 -> 0x00005678
   LSかつsplitは同時に成立するため独立した2フィールドにしてある
 - `hcd::await_packet`: SSPLIT → ACK/NYETならCSPLIT → NAKならSSPLITから
   やり直し、という状態機械。ラウンド数の上限は用途別に呼び出し側が渡す
-  （`CONTROL_SPLIT_ROUNDS`=512 / `INTERRUPT_POLL_SPLIT_ROUNDS`=1 /
+  （`CONTROL_SPLIT_ROUNDS`=512 / `INTERRUPT_POLL_SPLIT_ROUNDS`=4 /
   `BULK_SPLIT_ROUNDS`=20000）。splitではNAKリトライがハードウェアから
   ソフトウェア側に移るため、フレーム予算との兼ね合いを呼び出し側が決める。
-  この上限は**ソフト予算**であり、到達した瞬間ではなく「到達以降で最初に
-  訪れた安全な境界」で離脱する（罠3を参照）。したがって
-  `INTERRUPT_POLL_SPLIT_ROUNDS = 1`は「1回だけ聞いてNAKなら諦める」を意味する
+  Control／Bulkの上限は**ソフト予算**であり、到達した瞬間ではなく「到達以降で最初に
+  訪れた安全な境界」で離脱する（罠3を参照）。Interruptは周期転送の例外で、1 High-Speed
+  full frameにSSPLIT 1回＋CSPLIT最大3回を配置し、最後までNYETなら次のfull-frame境界で
+  transaction windowが失効した後に通常のidle timeoutとして離脱する
 - `registry::route_behind_hub`: ハブの動作速度とポートが報告したデバイス速度を
   比較して`Route`を決める
 - `hub::Hub::reset_port`: HSポートの拒否を撤去（速度差はsplitで扱えるため）
 - `FORCE_FS_LS_ONLY_HOST`は`false`が既定。定数自体は特定のハブのTTが
   怪しいときのフォールバックとして残す
+- Split keyboardはdescriptorの`bInterval`をms単位で保持し、1 kHz SYSTIMERで起きた非描画wakeから
+  前景でpollする。受信keyは`InputManager`の16 event queueへ入り、アプリは従来どおりframe境界で
+  取り出す。接続保守、I2C input、描画は高速pathへ移さない
 
 ### 実測した1回のsplitの流れ
 
@@ -764,6 +792,9 @@ Stage 7で定期`rescan()`をやめるまで、**この2つはどちらも隠れ
    抱えたままになる（USB2.0 11.17はNYET以外の応答が返るまでcomplete splitを
    続けることを要求している）。`max_split_rounds`は**ソフト予算**とし、安全な
    境界（NAK = TTがバッファを解放した時点）以降でしか離脱しないようにした。
+   ただし周期Interruptは例外で、scheduled CSPLIT windowが終わればtransaction自体が
+   full-frame境界で失効する。第20版はこの差を扱わず、idle HIDのNYETをhard capの5000 roundまで
+   追ってfreezeした。第21版は同一full frameのCSPLIT窓だけを使い、境界を待って正常終了する。
 4. **停止済みチャネルに`HCCHAR.ChDis`を書いてはいけない。** これが実際の
    原因だった。安全境界で離脱した時点でチャネルは既にhalt済みなので
    `force_halt_channel()`は無害なno-opのつもりだったが、**停止済みチャネルは

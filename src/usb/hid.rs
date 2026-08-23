@@ -15,7 +15,9 @@
 //! transfers and directly on `hcd.rs` for the Interrupt IN polling, which
 //! is not a control transfer and so does not go through `protocol.rs`.
 
-use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_BULK, PacketOutcome, Route};
+use super::hcd::{
+    self, CompletionWait, Endpoint, HCCHAR_EPTYPE_BULK, HCCHAR_EPTYPE_INTR, PacketOutcome, Route,
+};
 use super::protocol::{self, EnumeratedDevice, REQUEST_SET_CONFIGURATION};
 use crate::uart;
 
@@ -47,17 +49,17 @@ const INTERRUPT_POLL_TIMEOUT_ITERATIONS: u32 = 50_000;
 /// How many SSPLIT/CSPLIT round trips one poll of a device behind a
 /// High-Speed hub's TT may take (`hcd::run_packet`'s `max_split_rounds`).
 ///
-/// One attempt per poll. `hcd::run_packet`'s budget is a soft one -- it
-/// stops at the first *safe* boundary at or after this many rounds, never
-/// mid-handshake -- so 1 means "run the split through to its first NAK and
-/// stop there", which is exactly one question asked of the device.
+/// One SSPLIT plus up to three CSPLIT result checks per poll. Interrupt
+/// splits have a bounded scheduling window inside one High-Speed full frame;
+/// if all three checks return NYET, the HCD waits for that window to expire
+/// and reports the poll as ordinary "no input".
 ///
 /// That is the right shape for per-frame polling: an idle boot device NAKs
 /// (`SET_IDLE(0)` means it reports only on change), and the frame loop is
 /// back in ~17.5ms to ask again. Retrying harder inside one frame would
 /// spend the display's budget waiting on a device that has already said it
 /// has nothing.
-const INTERRUPT_POLL_SPLIT_ROUNDS: u32 = 1;
+const INTERRUPT_POLL_SPLIT_ROUNDS: u32 = 4;
 
 // Consecutive *hard* transaction errors (STALL/XACTERR/BBLERR/
 // XCS_XACT_ERR; see `PacketOutcome::Error`), not plain NAK timeouts --
@@ -68,6 +70,11 @@ const INTERRUPT_POLL_SPLIT_ROUNDS: u32 = 1;
 // small threshold is enough since real errors, unlike timeouts, resolve
 // quickly. See `InterruptIn::needs_reinit`.
 const POLL_FAILURE_GIVE_UP_THRESHOLD: u32 = 10;
+/// USB2.0 5.7.4: Low-Speed interrupt endpoints may request 10-255ms.
+/// Some devices put 1 in the descriptor as if they were Full-Speed; driving
+/// that literally through a TT consumes every full frame and is not a legal
+/// Low-Speed schedule.
+const LOW_SPEED_INTERRUPT_MIN_INTERVAL_MS: u8 = 10;
 
 /// A HID Boot Protocol interface and the Interrupt IN endpoint that
 /// carries its reports, as found in a configuration descriptor.
@@ -207,11 +214,31 @@ pub struct InterruptIn {
 
 impl InterruptIn {
     pub fn new(device_address: u8, route: Route, interface: &BootInterface) -> Self {
+        let interval = if route.low_speed_via_hub {
+            if interface.interval < LOW_SPEED_INTERRUPT_MIN_INTERVAL_MS {
+                uart::log_hex(
+                    b"USB HID: invalid Low-Speed bInterval, descriptor=",
+                    interface.interval as u32,
+                );
+            }
+            interface.interval.max(LOW_SPEED_INTERRUPT_MIN_INTERVAL_MS)
+        } else {
+            interface.interval.max(1)
+        };
         Self {
             endpoint: Endpoint {
                 device_address,
                 endpoint_number: interface.endpoint_address & 0x0F,
-                endpoint_type: HCCHAR_EPTYPE_BULK,
+                // A direct/Full-Speed fallback uses BULK classification so
+                // manual channel-0 polling does not depend on the periodic
+                // scheduler. A Split token, however, carries endpoint type
+                // to the hub's TT; calling an Interrupt endpoint Bulk makes
+                // stricter hubs reject its CSPLIT with XactErr.
+                endpoint_type: if route.split.is_some() {
+                    HCCHAR_EPTYPE_INTR
+                } else {
+                    HCCHAR_EPTYPE_BULK
+                },
                 mps: interface.max_packet_size,
                 is_in: true,
                 route,
@@ -219,7 +246,7 @@ impl InterruptIn {
             // Every endpoint's data toggle resets to DATA0 on
             // SET_CONFIGURATION (USB2.0 9.4.5).
             next_pid_data1: false,
-            interval: interface.interval.max(1),
+            interval,
             periodic: None,
             consecutive_hard_errors: 0,
         }
@@ -231,6 +258,16 @@ impl InterruptIn {
     /// device answers with a short packet anyway.
     pub fn max_packet_size(&self) -> usize {
         self.endpoint.mps as usize
+    }
+
+    /// Millisecond polling interval for a serialized Interrupt Split.
+    ///
+    /// Full/Low-Speed interrupt endpoints express `bInterval` in 1ms
+    /// frames. Direct endpoints promoted to persistent periodic DMA need no
+    /// foreground timer; only the High-Speed-hub Split fallback uses this.
+    pub fn split_poll_interval_ms(&self) -> Option<u64> {
+        (self.periodic.is_none() && self.endpoint.route.split.is_some())
+            .then_some(self.interval.max(1) as u64)
     }
 
     /// Exercises the controller's periodic frame-list path on channel 1.
@@ -268,6 +305,21 @@ impl InterruptIn {
         }
         self.periodic = hcd::enable_periodic_hid(&self.endpoint, self.interval);
         self.periodic.map(hcd::PeriodicHandle::channel)
+    }
+
+    /// Leaves persistent periodic DMA and resumes the original serialized
+    /// channel-0 polling path without resetting the device. The HCD keeps
+    /// the next DATA PID across the transition, including a report that
+    /// completed while the periodic channel was being halted.
+    pub fn use_frame_poll(&mut self) {
+        let Some(handle) = self.periodic.take() else {
+            return;
+        };
+        if let Some(next_pid_data1) = hcd::periodic_hid_fallback_pid(handle) {
+            self.next_pid_data1 = next_pid_data1;
+        } else {
+            self.consecutive_hard_errors = POLL_FAILURE_GIVE_UP_THRESHOLD;
+        }
     }
 
     /// True once polling has failed for long enough that the session

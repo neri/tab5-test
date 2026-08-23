@@ -147,15 +147,25 @@ impl Display {
         true
     }
 
-    /// Waits for the next frame boundary. Returns `None` after a DMA error,
-    /// which has already been logged.
-    pub fn wait_for_frame(&mut self) -> Option<()> {
+    /// Waits for the next frame while letting foreground service non-display
+    /// interrupts (notably the 1kHz tick used by serialized Split HID).
+    /// Returns `None` after a DMA error, which has already been logged.
+    pub fn wait_for_frame_with<F>(&mut self, mut service_non_frame: F) -> Option<()>
+    where
+        F: FnMut(),
+    {
         loop {
             let error = interrupts::dma_error();
             if error != 0 {
                 uart::log_hex(b"LCD: DMA interrupt error=", error);
                 self.dma.log_status();
                 return None;
+            }
+            let next_sequence = interrupts::frame_sequence();
+            if next_sequence != self.sequence {
+                self.sequence = next_sequence;
+                self.poll_underrun();
+                return Some(());
             }
             interrupts::wait_for_interrupt();
             let error = interrupts::dma_error();
@@ -170,6 +180,7 @@ impl Display {
                 self.poll_underrun();
                 return Some(());
             }
+            service_non_frame();
         }
     }
 

@@ -75,7 +75,8 @@ BLACK/REDです。通常のproduction設定だけを100回確認するときは`
 結果の`usb retries: packet=... command=...`はそれぞれ同一BOT phase内のQTD再投入回数と、
 BOT Reset Recovery後のREAD(10)再送回数です。複合試験前にUSBだけを短く確認する場合は`ut`を
 実行します。既定で同じ4 KiBを100回read・比較し、`completed`、transport `failures`、data
-`mismatch`に加え、`packet_retries`と`command_retries`を表示します。
+`mismatch`に加え、`packet_retries`、`command_retries`、`proactive_resyncs`を表示します。
+最後の値は、応答が止まる前にBOT command境界を再同期できた回数です。
 
 `mix`の結果には`rescans=...`も表示します。BOT ResetのEP0 recoveryまで失敗したときだけroot
 portをreset・再列挙し、再接続したMSCから同じread-only 4 KiBを取得します。開始時の基準dataと
@@ -150,6 +151,63 @@ USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::re
 Hub portのdevice descriptor取得に失敗した場合、通常の増分スキャンは同じ物理接続を保留して
 接続状態だけquietに監視します。約1秒ごとにport reset／列挙エラーを出し続けることはなく、抜き差し
 または明示的なfull rescanでだけ再試行します。第9版は起動時に`USB ENUM: bounded retry v9`を出します。
+1 packet QTD、BOT予防再同期、周期SSPLITの位相合わせを組み合わせた修正版は続けて
+`USB STABILITY: phase-aligned split HID v24`を出します。両classが同じbusへ登録されると
+`USB: MSC present, serializing HID and bulk on channel 0`が続きます。
+
+起動時の初回スキャンは、各段階の所要時間を10進ミリ秒で出します。`USB BOOT: root connect ms=`
+以降`scan total ms=`まではVBUSを入れた時点が起点で、USB MSCが見つかった場合は続けて
+`USB BOOT: unit ready ms=`／`unit ready attempts=`／`read capacity ms=`／`first LBA 0 read ms=`
+（最初のSCSIコマンドが起点）と、両者を足した`USB BOOT: usable from VBUS on, total ms=`が出ます。
+読めなかった場合は、メディアが無いと分かったときだけ
+`USB BOOT: mass storage has no medium, not usable`（REQUEST SENSEのASC `0x3A`による即断）、
+それ以外は`USB BOOT: mass storage did not become readable`になります。
+デバイスが無い起動では`USB BOOT: scan total ms=`と
+`USB BOOT: no device on USB-A during the initial scan`の2行になります（この経路だけが
+connect待ちの上限を使い切るので、その長さがUSBストレージを使わない起動のコストです）。
+これは起動時にUSB MSCを最優先のファイルシステムにするための待ち時間を実測で決めるためのもので、
+`usbmargin`が同じ計測をVBUSの再投入で繰り返します
+（[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)）。
+
+転送失敗時のpacket errorログには、`USB:   HCINT=`／`HCCHAR=`／`HCTSIZ=`／転送済みbyte数と
+HPRT／HFNUMが続きます。QTD status 1はCRC・transaction timeout・stuffing・false EOP・
+excessive NAKをまとめた値なので、HCINTのXactErr（bit 7）やChHltd（bit 1）で
+「デバイスが無応答」と「トランザクションが壊れた」を区別するために使います。BOT層の失敗は
+`USB BOT: bulk IN packet retries exhausted during CSW`のように**どの段階**
+（`CBW`／`data OUT`／`data IN`／`CSW`）で落ちたかを出します。
+
+packet errorのログには`USB:   port now:`（connected／enabled／powered／OVER-CURRENT）と
+`USB:   port since bus came up:`（OVER-CURRENT／connect-change／enable-change）が続きます。
+後者は**ISRがクリアしてしまうHPRTの変化ビットをラッチしたもの**で、
+ポートがenableされた時点から次にenableされるまで保持されます。`usbhw`でも同じ内容を確認できます。
+デバイスが電力不足で落ちたのかプロトコル上応答しないだけなのかは、ここで切り分けます
+（[`USB.md`](USB.md)の「電力問題の切り分け」）。
+
+`USB HID: periodic channel stalled, channel=N`は、Interrupt INのチャネルを
+コアが面倒を見なくなった（`HCCHAR.ChEna`が落ちた）状態の検出です。続けてHCCHAR／HCINT／
+HCINTMSK／HAINTMSK／HCFGとport状態を出し、そのHIDを再列挙へ送ります。これが無いと
+キーも来ずログも出ずデバイスだけ`usbinfo`に残ります。
+
+`USB BOT: session is unusable, skipping commands until re-enumeration`は、壊れたMSC sessionへ
+BOTコマンドを送らずに失敗させている状態です。HIDはそのまま維持し、`usbrescan`を明示的に
+実行したときだけ全バスを再列挙します。
+ハブ配下のデバイスが列挙できない場合は`USB: power-cycling hub port N`が出ます。
+セルフパワーハブでは`power-cycling USB-A`が下流ポートに届かないためです。
+
+stale sessionによる再列挙が連続する場合は
+`USB: repeated stale sessions, next rescan in frames=`を出してバックオフします。
+再列挙はバス全体をリセットするため、attach直後に必ず失敗するデバイスがあると
+正常なデバイスまで巻き添えで落とし続けるためです。
+
+チャネル0をhaltできなかった場合の`USB: channel 0 did not halt; the bus needs re-enumeration`だけが
+controller全体の「バス使用不能」を記録し、次のフレーム境界で自動的に再列挙します。
+class driverの復帰手順が失敗した場合の`USB BOT: reset recovery failed; this session needs
+re-enumeration`と、回復が2回続けて効かなかった場合の`USB BOT: recovery is not holding; this
+session needs re-enumeration`はMSC sessionだけを停止し、HIDを巻き込む自動再列挙は行いません。
+`reset recovery complete`が出ていても回復したとは限りません（control転送が通っただけで
+bulkが動かない状態があり、その検出が2回連続判定です）。それでもデバイスが応答しない場合は
+`USB: device unreachable after a port reset; power-cycling USB-A`を出してVBUSを1秒切ります
+（30秒に1回まで）。詳細は[`USB.md`](USB.md)の「転送失敗からの自動復帰」を参照してください。
 
 Bulk転送が応答しなかった場合、HCD共通ログは`USB: packet timed out waiting for channel halt`、
 BOT層は方向別に`USB BOT: bulk IN timed out`等を出します。以前のHCDログはBulk失敗でも
@@ -157,15 +215,23 @@ BOT層は方向別に`USB BOT: bulk IN timed out`等を出します。以前のH
 Recoveryできれば、続けて`USB BOT: reset recovery complete`と
 `USB MSC: retrying READ(10) after BOT recovery`が出ます。Recovery自体が完了しなければ
 `reset recovery failed`となり、READ(10)の1回再送も失敗した場合は呼び出し元へ失敗を返します。
-Bulk QTDは約1秒ごとにhaltして残量を回収し、同じDATA PID／未受信suffixで最大4回再投入します。
+Bulk QTDは1 packetに限定し、約1秒でhaltしなければ同じDATA PIDで最大4回再投入します。
 合計約5秒で応答しなければBOT Resetへ進みます。BOT ResetのIN statusを含むcontrol packetは約1秒で、
 いずれもCPU周波数からiteration数を算出します。`packet_retries`にはstatus 1とtimeoutの両方による
 QTD再投入を数えます。
 `USB: transfer QTD packet error, status=0x00000001`は、ESP-IDFと同じQTD定義でCRC、transaction
 timeout、stuff、false EOP、excessive NAKのいずれかです。BOT層は1 packet QTDならtoggleを
-進めず同一packetを50 ms間隔で最大20回まで再送します。複数packetのBulk IN QTDならdescriptor
-残量から正常受信済みの完全MPS packet数と次のDATA PIDを復元し、未受信suffixだけを再投入します。
-成功した再投入は`packet_retries`へ数えます。4 KiB READ(10)の正常なBulk INは1 QTDです。
+進めず同一packetを50 ms間隔で最大20回まで再送します。4 KiB READ(10)もendpoint MPS単位の
+QTDへ分割し、各完了後にsoftwareが次のDATA PIDを決めます。成功した再投入は
+`packet_retries`へ数えます。
+
+連続READでは、成功したREAD(10)を16回処理するごとにcommand間でMass Storage Resetと
+Bulk IN／OUTの`CLEAR_FEATURE(ENDPOINT_HALT)`を実行し、両toggleをDATA0へ戻します。
+実機で最短33 READ後にBulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔で
+BOT境界を再確立する予防策です。root portやHIDはresetしません。`ut`開始ログは
+`USB TEST: phase-aligned split HID v24`、実行回数は`proactive_resyncs=`で確認します。
+WRITE(10)の直前にも同じ再同期を行い、
+`USB MSC: proactive BOT resync before WRITE(10)`を出します。
 
 `usbhw`はSplit Transactionのレジスタに加え、USB割り込みのsource、global enable、
 総ISR回数、channel 0／periodic channel 1〜4／root-port／spurious回数、`GINTMSK`／`HAINTMSK`／`HCINTMSK0..4`、
@@ -209,6 +275,33 @@ CSPLITの複数phaseで処理し、idle HIDのNAKも安全境界まで回収す�
 さらに同じHigh-Speed hubの別portへSony USBメモリ（`054C:0243`）を接続し、3824 MiBのcapacity
 取得とLBA 0の512-byte読出し、末尾`55 AA`を確認しました。転送後もsplit conflicts 0、active 0、
 poll／cancel／stale-token／unknown cause 0で、submit／reapは353／353でした。
+ただし別のHigh-Speedハブ＋Low-Speed HIDでは列挙時に`HCINT=0x82`で失敗しました。第19版は
+SSPLITをmicroframe 0〜5に置き、最初のCSPLITを2 microframe後、NYET後を1 microframe後へ
+配置します。transaction error時は`split failed during SSPLIT|CSPLIT`も出します。
+第19版ではkeyboardの列挙とattachは成功し、最初のInterrupt INだけがCSPLITで`0x82`になりました。
+第20版はSplit HIDの`HCCHAR.EPType`を実descriptorどおりInterruptへ設定し、文字入力まで通りました。
+ただしidle時のCSPLIT NYETをControl／Bulkと同じ安全境界待ちで最大5000 round追い、
+`USB: giving up mid-split; the hub's TT never answered`の連続と入力freezeを起こしました。
+第21版はInterrupt Splitを1 full frame内のSSPLIT＋最大3 CSPLITに制限します。最後までNYETなら
+full-frame境界でTTの周期transactionが失効するのを待ち、ログを出さない通常のidle timeoutとして
+次のpollへ戻します。実機ではエラーとfreezeが消えましたが、poll自体は描画と同じ約57 Hzで反応が
+鈍い状態でした。第22版は1 kHz tickの非描画wakeからdescriptorの`bInterval`ごとに実行します。
+起動ログの`USB HID: Split foreground poll interval ms=N`が採用周期です。Control／Bulkで
+`giving up mid-split`が出た場合は引き続きTT異常です。
+Split HIDを抜いた直後は実行中packetが`split failed during CSPLIT`／`HCINT=0x82`を1回出し得ます。
+続く`USB: HID disconnected from hub port N`が局所切断の成功で、
+`USB: a device session went stale, rescanning...`が出た場合は下流切断を判定できずroot rescanへ
+fallbackしたことを示します。
+第24版のSplit keyboardは各pollのSSPLITをmicroframe 0へ揃えます。idle NAKならSSPLIT＋CSPLITの
+scheduled resultが確定した時点で終了し、同じ窓でSSPLITを再開しません。Low-Speed descriptorが
+10ms未満なら`USB HID: invalid Low-Speed bInterval, descriptor=N`を出して10msへ補正します。
+今回のdeviceは起動ログが`Split foreground poll interval ms=10`になり、静止時のSplit packet増加率は
+約100 packet/秒が期待値です。実機でも10秒間に約1,000 packet増加し、入力安定・エラーログなしを
+確認済みです。rounds/packetはTTが最初のCSPLITへNYETを返す回数で変わります。
+同じHigh-Speedハブ上でLow-Speed keyboardとHigh-Speed MSCを併用した第24版の`ut 100`は
+100/100、failure／mismatch 0、packet／command retry 0、予防再同期6回でPASSしました。
+直後のsnapshotはSplit 1,126 packet／2,370 round、conflict 0、active 0、stale token 0、
+port eventなしです。
 
 常設periodic HIDが有効なら起動ログに`USB HID: periodic channel enabled: N`、`usbhw`に
 `IRQ periodic: channels=0x..`が出ます。bit Nがchannel Nの割当てを表します。reportごとに

@@ -165,6 +165,15 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "usbmargin",
+        usage: "usbmargin [rounds]",
+        lines: &[
+            "measure how long USB Mass Storage takes to become readable after",
+            "its 5V comes on: cut VBUS, rescan, time connect/enumeration/ready/",
+            "LBA 0. read-only; default 5 rounds, maximum 20.",
+        ],
+    },
+    HelpEntry {
         name: "pf",
         usage: "pf",
         lines: &[
@@ -396,6 +405,24 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["USB MSC: read one 512-byte block (SCSI READ(10)), dump to UART log"],
     },
     HelpEntry {
+        name: "usbzero",
+        usage: "usbzero <lba> [count]",
+        lines: &[
+            "USB MSC: overwrite 1-8 blocks with zeros and verify each one from",
+            "the medium. clears the pattern a failed usbwritetest leaves behind.",
+            "destructive: the previous contents are gone for good.",
+        ],
+    },
+    HelpEntry {
+        name: "usbwritetest",
+        usage: "usbwritetest <lba>",
+        lines: &[
+            "USB MSC: write a pattern to one 512-byte block (SCSI WRITE(10)),",
+            "read it back, then restore the original contents and verify that",
+            "too. pick an LBA outside any filesystem you care about.",
+        ],
+    },
+    HelpEntry {
         name: "usbmbr",
         usage: "usbmbr",
         lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
@@ -600,6 +627,7 @@ pub fn execute(
         }
         b"mix" => cmd_mixed_soak(console, framebuffer, argument, usb_host),
         b"ut" => cmd_usb_read_test(console, framebuffer, argument, usb_host),
+        b"usbmargin" => cmd_usb_margin(console, framebuffer, argument, usb_host),
         b"pf" => {
             if argument.is_empty() {
                 psram::request_fallback_test();
@@ -646,6 +674,8 @@ pub fn execute(
         b"usbperiodic" => cmd_usbperiodic(console, framebuffer, usb_host),
         b"usbmsc" => cmd_usbmsc(console, framebuffer, usb_host),
         b"usbread" => cmd_usbread(console, framebuffer, argument, usb_host),
+        b"usbwritetest" => cmd_usb_write_test(console, framebuffer, argument, usb_host),
+        b"usbzero" => cmd_usbzero(console, framebuffer, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
         b"wifiinfo" => {
             *wifi_session = None;
@@ -1841,6 +1871,173 @@ fn cmd_mixed_soak(
     }
 }
 
+/// Milliseconds USB-A stays unpowered between `usbmargin` rounds.
+///
+/// A cold boot is what this command is standing in for, so each round has to
+/// start from a device that is genuinely unpowered rather than one that only
+/// saw a bus reset. `hcd::power_cycle_vbus` uses the same second for the same
+/// reason.
+const MARGIN_VBUS_OFF_MS: u32 = 1_000;
+/// Connect wait used while measuring. Deliberately far above both the
+/// steady-state limit and the boot limit: a truncated wait would report a
+/// device as absent instead of showing how long it actually took, which is
+/// the one number this command exists to produce.
+const MARGIN_CONNECT_WAIT_MS: u32 = 5_000;
+/// TEST UNIT READY budget per round, for the same reason.
+const MARGIN_READY_BUDGET_MS: u32 = 15_000;
+
+/// Measures the time from USB-A's 5V switching on until a mass-storage device
+/// behind it can actually be read, over several cold power cycles.
+///
+/// The firmware wants to prefer USB mass storage over the SD card when one is
+/// plugged in at boot, which means boot has to wait for a device that is
+/// powering up at that moment -- and the wait has to come from measurement,
+/// not a guess: too short silently boots off the wrong medium, too long
+/// delays every boot that has no USB device at all. Each round cuts VBUS,
+/// discards every session, and times a full scan plus the SCSI sequence a
+/// filesystem probe would run. Nothing is written to the device.
+///
+/// See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
+fn cmd_usb_margin(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    let rounds = if trim(argument).is_empty() {
+        5
+    } else {
+        match parse_u32(trim(argument)) {
+            Some(value) if value > 0 && value <= 20 => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: usbmargin [rounds] (1-20)");
+                return;
+            }
+        }
+    };
+
+    if let Some(boot) = usb_host.boot_scan_timing().copied() {
+        let mut line = Line::new();
+        line.push_str("boot scan: connect=");
+        line.push_u32(boot.connect_ms);
+        line.push_str(" enum=");
+        line.push_u32(boot.enumerated_ms);
+        line.push_str(" msc=");
+        line.push_u32(boot.mass_storage_ms);
+        line.push_str(" total=");
+        line.push_u32(boot.total_ms);
+        line.push_str("ms");
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    let mut usable_rounds = 0u32;
+    let mut minimum_total = u32::MAX;
+    let mut maximum_total = 0u32;
+    let mut maximum_connect = 0u32;
+    let mut maximum_ready = 0u32;
+
+    for round in 1..=rounds {
+        // Every address and endpoint toggle on the bus dies with the rail, so
+        // the registry has to be emptied before the power goes rather than
+        // after it comes back.
+        usb_host.clear();
+        if !usb::set_vbus_power(false) {
+            console.write_output_line(framebuffer, "usbmargin: VBUS off failed (PI4IOE2 @ 0x44)");
+            return;
+        }
+        delay::delay_ms(MARGIN_VBUS_OFF_MS);
+
+        // `rescan` switches the rail back on itself, inside the probe whose
+        // entry the timings are measured from.
+        let steady_state_connect_wait = usb::set_connect_wait_ms(MARGIN_CONNECT_WAIT_MS);
+        usb_host.rescan();
+        usb::set_connect_wait_ms(steady_state_connect_wait);
+
+        let Some(scan) = usb_host.last_scan_timing().copied() else {
+            console.write_output_line(framebuffer, "usbmargin: scan produced no timing");
+            return;
+        };
+        let ready = usb_host
+            .mass_storage_mut()
+            .map(|storage| storage.measure_ready_and_first_read(MARGIN_READY_BUDGET_MS));
+
+        let mut line = Line::new();
+        line.push_u32(round);
+        line.push_str(": con=");
+        line.push_u32(scan.connect_ms);
+        line.push_str(" ena=");
+        line.push_u32(scan.port_enabled_ms);
+        line.push_str(" enum=");
+        line.push_u32(scan.enumerated_ms);
+        line.push_str(" msc=");
+        line.push_u32(scan.mass_storage_ms);
+        match ready {
+            Some(ready) => {
+                line.push_str(" rdy=");
+                line.push_u32(ready.ready_ms);
+                line.push_str("/");
+                line.push_u32(ready.attempts);
+                line.push_str(" lba0=");
+                line.push_u32(ready.first_read_ms);
+                if ready.usable() {
+                    let total = scan.total_ms.saturating_add(ready.first_read_ms);
+                    line.push_str(" total=");
+                    line.push_u32(total);
+                    usable_rounds += 1;
+                    minimum_total = minimum_total.min(total);
+                    maximum_total = maximum_total.max(total);
+                    maximum_connect = maximum_connect.max(scan.connect_ms);
+                    maximum_ready = maximum_ready.max(ready.first_read_ms);
+                } else if ready.outcome == usb::ReadyOutcome::NoMedium {
+                    line.push_str(" NO MEDIUM");
+                } else {
+                    line.push_str(" UNREADABLE");
+                }
+            }
+            None if scan.connected => line.push_str(" no MSC attached"),
+            None => line.push_str(" no device"),
+        }
+        console.write_output_line(framebuffer, line.as_str());
+        uart::log(line.as_str().as_bytes());
+        uart::log(b"\r\n");
+    }
+
+    let mut line = Line::new();
+    line.push_str("usbmargin: usable ");
+    line.push_u32(usable_rounds);
+    line.push_str("/");
+    line.push_u32(rounds);
+    if usable_rounds == 0 {
+        line.push_str(" -- no measurement");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+    line.push_str(" total min=");
+    line.push_u32(minimum_total);
+    line.push_str(" max=");
+    line.push_u32(maximum_total);
+    line.push_str("ms");
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("worst connect=");
+    line.push_u32(maximum_connect);
+    line.push_str("ms scsi=");
+    line.push_u32(maximum_ready);
+    line.push_str("ms; 1.5x boot budget=");
+    // Half again on top of the worst round, rounded up to a tenth of a
+    // second: a suggestion to compare against the other devices' numbers,
+    // not a value to adopt from a single run.
+    line.push_u32(
+        maximum_total
+            .saturating_add(maximum_total / 2)
+            .div_ceil(100)
+            * 100,
+    );
+    line.push_str("ms");
+    console.write_output_line(framebuffer, line.as_str());
+}
+
 /// Short, read-only USB MSC stability test used before the full `mix` soak.
 /// It keeps the same persistent BOT session and repeats the same 4 KiB
 /// READ(10), so a timeout, recovery retry, or silent data mismatch is visible
@@ -1852,7 +2049,7 @@ fn cmd_usb_read_test(
     usb_host: &mut usb::UsbHost,
 ) {
     const STORAGE_BYTES: usize = 8 * 512;
-    uart::log(b"USB TEST: recovery v6\r\n");
+    uart::log(b"USB TEST: phase-aligned split HID v24\r\n");
     let count = if trim(argument).is_empty() {
         100
     } else {
@@ -1881,6 +2078,7 @@ fn cmd_usb_read_test(
     let mut reference = [0u8; STORAGE_BYTES];
     let mut current = [0u8; STORAGE_BYTES];
     let retries_before = mass_storage.read_retry_count();
+    let resyncs_before = mass_storage.maintenance_resync_count();
     let packet_retries_before = mass_storage.packet_retry_count();
     if !mass_storage.read_blocks(0, &mut reference) {
         console.write_output_line(framebuffer, "ut: initial USB read failed");
@@ -1903,6 +2101,9 @@ fn cmd_usb_read_test(
     }
 
     let retries = mass_storage.read_retry_count().wrapping_sub(retries_before);
+    let resyncs = mass_storage
+        .maintenance_resync_count()
+        .wrapping_sub(resyncs_before);
     let packet_retries = mass_storage
         .packet_retry_count()
         .wrapping_sub(packet_retries_before);
@@ -1922,6 +2123,8 @@ fn cmd_usb_read_test(
     line.push_u32(packet_retries);
     line.push_str(" command_retries=");
     line.push_u32(retries);
+    line.push_str(" proactive_resyncs=");
+    line.push_u32(resyncs);
     console.write_output_line(framebuffer, line.as_str());
 
     if completed == count && transport_failures == 0 && mismatches == 0 {
@@ -4981,11 +5184,16 @@ fn device_summary_text(summary: &usb::DeviceSummary) -> Line {
 fn device_kind_text(kind: &usb::DeviceKind) -> Line {
     let mut line = Line::new();
     line.push_str("  driver: ");
-    line.push_str(match kind {
-        usb::DeviceKind::Keyboard(_) => "HID Boot keyboard",
-        usb::DeviceKind::Mouse(_) => "HID Boot mouse",
-        usb::DeviceKind::MassStorage(_) => "Mass Storage (Bulk-Only Transport)",
-    });
+    match kind {
+        usb::DeviceKind::Keyboard(_) => line.push_str("HID Boot keyboard"),
+        usb::DeviceKind::Mouse(_) => line.push_str("HID Boot mouse"),
+        usb::DeviceKind::MassStorage(storage) => {
+            line.push_str("Mass Storage (Bulk-Only Transport)");
+            if storage.needs_reinit() {
+                line.push_str(" -- session unusable; run usbrescan");
+            }
+        }
+    }
     line
 }
 
@@ -5003,6 +5211,9 @@ fn cmd_usbmsc(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &m
         );
         return;
     };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
 
     console.write_output_line(framebuffer, "sending SCSI INQUIRY (bulk transfers)...");
     let Some(inquiry) = mass_storage.inquiry() else {
@@ -5084,6 +5295,9 @@ fn cmd_usbread(
         );
         return;
     };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
 
     // Some drives are not immediately ready to service a data-phase Bulk
     // command right after SET_CONFIGURATION; skipping this made an
@@ -5127,6 +5341,460 @@ fn cmd_usbread(
     console.write_output_line(framebuffer, "full 512-byte hex dump: see UART log");
 }
 
+/// Writes one block to USB Mass Storage, verifies it against its neighbours,
+/// and puts the original contents back -- the USB counterpart of
+/// `cmd_sdwritetest`, with two additions the SD test does not need.
+///
+/// **It reads a window around the target block, not just the block itself.**
+/// A test that writes LBA N and reads LBA N back cannot fail when the device
+/// actually wrote somewhere else: the same wrong address is used for both
+/// halves, so the comparison matches while data elsewhere is destroyed. The
+/// window makes that visible, and because the window was snapshotted first,
+/// a neighbour that did change can be put back.
+///
+/// **It flushes the device cache after every write.** A WRITE(10) that
+/// succeeds has reached the device, not the medium, and the read-back may be
+/// answered from the same cache -- so without SYNCHRONIZE CACHE(10) a test
+/// can report "restored" for data that never left the cache.
+fn cmd_usb_write_test(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    const BLOCK: usize = 512;
+    /// Blocks either side of the target that are checked for collateral
+    /// damage. One before and two after covers an off-by-one in any
+    /// direction and a write that ran long.
+    const WINDOW: usize = 4;
+
+    let Some(lba) = parse_u32(trim(argument)) else {
+        console.write_output_line(framebuffer, "usage: usbwritetest <lba>");
+        return;
+    };
+
+    console.write_output_line(
+        framebuffer,
+        "WARNING: temporarily overwrites 1 block, then restores it",
+    );
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
+        return;
+    };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
+
+    console.write_output_line(framebuffer, "waiting for media ready (TEST UNIT READY)...");
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line(framebuffer, "media not ready; aborting (nothing written)");
+        return;
+    }
+
+    // Every block index below assumes 512-byte logical blocks. A device with
+    // a different block length would be handed a data phase that does not
+    // match what its CDB asked for, which is exactly how a write ends up
+    // affecting blocks nobody named.
+    let Some(capacity) = mass_storage.read_capacity() else {
+        console.write_output_line(framebuffer, "READ CAPACITY(10) failed; aborting");
+        return;
+    };
+    if capacity.block_length != BLOCK as u32 {
+        let mut line = Line::new();
+        line.push_str("device block length is ");
+        line.push_u32(capacity.block_length);
+        line.push_str(" bytes, not 512; aborting");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+    if lba > capacity.last_lba {
+        let mut line = Line::new();
+        line.push_str("LBA beyond last block (");
+        line.push_u32(capacity.last_lba);
+        line.push_str("); aborting");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+
+    // The window starts one block before the target where there is room, so
+    // `target_index` is 1 everywhere except at LBA 0.
+    let first = lba.saturating_sub(1);
+    let last = lba.saturating_add(2).min(capacity.last_lba);
+    let count = (last - first + 1) as usize;
+    let target_index = (lba - first) as usize;
+
+    let mut snapshot = [[0u8; BLOCK]; WINDOW];
+    for (index, block) in snapshot.iter_mut().take(count).enumerate() {
+        if !mass_storage.read_blocks(first + index as u32, block) {
+            console.write_output_line(
+                framebuffer,
+                "could not read the block window, aborting (nothing written)",
+            );
+            return;
+        }
+    }
+
+    let mut pattern = [0u8; BLOCK];
+    for (index, byte) in pattern.iter_mut().enumerate() {
+        *byte = (index as u8) ^ 0xA5;
+    }
+
+    if !mass_storage.write_blocks(lba, &mut pattern) {
+        console.write_output_line(framebuffer, "pattern write failed, see UART log");
+        if mass_storage.needs_reinit() {
+            // Every remaining step would fail the same way and take seconds
+            // each to do it. Keep the failure local to MSC: resetting the
+            // whole bus here would also disconnect healthy HID devices.
+            console.write_output_line(
+                framebuffer,
+                "MSC session unusable; run 'usbrescan' before another storage command",
+            );
+            return;
+        }
+        write_usb_sense_line(console, framebuffer, mass_storage);
+        return;
+    }
+    let flushed = mass_storage.synchronize_cache();
+    match flushed {
+        usb::CacheSync::Flushed => {}
+        // Not a fault: the device simply has no such command. The
+        // verification reads below use Force Unit Access instead, which is
+        // the other way to find out what the medium holds.
+        usb::CacheSync::Unsupported => console.write_output_line(
+            framebuffer,
+            "device has no SYNCHRONIZE CACHE(10); verifying with FUA reads",
+        ),
+        usb::CacheSync::Failed => {
+            console.write_output_line(framebuffer, "SYNCHRONIZE CACHE(10) failed, see UART log")
+        }
+    }
+    // A device can still be programming its medium after answering. The SD
+    // side has the same trap; give it the chance to say so before the next
+    // command rather than letting a busy device fail one.
+    let _ = mass_storage.wait_until_ready(10);
+
+    // Compare the whole window, not just the block that was named.
+    let mut damaged = 0u32;
+    let mut target_ok = false;
+    let mut window_readable = true;
+    let mut fua_rejected = false;
+    for (index, original) in snapshot.iter().take(count).enumerate() {
+        let mut current = [0u8; BLOCK];
+        // Force Unit Access first: it is the only read that reports the
+        // medium rather than the cache. A device that rejects it is not
+        // broken, but the comparison it feeds is then weaker, so say so
+        // once instead of silently downgrading.
+        if !mass_storage.read_blocks_from_medium(first + index as u32, &mut current) {
+            if !mass_storage.read_blocks(first + index as u32, &mut current) {
+                // Both reads failed, so this says nothing about FUA -- the
+                // device is not answering at all. Claiming a rejected FUA
+                // here sent the reader looking at the wrong thing.
+                window_readable = false;
+                continue;
+            }
+            fua_rejected = true;
+        }
+        if index == target_index {
+            target_ok = current == pattern;
+        } else if current != *original {
+            damaged += 1;
+            let mut line = Line::new();
+            line.push_str("COLLATERAL DAMAGE: LBA ");
+            line.push_u32(first + index as u32);
+            line.push_str(" changed too");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+
+    if fua_rejected {
+        console.write_output_line(
+            framebuffer,
+            "FUA read rejected; read-back may come from the device cache",
+        );
+    }
+
+    let mut line = Line::new();
+    line.push_str("pattern write+read-back: ");
+    line.push_str(if target_ok { "match" } else { "MISMATCH" });
+    line.push_str(if window_readable {
+        ""
+    } else {
+        " (part of the window could not be re-read)"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+
+    // Restore every block that changed, target first. The snapshot is the
+    // only copy of the neighbours' contents, so this is the one chance to
+    // put them back.
+    let mut restore_ok = true;
+    let mut restore_flush_failed = false;
+    for (index, original) in snapshot.iter().take(count).enumerate() {
+        if mass_storage.needs_reinit() {
+            restore_ok = false;
+            break;
+        }
+        let block_lba = first + index as u32;
+        let mut current = [0u8; BLOCK];
+        let needs_restore = index == target_index
+            || !mass_storage.read_blocks(block_lba, &mut current)
+            || current != *original;
+        if !needs_restore {
+            continue;
+        }
+        let mut restore = *original;
+        if !mass_storage.write_blocks(block_lba, &mut restore) {
+            restore_ok = false;
+            continue;
+        }
+        // A refused or failed flush is not evidence that the write failed:
+        // whether the data is on the medium is what the Force Unit Access
+        // read below answers. Reporting a flush the device would not
+        // perform as "data not restored" sends the user looking for
+        // corruption that is not there.
+        if mass_storage.synchronize_cache() == usb::CacheSync::Failed {
+            restore_flush_failed = true;
+        }
+        let _ = mass_storage.wait_until_ready(10);
+        let mut check = [0u8; BLOCK];
+        let checked = mass_storage.read_blocks_from_medium(block_lba, &mut check)
+            || mass_storage.read_blocks(block_lba, &mut check);
+        if !checked || check != *original {
+            restore_ok = false;
+        }
+    }
+
+    console.write_output_line(
+        framebuffer,
+        if restore_ok {
+            "original data restored: yes"
+        } else {
+            "original data restored: NO -- see UART log, LBA may be corrupted"
+        },
+    );
+    if restore_flush_failed {
+        console.write_output_line(
+            framebuffer,
+            "note: the restore could not be flushed; verified by FUA read instead",
+        );
+    }
+    if mass_storage.needs_reinit() {
+        console.write_output_line(
+            framebuffer,
+            "MSC session unusable; run 'usbrescan', then usbzero this LBA",
+        );
+    } else if !restore_ok {
+        write_usb_sense_line(console, framebuffer, mass_storage);
+    }
+
+    let mut line = Line::new();
+    line.push_str("window LBA ");
+    line.push_u32(first);
+    line.push_str("-");
+    line.push_u32(last);
+    line.push_str(": collateral changes=");
+    line.push_u32(damaged);
+    line.push_str(match flushed {
+        usb::CacheSync::Flushed => " flush=ok",
+        usb::CacheSync::Unsupported => " flush=unsupported",
+        usb::CacheSync::Failed => " flush=FAILED",
+    });
+    console.write_output_line(framebuffer, line.as_str());
+    if damaged != 0 {
+        console.write_output_line(
+            framebuffer,
+            "a block nobody named changed: the write did not land where asked",
+        );
+    }
+}
+
+/// Overwrites blocks on USB Mass Storage with zeros, the USB counterpart of
+/// `sdzero` -- and the way to clear the pattern `usbwritetest` leaves behind
+/// when its restore cannot complete.
+///
+/// Zeroing is deliberately not folded into `usbwritetest`'s failure path: at
+/// the point that test gives up, the transport is usually dead, so the write
+/// that clears up would fail too. This is a separate command run afterwards,
+/// against a fresh session, which is also why it re-checks the block length
+/// and capacity for itself.
+fn cmd_usbzero(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    const BLOCK: usize = 512;
+    const MAX_BLOCKS: u32 = 8;
+
+    let (lba_text, rest) = split_first_word(argument);
+    let Some(lba) = parse_u32(lba_text) else {
+        console.write_output_line(framebuffer, "usage: usbzero <lba> [count]");
+        return;
+    };
+    let count = if trim(rest).is_empty() {
+        1
+    } else {
+        match parse_u32(trim(rest)) {
+            Some(value) if value > 0 && value <= MAX_BLOCKS => value,
+            _ => {
+                console.write_output_line(framebuffer, "usage: usbzero <lba> [count] (1-8)");
+                return;
+            }
+        }
+    };
+
+    console.write_output_line(
+        framebuffer,
+        "WARNING: overwrites blocks with zeros for good",
+    );
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
+        return;
+    };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
+
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line(framebuffer, "media not ready; aborting (nothing written)");
+        return;
+    }
+    let Some(capacity) = mass_storage.read_capacity() else {
+        console.write_output_line(framebuffer, "READ CAPACITY(10) failed; aborting");
+        return;
+    };
+    if capacity.block_length != BLOCK as u32 {
+        let mut line = Line::new();
+        line.push_str("device block length is ");
+        line.push_u32(capacity.block_length);
+        line.push_str(" bytes, not 512; aborting");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+    if lba.saturating_add(count - 1) > capacity.last_lba {
+        let mut line = Line::new();
+        line.push_str("range beyond last block (");
+        line.push_u32(capacity.last_lba);
+        line.push_str("); aborting");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+
+    let mut zeroed = 0u32;
+    let mut failed_lba = None;
+    let mut flush_failed = false;
+    for offset in 0..count {
+        let block_lba = lba + offset;
+        let mut zero = [0u8; BLOCK];
+        if !mass_storage.write_blocks(block_lba, &mut zero) {
+            failed_lba = Some(block_lba);
+            break;
+        }
+        if mass_storage.needs_reinit() {
+            failed_lba = Some(block_lba);
+            break;
+        }
+        // Same reasoning as `usbwritetest`: a write that has been accepted
+        // is not necessarily on the medium, and the check below has to see
+        // the medium rather than the cache.
+        if mass_storage.synchronize_cache() == usb::CacheSync::Failed {
+            flush_failed = true;
+        }
+        let _ = mass_storage.wait_until_ready(10);
+        let mut check = [0u8; BLOCK];
+        let checked = mass_storage.read_blocks_from_medium(block_lba, &mut check)
+            || mass_storage.read_blocks(block_lba, &mut check);
+        // The read-back decides, not the flush: a device that refuses to
+        // flush can still have taken the write.
+        if !checked || check != [0u8; BLOCK] {
+            failed_lba = Some(block_lba);
+            break;
+        }
+        zeroed += 1;
+    }
+
+    let mut line = Line::new();
+    match failed_lba {
+        None => {
+            line.push_str("zeroed ");
+            line.push_u32(zeroed);
+            line.push_str(" block(s) from LBA ");
+            line.push_u32(lba);
+        }
+        Some(block_lba) => {
+            line.push_str("stopped at LBA ");
+            line.push_u32(block_lba);
+            line.push_str(" after ");
+            line.push_u32(zeroed);
+            line.push_str(" block(s), see UART log");
+        }
+    }
+    console.write_output_line(framebuffer, line.as_str());
+    if flush_failed {
+        console.write_output_line(
+            framebuffer,
+            "note: SYNCHRONIZE CACHE(10) failed; zeros verified by FUA read instead",
+        );
+    }
+    if mass_storage.needs_reinit() {
+        console.write_output_line(
+            framebuffer,
+            "MSC session unusable; run 'usbrescan', then try again",
+        );
+    } else if failed_lba.is_some() {
+        write_usb_sense_line(console, framebuffer, mass_storage);
+    }
+}
+
+/// Shows why the last command failed, in the device's own words.
+fn write_usb_sense_line(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    mass_storage: &mut usb::UsbMassStorage,
+) {
+    let Some(sense) = mass_storage.request_sense() else {
+        console.write_output_line(framebuffer, "REQUEST SENSE failed, see UART log");
+        return;
+    };
+    let sense_key = sense[2] & 0x0F;
+    let mut line = Line::new();
+    line.push_str("sense key: 0x");
+    line.push_hex(sense_key as u32, 1);
+    line.push_str(" asc: 0x");
+    line.push_hex(sense[12] as u32, 2);
+    line.push_str(" ascq: 0x");
+    line.push_hex(sense[13] as u32, 2);
+    // Sense key 7 is DATA PROTECT: the medium is write protected, which is a
+    // property of the device rather than a fault in this firmware.
+    if sense_key == 0x07 {
+        line.push_str(" (write protected)");
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Stops a storage command before it spends time in a BOT session already
+/// known to be dead. Recovery is explicit because a full bus reset would
+/// also interrupt healthy HID devices.
+fn require_live_usb_msc(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    mass_storage: &usb::UsbMassStorage,
+) -> bool {
+    if !mass_storage.needs_reinit() {
+        return true;
+    }
+    console.write_output_line(
+        framebuffer,
+        "MSC session unusable; run 'usbrescan' before another storage command",
+    );
+    false
+}
+
 /// `docs/USB_MSC_PLAN.md` Stage 6, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
 /// reads LBA 0 from whichever Mass Storage device `UsbHost::rescan` already
 /// attached and hands it to the same `mbr::show` that `cmd_sdmbr` uses, so
@@ -5140,6 +5808,9 @@ fn cmd_usbmbr(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &m
         );
         return;
     };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
 
     console.write_output_line(framebuffer, "waiting for media ready (TEST UNIT READY)...");
     if !mass_storage.wait_until_ready(10) {
@@ -5279,6 +5950,27 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
     line.push_u32(irq.split_mode_conflicts);
     line.push_str(" active=");
     line.push_u32(irq.split_mode_active as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    // The port's change bits are cleared by the ISR, so this latched copy
+    // is the only place a power event survives long enough to be asked
+    // about after the fact.
+    let mut line = Line::new();
+    line.push_str("port events since bus came up: ");
+    let history = usb::port_event_history();
+    if history == 0 {
+        line.push_str("none");
+    } else {
+        if usb::port_over_current_seen() {
+            line.push_str("OVER-CURRENT ");
+        }
+        if usb::port_drop_seen() {
+            line.push_str("device-dropped ");
+        }
+        line.push_str("(HPRT bits 0x");
+        line.push_hex(history, 4);
+        line.push_str(")");
+    }
     console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();

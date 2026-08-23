@@ -27,7 +27,6 @@ const BULK_PACKET_RETRIES: u32 = 20;
 const BULK_TIMEOUT_RETRIES: u32 = 4;
 const BULK_PACKET_RETRY_DELAY_MS: u32 = 50;
 const MAX_BULK_MPS: usize = 512;
-const MAX_QTD_TRANSFER_BYTES: usize = 0x1_FFFF;
 
 const REQUEST_TYPE_HOST_TO_DEVICE_CLASS_INTERFACE: u8 = 0x21;
 const REQUEST_TYPE_HOST_TO_DEVICE_ENDPOINT: u8 = 0x02;
@@ -129,8 +128,24 @@ pub struct BulkOnlyTransport {
     out_toggle: bool,
     next_tag: u32,
     last_recovery_succeeded: bool,
+    /// Commands that have needed BOT Reset Recovery without a successful
+    /// command in between. See `execute_command`.
+    consecutive_recoveries: u32,
+    /// Whether this session has already said it is skipping commands.
+    reported_unusable: bool,
+    /// This device's BOT session can no longer be trusted.  This is kept
+    /// separate from `hcd::bus_unusable`: a device that no longer answers
+    /// Reset Recovery does not prove that the shared host controller (and
+    /// therefore unrelated HID devices) is broken.
+    unusable: bool,
     packet_retries: u32,
 }
+
+/// How many recoveries in a row are allowed before the session is declared
+/// beyond repair. Two: one recovery that holds is normal after a transient
+/// transfer failure, while a second failure immediately after a "successful"
+/// recovery means the sequence is not fixing whatever is actually wrong.
+const RECOVERY_ATTEMPT_LIMIT: u32 = 2;
 
 impl BulkOnlyTransport {
     pub fn attach(device: &EnumeratedDevice, interface: BotInterface) -> Option<Self> {
@@ -153,6 +168,9 @@ impl BulkOnlyTransport {
             out_toggle: false,
             next_tag: 0,
             last_recovery_succeeded: false,
+            consecutive_recoveries: 0,
+            reported_unusable: false,
+            unusable: false,
             packet_retries: 0,
         })
     }
@@ -166,7 +184,27 @@ impl BulkOnlyTransport {
         data: &mut [u8],
     ) -> Option<CommandResult> {
         self.last_recovery_succeeded = false;
+        if self.unusable || hcd::bus_unusable() {
+            // This BOT session, or the controller below it, is already known
+            // to be beyond what this layer can repair. Every command
+            // attempted in the meantime costs a full transfer timeout plus
+            // another failed recovery. Fail immediately instead; the
+            // caller's own error path is the same either way.
+            if !self.reported_unusable {
+                self.reported_unusable = true;
+                uart::log(
+                    b"USB BOT: session is unusable, skipping commands until re-enumeration\r\n",
+                );
+            }
+            return None;
+        }
         let result = self.execute_command_once(cdb, direction_in, data);
+        if result.is_some() {
+            // A command that got through is the only evidence that the
+            // session is healthy, so it is the only thing that clears the
+            // count.
+            self.consecutive_recoveries = 0;
+        }
         if result.is_none() {
             // Once a CBW has been accepted, a transport failure can leave
             // the device waiting in any BOT phase and both endpoint toggles
@@ -178,8 +216,28 @@ impl BulkOnlyTransport {
             self.last_recovery_succeeded = self.reset_recovery();
             if self.last_recovery_succeeded {
                 uart::log(b"USB BOT: reset recovery complete\r\n");
+                // "Complete" only means the reset sequence's control
+                // transfers went through. The device can answer those and
+                // still not move a single bulk packet, in which case every
+                // command fails, recovers, and fails again -- which looks
+                // like progress in the log while nothing works. Recovery
+                // that does not survive the next command is not recovery.
+                self.consecutive_recoveries = self.consecutive_recoveries.saturating_add(1);
+                if self.consecutive_recoveries >= RECOVERY_ATTEMPT_LIMIT {
+                    uart::log(
+                        b"USB BOT: recovery is not holding; this session needs re-enumeration\r\n",
+                    );
+                    self.unusable = true;
+                }
             } else {
-                uart::log(b"USB BOT: reset recovery failed\r\n");
+                // Recovery talks to the device over its control endpoint,
+                // so failing it means the device is not answering there
+                // either -- the channel itself halts perfectly well in this
+                // case, which is why nothing below this layer can notice.
+                // Nothing addressed to this device will work again until
+                // the registry rebuilds its session.
+                uart::log(b"USB BOT: reset recovery failed; this session needs re-enumeration\r\n");
+                self.unusable = true;
             }
         }
         result
@@ -188,7 +246,35 @@ impl BulkOnlyTransport {
     /// Whether the immediately preceding failed command restored the BOT
     /// session to a state in which a command-specific retry is safe.
     pub fn last_recovery_succeeded(&self) -> bool {
-        self.last_recovery_succeeded
+        self.last_recovery_succeeded && !self.unusable && !hcd::bus_unusable()
+    }
+
+    /// True when this device must be re-enumerated before another BOT
+    /// command is attempted. This deliberately says nothing about other
+    /// devices on the same bus.
+    pub fn needs_reinit(&self) -> bool {
+        self.unusable || hcd::bus_unusable()
+    }
+
+    /// Re-establishes the BOT command boundary while the device is still
+    /// responsive. This is the same class reset and endpoint-toggle reset as
+    /// failure recovery, but is invoked between commands rather than after a
+    /// transport has already stopped answering.
+    pub fn resynchronize(&mut self) -> bool {
+        self.last_recovery_succeeded = false;
+        if self.unusable || hcd::bus_unusable() {
+            return false;
+        }
+        hcd::recover_channel_after_packet_failure();
+        if self.reset_recovery() {
+            self.consecutive_recoveries = 0;
+            self.reported_unusable = false;
+            true
+        } else {
+            uart::log(b"USB BOT: proactive resynchronization failed\r\n");
+            self.unusable = true;
+            false
+        }
     }
 
     /// Number of QTD suffixes resubmitted after status 1 or timeout.
@@ -214,7 +300,7 @@ impl BulkOnlyTransport {
             CBW_FLAGS_DATA_OUT
         };
         let mut cbw = build_cbw(tag, data.len() as u32, flags, cdb);
-        if !self.bulk_transfer_out(&mut cbw) {
+        if !self.bulk_transfer_out(b"CBW", &mut cbw) {
             uart::log(b"USB BOT: CBW send failed\r\n");
             return None;
         }
@@ -222,16 +308,16 @@ impl BulkOnlyTransport {
         let transferred = if data.is_empty() {
             0
         } else if direction_in {
-            self.bulk_transfer_in(data)?
+            self.bulk_transfer_in(b"data IN", data)?
         } else {
-            if !self.bulk_transfer_out(data) {
+            if !self.bulk_transfer_out(b"data OUT", data) {
                 return None;
             }
             data.len()
         };
 
         let mut csw = [0u8; CSW_LEN];
-        let csw_received = self.bulk_transfer_in(&mut csw)?;
+        let csw_received = self.bulk_transfer_in(b"CSW", &mut csw)?;
         if csw_received < CSW_LEN {
             uart::log(b"USB BOT: short CSW\r\n");
             return None;
@@ -247,7 +333,12 @@ impl BulkOnlyTransport {
         })
     }
 
-    fn bulk_transfer_out(&mut self, data: &mut [u8]) -> bool {
+    /// `phase` names which part of the BOT sequence this transfer is, so a
+    /// failure log says whether the command block, the data, or the status
+    /// wrapper is what did not get through. The three fail for different
+    /// reasons and the distinction is the first thing anyone reading the
+    /// log needs.
+    fn bulk_transfer_out(&mut self, phase: &[u8], data: &mut [u8]) -> bool {
         let mps = self.interface.bulk_out_mps.max(1) as usize;
         let mut offset = 0usize;
         while offset < data.len() {
@@ -264,15 +355,15 @@ impl BulkOnlyTransport {
                     offset += chunk_len;
                 }
                 PacketOutcome::Timeout(_) => {
-                    uart::log(b"USB BOT: bulk OUT timed out\r\n");
+                    log_phase_failure(b"bulk OUT timed out", phase);
                     return false;
                 }
                 PacketOutcome::PacketError(_) => {
-                    uart::log(b"USB BOT: bulk OUT packet retries exhausted\r\n");
+                    log_phase_failure(b"bulk OUT packet retries exhausted", phase);
                     return false;
                 }
                 PacketOutcome::Error => {
-                    uart::log(b"USB BOT: bulk OUT transaction error\r\n");
+                    log_phase_failure(b"bulk OUT transaction error", phase);
                     return false;
                 }
             }
@@ -280,20 +371,26 @@ impl BulkOnlyTransport {
         true
     }
 
-    fn bulk_transfer_in(&mut self, buffer: &mut [u8]) -> Option<usize> {
+    fn bulk_transfer_in(&mut self, phase: &[u8], buffer: &mut [u8]) -> Option<usize> {
         let mps = self.interface.bulk_in_mps.max(1) as usize;
         if mps > MAX_BULK_MPS {
             uart::log(b"USB BOT: unsupported Bulk IN MPS\r\n");
             return None;
         }
-        let max_direct = MAX_QTD_TRANSFER_BYTES / mps * mps;
         let mut staging = BulkInStaging {
             bytes: [0u8; MAX_BULK_MPS],
         };
         let mut received = 0usize;
         while received < buffer.len() {
             let remaining = buffer.len() - received;
-            let direct_len = (remaining / mps * mps).min(max_direct);
+            // Keep every descriptor to one USB packet. A 4 KiB QTD is valid
+            // according to the DWC descriptor format, but repeated real-device
+            // tests eventually leave the target NAKing that descriptor and
+            // then EP0 itself. One-packet QTDs make every completion and DATA
+            // PID transition explicit in software and bound retry ambiguity
+            // to exactly one packet. Short responses still use the aligned
+            // MPS-sized staging buffer below.
+            let direct_len = if remaining >= mps { mps } else { 0 };
             let endpoint = self.in_endpoint();
             let outcome = if direct_len > 0 {
                 self.run_bulk_packet(
@@ -327,15 +424,15 @@ impl BulkOnlyTransport {
                     }
                 }
                 PacketOutcome::Timeout(_) => {
-                    uart::log(b"USB BOT: bulk IN timed out\r\n");
+                    log_phase_failure(b"bulk IN timed out", phase);
                     return None;
                 }
                 PacketOutcome::PacketError(_) => {
-                    uart::log(b"USB BOT: bulk IN packet retries exhausted\r\n");
+                    log_phase_failure(b"bulk IN packet retries exhausted", phase);
                     return None;
                 }
                 PacketOutcome::Error => {
-                    uart::log(b"USB BOT: bulk IN transaction error\r\n");
+                    log_phase_failure(b"bulk IN transaction error", phase);
                     return None;
                 }
             }
@@ -356,22 +453,21 @@ impl BulkOnlyTransport {
     }
 
     /// Descriptor DMA reports QTD status 1 for a packet-level failure,
-    /// including excessive NAK. A one-packet QTD can safely be replayed with
-    /// the same DATA PID: a lost ACK can produce only a duplicate, which the
-    /// endpoint acknowledges without consuming twice. For a multi-packet IN
-    /// QTD, the descriptor's remaining length identifies the complete packets
-    /// already received. Keep those bytes, advance DATA PID by their parity,
-    /// and submit only the unreceived MPS-multiple suffix.
+    /// including excessive NAK. BOT now calls this with at most one MPS, so
+    /// the QTD can safely be replayed with the same DATA PID: a lost ACK can
+    /// produce only a duplicate, which the endpoint acknowledges without
+    /// consuming twice.
     fn run_bulk_packet(
         &mut self,
         endpoint: &Endpoint,
         pid_data1: bool,
         buffer: &mut [u8],
     ) -> PacketOutcome {
-        let total_len = buffer.len();
         let mps = endpoint.mps.max(1) as usize;
-        let mut completed = 0usize;
-        let mut next_pid_data1 = pid_data1;
+        if buffer.len() > mps {
+            uart::log(b"USB BOT: conservative QTD exceeds one packet\r\n");
+            return PacketOutcome::Error;
+        }
         let mut packet_error_retries = 0u32;
         let mut timeout_retries = 0u32;
         loop {
@@ -380,67 +476,32 @@ impl BulkOnlyTransport {
             let outcome = hcd::run_packet(
                 endpoint,
                 false,
-                next_pid_data1,
+                pid_data1,
                 bulk_timeout_iterations(),
                 BULK_SPLIT_ROUNDS,
                 CompletionWait::Interrupt,
                 can_retry_timeout,
                 can_retry_error,
-                &mut buffer[completed..],
+                buffer,
             );
             match outcome {
-                PacketOutcome::Ok(transferred) => {
-                    return PacketOutcome::Ok(completed.saturating_add(transferred));
-                }
-                PacketOutcome::PacketError(transferred) if can_retry_error => {
-                    let remaining_len = total_len - completed;
-                    if endpoint.is_in && remaining_len > mps {
-                        // The failed packet itself is not included in the
-                        // completed byte count. Only a whole-MPS prefix gives
-                        // an unambiguous next buffer address and DATA PID.
-                        if transferred > remaining_len || transferred % mps != 0 {
-                            uart::log(b"USB BOT: invalid partial Bulk IN progress\r\n");
-                            return PacketOutcome::Error;
-                        }
-                        completed += transferred;
-                        if completed == total_len {
-                            return PacketOutcome::PacketError(completed);
-                        }
-                        if (transferred / mps) & 1 != 0 {
-                            next_pid_data1 = !next_pid_data1;
-                        }
-                    }
+                PacketOutcome::Ok(transferred) => return PacketOutcome::Ok(transferred),
+                PacketOutcome::PacketError(_) if can_retry_error => {
                     packet_error_retries += 1;
                     self.packet_retries = self.packet_retries.wrapping_add(1);
                     hcd::recover_channel_after_packet_failure();
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
                 PacketOutcome::PacketError(transferred) => {
-                    return PacketOutcome::PacketError(completed.saturating_add(transferred));
+                    return PacketOutcome::PacketError(transferred);
                 }
-                PacketOutcome::Timeout(transferred) if can_retry_timeout => {
-                    let remaining_len = total_len - completed;
-                    if endpoint.is_in && remaining_len > mps {
-                        if transferred > remaining_len || transferred % mps != 0 {
-                            uart::log(b"USB BOT: invalid timed-out Bulk IN progress\r\n");
-                            return PacketOutcome::Error;
-                        }
-                        completed += transferred;
-                        if completed == total_len {
-                            return PacketOutcome::Timeout(completed);
-                        }
-                        if (transferred / mps) & 1 != 0 {
-                            next_pid_data1 = !next_pid_data1;
-                        }
-                    }
+                PacketOutcome::Timeout(_) if can_retry_timeout => {
                     timeout_retries += 1;
                     self.packet_retries = self.packet_retries.wrapping_add(1);
                     hcd::recover_channel_after_packet_failure();
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
-                PacketOutcome::Timeout(transferred) => {
-                    return PacketOutcome::Timeout(completed.saturating_add(transferred));
-                }
+                PacketOutcome::Timeout(transferred) => return PacketOutcome::Timeout(transferred),
                 PacketOutcome::Error => return PacketOutcome::Error,
             }
         }
@@ -568,4 +629,13 @@ fn parse_csw(bytes: &[u8; CSW_LEN]) -> Option<CommandStatus> {
         tag: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
         status: bytes[12],
     })
+}
+
+/// Writes one `USB BOT: <what> during <phase>` line.
+fn log_phase_failure(what: &[u8], phase: &[u8]) {
+    uart::log(b"USB BOT: ");
+    uart::log(what);
+    uart::log(b" during ");
+    uart::log(phase);
+    uart::log(b"\r\n");
 }

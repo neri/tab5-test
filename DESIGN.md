@@ -49,6 +49,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [USB_HOST_PLAN.md](docs/USB_HOST_PLAN.md)、
 [USB_INTERRUPT_REFACTOR_PLAN.md](docs/USB_INTERRUPT_REFACTOR_PLAN.md)、
 [USB_MSC_PLAN.md](docs/USB_MSC_PLAN.md)、
+[USB_MSC_BOOT_MARGIN_PLAN.md](docs/USB_MSC_BOOT_MARGIN_PLAN.md)、
+[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
 [USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)、
 [WIFI_C6_PLAN.md](docs/WIFI_C6_PLAN.md)、
 [TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
@@ -63,8 +65,11 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - 日本語フォント、省電力制御は未実装です。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
-- ストレージはブロック単位の読み書きとMBR表示までです。FAT/exFATの解析、
-  USB MSCの書き込み、SDのUHS-Iモードは未実装です（[STORAGE.md](docs/STORAGE.md)）。
+- ストレージはブロック単位の読み書きとMBR表示までです。FAT/exFATの解析と
+  SDのUHS-Iモードは未実装です。USB MSCのWRITE(10)は実装・実機受入済みですが、
+  間欠故障の根本原因は未特定で、各WRITE前の予防的BOT再同期を必要とします
+  （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
+  [STORAGE.md](docs/STORAGE.md)）。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
   （[WIFI.md](docs/WIFI.md)）。
@@ -73,5 +78,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
   受信データの保存先はメモリだけです（[NETWORK.md](docs/NETWORK.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
-  読み出しまで実機確認済みです。文字列記述子の取得、periodic scheduler基盤、
-  多段ハブは未実装です（[USB.md](docs/USB.md)）。
+  読み書きまで実機確認済みです。High-Speedハブ配下Low-Speed HIDのSplit経路も
+  10 ms周期で実機確認済みで、同じハブ上のHigh-Speed MSCとの併用も`ut 100`を
+  retry 0で完走しています。
+  文字列記述子の取得と多段ハブは未実装です
+  （[USB.md](docs/USB.md)）。

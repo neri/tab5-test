@@ -46,10 +46,11 @@ mod registry;
 
 pub(crate) use hcd::handle_interrupt;
 pub use hcd::{
-    Speed, fs_ls_only_host_forced, interrupt_diagnostics, pi4ioe2_register, probe_split_support,
-    set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit,
+    Speed, fs_ls_only_host_forced, interrupt_diagnostics, pi4ioe2_register, port_drop_seen,
+    port_event_history, port_over_current_seen, probe_split_support, set_connect_wait_ms,
+    set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit, set_vbus_power,
 };
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
-pub use msc::UsbMassStorage;
+pub use msc::{CacheSync, ReadyOutcome, UsbMassStorage};
 pub use registry::{DeviceKind, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost};

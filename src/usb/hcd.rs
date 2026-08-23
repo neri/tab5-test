@@ -42,6 +42,70 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// UART.
 static NO_DEVICE_TIMEOUT_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Every port event seen since the bus was last brought up, as HPRT bits.
+///
+/// The port's change bits are write-1-to-clear, and the ISR clears them as
+/// part of acknowledging the interrupt. That makes them useless to anything
+/// reading HPRT afterwards -- including the failure logs, which is precisely
+/// when "did the device drop off the bus?" and "did the 5V switch
+/// current-limit?" are the questions worth asking. Latching them here keeps
+/// the answer until the next `probe_port`.
+static USB_PORT_EVENT_HISTORY: AtomicU32 = AtomicU32::new(0);
+
+/// Port events latched since the bus was last brought up (HPRT bit
+/// positions: `prtconndet`, `prtenchng`, `prtovrcurract`, `prtovrcurrchng`).
+pub fn port_event_history() -> u32 {
+    USB_PORT_EVENT_HISTORY.load(Ordering::Relaxed)
+}
+
+/// True if the port ever reported over-current since the last `probe_port`.
+///
+/// Whether this can ever be true on this board depends on the USB-A 5V
+/// switch's fault output actually reaching the controller; a switch whose
+/// flag pin is not wired stays silent no matter how hard it current-limits.
+/// A `false` here is therefore weak evidence, while a `true` is conclusive.
+pub fn port_over_current_seen() -> bool {
+    port_event_history() & (HPRT_PRTOVRCURRACT | HPRT_PRTOVRCURRCHNG) != 0
+}
+
+/// True if the device dropped off the bus (or the port was disabled) since
+/// the last `probe_port` -- the signature of a device that browned out and
+/// re-attached, as opposed to one that simply stopped answering.
+pub fn port_drop_seen() -> bool {
+    port_event_history() & (HPRT_PRTCONNDET | HPRT_PRTENCHNG) != 0
+}
+
+/// Set when the bus has been left in a state no further transfer can be
+/// expected to survive.
+///
+/// Only a controller-level failure puts it here: channel 0 could not be
+/// halted after a failed packet. This driver runs every control and bulk
+/// transfer on that channel, so carrying on would put every device at risk.
+///
+/// A class/device recovery failure is deliberately not stored here. In
+/// particular, a Mass Storage device that no longer answers BOT Reset
+/// Recovery has a dead BOT session, but an independently scheduled HID
+/// endpoint can still be healthy. The class driver owns that narrower state.
+static BUS_UNUSABLE: AtomicBool = AtomicBool::new(false);
+
+/// Records that the bus needs rebuilding before anything else is attempted.
+pub(super) fn note_bus_unusable() {
+    BUS_UNUSABLE.store(true, Ordering::Release);
+}
+
+/// Whether the bus has been marked unusable since the last rescan.
+///
+/// Class drivers read this to stop driving a controller that is going to
+/// fail every remaining step, rather than spending seconds proving it.
+pub(super) fn bus_unusable() -> bool {
+    BUS_UNUSABLE.load(Ordering::Acquire)
+}
+
+/// Consumes the flag, so one failure produces one escalation.
+pub(super) fn take_bus_unusable() -> bool {
+    BUS_UNUSABLE.swap(false, Ordering::AcqRel)
+}
+
 // The ISR only snapshots and acknowledges hardware. Foreground code owns
 // every transfer state transition and consumes `CHANNEL0_PENDING`; counters
 // remain monotonic across rescans so `usbhw` can expose interrupt storms.
@@ -357,6 +421,14 @@ fn set_vbus(on: bool) -> bool {
     set_vbus_bit(VBUS_ENABLE_BIT, on)
 }
 
+/// Switches USB-A's 5V rail without the caller having to know which expander
+/// bit carries it. `probe_port` turns the rail back on itself, so a caller
+/// that wants to measure a device coming up from cold only has to switch it
+/// off, discard every session, and rescan.
+pub fn set_vbus_power(on: bool) -> bool {
+    set_vbus(on)
+}
+
 /// Fully removes and restores USB-A device power. A root-port reset does not
 /// discharge a hub or MSC, so a device-side EP0/TT state can otherwise
 /// survive every software rescan. Callers must discard all live USB sessions
@@ -519,10 +591,16 @@ pub fn set_fs_ls_only_host_forced(forced: bool) {
 
 const HPRT_PRTCONNSTS: u32 = 1 << 0;
 const HPRT_PRTENA: u32 = 1 << 2;
-// Bit 4 (prtovrcurract) is not acted on, but it is included in the HPRT
-// value logged when a transfer fails: a device that stops answering
-// because the board's 5V switch current-limited looks exactly like one
-// that stopped answering for protocol reasons, except for this bit.
+// A device that stops answering because the board's 5V switch
+// current-limited looks exactly like one that stopped answering for
+// protocol reasons -- except for these bits. `prtovrcurract` is a live
+// level, while `prtconndet`/`prtenchng`/`prtovrcurrchng` are the W1C events
+// the ISR consumes, which is why they are latched into
+// `USB_PORT_EVENT_HISTORY` rather than read back afterwards.
+const HPRT_PRTCONNDET: u32 = 1 << 1;
+const HPRT_PRTENCHNG: u32 = 1 << 3;
+const HPRT_PRTOVRCURRACT: u32 = 1 << 4;
+const HPRT_PRTOVRCURRCHNG: u32 = 1 << 5;
 const HPRT_PRTRST: u32 = 1 << 8;
 const HPRT_PRTPWR: u32 = 1 << 12;
 const HPRT_PRTSPD_SHIFT: u32 = 17;
@@ -596,7 +674,7 @@ const HCCHAR_LSPDDEV: u32 = 1 << 17;
 // hardware.
 pub const HCCHAR_EPTYPE_CTRL: u32 = 0 << 18;
 pub const HCCHAR_EPTYPE_BULK: u32 = 2 << 18;
-const HCCHAR_EPTYPE_INTR: u32 = 3 << 18;
+pub const HCCHAR_EPTYPE_INTR: u32 = 3 << 18;
 
 /// HCCHAR bits[21:20], the field the databook calls MC/EC. With
 /// `HCSPLT.SpltEna` clear it is a periodic multi-count and 0 is harmless
@@ -621,6 +699,7 @@ const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD: u32 = 1 << 1;
 const HCINT_STALL: u32 = 1 << 3;
 const HCINT_NAK: u32 = 1 << 4;
+const HCINT_NYET: u32 = 1 << 6;
 const HCINT_XACTERR: u32 = 1 << 7;
 const HCINT_BBLERR: u32 = 1 << 8;
 const HCINT_XCS_XACT_ERR: u32 = 1 << 12;
@@ -668,6 +747,11 @@ pub(crate) fn handle_interrupt() {
             let hprt = read(HPRT);
             USB_LAST_HPRT.store(hprt, Ordering::Relaxed);
             let changes = hprt & (HPRT_W1C_MASK & !HPRT_PRTENA);
+            // Latched separately from `USB_PORT_PENDING`, which is consumed
+            // by whoever takes the hotplug edge; this one survives so a
+            // later failure log can still say what the port has been through.
+            USB_PORT_EVENT_HISTORY
+                .fetch_or(changes | (hprt & HPRT_PRTOVRCURRACT), Ordering::Relaxed);
             if active & GINT_PRTINT != 0 {
                 // Match `usb_dwc_ll_hprt_intr_read_and_clear`: preserve the
                 // control fields, W1C the change bits, but write PRTENA as 0
@@ -718,6 +802,14 @@ const HCSPLT_HUBADDR_SHIFT: u32 = 7; // bits[13:7]
 const HCSPLT_XACTPOS_ALL: u32 = 3 << 14;
 const HCSPLT_COMPSPLT: u32 = 1 << 16;
 const HCSPLT_SPLTENA: u32 = 1 << 31;
+
+// HFNUM.FRNUM advances once per High-Speed microframe; its low three bits
+// are therefore the 0..7 microframe index within a 1ms frame.
+const HFNUM_FRNUM_MASK: u32 = 0xFFFF;
+const HFNUM_UFRAME_MASK: u32 = 0x7;
+const LAST_SSPLIT_UFRAME: u32 = 5;
+const PERIODIC_SSPLIT_UFRAME: u32 = 0;
+const SPLIT_FRAME_WAIT_ITERATIONS: u32 = 1_000_000;
 
 // HCTSIZi in Scatter/Gather DMA mode repurposes the low byte as SCHED_INFO
 // (bits[7:0], must be 0xFF for non-periodic channels or the channel can
@@ -920,6 +1012,19 @@ impl<'a> Channel0Transfer<'a> {
                     b"USB: transfer QTD packet error, status=",
                     status >> QTD_STATUS_SHIFT,
                 );
+                // QTD status 1 covers CRC, transaction timeout, stuffing,
+                // false EOP *and* excessive NAK, which are not the same
+                // problem: a device that is merely busy NAKs, while the
+                // others mean the transaction itself went wrong. HCINT
+                // separates them, and the channel/port state says whether
+                // the host is still able to run transactions at all --
+                // which is the question when the control endpoint stops
+                // working right after a bulk failure.
+                uart::log_hex(b"USB:   HCINT=", self.completion);
+                uart::log_hex(b"USB:   HCCHAR=", unsafe { read(CHAN0_HCCHAR) });
+                uart::log_hex(b"USB:   HCTSIZ=", unsafe { read(CHAN0_HCTSIZ) });
+                uart::log_hex(b"USB:   bytes transferred=", transferred as u32);
+                log_port_state();
             }
             return PacketOutcome::PacketError(transferred);
         }
@@ -1009,6 +1114,38 @@ const DEBOUNCE_DELAY_MS: u32 = 250;
 // "A delay of at least 25ms to enter Host mode" (ESP-IDF `INIT_DELAY_MS`).
 const FORCE_HOST_MODE_DELAY_MS: u32 = 30;
 
+/// How long `probe_port` waits for a device to pull its data line up after
+/// VBUS came on, in milliseconds.
+///
+/// The frame loop re-probes an empty root port on a timer and blocks the
+/// whole loop while it waits, so the steady-state value has to stay short.
+/// Boot is the one caller that can afford to wait longer, because finding a
+/// USB mass-storage device there decides which filesystem the firmware comes
+/// up on; `input::InputManager::new` raises the limit for its one initial
+/// scan and puts it back. See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
+const DEFAULT_CONNECT_WAIT_MS: u32 = 500;
+/// Upper bound accepted by [`set_connect_wait_ms`], so the poll count it is
+/// converted into cannot overflow and no caller can block the foreground
+/// for an unbounded time.
+const MAX_CONNECT_WAIT_MS: u32 = 60_000;
+
+static CONNECT_WAIT_MS: AtomicU32 = AtomicU32::new(DEFAULT_CONNECT_WAIT_MS);
+
+/// Sets the root-port connect wait used by the next [`probe_port`] and
+/// returns the previous value, so a caller that needs a longer one-off wait
+/// can restore the steady-state limit afterwards.
+pub fn set_connect_wait_ms(milliseconds: u32) -> u32 {
+    CONNECT_WAIT_MS.swap(
+        milliseconds.clamp(1, MAX_CONNECT_WAIT_MS),
+        Ordering::Relaxed,
+    )
+}
+
+/// The connect wait the next [`probe_port`] will use.
+pub fn connect_wait_ms() -> u32 {
+    CONNECT_WAIT_MS.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Speed {
     High,
@@ -1027,6 +1164,15 @@ pub struct HostPort {
     pub connected: bool,
     pub enabled: bool,
     pub speed: Speed,
+    /// Milliseconds from the VBUS enable write at the top of `probe_port`
+    /// until HPRT first reported a device connected, or 0 if none did.
+    /// This is the part of the boot path whose length is set by the device
+    /// rather than by this driver's fixed delays, and the reason
+    /// [`set_connect_wait_ms`] exists.
+    pub connect_ms: u32,
+    /// Milliseconds from the same VBUS enable write until the port was
+    /// enabled after debounce and the reset pulse, or 0 if it never was.
+    pub enabled_ms: u32,
 }
 
 /// What the silicon itself reports about split-transaction support, as
@@ -1246,7 +1392,17 @@ fn dead_port(vbus_enable_acked: bool, core_alive: bool, core_id: u32) -> HostPor
         connected: false,
         enabled: false,
         speed: Speed::Unknown,
+        connect_ms: 0,
+        enabled_ms: 0,
     }
+}
+
+/// Milliseconds elapsed since a `tick::now_ms` reading, saturated into the
+/// `u32` the timing fields carry. Every measurement here is 0 until
+/// `tick::init` has run, which is fine: `app::run` starts the tick before
+/// it builds the `InputManager` that owns the USB host.
+fn milliseconds_since(start: u64) -> u32 {
+    crate::tick::now_ms().saturating_sub(start) as u32
 }
 
 /// Runs the full Stage 1 sequence from scratch: VBUS on, UTMI PHY and
@@ -1257,6 +1413,7 @@ fn dead_port(vbus_enable_acked: bool, core_alive: bool, core_id: u32) -> HostPor
 /// is no persistent handle at this layer (that is `hid_keyboard::UsbKeyboard`,
 /// built on top).
 pub fn probe_port() -> HostPort {
+    let started_ms = crate::tick::now_ms();
     let vbus_enable_acked = set_vbus(true);
     if !vbus_enable_acked {
         uart::log(b"USB: VBUS enable (PI4IOE2 @ 0x44) not acknowledged; continuing anyway\r\n");
@@ -1292,22 +1449,27 @@ pub fn probe_port() -> HostPort {
     hprt_modify(HPRT_PRTPWR, HPRT_PRTPWR); // port power on
     enable_controller_interrupts();
 
-    if !wait_for_connect() {
-        // The foreground periodically probes an empty root port. Emit this
-        // once for that disconnected interval, then wait until a connection
-        // has actually been observed before allowing it again.
-        log_no_device_timeout_once();
-        return HostPort {
-            vbus_enable_acked,
-            core_alive,
-            core_id,
-            fifo_depth_words,
-            channel_count,
-            connected: false,
-            enabled: false,
-            speed: Speed::Unknown,
-        };
-    }
+    let connect_ms = match wait_for_connect(started_ms) {
+        Some(elapsed) => elapsed,
+        None => {
+            // The foreground periodically probes an empty root port. Emit
+            // this once for that disconnected interval, then wait until a
+            // connection has actually been observed before allowing it again.
+            log_no_device_timeout_once();
+            return HostPort {
+                vbus_enable_acked,
+                core_alive,
+                core_id,
+                fifo_depth_words,
+                channel_count,
+                connected: false,
+                enabled: false,
+                speed: Speed::Unknown,
+                connect_ms: 0,
+                enabled_ms: 0,
+            };
+        }
+    };
 
     note_root_device_connected();
 
@@ -1323,6 +1485,8 @@ pub fn probe_port() -> HostPort {
             connected: false,
             enabled: false,
             speed: Speed::Unknown,
+            connect_ms,
+            enabled_ms: 0,
         };
     }
 
@@ -1338,6 +1502,11 @@ pub fn probe_port() -> HostPort {
     };
     if enabled {
         finish_port_enable();
+        // Only now is the history worth keeping: this driver's own reset
+        // pulse sets `prtenchng` (and can set `prtconndet`), so clearing it
+        // any earlier would leave every later log claiming the device had
+        // dropped off the bus. "Since the bus came up" means since here.
+        USB_PORT_EVENT_HISTORY.store(0, Ordering::Relaxed);
     } else {
         uart::log(b"USB: port reset completed but the port did not enable\r\n");
     }
@@ -1351,6 +1520,12 @@ pub fn probe_port() -> HostPort {
         connected: true,
         enabled,
         speed,
+        connect_ms,
+        enabled_ms: if enabled {
+            milliseconds_since(started_ms)
+        } else {
+            0
+        },
     }
 }
 
@@ -1559,7 +1734,40 @@ fn configure_fifos(fifo_depth_words: u32) {
     flush_fifos();
 }
 
-fn flush_fifos() {
+/// True while any periodic HID channel holds an armed QTD.
+///
+/// The periodic TX FIFO and the single host RX FIFO belong to the whole
+/// controller, not to the channel that happened to fail. Flushing them
+/// while a keyboard or mouse is waiting on channel 1-4 throws that
+/// endpoint's in-flight data away, and the device's session dies with it --
+/// which is how a failed mass-storage transfer used to take the keyboard
+/// down with it.
+fn periodic_channels_armed() -> bool {
+    const PERIODIC_CHANNEL_MASK: u32 = 0x1E;
+    PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) != 0
+        || unsafe { read(HAINTMSK) } & PERIODIC_CHANNEL_MASK != 0
+}
+
+/// Flushes what channel 0's failed transfer can have left behind, without
+/// disturbing periodic endpoints when any are armed.
+///
+/// Channel 0 sends through the non-periodic TX FIFO, so that one is always
+/// safe to flush. The periodic TX FIFO and the RX FIFO are shared, so they
+/// are only flushed when nothing periodic is running. The cost of skipping
+/// them is that residue from the failed transfer may remain in the RX FIFO;
+/// the cost of not skipping them is a working keyboard destroyed by an
+/// unrelated device's failure, which is the worse of the two and the one
+/// seen on real hardware.
+fn flush_channel0_fifos() {
+    if periodic_channels_armed() {
+        flush_non_periodic_tx_fifo();
+        uart::log(b"USB: periodic channels armed, flushed only the non-periodic FIFO\r\n");
+        return;
+    }
+    flush_fifos();
+}
+
+fn flush_non_periodic_tx_fifo() {
     unsafe {
         modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 0); // select non-periodic TX FIFO
         modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
@@ -1567,6 +1775,10 @@ fn flush_fifos() {
     if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
         uart::log(b"USB: non-periodic TX FIFO flush timed out\r\n");
     }
+}
+
+fn flush_fifos() {
+    flush_non_periodic_tx_fifo();
     unsafe {
         modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 1 << 6); // select periodic TX FIFO
         modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
@@ -1598,19 +1810,24 @@ pub fn recover_channel_after_packet_failure() {
         modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
     }
     prepare_channel0_interrupt();
-    flush_fifos();
+    flush_channel0_fifos();
 }
 
-fn wait_for_connect() -> bool {
+/// Waits for HPRT to report a connected device, returning the milliseconds
+/// it took (measured from `started_ms`, so it includes this driver's own
+/// VBUS-settle and core bring-up delays) or `None` if the wait ran out.
+///
+/// Run `usbinfo` after plugging a device in later than this budget allows.
+fn wait_for_connect(started_ms: u64) -> Option<u32> {
     const POLL_INTERVAL_US: u32 = 2_000;
-    const MAX_POLLS: u32 = 250; // ~500ms; run `usbinfo` after plugging in the device
-    for _ in 0..MAX_POLLS {
+    let max_polls = (connect_wait_ms() * 1_000).div_ceil(POLL_INTERVAL_US);
+    for _ in 0..max_polls {
         if unsafe { read(HPRT) } & HPRT_PRTCONNSTS != 0 {
-            return true;
+            return Some(milliseconds_since(started_ms));
         }
         delay_us(POLL_INTERVAL_US);
     }
-    false
+    None
 }
 
 fn reset_pulse() {
@@ -1750,7 +1967,8 @@ impl Route {
 pub struct Endpoint {
     pub device_address: u8,
     pub endpoint_number: u8,
-    /// `HCCHAR_EPTYPE_CTRL` or `HCCHAR_EPTYPE_BULK`.
+    /// `HCCHAR_EPTYPE_CTRL`, `HCCHAR_EPTYPE_BULK`, or
+    /// `HCCHAR_EPTYPE_INTR` for a software-scheduled split HID packet.
     pub endpoint_type: u32,
     pub mps: u16,
     pub is_in: bool,
@@ -1928,9 +2146,45 @@ pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> Pe
     {
         return PeriodicRead::Error;
     }
-    let hcint = USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
+    let mut hcint = USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
     if hcint & HCINT_CHHLTD == 0 {
-        return PeriodicRead::Pending;
+        // An idle Interrupt IN endpoint stays pending indefinitely: with
+        // descriptor DMA the core NAK-retries without halting the channel,
+        // so "no report yet" and "this channel is dead" look identical from
+        // the pending mask alone. The channel's own enable bit tells them
+        // apart -- a channel the core is still polling has it set.
+        if unsafe { read(channel_register(slot + 1, HCCHAR_OFFSET)) } & HCCHAR_CHENA == 0 {
+            // Completion clears ChEna before (or concurrently with) the ISR
+            // publishing HCINT. Without this masked recheck, foreground can
+            // land in that window and call a healthy, just-completed report
+            // a stalled channel. That false error eventually resets every
+            // USB session, including unrelated MSC.
+            let interrupts_were_enabled = crate::interrupts::mask_machine_interrupts();
+            hcint |= USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
+            let hcint_address = channel_register(slot + 1, HCINT_OFFSET);
+            let hardware = unsafe { read(hcint_address) };
+            if hardware != 0 {
+                unsafe { write(hcint_address, hardware) };
+                hcint |= hardware;
+            }
+            let still_disabled =
+                unsafe { read(channel_register(slot + 1, HCCHAR_OFFSET)) } & HCCHAR_CHENA == 0;
+            crate::interrupts::restore_machine_interrupts(interrupts_were_enabled);
+
+            if hcint & HCINT_CHHLTD == 0 && still_disabled {
+                report_stalled_periodic_channel(slot);
+                // Invalidate the driver's token so every later read reports
+                // an error too, which is what drives the HID driver's
+                // consecutive error threshold into asking for a rescan.
+                // Without this the endpoint simply goes quiet: no keys, no
+                // log, and a device that still shows up in `usbinfo`.
+                PERIODIC_HID_GENERATION[slot].fetch_add(1, Ordering::AcqRel);
+                return PeriodicRead::Error;
+            }
+        }
+        if hcint & HCINT_CHHLTD == 0 {
+            return PeriodicRead::Pending;
+        }
     }
 
     let qtd_address = periodic_qtd_address(slot);
@@ -1963,6 +2217,29 @@ pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> Pe
     PERIODIC_HID_PID_DATA1[slot].fetch_xor(true, Ordering::AcqRel);
     arm_periodic_hid(slot);
     PeriodicRead::Complete(transferred.min(report.len()))
+}
+
+/// Reports a periodic channel the core has stopped servicing, with the
+/// registers needed to find out why it stopped.
+fn report_stalled_periodic_channel(slot: usize) {
+    let channel = slot + 1;
+    PERIODIC_HID_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+    uart::log_u32(
+        b"USB HID: periodic channel stalled, channel=",
+        channel as u32,
+    );
+    uart::log_hex(b"USB HID:   HCCHAR=", unsafe {
+        read(channel_register(channel, HCCHAR_OFFSET))
+    });
+    uart::log_hex(b"USB HID:   HCINT=", unsafe {
+        read(channel_register(channel, HCINT_OFFSET))
+    });
+    uart::log_hex(b"USB HID:   HCINTMSK=", unsafe {
+        read(channel_register(channel, HCINTMSK_OFFSET))
+    });
+    uart::log_hex(b"USB HID:   HAINTMSK=", unsafe { read(HAINTMSK) });
+    uart::log_hex(b"USB HID:   HCFG=", unsafe { read(HCFG) });
+    log_port_state();
 }
 
 fn arm_periodic_hid(slot: usize) {
@@ -2056,12 +2333,38 @@ pub fn disable_periodic_hid() -> bool {
         }
         let channel = slot + 1;
         let hcchar_address = channel_register(channel, HCCHAR_OFFSET);
+        let mut completion = USB_PERIODIC_PENDING[slot].swap(0, Ordering::AcqRel);
         if unsafe { read(hcchar_address) } & HCCHAR_CHENA != 0 {
             unsafe { modify(hcchar_address, HCCHAR_CHDIS, HCCHAR_CHDIS) };
-            let _ = wait_for_periodic_channel_halt(slot, crate::startup::cpu_hz() / 10);
+            if let (Some(hcint), _) =
+                wait_for_periodic_channel_halt(slot, crate::startup::cpu_hz() / 10)
+            {
+                completion |= hcint;
+            }
+        } else {
+            let hcint_address = channel_register(channel, HCINT_OFFSET);
+            let hardware = unsafe { read(hcint_address) };
+            if hardware != 0 {
+                unsafe { write(hcint_address, hardware) };
+                completion |= hardware;
+            }
         }
         let halted = unsafe { read(hcchar_address) } & HCCHAR_CHENA == 0;
         all_halted &= halted;
+
+        // Preserve the endpoint toggle when changing from persistent
+        // periodic DMA to channel-0 frame polling. A report that completed
+        // just before the halt consumed the programmed PID even if foreground
+        // had not reaped it yet; account for that dropped report here.
+        let qtd_address = periodic_qtd_address(slot);
+        cache_writeback_invalidate(qtd_address, 8);
+        let qtd_status = unsafe { read(qtd_address) } & QTD_STATUS_MASK;
+        if completion & HCINT_XFERCOMPL != 0
+            && completion & (HCINT_STALL | HCINT_ERROR_MASK) == 0
+            && qtd_status == QTD_STATUS_SUCCESS
+        {
+            PERIODIC_HID_PID_DATA1[slot].fetch_xor(true, Ordering::AcqRel);
+        }
         unsafe {
             write(channel_register(channel, HCINTMSK_OFFSET), 0);
             modify(HAINTMSK, 1 << channel, 0);
@@ -2075,7 +2378,6 @@ pub fn disable_periodic_hid() -> bool {
         USB_PERIODIC_PENDING[slot].store(0, Ordering::Release);
         PERIODIC_HID_MPS[slot].store(0, Ordering::Release);
         PERIODIC_HID_INTERVAL[slot].store(0, Ordering::Release);
-        PERIODIC_HID_PID_DATA1[slot].store(false, Ordering::Release);
     }
     unsafe {
         modify(HCFG, HCFG_PERSCHEDENA, 0);
@@ -2084,6 +2386,19 @@ pub fn disable_periodic_hid() -> bool {
     PERIODIC_HID_ACTIVE_MASK.store(0, Ordering::Release);
     rebuild_periodic_frame_list();
     all_halted
+}
+
+/// Returns the DATA PID to use when a disabled persistent endpoint falls
+/// back to channel-0 polling. Valid after [`disable_periodic_hid`] and until
+/// the slot is allocated again.
+pub fn periodic_hid_fallback_pid(handle: PeriodicHandle) -> Option<bool> {
+    let slot = handle.slot as usize;
+    if slot >= PERIODIC_HID_SLOT_COUNT
+        || handle.generation != PERIODIC_HID_GENERATION[slot].load(Ordering::Acquire)
+    {
+        return None;
+    }
+    Some(PERIODIC_HID_PID_DATA1[slot].load(Ordering::Acquire))
 }
 
 /// Result of the opt-in channel-1 periodic scheduler diagnostic.
@@ -2390,8 +2705,9 @@ pub fn run_packet(
         timeout_iterations,
         max_split_rounds,
         sleep_on_interrupt,
+        false,
     ) {
-        Some(hcint) => hcint,
+        Some(halt) => halt.hcint,
         None => {
             if !quiet_timeout {
                 uart::log(b"USB: packet timed out waiting for channel halt\r\n");
@@ -2519,6 +2835,22 @@ fn run_split_packet(
     let hctsiz = (xfer_len as u32 & HCTSIZ_XFERSIZE_MASK) | (1 << HCTSIZ_PKTCNT_SHIFT) | pid;
     let hcsplt = endpoint.route.hcsplt();
 
+    let periodic_split = endpoint.endpoint_type == HCCHAR_EPTYPE_INTR;
+    // A periodic Interrupt split gets a fixed SSPLIT/CSPLIT mask within one
+    // High-Speed full frame. Put its SSPLIT in uframe 0 so the three result
+    // checks at 2/3/4 always fit. Control/Bulk may start through uframe 5.
+    let start_slot_ready = if periodic_split {
+        wait_for_periodic_split_start_slot()
+    } else {
+        wait_for_split_start_slot()
+    };
+    if !start_slot_ready {
+        leave_split_mode();
+        if !quiet_errors {
+            uart::log(b"USB: split scheduler saw no High-Speed frame progress\r\n");
+        }
+        return PacketOutcome::Error;
+    }
     prepare_channel0_interrupt();
     unsafe {
         modify(HCFG, HCFG_DESCDMA, 0); // buffer DMA for this packet only
@@ -2532,7 +2864,14 @@ fn run_split_packet(
     // Unlike a directly addressed HID endpoint, each software-driven split
     // phase halts on its ACK/NAK/NYET handshake. It can therefore sleep for
     // the channel IRQ even when an idle HID caller requested a quiet timeout.
-    let outcome = await_packet(hcsplt, hctsiz, timeout_iterations, max_split_rounds, true);
+    let outcome = await_packet(
+        hcsplt,
+        hctsiz,
+        timeout_iterations,
+        max_split_rounds,
+        true,
+        periodic_split,
+    );
 
     // Giving up leaves the channel enabled in the middle of a split, so it
     // has to be stopped *before* the controller's DMA mode changes back
@@ -2554,7 +2893,9 @@ fn run_split_packet(
         force_halt_channel();
         // An abandoned in-flight split can also leave residue in the
         // FIFOs, which the next transfer -- on any endpoint, to any device
-        // -- would read as its own data.
+        // -- would read as its own data. Split mode excludes periodic
+        // channels by construction (`enter_split_mode`), so this one can
+        // always take the full flush.
         flush_fifos();
     }
     // Restore Scatter/Gather DMA before anything can return: every other
@@ -2567,13 +2908,14 @@ fn run_split_packet(
     }
     leave_split_mode();
 
-    let Some(hcint) = outcome else {
+    let Some(halt) = outcome else {
         if !quiet_timeout {
             uart::log(b"USB: split transfer timed out waiting for the hub's TT\r\n");
             log_port_state();
         }
         return PacketOutcome::Timeout(0);
     };
+    let hcint = halt.hcint;
 
     if hcint & HCINT_STALL != 0 {
         if !quiet_errors {
@@ -2583,6 +2925,11 @@ fn run_split_packet(
     }
     if hcint & HCINT_ERROR_MASK != 0 {
         if !quiet_errors {
+            uart::log(if halt.complete_split {
+                b"USB: split failed during CSPLIT\r\n"
+            } else {
+                b"USB: split failed during SSPLIT\r\n"
+            });
             uart::log_hex(b"USB: split transfer transaction error, HCINT=", hcint);
             log_port_state();
         }
@@ -2628,13 +2975,21 @@ fn run_split_packet(
 /// packet when a NAK sends the sequence back to a fresh start split; it is
 /// ignored when `hcsplt` says this is not a split packet.
 ///
-/// `max_split_rounds` is a *soft* budget, and deliberately so: it stops the
-/// sequence at the first safe boundary at or after that many rounds, rather
-/// than the moment it is reached. A split may only be abandoned once the TT
-/// has let go of it -- USB2.0 11.17 requires the host to keep issuing
-/// complete splits until the TT answers something other than NYET, so a
-/// NAK (the TT discarding its buffer) or a conclusion is the only legal
-/// place to walk away.
+/// `max_split_rounds` is a *soft* budget for non-periodic Control/Bulk
+/// transfers, and deliberately so: it stops the sequence at the first safe
+/// boundary at or after that many rounds, rather than the moment it is
+/// reached. A non-periodic split may only be abandoned once the TT has let
+/// go of it -- USB2.0 11.17 requires the host to keep issuing complete splits
+/// until the TT answers something other than NYET, so a NAK (the TT
+/// discarding its buffer) or a conclusion is the only legal place to walk
+/// away.
+///
+/// Periodic Interrupt splits have a different boundary: all of their start
+/// and complete splits belong to one High-Speed full frame. If its scheduled
+/// CSPLIT window ends in NYET, the periodic transaction expires at the next
+/// full-frame boundary. `periodic_split` waits for that boundary and returns
+/// a quiet timeout; the next rendered frame starts a new SSPLIT instead of
+/// spinning thousands of times on a transaction whose schedule has ended.
 ///
 /// Getting this wrong is not a subtle protocol nicety. When an idle
 /// keyboard poll gave up as soon as its budget ran out, it left the hub's
@@ -2643,14 +2998,23 @@ fn run_split_packet(
 /// looked like it had died. It went unnoticed at first only because the
 /// frame loop was resetting the whole bus every few seconds anyway, which
 /// cleared the wedged TT as a side effect.
+#[derive(Clone, Copy)]
+struct PacketHalt {
+    hcint: u32,
+    complete_split: bool,
+}
+
 fn await_packet(
     hcsplt: u32,
     hctsiz: u32,
     timeout_iterations: u32,
     max_split_rounds: u32,
     sleep_on_interrupt: bool,
-) -> Option<u32> {
+    periodic_split: bool,
+) -> Option<PacketHalt> {
     let mut rounds = 0u32;
+    let mut complete_split = false;
+    let split_full_frame = hs_full_frame();
     loop {
         let strategy = if sleep_on_interrupt {
             WaitStrategy::Interrupt
@@ -2664,23 +3028,54 @@ fn await_packet(
         }
 
         if hcsplt & HCSPLT_SPLTENA == 0 {
-            return Some(hcint);
+            return Some(PacketHalt {
+                hcint,
+                complete_split: false,
+            });
         }
         // Only a bare handshake keeps a split packet going; anything that
         // concludes it (data moved, STALL, error) is the caller's business.
         if hcint & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_ERROR_MASK) != 0 {
-            return Some(hcint);
+            return Some(PacketHalt {
+                hcint,
+                complete_split,
+            });
         }
         rounds += 1;
+
+        if periodic_split && hcint & HCINT_NAK != 0 {
+            // NAK is the completed periodic transaction's ordinary "no
+            // report" result (or a TT which could not accept this slot).
+            // Its buffer is already released. Starting another SSPLIT in
+            // the same scheduling window both violates bInterval and uses
+            // up the CSPLIT slots reserved for the next transaction.
+            return None;
+        }
 
         // A NAK invalidates the TT's buffer for this transaction, so the
         // next step is a fresh start split rather than another complete
         // split. Anything else (the ACK that accepts a start split, a NYET
         // that says "not yet") continues into the complete-split half.
-        let in_complete_split = hcint & HCINT_NAK == 0;
+        let next_is_complete_split = hcint & HCINT_NAK == 0;
 
-        if !in_complete_split && rounds >= max_split_rounds {
+        if !next_is_complete_split && rounds >= max_split_rounds {
             return None; // out of budget, and the TT has let go: safe to stop
+        }
+        if periodic_split
+            && complete_split
+            && hcint & HCINT_NYET != 0
+            && (rounds >= max_split_rounds
+                || hs_full_frame() != split_full_frame
+                || unsafe { read(HFNUM) } & HFNUM_UFRAME_MASK == HFNUM_UFRAME_MASK)
+        {
+            // An idle Interrupt IN commonly ends its available CSPLITs in
+            // NYET. Do not apply the Control/Bulk rule that can chase NYET
+            // indefinitely: after this periodic frame expires, the TT is no
+            // longer holding a transaction that must be collected. Waiting
+            // for the boundary before restoring descriptor DMA also keeps a
+            // fresh packet from colliding with the expiring TT state.
+            let _ = wait_for_next_hs_full_frame(split_full_frame);
+            return None;
         }
         if rounds >= SPLIT_HARD_ROUND_CAP {
             // Last resort against a wedged TT that answers NYET forever.
@@ -2690,9 +3085,32 @@ fn await_packet(
             uart::log(b"USB: giving up mid-split; the hub's TT never answered\r\n");
             return None;
         }
+        // The TT needs downstream bus time after accepting an SSPLIT. DWC2's
+        // reference scheduler advances two microframes after a start split;
+        // immediately re-enabling the channel can put CSPLIT in the same
+        // microframe and stricter hubs answer XactErr. Repeated CSPLITs after
+        // NYET advance one microframe. A NAK releases the TT buffer and starts
+        // a new SSPLIT in a legal 0..5 slot.
+        let schedule_ready = if next_is_complete_split {
+            wait_split_microframes(if complete_split { 1 } else { 2 })
+        } else {
+            wait_split_microframes(1) && wait_for_split_start_slot()
+        };
+        if !schedule_ready {
+            uart::log(b"USB: split scheduler lost High-Speed frame progress\r\n");
+            return None;
+        }
+        if periodic_split && next_is_complete_split && hs_full_frame() != split_full_frame {
+            // Foreground interrupt latency can skip over the intended
+            // microframe even though HFNUM itself advanced normally. Never
+            // launch a periodic CSPLIT in the next full frame: its TT window
+            // belonged to the frame containing the SSPLIT and has expired.
+            return None;
+        }
+        complete_split = next_is_complete_split;
         prepare_channel0_interrupt();
         unsafe {
-            if in_complete_split {
+            if complete_split {
                 write(CHAN0_HCSPLT, hcsplt | HCSPLT_COMPSPLT);
             } else {
                 // Starting over: put back the packet count and PID the core
@@ -2707,6 +3125,69 @@ fn await_packet(
     }
 }
 
+/// Waits until an SSPLIT can leave at least two later microframes in the
+/// current frame for its first CSPLIT.
+fn wait_for_split_start_slot() -> bool {
+    for _ in 0..SPLIT_FRAME_WAIT_ITERATIONS {
+        let microframe = unsafe { read(HFNUM) } & HFNUM_UFRAME_MASK;
+        if microframe <= LAST_SSPLIT_UFRAME {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Aligns a periodic SSPLIT with uframe 0. The following CSPLIT attempts are
+/// then deterministically placed in uframes 2, 3, and 4 instead of inheriting
+/// the fixed phase difference between the 1kHz system tick and USB SOF.
+fn wait_for_periodic_split_start_slot() -> bool {
+    let initial = unsafe { read(HFNUM) } & HFNUM_FRNUM_MASK;
+    let initial_full_frame = initial >> 3;
+    let started_in_uframe_zero = initial & HFNUM_UFRAME_MASK == PERIODIC_SSPLIT_UFRAME;
+    for _ in 0..SPLIT_FRAME_WAIT_ITERATIONS {
+        let now = unsafe { read(HFNUM) } & HFNUM_FRNUM_MASK;
+        if now & HFNUM_UFRAME_MASK == PERIODIC_SSPLIT_UFRAME
+            && (!started_in_uframe_zero || now >> 3 != initial_full_frame)
+        {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Waits for High-Speed bus time rather than a CPU-delay approximation, so
+/// CPU clock changes cannot collapse SSPLIT/CSPLIT spacing.
+fn wait_split_microframes(count: u32) -> bool {
+    let start = unsafe { read(HFNUM) } & HFNUM_FRNUM_MASK;
+    for _ in 0..SPLIT_FRAME_WAIT_ITERATIONS {
+        let now = unsafe { read(HFNUM) } & HFNUM_FRNUM_MASK;
+        if now.wrapping_sub(start) & HFNUM_FRNUM_MASK >= count {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+#[inline]
+fn hs_full_frame() -> u32 {
+    (unsafe { read(HFNUM) } & HFNUM_FRNUM_MASK) >> 3
+}
+
+/// Waits for the periodic TT transaction's 1ms scheduling window to expire.
+/// A fresh HID poll may issue a new SSPLIT after this returns.
+fn wait_for_next_hs_full_frame(start_full_frame: u32) -> bool {
+    for _ in 0..SPLIT_FRAME_WAIT_ITERATIONS {
+        if hs_full_frame() != start_full_frame {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 /// Enters the controller-wide buffer-DMA mode used by Split transactions.
 ///
 /// Periodic descriptor DMA and Split buffer DMA cannot coexist on this DWC.
@@ -2715,9 +3196,7 @@ fn await_packet(
 /// future allocator change cannot silently switch DMA mode underneath an
 /// active periodic channel.
 fn enter_split_mode() -> bool {
-    const PERIODIC_CHANNEL_MASK: u32 = 0x1E;
-    if PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) != 0
-        || unsafe { read(HAINTMSK) } & PERIODIC_CHANNEL_MASK != 0
+    if periodic_channels_armed()
         || SPLIT_MODE_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -2740,7 +3219,9 @@ fn leave_split_mode() {
 /// a cleared enable bit means the core dropped the port, and
 /// prtovrcurract (bit 4) means the board's 5V supply gave up.
 fn log_port_state() {
-    uart::log_hex(b"USB:   HPRT=", unsafe { read(HPRT) });
+    let hprt = unsafe { read(HPRT) };
+    uart::log_hex(b"USB:   HPRT=", hprt);
+    log_port_flags(hprt);
     // A Full-Speed device may enter suspend after a few milliseconds without
     // bus activity. Sampling HFNUM across one millisecond tells a failed
     // control-transfer caller whether this host is still generating frames.
@@ -2750,19 +3231,78 @@ fn log_port_state() {
     uart::log_hex(b"USB:   HFNUM +1ms=", unsafe { read(HFNUM) });
 }
 
+/// Spells out the port state and everything the port has been through since
+/// the bus came up, so a failure log answers "was this a power problem?"
+/// without anyone decoding HPRT by hand.
+fn log_port_flags(hprt: u32) {
+    uart::log(b"USB:   port now:");
+    uart::log(if hprt & HPRT_PRTCONNSTS != 0 {
+        b" connected" as &[u8]
+    } else {
+        b" DISCONNECTED"
+    });
+    uart::log(if hprt & HPRT_PRTENA != 0 {
+        b" enabled" as &[u8]
+    } else {
+        b" NOT-ENABLED"
+    });
+    uart::log(if hprt & HPRT_PRTPWR != 0 {
+        b" powered" as &[u8]
+    } else {
+        b" UNPOWERED"
+    });
+    if hprt & HPRT_PRTOVRCURRACT != 0 {
+        uart::log(b" OVER-CURRENT");
+    }
+    uart::log(b"\r\n");
+
+    let history = port_event_history();
+    uart::log(b"USB:   port since bus came up:");
+    if history == 0 {
+        uart::log(b" no events");
+    } else {
+        if history & (HPRT_PRTOVRCURRACT | HPRT_PRTOVRCURRCHNG) != 0 {
+            uart::log(b" OVER-CURRENT");
+        }
+        if history & HPRT_PRTCONNDET != 0 {
+            uart::log(b" connect-change");
+        }
+        if history & HPRT_PRTENCHNG != 0 {
+            uart::log(b" enable-change");
+        }
+    }
+    uart::log(b"\r\n");
+}
+
 /// Explicitly requests a channel halt and waits (briefly) for it, so a
 /// channel left mid-transaction by a timed-out packet does not race the
 /// next packet's configuration. Best-effort: even if the halt never
 /// confirms, `HCINT` is still cleared so stale bits cannot be misread as
 /// belonging to the next transfer.
 fn force_halt_channel() {
+    // A completed channel has already cleared ChEna. Asking ChDis of an
+    // inactive channel cannot produce another halt interrupt on this core;
+    // treating that missing interrupt as a controller failure creates a
+    // false global re-enumeration after an ordinary completion race.
+    if unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA == 0 {
+        prepare_channel0_interrupt();
+        return;
+    }
     unsafe {
         modify(CHAN0_HCCHAR, HCCHAR_CHDIS, HCCHAR_CHDIS);
     }
     // Cleanup must remain short even if the core fails to raise a halt IRQ;
     // sleeping until the next display frame would unnecessarily add ~17 ms
     // to an already failed transfer.
-    let _ = wait_for_channel0_halt(HALT_CONFIRM_ITERATIONS, WaitStrategy::Poll);
+    let halted = wait_for_channel0_halt(HALT_CONFIRM_ITERATIONS, WaitStrategy::Poll).is_some();
+    if !halted {
+        // Everything this driver does goes through channel 0. Carrying on
+        // as if the cleanup had worked is what turned one failed transfer
+        // into a bus that stayed dead: say so, and let the registry decide
+        // how far to escalate.
+        uart::log(b"USB: channel 0 did not halt; the bus needs re-enumeration\r\n");
+        note_bus_unusable();
+    }
     prepare_channel0_interrupt();
 }
 

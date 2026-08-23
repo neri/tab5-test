@@ -3,7 +3,9 @@
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
 > [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)、[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md)、
 > [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md)、
-> [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)、[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)
+> [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)、[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)、
+> [`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)、
+> [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)
 
 Tab5のUSB-Aコネクタに繋がるHigh-Speed USB-DWCコントローラーをホストとして
 使用します。モジュールの層構成（`hcd`／`protocol`／`hid`／`hid_keyboard`／
@@ -23,6 +25,9 @@ USB Serial/JTAG（GPIO24/25）は対象外です。
 - 1段のUSBハブ配下の複数デバイス列挙と逐次ポーリング（`src/usb/hub.rs`）。
 - USB Mass Storageの読み出し（`src/usb/msc.rs`）。詳細は
   [`STORAGE.md`](STORAGE.md)。直結・ハブ経由のどちらでも動作します。
+  書き込み（WRITE(10)、`usbwritetest`）も実装・実機受入済みですが、間欠故障の根本原因は
+  未特定で、各WRITE前の予防的BOT再同期を必要とします
+  （[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)）。
 - High-Speedハブ配下にFull/Low-Speedデバイスを繋ぐ構成（Split Transaction）。
 
 ## 中断したFloppy実装
@@ -35,6 +40,19 @@ UFI/CBI USB Floppy用の試作クラスドライバは`src/usb/floppy.rs`に保�
 `0x02`、status Interrupt IN `0x83`）でのCBI ADSC制御要求は、descriptor-DMAの
 SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再開条件は
 [`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)を参照する。
+
+## root portのconnect待ち
+
+`probe_port`が「VBUSを入れてからデバイスがpull-upを上げるまで」を待つ上限は
+runtimeに切り替えられます（`hcd::set_connect_wait_ms`）。定常値は500 msで、
+フレームループが空ポートを定期再probeする間はこの時間ずっとブロックするため
+長くできません。起動時の初回スキャンだけは`InputManager::new`が1,000 msへ
+上げ、直後に戻します。起動時にUSBメモリがあればそれを最優先のファイル
+システムにする予定があり、そのときデバイスは電源投入直後で立ち上がっている
+途中だからです。1,000 msは実測（最悪246 ms、うち約80 msは`probe_port`自身の
+固定遅延）の約4倍で、**USB-Aに何も挿していない起動だけがこの全額を払います**。
+計測手順と根拠は[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)に
+あります。`usbmargin`は計測中だけ5,000 msを使います。
 
 ## バスの所有とスキャン周期
 
@@ -53,10 +71,146 @@ SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再�
 - ルートポートが空のときの再スキャン: 300フレームごと（ブロッキングの
   リセット・デバウンスを伴うため粗い間隔にしてある）
 
+## 電力問題の切り分け
+
+デバイスが応答しなくなったとき、それが「プロトコル上の失敗」なのか「5Vが足りずに
+デバイスが落ちた」のかは、コントローラーのステータスからある程度分かります。
+
+HPRTの`prtconndet`（bit 1）・`prtenchng`（bit 3）・`prtovrcurrchng`（bit 5）は
+**write-1-to-clearで、ISRが割り込みを確認する時点でクリアされます**。そのため失敗後に
+前景でHPRTを読んでも痕跡は残りません。現在はISRがこれらを
+`USB_PORT_EVENT_HISTORY`へ**ラッチ**し、`probe_port`がポートをenableできた時点だけが
+クリアします（このドライバ自身のreset pulseが`prtenchng`を、場合によっては`prtconndet`も
+立てるため、それより前でクリアすると以後のログが常に「デバイスが脱落した」と主張します）。転送失敗時のログと`usbhw`が同じ内容を表示します。
+
+```text
+USB:   port now: connected enabled powered
+USB:   port since bus came up: OVER-CURRENT connect-change
+```
+
+読み方:
+
+- **OVER-CURRENT** — コントローラーが過電流入力を見た。**これが出たら電力問題は確定**。
+  ただしTab5のUSB-A 5Vスイッチのfault出力がSoCへ配線されていない場合、
+  どれだけ電流制限がかかっても永遠に出ません。**出ないことは弱い証拠**です。
+- **connect-change** — デバイスが一度バスから消えた。ブラウンアウトして再起動した
+  デバイスはこうなります。「応答しないだけ」と「電源が落ちた」を分ける実用的な指標です。
+- **enable-change** — コアがポートを無効化した（babble等）。
+
+ハブ配下なら、より確実な指標があります。**USBハブはポートごとの過電流を
+`wPortStatus`のbit 3で報告する**（規格）ので、`usbhub`の表示に`OVERCURRENT`が出ます。
+バスパワーのハブは供給能力が低く、ここに出る可能性が高いです。
+
+なお`ina226.rs`が測るのは**バッテリーパック**であってUSB-Aの5Vではないため、
+VBUSの電圧降下は直接は見えません（システム全体の電流の跳ね上がりは見えます）。
+
+## 転送失敗の巻き添え（FIFOの共有）
+
+periodic TX FIFOとhost RX FIFOは**コントローラー全体で共有**で、失敗したチャネルの
+持ち物ではありません。channel 0（control／bulk）の失敗回復で全FIFOをflushすると、
+channel 1〜4で待機中のHIDのin-flightデータが道連れになり、**無関係なMSCの転送失敗が
+キーボードのsessionを殺します**（実機では`usbfs on`でHIDを繋いだ後、`usbwritetest`で
+HIDのポートが死にました）。
+
+現在、`recover_channel_after_packet_failure`はperiodicチャネルがarmされている間は
+**non-periodic TX FIFOだけをflushします**（channel 0が送信に使うのはそこだけです）。
+skipした場合は`USB: periodic channels armed, flushed only the non-periodic FIFO`を
+出します。代償は失敗した転送の残骸がRX FIFOに残り得ることですが、動作中のキーボードを
+無関係なデバイスの失敗で壊すほうが実害が大きいと判断しています。Split転送の後始末は
+従来どおり全FIFOをflushします（Splitとperiodicは`enter_split_mode`により排他なので、
+巻き添えにするものが存在しません）。
+
+## periodic HIDの停止検出
+
+Interrupt IN endpointは、descriptor DMAではNAKでhaltしません。**アイドル中の
+キーボードと、コアが面倒を見なくなった死んだチャネルは、pendingマスクだけでは
+区別できません**（どちらも「まだ完了していない」）。区別できるのはチャネル自身の
+`HCCHAR.ChEna`で、コアがまだpollしているチャネルはこれが立っています。
+
+`take_periodic_hid_report`は、pendingかつ`ChEna`が落ちている場合に割り込みを一時maskし、
+atomic pendingとhardware HCINTを再確認します。正常な完了は`ChEna`を落としてからISRへ
+公開されるため、この再確認がないと完了直前のreportを停止と誤認する競合が生じます。
+再確認後も完了がなく`ChEna`が落ちている場合だけ「停止」と判定し、
+`USB HID: periodic channel stalled, channel=N`とHCCHAR／HCINT／HCINTMSK／HAINTMSK／
+HCFG／port状態を出したうえで、そのslotのgenerationを進めます。以後の読み出しは
+errorになるので、HIDドライバの連続エラー閾値が再列挙を要求します。この検出が無いと、
+**キーも来ず、ログも出ず、`usbinfo`にはデバイスが残ったまま**という状態になります
+（実機で発生しました）。
+
+## 転送失敗からの自動復帰
+
+すべてのcontrol／bulk転送はチャネル0を共有します。したがって**チャネル0をhaltできない
+まま放置すると、以後のcontrol転送まで失敗し、バス全体が死んだままになります**。実機では
+1回のBulk timeoutからこの状態に入り、`usbrescan`でも復帰せず（HPRTはconnected／enabled
+のまま、列挙の8 byte device descriptor読み出しがpacket errorで失敗）、本体をcold boot
+するまで戻りませんでした。
+
+復帰の範囲は、故障が確認できた層に限定します。
+
+1. **チャネル0をhaltできなかった場合だけ**コントローラー全体を「バス使用不能」と記録し
+   （`hcd::note_bus_unusable`）、`UsbHost::needs_reinit`経由で`InputManager`が次の
+   フレーム境界に全バスを再列挙します
+   （`USB: channel 0 did not halt; the bus needs re-enumeration`）。この状態では次のcontrol／
+   bulk転送を安全に開始できないため、HIDを含む全sessionの作り直しが必要です。
+2. **BOT Reset Recoveryが失敗した、または2回続けて効かなかった場合はMSC sessionだけを
+   使用不能にします**（`this session needs re-enumeration`）。実機ではこのときもチャネル0は
+   正常にhaltしており、別チャネルのHIDまで壊れた証拠はありません。したがって自動の全バス
+   再列挙は行わず、以後のMSC commandを即時に失敗させます。`usbrescan`を明示的に実行すると
+   sessionを作り直します。BOT Reset Recoveryの成功はcontrol転送が通ったことしか示さないため、
+   直後のcommandも失敗したら「回復していない」と判定します（成功したcommandだけが連続回数を
+   リセットします）。
+
+再列挙自体もバス全体をリセットするため、**取り付けた直後に必ず失敗するデバイスがあると
+「attach→失敗→リセット→attach」のループになり、同じバス上の正常なデバイスまで
+毎秒何度も落とされます**（実機ではSplit経由のHIDがこれを起こし、MSCが巻き添えになりました）。
+そのため`InputManager`は、stale sessionによる再列挙が連続する場合にバックオフします。
+1回目は即座（ケーブルを抜いた通常のケースで待たされないため）、2回目以降は
+60フレーム×連続回数（最大600フレーム＝約10秒）空け、600フレーム無事に経過したら
+連続回数をリセットします。`USB: repeated stale sessions, next rescan in frames=`が
+そのログです。
+
+`usbwritetest`と`usbzero`は、MSC sessionまたはバスが使用不能と記録された時点で残りの
+手順を打ち切り、`usbrescan`を案内します。どのみち全部同じ失敗をするうえ、1手順あたり
+数秒かかるためです。復帰後に残骸を消すには`usbzero <lba>`を使います。
+
+3. 再列挙で「HPRTはconnectedなのにデバイスが応答しない」（ポートがenableしない、または
+   列挙が失敗する）と判定した場合、
+   `USB: device unreachable after a port reset; power-cycling USB-A`を出して**VBUSを
+   1秒切って入れ直し**、もう一度スキャンします。port resetは`probe_port`が既に行っている
+   ため、ソフトウェアに残された手段はこれだけです。
+4. **ハブ配下のデバイスが列挙できない場合は、そのハブポートの電源を切ります**
+   （`USB: power-cycling hub port N`）。**セルフパワーハブではroot側のVBUSを切っても
+   下流ポートの電源は落ちない**ので、1と2では何も起きません。ハブがper-port電源
+   スイッチングに対応している場合だけ実行します（gangedのハブは他のポート＝
+   キーボード等まで巻き添えにするため）。電源復帰後にdebounceして1回だけ再列挙し、
+   それでも駄目なら`USB: still unreachable after a port power cycle; hub port N`を出して
+   そのポートを保留にします。
+
+自動power cycleは（root VBUS・ハブポートのどちらも）前回から30秒以上経過している場合
+だけ実行します。
+
+BOT層は、MSC sessionまたはコントローラーが使用不能と記録されている間**コマンドを送らず
+即座に失敗します**（`USB BOT: session is unusable, skipping commands until re-enumeration`）。
+再列挙までに投げたcommandは、1本ごとにtimeoutとReset Recovery失敗を積み上げるだけで、
+実機ではこれが「1回の書き込み失敗が数分のログとシェルの無応答」になっていました。
+
+VBUSの自動power cycleは1回の再列挙につき最大1回で、さらに前回から30秒以上経過している
+場合に限ります（`POWER_RECOVERY_INTERVAL_MS`。ハブポートの電源断とも共有します）。power cycleは1秒以上ブロックしバス上の
+全デバイスを落とすため、応答しないデバイスが刺さったままフレームループが数秒ごとに
+電源を切り続ける状態を避けるためです。`mix`の明示的なpower cycleも同じ間隔を共有します。
+
 増分スキャンで列挙に失敗したポート、または対応class driverが無いポートは、その物理接続を
 保留状態として記録します。以後は約1秒ごとにHubの接続／change bitだけをquietに読み、同じdeviceを
 reset・再列挙し続けません。抜き差しを検出した場合、または`usbrescan`／`mix`が明示的にfull rescan
 した場合だけ列挙を再試行します。これにより列挙失敗ログがconsole操作を妨げる連続出力になりません。
+
+セルフパワーハブはupstreamを抜いても下流deviceへ給電し続けるため、再接続時に古いdevice
+address／configurationや`C_PORT_RESET`が残り得ます。下流port列挙では古い`C_PORT_RESET`を
+先にclearし、新しい`SET_FEATURE(PORT_RESET)`後のreset完了change、または実際に観測した
+RESET assert→deassertを待ってからaddress 0へアクセスします。reset要求直後の最初のstatusが
+まだRESET=0でも完了とは扱いません。給電中ハブへHIDとMSCを事前接続した実機では両方を初回認識し、
+FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上流再接続も5/5回、HIDの
+抜き直しなしで認識しました。
 
 ## 転送方式の現状
 
@@ -67,6 +221,10 @@ reset・再列挙し続けません。抜き差しを検出した場合、また
   世代token、IRQ pendingはchannelごとに独立しています。割当て不能時とHigh-Speedハブ配下は、
   controller-wide DMA modeとSplitの調停が未実装なため、従来の`BULK`分類＋frame pollへfallback
   します。root直結High-Speed HIDもinterval解釈の実機確認前なのでfallbackです。
+  ハブの初回／増分スキャンでは、occupied portをすべて列挙し終えるまでperiodic channelを
+  開始しません。低い番号のportに事前接続されたHIDが先にperiodic DMAを開始すると、後続portの
+  channel 0列挙controlと競合し、HID後挿し時だけ成功する状態になったためです。全port処理後に
+  MSC併用ならchannel 0逐次化、HIDだけならperiodic開始を一度だけ選択します。
 - 転送はチャネル0を使った逐次・同期方式で、真の並列転送はしません。
   [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md) Stage 1として、
   High-Speed DWCのsource 93をCLICへルーティングし、channel／root-port状態を短いISRで
@@ -84,12 +242,19 @@ reset・再列挙し続けません。抜き差しを検出した場合、また
   Bulk IN／OUT両endpointのhalt解除、DATA0へのtoggle同期からなるBOT Reset Recoveryを
   実行します。安全に再送できるREAD(10)だけはRecovery後に1回再試行し、再試行数を
   session内で計数します。WRITE系commandの自動再送は行いません。
-  descriptor DMAのQTD status 1はpacket errorとして扱います。1 packet QTDならtoggleを
-  進めず同一DATA PIDを50 ms間隔・最大20回の範囲で再送します。複数packetのBulk IN QTDは
-  descriptor残量が示す完全MPS packetを保持し、そのpacket数から次のDATA PIDを復元して未受信
-  suffixだけを再投入します。MPS境界でない進捗はReset Recoveryへ進みます。MSCの4 KiB Bulk INは
-  MPS 64 byteごとにchannelを再起動せず1 QTDへまとめ、descriptor DMAにpacket分割を任せます。
+  descriptor DMAのQTD status 1はpacket errorとして扱います。MSCのQTDは1 endpoint MPS以下に
+  限定し、toggleを進めず同一DATA PIDを50 ms間隔・最大20回の範囲で再送します。ACKだけを
+  失ってdeviceがpacketを受理済みでも、同じPIDのduplicateは再消費されません。4 KiB Bulk INも
+  MPS単位に分割し、各packetの完了とDATA PIDをsoftwareが確定してから次へ進みます。
   13/36/8 byteの短いIN応答は、QTD長をMPS倍数に保つ内蔵SRAM staging経由で受信します。
+  連続READ(10)では、成功16回ごとにcommand間でMass Storage Resetと両Bulk endpointの
+  halt解除を行い、DATA toggleをDATA0へ予防的に再同期します。実機ではFS-onlyで最短33回、
+  High-Speed直結でも52回後にBulk INからEP0まで無応答になったため、応答が残っている間に
+  BOT境界だけを再確立する緩和策です。High-Speed直結の`ut 100`は予防再同期6回、retry 0で
+  100/100を完走しました。FS-onlyハブ＋HID併用でも同条件で100/100を完走し、試験後も
+  HIDは動作しました。root portとHIDはresetしません。
+  WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じBOT再同期を行い、
+  常にDATA0へ揃えたcommand境界から開始します。
 - rootへ直接接続したHID Boot keyboardは、attach時にstaticな512-byte aligned
   32-entry frame list／QTD bankを割り当て、`HCCHAR.eptype=INTR`で常時待機します。report完了IRQを
   前景がtakeして次QTDをrearmするため、idle中にchannel 0をpollしません。この常設経路は
@@ -98,14 +263,57 @@ reset・再列挙し続けません。抜き差しを検出した場合、また
   key reportだけchannel 1で完了・rearmしました。channel 1〜4 allocator、root直結mouse、
   Full-Speedハブ配下の複数HIDも実装済みです。後者はHigh-Speedハブを`usbfs on`でFull-Speed
   列挙する代替試験により、keyboard=channel 1、mouse=channel 2の同時動作を確認済みです。
+- **MSCとHIDが同じバスに存在する場合は、HIDのpersistent periodic DMAを停止し、control／
+  bulk／HIDをchannel 0で逐次実行します。** Full-Speed固定の実機試験ではperiodic QTDをarm
+  したままのMSC READ(10)が33回成功後にtimeoutし、Recovery後の再送も同じ形で失敗しました。
+  RX FIFOを共有する複数DMA channelの同時稼働を避けるための安定性優先policyです。切替時は
+  periodic channelをhaltし、完了済みreportの有無をQTD／HCINTから回収して次のDATA PIDを
+  frame pollへ引き継ぎます。device resetや再列挙は行わず、`USB: MSC present, serializing HID
+  and bulk on channel 0`を出します。MSCが無い構成では従来どおりperiodic channelを使います。
 - High-Speedハブ配下のFS/LS HIDは、Splitがbuffer DMA、periodicがdescriptor DMAという
   controller-wide制約のため、channel 0のserialized Split fallbackを使います。各SSPLIT／CSPLIT
   phaseはIRQ＋WFIで待ち、レジスタをspin pollしません。HCDはSplit modeを排他状態として管理し、
   periodic channelが残っていればDMA modeを切り替えずエラーにします。`usbhw`の`IRQ split`で
-  packet／round／conflictとmode activeを確認できます。keyboard＋mouseのHigh-Speedハブ実機回帰では
+  packet／round／conflictとmode activeを確認できます。SSPLITはmicroframe 0〜5に限定し、TTが
+  downstream transactionを処理する時間として最初のCSPLITを2 microframe後、NYET後の再CSPLITを
+  1 microframe後に投入します。keyboard＋mouseの旧High-Speedハブ実機回帰では
   4745 packets／58727 roundsをIRQ＋WFIで処理し、poll／conflictはいずれも0でした。
   同じハブへHigh-Speed USBメモリを追加し、Split HIDを維持したままMSCの`INQUIRY`、
-  `TEST UNIT READY`、`READ CAPACITY(10)`、`READ(10)`も実機成功しています。
+  `TEST UNIT READY`、`READ CAPACITY(10)`、`READ(10)`も実機成功しています。一方、今回の
+  High-Speedハブ＋Low-Speed HIDではmicroframe間隔なしの実装が`HCINT=0x82`で列挙失敗しており、
+  第19版で列挙・class attachまでは成功しました。続く最初のInterrupt INがCSPLITで`0x82`に
+  なった原因は、直結fallback用の`HCCHAR.EPType=BULK`をSplit tokenにも流用していたことです。
+  第20版はSplit HIDだけをdescriptorどおり`EPType=INTR`にして文字入力まで成功しましたが、idle時の
+  CSPLIT NYETを最大5000 round追跡して`giving up mid-split`と長いfreezeを繰り返しました。
+  第21版は周期InterruptだけSSPLIT＋最大3回のCSPLITを同じHigh-Speed full frame内で試し、NYETのまま
+  scheduling windowが終わればfull-frame境界を待って通常の`Timeout`（reportなし）として終了します。
+  Control／BulkのNYET回収規則とhard capは変更しません。第21版の実機ではエラーとfreezeが消えました。
+  ただしSplit packet数が約57回/秒で描画周期に縛られ、descriptorの`bInterval`より遅いことが次の
+  入力遅延になりました。第22版は既存1 kHz tickの非描画wakeからSplit keyboardだけを
+  `bInterval` msごとにpollし、受信keyを16 event queueへ保持します。通常のframe境界ではqueueを
+  消費するだけなので、USBのsampling周期と表示の更新周期を分離します。起動時に実際の値を
+  `USB HID: Split foreground poll interval ms=N`で表示します。新しいHigh-Speedハブ＋Low-Speed
+  keyboardの実機で50,661 packet／202,076 roundを処理し、入力遅延・エラー・freezeなし、
+  mode conflict 0、stale token 0、port event 0を確認しました。この第22版時点ではMSC併用回帰は
+  未確認でした。
+  第23版はSplit HIDの転送がstaleになったとき、まず所有する下流portのcurrent connection／changeを
+  hub EP0で確認します。抜去または差し替えなら該当slotだけを破棄し、root busをresetしません。
+  同じハブ上のMSC address／BOT sessionは維持され、HID再挿入は既存の増分port scanが処理します。
+  物理抜去と同時に走っていたSplit packetの最初の`XACTERR`は検出契機として1回だけ出ます。
+  第23版の抜去・再挿入動作は実機確認済みです。
+  第24版はperiodic SSPLITを次のHigh-Speed microframe 0へ位相合わせします。`bInterval=1ms`の
+  system tickとUSB SOFが固定位相でも、遅いslotから開始してCSPLIT窓を失い続けません。また周期転送の
+  NAKは通常の「reportなし」としてそのpollを終了し、Control／Bulk用の「新しいSSPLITから再試行」へ
+  入りません。第23版で145,394 packet／436,167 round（ほぼ3 round/poll）だった取りこぼしへの修正で、
+  Low-Speed Interruptの規格上の最小interval 10msも適用します。この実機のdescriptor値1msをそのまま
+  使った第23版はTTを毎full frame占有して58万IRQまで増えました。第24版は
+  `USB HID: invalid Low-Speed bInterval, descriptor=1`を出して10msへ補正し、起動時の採用値も
+  `Split foreground poll interval ms=10`で確認できます。High-Speedハブ＋Low-Speed keyboardの
+  実機では入力が安定し、エラーログなし、10秒静止時のSplit packet増加が約1,000回
+  （約100 packet/秒）であることを確認済みです。同じハブへHigh-Speed MSCを追加した最終回帰も、
+  `ut 100`が100/100、failure／mismatch 0、packet／command retry 0、予防再同期6回でPASSしました。
+  直後の`usbhw`はSplit 1,126 packet／2,370 round、conflict 0、active 0、stale token 0、
+  port eventなしでした。
 - USB-Aの5V（VBUS）は2個目のPI4IOE5V6408（E2、I2Cアドレス`0x44`）のbit 3です。
   同じexpanderは電源断や充電制御とも共用するため、書き換えはビット単位の
   read-modify-write（`hcd::set_pi4ioe2_output_bit`）で行います
@@ -140,7 +348,10 @@ Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_
 | `usbperiodic` | 常設periodicが無効な最初のHIDでchannel 1＋frame listを1転送だけ試験（旧Go/No-Go診断） |
 | `usbvbus <0-7> on\|off` | PI4IOE2（`0x44`）の出力ビット直接操作（bit 3がVBUS）。診断用 |
 | `usbmsc`／`usbread`／`usbmbr` | USB Mass Storage（[`STORAGE.md`](STORAGE.md)） |
-| `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数を表示） |
+| `usbwritetest <lba>` | USB MSCの1ブロック書き込み・照合・復元 |
+| `usbzero <lba> [count]` | USB MSCの1〜8ブロックをゼロで上書き（破壊的）。テスト失敗後の後始末 |
+| `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数・予防再同期数を表示） |
+| `usbmargin [rounds]` | VBUSを切って入れ直し、LBA 0が読めるまでの時間を計測（read-only、既定5回、最大20回） |
 
 未対応デバイスが列挙まで成功した場合、UARTには各interfaceの
 `number/class/subclass/protocol`（上位byteから順）を16進で出す。これは対応する

@@ -4,7 +4,33 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
 > コードを優先してください。
 
-## 状態: Stage 1〜6・第10版120分複合試験完了
+## 状態: Stage 1〜6・第10版120分複合試験完了（読み出し）／WRITE(10)安定化受入完了（[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)）
+
+## 追補（2026-08-23）: WRITE(10)と`usbwritetest`
+
+本計画は読み出しだけを対象とし、WRITE(10)は「範囲外（将来検討）」に置いていた。
+そのため**MSC実装時から書き込みは一度も実機で試されていなかった**。SD側の
+`sdwritetest`と同じ形の書き込み試験を追加したのがこの追補である。
+
+- `UsbMassStorage::write_blocks(lba, buffer)` — SCSI WRITE(10)（opcode `0x2A`）。
+  BOT層は既にdata-out方向を実装済みで、追加したのはSCSI層だけ。
+- `usbwritetest <lba>` — 対象LBAの前1・後2ブロックを保持→パターンを書く→フラッシュ→
+  窓全体を読み直して照合→元データを書き戻して再照合。**窓が読めなければ何も書かずに
+  中止する**（復元がその読み出しに依存するため）。
+- `usbzero <lba> [count]` — 1〜8ブロックをゼロで上書きし、FUA readで媒体から確認する。
+  テストが途中で失敗して残したパターンを消すためのもの。
+- **WRITE(10)は自動再送しない。** READ(10)はReset Recovery後に1回再送するが、
+  書き込みは途中まで媒体へ届いている可能性があるため再送しない。この方針を保つため、
+  再送処理はBOT共通層ではなく`UsbMassStorage::read_blocks`に限定してある。
+- `ut`と`mix`はread-onlyのまま。
+
+実機で発生した間欠的な無応答は、第18版の予防的BOT再同期とハブ初期化修正後、
+High-Speed直結／FS-onlyハブ＋HID併用の受入試験を完走した。調査記録・確定した事実・
+否定した仮説・入れた緩和策は
+[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)にまとめてある。
+第24版ではHigh-Speedハブ上のLow-Speed HIDとHigh-Speed MSCを併用し、`ut 100`を
+100/100、failure／mismatch 0、予防再同期6回、packet／command retry 0で完走した。
+Split診断もconflict 0、active 0、stale token 0、port eventなしで、最終複合回帰を合格とした。
 
 ## 追補（2026-08-21）: 連続READ(10)のtimeoutとReset Recovery
 
@@ -100,6 +126,38 @@ mismatch 0、QTD retry 2、command retry 0でPASSした。2回の一時停止を
 phase内のQTD再投入で回復しており、従来91/100で再現したfailureを解消した。直接原因はPSRAM
 帯域やHigh-Speed PHYではなく、descriptor DMAが長時間haltしない場合に1個のQTDを5秒間放置し、
 その後すぐBOT Resetしていた回復粒度だった。次の受入試験は`mix 1`、その後`mix`既定120分とする。
+
+2026-08-23の再調査では、HID periodic DMAを停止して全classをchannel 0へ逐次化したFS-only
+構成でも`ut 100`が39/100で失敗した。さらに4 KiB data phaseをMPS 64 byte単位の1 packet
+QTDへ戻し、短いIN responseのstagingだけを維持した構成も40/100で同じ無応答になった。
+どちらもHPRTはconnected／enabled／powered、port eventなしで、失敗後もHIDは動作した。
+同じ1 packet QTDをHigh-Speed直結／MPS 512で試しても52/100で同じ無応答になった。
+したがって速度、ハブ、HID同時DMA、複数packet QTD、全バス故障は原因から外した。第15版は
+成功16 READごとにMass Storage Resetと両Bulk endpointのhalt解除をcommand間で行い、EP0が
+まだ応答するうちにBOT境界を予防再同期する。High-Speed直結／MPS 512の`ut 100`は
+100/100、failure／mismatch 0、予防再同期6回、packet／command retry 0でPASSした。
+続くFS-onlyハブ／MPS 64＋HID併用でも同じく100/100、failure／mismatch 0、予防再同期6回、
+packet／command retry 0でPASSし、試験後もHIDは動作した。連続READの安定化とMSCによる
+HID巻き添え防止の受入条件は満たした。WRITE経路の安定性は引き続き別に確認する。
+
+第16版は各WRITE(10)の直前にも同じBOT再同期を行う。WRITEはtransport失敗後に媒体へどこまで
+届いたか判断できず、自動再送できないため、失敗後ではなく応答中のcommand境界でMass Storage
+Resetと両Bulk toggleのDATA0同期を済ませる。High-Speed直結の`usbwritetest 2`はpatternの
+書き込み・FUA照合、原本の書き戻し・照合、LBA 1〜4の周辺照合がすべて成功した。この媒体は
+SYNCHRONIZE CACHE(10)をsense key 5／ASC `0x24`で拒否するため、想定どおりFUAで検証した。
+続けて同じ試験を10回実行し、各回のpattern照合、原本復元、LBA 1〜4の周辺照合がすべて
+成功した。pattern書き込みと復元を合わせて計20回のWRITEを連続成功している。残る確認は
+HID併用FS-only試験である。FS-onlyハブ＋HID併用でも同じ試験を10/10完走したが、HIDを
+挿したままハブを接続すると初回列挙されず、HIDだけ抜き直すと認識する別問題が判明した。
+第17版はハブの全occupied port列挙後までHID periodic開始を延期し、後続portのchannel 0
+列挙controlと同時稼働させない。さらにセルフパワーハブは給電状態で接続するとHIDを認識せず、
+ハブ電源を切ってから接続すると認識することが判明した。下流port resetがassertされる前の
+RESET=0を完了と誤判定し、保持された古いaddress/configurationを初期化できていないraceと一致する。
+第18版は古い`C_PORT_RESET`をclearしてからresetを要求し、新しい完了edgeまたは観測済みの
+assert→deassertを待つ。給電中ハブ＋HID事前接続の再試行ではHIDとMSCを初回認識し、FS-only
+`ut 100`も100/100、予防再同期6回、packet／command retry 0でPASSした。その直前の1回は
+認識しなかったが接触不良の可能性が報告され、その後は給電したままの上流再接続を5/5回、
+HIDの抜き直しなしで認識した。ハブ初期化の実機回帰を合格とする。
 
 同じ第6版の`mix 1`はHigh-Speed／MPS 512 byteで、3,441 frame、SD/USB I/O 57回、PSRAM heap
 検査3,138回を完走した。途中のBulk INはQTD再投入4回を使い切った後にBOT Reset Recoveryと
@@ -441,9 +499,11 @@ Stage 6は「`mbr::show`によるパース処理の共通化」だけを実装�
 - FAT/exFAT等ファイルシステム本体の解析。`SD_CARD_PLAN.md`のStage 4b以降と
   共通のタスクとしてまとめて着手する想定（`BlockDevice`抽象はそのまま
   ファイルシステム層の下敷きにできる見込み）
-- WRITE(10)による書き込み。SD側で`sdwritetest`実装時に踏んだ「書き込み後
-  カードがビジー状態になる」に類する罠がUSB側にもある可能性が高く、
-  読み込みが安定してから別途着手する
+- **WRITE(10)による書き込み**（→ 上の「追補（2026-08-23）」で`write_blocks`と
+  `usbwritetest`を実装し、第18版で安定化受入を完了。
+  [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)。以下は本計画立案時点の記録）。SD側で
+  `sdwritetest`実装時に踏んだ「書き込み後カードがビジー状態になる」に類する罠が
+  USB側にもある可能性が高く、読み込みが安定してから別途着手する
 - 複数LUN対応、複数パーティションを跨いだGPT解析（`sdmbr`と同じくGPT
   保護MBRの検出止まりとする）
 - MSCデバイスの複数同時使用、抜き差し耐性（`UsbKeyboard`の
