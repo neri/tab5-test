@@ -17,6 +17,7 @@ mod console;
 mod delay;
 mod dma2d;
 mod framebuffer;
+mod fs;
 mod gpio;
 mod i2c;
 mod icm;

@@ -78,10 +78,28 @@ IROM命令に依存しないようにします。同期中もLCDのframe ISRは�
 interruptは許可したままですが、trap入口、ISR、参照定数、状態はIRAM/DRAM内に
 閉じています。その後、既知画素を再読出しし、外部PSRAMへ同期されたことを確認します。
 
+## 32 MiBの分割
+
+マッピングは先頭から順に3つの固定領域へ分かれます。境界はコンパイル時定数で、
+起動ごとに変わりません。
+
+```text
+0x48000000..0x481c2000  フレームバッファ（1,843,200 byte）
+0x481c2000..0x489c2000  RAMディスク（8 MiB、`Psram::ram_disk`）
+0x489c2000..0x4a000000  ヒープ（23,322,624 byte、約22.24 MiB）
+```
+
+RAMディスクをヒープから動的に確保せず固定予約にしているのは、8 MiBという
+長寿命の確保がヒープを断片化し、起動後の順序次第で失敗し得るうえ、誤って解放
+されるとファイルシステムの裏付け領域が別の所有者へ渡ってしまうためです
+（[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)）。容量のruntime変更は実装しません。
+マッピングが3領域に足りない小ささで返った場合、`Psram::ram_disk`は`None`を返し、
+ヒープへ領域を戻すfallbackは行いません。
+
 ## ヒープ（グローバルアロケータ）
 
-32 MiBの割り当てのうち残り約30.24 MiB（`Psram::heap`が返す、フレームバッファ
-直後から割り当て末尾までの範囲）は`src/main.rs`のグローバルアロケータへ渡します。
+32 MiBの割り当てのうちフレームバッファとRAMディスクを除いた約22.24 MiB
+（`Psram::heap`が返す範囲）は`src/main.rs`のグローバルアロケータへ渡します。
 
 `src/main.rs`は`extern crate alloc`を宣言し、`linked_list_allocator`crateの
 `LockedHeap`（spinロック付き）を`#[global_allocator]`として静的に配置します。
@@ -93,5 +111,6 @@ interruptは許可したままですが、trap入口、ISR、参照定数、状�
 シェルの`alloctest <MiB>`コマンドは、この確保済みヒープから実際に
 `Vec<u8>`を`try_reserve_exact`で確保し、インデックス由来のパターンを書き込んで
 読み直すことで、PSRAM全域の読み書きを実機検証します（`src/app/shell.rs`）。
-`mem`コマンドはヒープ容量も表示します。`MAPPED_BYTES - FRAMEBUFFER_BYTES`を
-MiBへ切り捨てた値なので30 MiBと出ます（実際は31,711,232 byte＝約30.24 MiB）。
+`mem`コマンドはRAMディスクの予約量とヒープ容量も表示します。ヒープは
+`MAPPED_BYTES - FRAMEBUFFER_BYTES - RAM_DISK_BYTES`をMiBへ切り捨てた値なので
+22 MiBと出ます（実際は23,322,624 byte＝約22.24 MiB）。

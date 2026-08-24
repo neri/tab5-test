@@ -3421,8 +3421,15 @@ fn cycle_count() -> u32 {
 /// invalidates them, matching `sdmmc.rs`'s helper of the same name (same
 /// ROM call, same reasoning: the QTD list and transfer buffers here are
 /// DMA-shared memory, exactly like SD's IDMAC descriptors).
+///
+/// The result is deliberately dropped here while `sdmmc.rs` treats it as a
+/// transfer failure. The buffers on this side are declared with an explicit
+/// alignment where DMA touches them, and this path has been through the
+/// acceptance testing in `docs/USB_WRITE_STABILITY_PLAN.md` as it stands;
+/// turning refusals into failures here is a change to a verified transport
+/// that belongs with its own bus testing, not with an SD card fix.
 fn cache_writeback_invalidate(address: usize, length: usize) {
-    crate::psram::writeback_invalidate(address, length);
+    let _ = crate::psram::writeback_invalidate(address, length);
 }
 
 /// # Safety

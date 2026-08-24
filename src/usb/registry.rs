@@ -71,6 +71,51 @@ enum ScanOutcome {
     Unreachable,
 }
 
+/// How many physical connection changes have been seen at one point on the
+/// bus, split so that a root-level event is distinguishable from a
+/// port-level one.
+///
+/// Two counters rather than their sum: a sum would have to argue that
+/// neither counter can decrease for equality to mean "nothing happened",
+/// and comparing the pair needs no argument at all.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct ConnectionEpoch {
+    root: u32,
+    port: u32,
+}
+
+/// Why a rescan is being run.
+///
+/// The bus sequence is the same either way; what differs is what the layers
+/// above should conclude from it. A `Recovery` rescan that finds the same
+/// medium found the medium it expected; a `PhysicalConnectionChange` rescan
+/// that finds the same medium found one that was nonetheless taken away and
+/// put back, which is not the same thing for anything holding an open file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RescanReason {
+    /// Asked for from the shell.
+    Manual,
+    /// A device session failed and is being rebuilt.
+    Recovery,
+    /// Following a VBUS power cycle this firmware performed.
+    PowerRecovery,
+    /// A connect or disconnect edge was observed. Set by the caller, or
+    /// found by `rescan` itself in a still-pending edge, in which case it
+    /// replaces whatever the caller said.
+    PhysicalConnectionChange,
+}
+
+impl RescanReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            RescanReason::Manual => "manual",
+            RescanReason::Recovery => "recovery",
+            RescanReason::PowerRecovery => "power recovery",
+            RescanReason::PhysicalConnectionChange => "connection change",
+        }
+    }
+}
+
 /// Where an attached device is plugged in, for logging and shell display.
 /// Class drivers do not need this -- it never leaves the registry.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -392,6 +437,10 @@ pub struct UsbHost {
     /// attached *or* nothing here can drive what is. `records` is the
     /// inventory; this is only what the frame loop and the class-specific
     /// shell commands can dispatch to.
+    /// Physical connection changes seen at the root port, and at each hub
+    /// port. See [`Self::connection_epoch_at`].
+    root_epoch: u32,
+    port_epochs: [u32; SLOT_COUNT],
     slots: [Option<DeviceKind>; SLOT_COUNT],
     /// Every device that answered enumeration, in the same slot order --
     /// including the hub itself (index 0, where a hub leaves `slots`
@@ -424,6 +473,8 @@ impl UsbHost {
             hub_port_scan_failures: 0,
             next_keyboard_slot: 0,
             unhandled_slots: 0,
+            root_epoch: 0,
+            port_epochs: [0; SLOT_COUNT],
             slots: [NONE_DRIVER; SLOT_COUNT],
             records: [NONE_RECORD; SLOT_COUNT],
             last_scan: None,
@@ -514,10 +565,65 @@ impl UsbHost {
     /// `usbread`/`usbmbr` no longer enumerate their own device fresh on
     /// every call; they share whatever `rescan` already attached, wherever
     /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
+    ///
+    /// The single-device diagnostics keep using this. The filesystem layer
+    /// does not: it addresses storage by index through
+    /// [`Self::mass_storage_at`], because "the first one found" is not a
+    /// name a mount can be recorded against.
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
         self.slots.iter_mut().flatten().find_map(|slot| match slot {
             DeviceKind::MassStorage(storage) => Some(storage),
             DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
+        })
+    }
+
+    /// The `index`-th attached Mass Storage device in topology order.
+    ///
+    /// Topology order is slot order -- the direct port, then hub ports low
+    /// to high -- and not enumeration order or USB address order. Addresses
+    /// are handed out afresh on every enumeration and can be reused for a
+    /// different device after a removal, so an address makes a poor name for
+    /// something a mount has to keep referring to. Position on the bus at
+    /// least does not move on its own.
+    ///
+    /// It still is not an identity. Unplugging the first of two sticks
+    /// renumbers the second, which is why a mount records a fingerprint
+    /// beside this index rather than trusting it alone.
+    pub fn mass_storage_at(&mut self, index: usize) -> Option<&mut UsbMassStorage> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .filter_map(|slot| match slot {
+                DeviceKind::MassStorage(storage) => Some(storage),
+                DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
+            })
+            .nth(index)
+    }
+
+    /// Where the `index`-th Mass Storage device is plugged in.
+    ///
+    /// Costs nothing on the bus -- it reads the registry's own records --
+    /// which is what makes it usable as a per-operation check. A mount
+    /// records the location it was made against, so the index pointing at a
+    /// different device after a re-enumeration is caught even when both
+    /// devices are the same size.
+    pub fn mass_storage_location(&self, index: usize) -> Option<Location> {
+        self.mass_storage_inventory()
+            .nth(index)
+            .map(|(location, _)| location)
+    }
+
+    /// Read-only inventory of the attached Mass Storage devices, in the same
+    /// order [`Self::mass_storage_at`] indexes them.
+    ///
+    /// Separate from the accessor because listing what is there and driving
+    /// one of them are different jobs: a display walks every device, and
+    /// taking a `&mut` per device to do that would mean borrowing the whole
+    /// registry once per row.
+    pub fn mass_storage_inventory(&self) -> impl Iterator<Item = (Location, &DeviceSummary)> {
+        self.bus_devices().filter_map(|device| {
+            matches!(device.driver, Some(DeviceKind::MassStorage(_)))
+                .then_some((device.record.location, &device.record.summary))
         })
     }
 
@@ -554,16 +660,37 @@ impl UsbHost {
     /// registry remains the sole bus owner, so only `InputManager` consumes
     /// this edge and decides whether to rebuild every address/session.
     pub fn take_root_connection_change(&mut self) -> bool {
-        hcd::take_root_connection_change()
+        let changed = hcd::take_root_connection_change();
+        if changed {
+            // The root port's own connect/disconnect edge takes the whole
+            // bus with it. `rescan` deliberately consumes and discards the
+            // edges its own reset produces, so what reaches here is real.
+            self.root_epoch = self.root_epoch.wrapping_add(1);
+        }
+        changed
     }
 
-    /// Drops every slot and the hub handle without touching the bus --
-    /// what `InputManager` calls once `root_disconnected` reports the cable
-    /// itself came out.
+    /// Drops every slot and the hub handle without touching the bus.
+    ///
+    /// Not a physical edge by itself: `power_cycle_and_rescan` clears the
+    /// registry too, and a power cycle is this firmware taking the bus down
+    /// on purpose rather than the user removing anything. The caller that
+    /// *did* observe a removal uses [`Self::clear_disconnected`].
     pub fn clear(&mut self) {
         self.clear_registry();
         self.last_probe = None;
         self.unhandled_slots = 0;
+    }
+
+    /// [`Self::clear`], plus recording that the cable itself came out.
+    ///
+    /// What `InputManager` calls once `root_disconnected` reports USB-A
+    /// empty. Everything that was on the bus has physically gone, so any
+    /// mount made against it is invalid even if the identical device is
+    /// plugged back in a moment later.
+    pub fn clear_disconnected(&mut self) {
+        self.root_epoch = self.root_epoch.wrapping_add(1);
+        self.clear();
     }
 
     /// Drops registered driver state but preserves which still-connected
@@ -650,31 +777,81 @@ impl UsbHost {
         if stale_ports == 0 {
             return false;
         }
+        // The trigger was a failing transfer, so the port may still be
+        // reporting itself connected while the device behind it is on its
+        // way out. Debouncing is worth the extra polls for that.
+        self.detach_hub_ports(stale_ports, true) != 0
+    }
 
-        let Some(hub) = self.hub.take() else {
+    /// Sweeps every occupied hub port and drops the ones whose device has
+    /// gone.
+    ///
+    /// This exists because nothing else notices. A hub-port unplug leaves
+    /// the root port untouched, and the only device kinds that report a
+    /// failing session upward are the HIDs -- Mass Storage is deliberately
+    /// left out of `needs_reinit` so that a dead storage session cannot
+    /// trigger a bus-wide re-enumeration and take a working keyboard with
+    /// it. The result was a port that stayed occupied by a device that was
+    /// no longer there: `has_room` reported no room, `scan_empty_hub_ports`
+    /// skipped the port as already driven, and re-inserting anything did
+    /// nothing. The sweep is what turns "no session works any more" into
+    /// "the slot is empty".
+    ///
+    /// Only the latched status is read, with no debounce: this runs on a
+    /// timer over every port rather than in response to a specific failure,
+    /// and a hub latches `C_PORT_CONNECTION` until it is cleared, so an
+    /// unplug cannot be missed by not waiting for it.
+    ///
+    /// Returns whether anything was detached.
+    pub fn detach_disconnected_hub_ports(&mut self) -> bool {
+        let mut occupied = 0u16;
+        for (index, slot) in self.slots.iter().enumerate().skip(1) {
+            if slot.is_some() {
+                occupied |= 1u16 << index;
+            }
+        }
+        if occupied == 0 {
             return false;
+        }
+        self.detach_hub_ports(occupied, false) != 0
+    }
+
+    /// Drops each of `candidates`' slots whose hub port is no longer
+    /// connected. Returns the bits actually detached.
+    fn detach_hub_ports(&mut self, candidates: u16, debounce: bool) -> u16 {
+        // Taken out of `self` for the duration so the loop can borrow the
+        // hub while clearing `self.slots`.
+        let Some(hub) = self.hub.take() else {
+            return 0;
         };
         let mut detached = 0u16;
         for port in 1..=hub.port_count().min(MAX_HUB_PORTS) {
             let bit = 1u16 << port;
-            if stale_ports & bit == 0 {
+            if candidates & bit == 0 {
                 continue;
             }
-            let changed_or_gone = match hub.port_status(port) {
+            let changed_or_gone = match hub.port_status_quiet(port) {
                 Some(status) if !status.connected() => true,
                 Some(status) if status.connection_changed() => {
+                    // Cleared here so the same edge is not reported again on
+                    // the next sweep. The slot is dropped either way, so the
+                    // edge has been acted on whether or not the clear takes.
                     let _ = hub.clear_port_connection_change(port);
                     true
                 }
-                Some(_) => matches!(hub.debounce_connected_port(port), Some(false)),
+                Some(_) if debounce => matches!(hub.debounce_connected_port(port), Some(false)),
+                Some(_) => false,
                 None => false,
             };
             if changed_or_gone {
                 self.slots[port as usize] = None;
                 self.records[port as usize] = None;
                 self.clear_unhandled_slot(port as usize);
+                // Only this port's count. The devices on the other ports
+                // have not moved.
+                self.port_epochs[port as usize] = self.port_epochs[port as usize].wrapping_add(1);
                 detached |= bit;
-                uart::log_hex(b"USB: HID disconnected from hub port ", port as u32);
+                uart::log_hex(b"USB: device disconnected from hub port ", port as u32);
             }
         }
         self.hub = Some(hub);
@@ -683,9 +860,40 @@ impl UsbHost {
             self.hub_port_scan_paused = false;
             self.hub_port_scan_failures = 0;
             self.next_keyboard_slot = 0;
-            true
-        } else {
-            false
+        }
+        detached
+    }
+
+    /// Physical connection changes observed at one point on the bus.
+    ///
+    /// A mount records this for the port its device is on, and treats any
+    /// advance as "the medium may have been taken away". Counted per port
+    /// rather than for the bus as a whole: a bus-wide count meant that
+    /// pulling any one device out of a hub invalidated the mounts of every
+    /// other device on it, which had not moved and had nothing to do with
+    /// it.
+    ///
+    /// The root count is reported alongside the port's, and both are
+    /// compared. An event at the root -- the USB-A cable itself coming out,
+    /// or the root port reporting a connection change -- takes the whole bus
+    /// with it, hub included, so it has to invalidate every location rather
+    /// than just slot 0's.
+    ///
+    /// This is not a generation and identifies nothing. It only answers
+    /// "has anything been unplugged here since you last asked".
+    pub fn connection_epoch_at(&self, location: Option<Location>) -> ConnectionEpoch {
+        let port = match location {
+            Some(Location::Direct) => self.port_epochs[0],
+            Some(Location::HubPort(port)) => {
+                self.port_epochs.get(port as usize).copied().unwrap_or(0)
+            }
+            // Nothing to attribute to a port, so only the root count
+            // applies. Reached by mounts that are not on USB at all.
+            None => 0,
+        };
+        ConnectionEpoch {
+            root: self.root_epoch,
+            port,
         }
     }
 
@@ -800,12 +1008,36 @@ impl UsbHost {
     /// of just one, since a bus reset invalidates all of them together
     /// anyway; there is no persistent bus state to keep in sync
     /// incrementally.
-    pub fn rescan(&mut self) {
-        // Drop an edge which led us here, then discard the connection/enable
-        // changes generated by our own reset sequence. A later physical edge
-        // is the only event `InputManager` should treat as hotplug.
-        let _ = hcd::take_root_connection_change();
+    /// `reason` records why, for the log, and separates the two rescans that
+    /// look identical on the bus but mean opposite things upstream: one that
+    /// rebuilds a session after a transfer failure, where the medium is
+    /// expected to be the same one, and one that follows the user unplugging
+    /// something, where it is expected not to be.
+    pub fn rescan(&mut self, reason: RescanReason) {
+        // An edge still pending when a rescan starts is a *physical* one:
+        // this reset has not run yet, so nothing here produced it. It used to
+        // be discarded along with the reset's own edges, which meant an
+        // unplug-replug that happened to land just before a rescan left no
+        // trace -- the medium had been away, and every mount over it went on
+        // as though it had not. Counting it here is what makes the epoch
+        // honest, and it outranks whatever reason the caller gave.
+        let physical = hcd::take_root_connection_change();
+        let reason = if physical {
+            RescanReason::PhysicalConnectionChange
+        } else {
+            reason
+        };
+        if physical {
+            self.root_epoch = self.root_epoch.wrapping_add(1);
+        }
+        uart::log(b"USB: rescan (");
+        uart::log(reason.name().as_bytes());
+        uart::log(b")\r\n");
+
         self.rescan_inner();
+        // The reset above generates its own connection and enable changes.
+        // Those are this firmware's doing, not the user's, and must not be
+        // mistaken for a hotplug on the next poll.
         let _ = hcd::take_root_connection_change();
     }
 
@@ -824,7 +1056,7 @@ impl UsbHost {
         // rail has just been cycled, so the scan below finding nothing is
         // not a reason to cycle it again.
         self.last_power_recovery_ms = Some(tick::now_ms());
-        self.rescan();
+        self.rescan(RescanReason::PowerRecovery);
         true
     }
 

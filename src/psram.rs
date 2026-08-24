@@ -2,8 +2,17 @@
 //!
 //! Maps the Tab5's full 32 MiB PSRAM at `0x4800_0000` (well within the chip's
 //! 64 MiB PSRAM MMU window) and verifies the mapping before returning it to
-//! the caller. The first framebuffer-sized slot backs the LCD module;
-//! [`Psram::heap`] exposes everything after it for a global allocator.
+//! the caller. The mapping is cut into three fixed spans, in this order:
+//! the framebuffer the LCD module scans out, the RAM disk [`Psram::ram_disk`]
+//! hands to `fs::RamBlockDevice`, and everything left over, which
+//! [`Psram::heap`] gives the global allocator.
+//!
+//! The RAM disk is reserved here rather than allocated from the heap on
+//! demand because it is one long-lived 8 MiB block: taking it from the
+//! allocator would fragment the heap for the rest of the boot, could fail
+//! outright once anything else has allocated, and would let a stray free
+//! hand the filesystem's backing store to another owner. The split is fixed
+//! at compile time, and the layout does not change from boot to boot.
 
 use core::mem::transmute;
 
@@ -14,10 +23,24 @@ pub const HEIGHT: usize = 1280;
 pub const BYTES_PER_PIXEL: usize = 2;
 pub const FRAMEBUFFER_BYTES: usize = WIDTH * HEIGHT * BYTES_PER_PIXEL;
 
+/// Fixed PSRAM reservation for `fs::RamBlockDevice`, immediately after the
+/// framebuffer. 8 MiB is 16,384 512-byte blocks, which is comfortably above
+/// FAT16's minimum useful volume size and still leaves the heap over 22 MiB.
+/// The capacity is not runtime-configurable: see this module's header for why
+/// it is carved out of the mapping instead of allocated.
+pub const RAM_DISK_BYTES: usize = 8 * 1024 * 1024;
+/// Offset of the RAM disk within the mapping.
+const RAM_DISK_OFFSET: usize = FRAMEBUFFER_BYTES;
+/// Offset of the heap within the mapping: everything after the RAM disk.
+const HEAP_OFFSET: usize = RAM_DISK_OFFSET + RAM_DISK_BYTES;
+
 const PSRAM_VADDR: usize = 0x4800_0000;
 pub const MAPPED_BYTES: usize = 32 * 1024 * 1024;
 const PAGE_BYTES: usize = 64 * 1024;
-const CACHE_LINE_BYTES: usize = 64;
+/// Line size of both ESP32-P4 cache levels. Any buffer a DMA engine writes
+/// into must start on one of these boundaries, or the invalidate that makes
+/// the CPU see the transfer is refused.
+pub const CACHE_LINE_BYTES: usize = 64;
 
 const HP_SYS_CLKRST: usize = 0x500E_6000;
 const HP_RST_EN0: usize = HP_SYS_CLKRST + 0xC0;
@@ -254,11 +277,33 @@ impl Psram {
         Some(self.base as *mut u16)
     }
 
-    /// Returns the PSRAM span after the framebuffer, for use as a heap.
+    /// Returns the fixed RAM disk span between the framebuffer and the heap.
+    ///
+    /// `None` when the mapping came back smaller than the three spans need,
+    /// which is the same shape as `framebuffer`'s check. There is no fallback
+    /// that returns the reservation to the heap: the boot-to-boot stability of
+    /// the layout is the point of reserving it.
+    pub fn ram_disk(&self) -> Option<(*mut u8, usize)> {
+        if HEAP_OFFSET > self.bytes {
+            return None;
+        }
+        Some(((self.base + RAM_DISK_OFFSET) as *mut u8, RAM_DISK_BYTES))
+    }
+
+    /// Returns the PSRAM span after the framebuffer and the RAM disk, for use
+    /// as a heap.
     pub fn heap(&self) -> (*mut u8, usize) {
+        // Without room for the RAM disk there is nothing to skip past it, so
+        // the heap keeps the pre-RAM-disk layout rather than underflowing.
+        if HEAP_OFFSET > self.bytes {
+            return (
+                (self.base + FRAMEBUFFER_BYTES) as *mut u8,
+                self.bytes.saturating_sub(FRAMEBUFFER_BYTES),
+            );
+        }
         (
-            (self.base + FRAMEBUFFER_BYTES) as *mut u8,
-            self.bytes - FRAMEBUFFER_BYTES,
+            (self.base + HEAP_OFFSET) as *mut u8,
+            self.bytes - HEAP_OFFSET,
         )
     }
 
@@ -292,14 +337,27 @@ impl Psram {
     }
 }
 
-/// Writes back and invalidates an arbitrary span of the mapped PSRAM window.
+/// Writes back and invalidates an arbitrary span of memory.
 ///
-/// Unlike `Psram::writeback_range`, which is bounded to the framebuffer, this
-/// takes a raw address so a caller staging its own buffer -- `membench`
-/// wanting a cold cache before each pass -- can drop it out of both levels.
-/// The caller is responsible for the span lying inside the mapping.
-pub fn writeback_invalidate(address: usize, bytes: usize) {
-    let _ = iram_cache_writeback_invalidate(address as u32, bytes as u32);
+/// Unlike `Psram::writeback_range`, which is bounded to the framebuffer and
+/// aligns the span itself, this takes the address as given so a caller
+/// staging its own buffer -- `membench` wanting a cold cache before each
+/// pass, or a DMA driver bracketing a transfer -- can drop it out of both
+/// levels.
+///
+/// **`address` must be [`CACHE_LINE_BYTES`]-aligned.** The ROM routine
+/// refuses a span that starts mid-line and reports the refusal; it does not
+/// round down. `bytes` needs no alignment, being rounded up to whole lines.
+///
+/// Returns whether both cache levels accepted the operation. **A `false` is
+/// not cosmetic**: after a refused invalidate the CPU still holds its own
+/// copy of the span, so a caller that goes on to read a buffer DMA has just
+/// filled will read what was in the cache instead -- for a freshly zeroed
+/// buffer, zeros. Callers bracketing DMA must treat it as a failed transfer
+/// rather than ignoring it.
+#[must_use]
+pub fn writeback_invalidate(address: usize, bytes: usize) -> bool {
+    iram_cache_writeback_invalidate(address as u32, bytes as u32)
 }
 
 /// Marks the next CPU-only reboot to reject an otherwise valid 200 MHz DQS

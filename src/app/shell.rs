@@ -11,11 +11,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{lsusb, mbr, membench};
+use super::{blockdev, files, lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
+use crate::fs;
+use crate::fs::vfs::Vfs;
+use crate::fs::{Devices, RamBlockDevice, SdSlot};
 use crate::{
     delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc, startup,
     tick, uart, usb, wifi,
@@ -323,6 +326,93 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["show MBR partition table (LBA 0)"],
     },
     HelpEntry {
+        name: "devices",
+        usage: "devices",
+        lines: &[
+            "list block devices (ram, sd0, usb0) with their geometry and",
+            "what LBA 0 turned out to be: an MBR with its usable and",
+            "rejected primary entries, an unpartitioned FAT/exFAT volume,",
+            "a sector readable as both (refused), or neither",
+        ],
+    },
+    HelpEntry {
+        name: "blkread",
+        usage: "blkread <device> [pN] <lba>",
+        lines: &[
+            "read one block through the block layer and dump it to UART.",
+            "with pN the lba is relative to that MBR primary partition,",
+            "and one past its end is refused before reaching the medium",
+        ],
+    },
+    HelpEntry {
+        name: "mount",
+        usage: "mount [<ram|sd0pN|usbMpN>]",
+        lines: &[
+            "with no argument, list mounts. with one, attach that volume:",
+            "ram lands on /ram, everything else on /vol/<name>. usbM counts",
+            "storage devices in bus order, as 'devices' lists them, so two",
+            "sticks are usb0 and usb1. SD and USB are always read-only;",
+            "only /ram is writable",
+        ],
+    },
+    HelpEntry {
+        name: "umount",
+        usage: "umount <mount point>",
+        lines: &["detach a volume; refused while it still has open files"],
+    },
+    HelpEntry {
+        name: "mounts",
+        usage: "mounts",
+        lines: &[
+            "list what is mounted where, with each mount's media generation",
+            "and what its identity rests on. 'size only' means the medium",
+            "offered nothing but its capacity, so a match proves little",
+        ],
+    },
+    HelpEntry {
+        name: "fsverify",
+        usage: "fsverify",
+        lines: &[
+            "re-check every mount against the medium it was mounted from.",
+            "a changed medium drops the mount and fails its open files; a",
+            "device that is absent or will not identify itself is left",
+            "alone, since neither shows the medium is different",
+        ],
+    },
+    HelpEntry {
+        name: "ls",
+        usage: "ls [<path>]",
+        lines: &[
+            "list a directory. with no path, list the mount points.",
+            "paths are absolute, e.g. ls /ram, and a path containing",
+            "spaces goes in double quotes",
+        ],
+    },
+    HelpEntry {
+        name: "cat",
+        usage: "cat <path> [offset]",
+        lines: &[
+            "print a file, e.g. cat /ram/README.TXT. a path with spaces in",
+            "it goes in double quotes. reports the bytes read against the",
+            "size in the directory entry, so a chain that ends early shows",
+            "as SHORT READ instead of a plausible prefix",
+        ],
+    },
+    HelpEntry {
+        name: "write",
+        usage: "write <path> <text>",
+        lines: &[
+            "create or replace a file with one line of text, e.g.",
+            "write /ram/NOTE.TXT hello. only /ram is writable; SD and USB",
+            "refuse before any command reaches the medium",
+        ],
+    },
+    HelpEntry {
+        name: "append",
+        usage: "append <path> <text>",
+        lines: &["add one line to a file, creating it if it is not there"],
+    },
+    HelpEntry {
         name: "sdreadpsram",
         usage: "sdreadpsram <lba> <n>",
         lines: &["DMA n blocks (n<=8) into PSRAM, verify vs SRAM"],
@@ -597,6 +687,8 @@ pub fn execute(
     framebuffer: &mut Framebuffer,
     line: &[u8],
     usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
     wifi_session: &mut Option<wifi::Rpc>,
     net_stack: &mut Option<net::Stack>,
 ) -> Outcome {
@@ -676,6 +768,71 @@ pub fn execute(
         b"sdwritetest" => cmd_sdwritetest(console, framebuffer, argument),
         b"sdzero" => cmd_sdzero(console, framebuffer, argument),
         b"sdmbr" => cmd_sdmbr(console, framebuffer),
+        b"devices" => cmd_devices(console, framebuffer, usb_host, ram_disk),
+        b"blkread" => cmd_blkread(console, framebuffer, argument, usb_host, ram_disk),
+        b"mounts" => files::show_mounts(console, framebuffer, vfs),
+        b"fsverify" => {
+            with_devices(usb_host, ram_disk, |devices| {
+                files::verify(console, framebuffer, devices, vfs)
+            });
+        }
+        b"mount" => {
+            if argument.is_empty() {
+                files::show_mounts(console, framebuffer, vfs);
+            } else if let Some(name) = single_argument(
+                console,
+                framebuffer,
+                argument,
+                "usage: mount [<ram|sd0pN|usbMpN>]",
+            ) {
+                let name = as_str(name);
+                with_devices(usb_host, ram_disk, |devices| {
+                    files::mount(console, framebuffer, devices, vfs, name)
+                });
+            }
+        }
+        b"umount" => {
+            if let Some(path) = single_argument(
+                console,
+                framebuffer,
+                argument,
+                "usage: umount <mount point>",
+            ) {
+                files::unmount(console, framebuffer, vfs, as_str(path));
+            }
+        }
+        b"ls" => {
+            let path = if argument.is_empty() {
+                Some(&b"/"[..])
+            } else {
+                single_argument(console, framebuffer, argument, "usage: ls [<path>]")
+            };
+            if let Some(path) = path {
+                let path = as_str(path);
+                with_devices(usb_host, ram_disk, |devices| {
+                    files::list(console, framebuffer, devices, vfs, path)
+                });
+            }
+        }
+        b"cat" => cmd_cat(console, framebuffer, argument, usb_host, ram_disk, vfs),
+        b"write" => cmd_write(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            fs::vfs::OpenMode::Truncate,
+        ),
+        b"append" => cmd_write(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            fs::vfs::OpenMode::Append,
+        ),
         b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
         b"lsusb" => cmd_lsusb(console, framebuffer, argument, usb_host),
         b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
@@ -850,6 +1007,12 @@ fn cmd_mem(console: &mut Console, framebuffer: &mut Framebuffer) {
     let mut line = Line::new();
     line.push_str("framebuffer: ");
     line.push_u32(psram::FRAMEBUFFER_BYTES as u32);
+    line.push_str(" bytes");
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("ram disk: ");
+    line.push_u32(psram::RAM_DISK_BYTES as u32);
     line.push_str(" bytes");
     console.write_output_line(framebuffer, line.as_str());
 
@@ -1086,7 +1249,11 @@ fn misa_has_extension(misa: u32, extension: u8) -> bool {
 /// Bytes of PSRAM past the framebuffer, matching `Psram::heap`'s split
 /// and backing the global allocator installed in `main`.
 fn heap_bytes() -> usize {
-    psram::MAPPED_BYTES - psram::FRAMEBUFFER_BYTES
+    // The three PSRAM spans in order: the framebuffer, the RAM disk, and the
+    // heap with whatever is left. `Psram::heap` does the same arithmetic on
+    // the mapping it actually got; this is the compile-time view, which is
+    // the same number whenever the mapping came up at its full size.
+    psram::MAPPED_BYTES - psram::FRAMEBUFFER_BYTES - psram::RAM_DISK_BYTES
 }
 
 /// Allocates `mib` MiB from the PSRAM-backed global allocator, fills it with
@@ -1963,7 +2130,7 @@ fn cmd_usb_margin(
         // `rescan` switches the rail back on itself, inside the probe whose
         // entry the timings are measured from.
         let steady_state_connect_wait = usb::set_connect_wait_ms(MARGIN_CONNECT_WAIT_MS);
-        usb_host.rescan();
+        usb_host.rescan(usb::RescanReason::PowerRecovery);
         usb::set_connect_wait_ms(steady_state_connect_wait);
 
         let Some(scan) = usb_host.last_scan_timing().copied() else {
@@ -2200,7 +2367,7 @@ fn ensure_usb_mass_storage_ready(
     uart::log(b"mix: USB MSC missing/not ready; resetting and rescanning root port\r\n");
     for _ in 0..max_rescan_attempts {
         *rescans = rescans.wrapping_add(1);
-        usb_host.rescan();
+        usb_host.rescan(usb::RescanReason::Recovery);
         let ready = match usb_host.mass_storage_mut() {
             Some(mass_storage) => mass_storage.wait_until_ready(10),
             None => false,
@@ -2250,7 +2417,7 @@ fn read_initial_usb_block(
     uart::log(b"mix: initial USB read failed; resetting and rescanning root port\r\n");
     for _ in 0..max_rescan_attempts {
         *rescans = rescans.wrapping_add(1);
-        usb_host.rescan();
+        usb_host.rescan(usb::RescanReason::Recovery);
         let read_ok = match usb_host.mass_storage_mut() {
             Some(mass_storage) => {
                 mass_storage.wait_until_ready(10) && mass_storage.read_blocks(0, buffer)
@@ -2307,7 +2474,7 @@ fn read_usb_soak_block(
     uart::log(b"mix: USB BOT recovery exhausted; resetting and rescanning root port\r\n");
     for _ in 0..max_rescan_attempts {
         *rescans = rescans.wrapping_add(1);
-        usb_host.rescan();
+        usb_host.rescan(usb::RescanReason::Recovery);
         let Some(mass_storage) = usb_host.mass_storage_mut() else {
             delay::delay_ms(200);
             continue;
@@ -2405,7 +2572,13 @@ fn exercise_heap_stripe(heap: &mut [u8], iteration: u32, stripe_bytes: usize) ->
         let value = (index as u8).wrapping_mul(37).wrapping_add(iteration as u8);
         unsafe { pointer.add(index).write_volatile(value) };
     }
-    psram::writeback_invalidate(pointer as usize, stripe_bytes);
+    // The stripe starts wherever the heap and the iteration put it, so this
+    // is refused whenever that is not a cache line boundary, and the readback
+    // below is then served from cache instead of from PSRAM. That weakens the
+    // stripe as a PSRAM test rather than making it report a false result, so
+    // it is left alone here; aligning the stripe is a change to what this
+    // soak measures and belongs with that command, not with an SD card fix.
+    let _ = psram::writeback_invalidate(pointer as usize, stripe_bytes);
     for index in 0..stripe_bytes {
         let expected = (index as u8).wrapping_mul(37).wrapping_add(iteration as u8);
         if unsafe { pointer.add(index).read_volatile() } != expected {
@@ -4890,6 +5063,162 @@ fn cmd_sdzero(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[
     console.write_output_line(framebuffer, "block zeroed");
 }
 
+/// `write <path> <text>` / `append <path> <text>`.
+///
+/// The text is the rest of the line, unsplit and unquoted: everything after
+/// the path is content, so a quote in it is a quote rather than a delimiter.
+/// Only the path has to be told apart from what follows it.
+fn cmd_write(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    mode: fs::vfs::OpenMode,
+) {
+    let Some((path_text, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    if path_text.is_empty() {
+        console.write_output_line(framebuffer, "usage: write <path> <text>");
+        return;
+    }
+    let path = as_str(path_text);
+    let text = as_str(rest);
+    with_devices(usb_host, ram_disk, |devices| {
+        files::write(console, framebuffer, devices, vfs, path, text, mode)
+    });
+}
+
+/// `cat <path> [offset]`.
+///
+/// The only command here that takes a second argument, and the reason the
+/// shell needed quoting at all: with the path settled by the quote rather
+/// than by where the spaces fall, the offset can go back to being an
+/// ordinary trailing word.
+fn cmd_cat(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+) {
+    const USAGE: &str = "usage: cat <path> [offset]";
+    let Some((path_text, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    if path_text.is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let offset = if rest.is_empty() {
+        0
+    } else {
+        // A trailing word that is not a number is almost always the tail of
+        // a path whose quotes were left off, so the message names that
+        // rather than reprinting the usage line. `single_argument`'s wording
+        // does not fit here: a second argument is expected, it just has to
+        // be a number.
+        match parse_u32(rest) {
+            Some(offset) => offset,
+            None => {
+                console.write_output_line(
+                    framebuffer,
+                    "offset must be a number; quote paths containing spaces",
+                );
+                return;
+            }
+        }
+    };
+
+    let path = as_str(path_text);
+    with_devices(usb_host, ram_disk, |devices| {
+        files::concatenate(console, framebuffer, devices, vfs, path, offset as u64)
+    });
+}
+
+/// Builds the `fs::Devices` view for one command and runs `body` on it.
+///
+/// The SD slot starts unopened and activates only if the command actually
+/// resolves `sd0`, so `blkread ram 0` does not put an SD identification
+/// sequence in the log. Activation does not outlive the command: the slot has
+/// no detect line, so whether a card is there -- and whether it is the same
+/// one -- is only answerable by asking again.
+///
+/// The USB session comes from the host registry, and the RAM disk from the
+/// frame loop that owns it. Neither is created here.
+fn with_devices<T>(
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    body: impl FnOnce(&mut Devices) -> T,
+) -> T {
+    let mut sd = SdSlot::new();
+    let mut devices = Devices {
+        ram: ram_disk,
+        sd: &mut sd,
+        usb: usb_host,
+    };
+    body(&mut devices)
+}
+
+/// `docs/FILESYSTEM_PLAN.md` Stage 1: what the block layer sees, before
+/// there is a VFS to mount any of it.
+fn cmd_devices(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+) {
+    with_devices(usb_host, ram_disk, |devices| {
+        blockdev::show_devices(console, framebuffer, devices)
+    });
+}
+
+fn cmd_blkread(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+) {
+    let (device_text, rest) = split_first_word(argument);
+    let (second, rest) = split_first_word(trim(rest));
+    // The partition is optional and sits between the two required words, so
+    // the second word is whichever of the two it turned out to be.
+    let (partition_number, lba_text) = match second.first() {
+        Some(b'p') => (parse_u32(&second[1..]), trim(rest)),
+        _ => (None, second),
+    };
+    if device_text.is_empty() || lba_text.is_empty() {
+        console.write_output_line(framebuffer, "usage: blkread <device> [pN] <lba>");
+        return;
+    }
+    if matches!(second.first(), Some(b'p')) && partition_number.is_none() {
+        console.write_output_line(framebuffer, "partition must be p1..p4");
+        return;
+    }
+    let Some(lba) = parse_u32(lba_text) else {
+        console.write_output_line(framebuffer, "usage: blkread <device> [pN] <lba>");
+        return;
+    };
+    let device_name = as_str(device_text);
+
+    with_devices(usb_host, ram_disk, |devices| {
+        blockdev::read_block(
+            console,
+            framebuffer,
+            devices,
+            device_name,
+            partition_number.map(|number| number as u8),
+            lba as u64,
+        )
+    });
+}
+
 /// Reads LBA 0 from the SD card and hands it to `mbr::show` -- the
 /// device-specific half of the SD/USB split described in
 /// `docs/USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
@@ -5125,7 +5454,7 @@ fn cmd_usbrescan(
     usb_host: &mut usb::UsbHost,
 ) {
     console.write_output_line(framebuffer, "probing USB-A host port (USB-DWC HS)...");
-    usb_host.rescan();
+    usb_host.rescan(usb::RescanReason::Manual);
     report_usb_state(console, framebuffer, usb_host);
 }
 
@@ -5156,7 +5485,7 @@ fn cmd_usbfs(
             "USB host High-Speed restored; resetting and rescanning..."
         },
     );
-    usb_host.rescan();
+    usb_host.rescan(usb::RescanReason::Manual);
     report_usb_state(console, framebuffer, usb_host);
 }
 
@@ -6690,6 +7019,64 @@ fn split_first_word(bytes: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Splits the next argument off `input`, honouring double quotes, and
+/// returns it with whatever follows.
+///
+/// Quoting exists because file names contain spaces. FAT long names have
+/// always allowed them, and once a command takes two paths there is no
+/// position-based rule that can tell where the first one ends -- so the
+/// quote has to be the thing that says.
+///
+/// There are no escape sequences inside a quoted argument. A closing quote
+/// ends it, full stop. Nothing is lost by that: `fs::path` rejects `"` in a
+/// path component, so a file name can never contain the character that would
+/// need escaping.
+///
+/// `None` means a quote was opened and never closed, which is reported
+/// rather than guessed at -- the alternative is silently treating the rest
+/// of the line as one argument, which is exactly wrong if the user simply
+/// forgot the other quote.
+fn split_argument(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let input = trim(input);
+    let Some(&b'"') = input.first() else {
+        let (word, rest) = split_first_word(input);
+        return Some((word, trim(rest)));
+    };
+    let rest = &input[1..];
+    let end = rest.iter().position(|&byte| byte == b'"')?;
+    Some((&rest[..end], trim(&rest[end + 1..])))
+}
+
+/// Reads exactly one argument, rejecting anything left over.
+///
+/// Trailing text is an error rather than something to ignore, because the
+/// likely cause is an unquoted path with a space in it. Ignoring it would
+/// send the truncated half to the filesystem and report that no such file
+/// exists, which points at the wrong thing.
+fn single_argument<'a>(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    input: &'a [u8],
+    usage: &str,
+) -> Option<&'a [u8]> {
+    let Some((argument, rest)) = split_argument(input) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return None;
+    };
+    if argument.is_empty() {
+        console.write_output_line(framebuffer, usage);
+        return None;
+    }
+    if !rest.is_empty() {
+        console.write_output_line(
+            framebuffer,
+            "unexpected extra argument; quote paths containing spaces",
+        );
+        return None;
+    }
+    Some(argument)
+}
+
 /// Command-line bytes only ever hold what `Console::push` accepted (printable
 /// ASCII or space), so this is always valid UTF-8; the empty fallback is
 /// unreachable in practice but keeps this infallible.
@@ -6717,6 +7104,13 @@ impl Line {
         }
     }
 
+    /// Whether another byte would be dropped rather than appended. `cat`
+    /// uses it to break a long line at the buffer's width instead of
+    /// silently truncating what it prints.
+    pub(crate) fn is_full(&self) -> bool {
+        self.len >= self.buffer.len()
+    }
+
     pub(crate) fn push_str(&mut self, text: &str) {
         for byte in text.bytes() {
             if self.len < self.buffer.len() {
@@ -6732,6 +7126,31 @@ impl Line {
             return;
         }
         let mut digits = [0u8; 10];
+        let mut count = 0;
+        let mut remaining = value;
+        while remaining > 0 {
+            digits[count] = b'0' + (remaining % 10) as u8;
+            remaining /= 10;
+            count += 1;
+        }
+        for &digit in digits[..count].iter().rev() {
+            if self.len < self.buffer.len() {
+                self.buffer[self.len] = digit;
+                self.len += 1;
+            }
+        }
+    }
+
+    /// The 64-bit form, for the LBAs and capacities the block layer carries.
+    /// Kept separate from `push_u32` rather than replacing it: the 64-bit
+    /// division this needs is a called routine on RV32, and most callers are
+    /// printing counters that are 32-bit by nature.
+    pub(crate) fn push_u64(&mut self, value: u64) {
+        if value <= u32::MAX as u64 {
+            self.push_u32(value as u32);
+            return;
+        }
+        let mut digits = [0u8; 20];
         let mut count = 0;
         let mut remaining = value;
         while remaining > 0 {

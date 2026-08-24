@@ -5,6 +5,26 @@ edition = "2024"
 publish = false
 
 [dependencies]
+# FAT12/16/32 (and, later, exFAT) parsing. Like `smoltcp` below, this is a
+# fully specified on-disk format rather than a hardware layer, which is where
+# this repository's "implement it yourself" rule stops applying. The candidate
+# comparison behind this choice is in `docs/FILESYSTEM_PLAN.md`.
+# `default-features = false` drops `std`, which would pull in chrono and a
+# clock this target does not have; `src/fs/clock.rs` supplies the RTC instead.
+# `write` is on for the RAM disk. It is not what keeps SD and USB read-only --
+# their block adapters refuse writes outright (`docs/FILESYSTEM.md`).
+hadris-fat = { version = "2.1.0", default-features = false, features = [
+    "read",
+    "write",
+    "lfn",
+    "sync",
+    "alloc",
+    # exFAT is an explicitly unstable preview in this crate, and is mounted
+    # read-only here for that reason among others -- see `docs/FILESYSTEM.md`.
+    "unstable-exfat",
+] }
+hadris-io = { version = "2.1.0", default-features = false, features = ["sync"] }
+embedded-io = { version = "0.7", default-features = false }
 linked_list_allocator = "0.10.6"
 # Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,
 # this does not invoke ECO5-only ROM functions before Rust reaches `main`.

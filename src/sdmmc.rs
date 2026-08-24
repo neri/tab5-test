@@ -182,13 +182,50 @@ impl Descriptor {
     }
 }
 
+/// Every buffer the IDMAC transfers to or from must start on a cache line.
+///
+/// The engine moves bytes to and from RAM behind both cache levels, so a
+/// transfer is bracketed by a writeback-invalidate over the buffer. The ROM
+/// cache routine refuses a span that starts mid-line, and a refused
+/// invalidate leaves the CPU holding its own copy: a read then returns
+/// whatever the buffer held before the transfer -- for a freshly zeroed
+/// buffer, a block of zeros, with no error anywhere. `sdio.rs` and
+/// `wifi/hosted.rs` already state this requirement for the C6 side and meet
+/// it with an aligned staging buffer; the SD card side used to leave it to
+/// whatever alignment a caller's stack slot happened to have, which is a
+/// coin toss that silently returns wrong data when it loses.
+///
+/// Rather than push the requirement onto every caller, the read and write
+/// entry points below stage an unaligned buffer through [`DmaBlock`] or
+/// [`DmaStaging`]. `data_transfer_on` is the exception: it is the raw entry
+/// point `sdio.rs` uses, whose caller already supplies aligned buffers, so it
+/// checks and refuses instead of staging.
+const DMA_ALIGN: usize = crate::psram::CACHE_LINE_BYTES;
+/// Staging span for a multi-block transfer from an unaligned buffer. Eight
+/// blocks keeps the copy loop short without putting a descriptor chain's
+/// worth of stack behind it.
+const DMA_STAGING_BYTES: usize = 8 * BLOCK_BYTES;
+
+#[repr(C, align(64))]
+struct DmaBlock([u8; BLOCK_BYTES]);
+
+#[repr(C, align(64))]
+struct DmaStaging([u8; DMA_STAGING_BYTES]);
+
+/// Whether `buffer` can be handed to the IDMAC directly.
+fn is_dma_aligned(buffer: &[u8]) -> bool {
+    buffer.as_ptr() as usize % DMA_ALIGN == 0
+}
+
 /// Matches `SDMMC_DMA_MAX_BUF_LEN`: the largest single buffer a descriptor's
 /// 13-bit `buffer1_size` field is used for (ESP-IDF caps it here too, well
 /// under the field's 8191-byte range).
 const DESC_MAX_BUFFER_BYTES: usize = 4096;
 /// Blocks per call are capped by this many chained descriptors -- 8 * 4096
-/// bytes = 64 KiB, comfortably more than any single shell command needs.
+/// bytes = 32 KiB, comfortably more than any single shell command needs.
 const MAX_DESCRIPTORS: usize = 8;
+/// Largest transfer one call can cover, for callers that split their own.
+pub const MAX_TRANSFER_BYTES: usize = MAX_DESCRIPTORS * DESC_MAX_BUFFER_BYTES;
 
 pub struct SdCard {
     pub rca: u16,
@@ -477,8 +514,18 @@ const SD_ACCESS_MODE_HIGH_SPEED: u32 = 1; // SD_ACCESS_MODE_SDR25, 50 MHz
 /// sent as "no change" (0xF), matching `other_func_mask` in ESP-IDF's
 /// `sdmmc_send_cmd_switch_func`.
 fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
-    let mut buffer = [0u8; 64];
-    cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
+    // The status block is an IDMAC destination like any other, so it is
+    // declared aligned rather than staged: it is local to this function, and
+    // one line of attribute is cheaper than a copy (see `DMA_ALIGN`).
+    #[repr(C, align(64))]
+    struct StatusBlock([u8; 64]);
+
+    let mut status = StatusBlock([0u8; 64]);
+    let buffer = &mut status.0;
+    if !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
+        uart::log(b"SDMMC: CMD6 cache writeback refused\r\n");
+        return None;
+    }
 
     let mut descriptor = Descriptor {
         control: DESC_OWNED_BY_IDMAC | DESC_FIRST | DESC_LAST | DESC_CHAINED,
@@ -488,7 +535,10 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
         reserved: [0; 12],
     };
     let descriptor_address = &raw mut descriptor as usize;
-    cache_writeback_invalidate(descriptor_address, size_of::<Descriptor>());
+    if !cache_writeback_invalidate(descriptor_address, size_of::<Descriptor>()) {
+        uart::log(b"SDMMC: CMD6 descriptor writeback refused\r\n");
+        return None;
+    }
 
     unsafe {
         write(BLKSIZ, buffer.len() as u32);
@@ -548,8 +598,11 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
     }
     wait_data_not_busy();
 
-    cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
-    Some(buffer)
+    if !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
+        uart::log(b"SDMMC: CMD6 cache invalidate refused\r\n");
+        return None;
+    }
+    Some(status.0)
 }
 
 /// Negotiates SD "High Speed" (50 MHz signaling, function group 1 = Access
@@ -618,6 +671,20 @@ fn set_high_speed() -> Result<bool, ()> {
 /// offset on the wire, so `card.high_capacity` selects whether `lba` is sent
 /// as-is or multiplied by the block size.
 pub fn read_block(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bool {
+    if !is_dma_aligned(buffer.as_slice()) {
+        let mut staging = DmaBlock([0; BLOCK_BYTES]);
+        if !read_block_aligned(card, lba, &mut staging.0) {
+            return false;
+        }
+        buffer.copy_from_slice(&staging.0);
+        return true;
+    }
+    read_block_aligned(card, lba, buffer)
+}
+
+/// The transfer itself. `buffer` is already cache-line aligned, either
+/// because the caller's was or because it is the staging block.
+fn read_block_aligned(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bool {
     let address = if card.high_capacity {
         lba
     } else {
@@ -629,7 +696,10 @@ pub fn read_block(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bo
     // later, unrelated cache eviction could flush old CPU-side data over
     // what DMA just wrote. Matches ESP-IDF's C2M `esp_cache_msync` on the
     // buffer before `sdmmc_host_dma_prepare`.
-    cache_writeback_invalidate(buffer.as_ptr() as usize, BLOCK_BYTES);
+    if !cache_writeback_invalidate(buffer.as_ptr() as usize, BLOCK_BYTES) {
+        uart::log(b"SDMMC: CMD17 cache writeback before DMA was refused\r\n");
+        return false;
+    }
 
     let mut descriptor = Descriptor {
         control: DESC_OWNED_BY_IDMAC | DESC_FIRST | DESC_LAST | DESC_CHAINED,
@@ -639,7 +709,10 @@ pub fn read_block(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bo
         reserved: [0; 12],
     };
     let descriptor_address = &raw mut descriptor as usize;
-    cache_writeback_invalidate(descriptor_address, size_of::<Descriptor>());
+    if !cache_writeback_invalidate(descriptor_address, size_of::<Descriptor>()) {
+        uart::log(b"SDMMC: CMD17 descriptor writeback was refused\r\n");
+        return false;
+    }
 
     unsafe {
         write(BLKSIZ, BLOCK_BYTES as u32);
@@ -702,28 +775,103 @@ pub fn read_block(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -> bo
         return false;
     }
 
-    cache_writeback_invalidate(buffer.as_ptr() as usize, BLOCK_BYTES);
+    // Without this the block is in RAM but the CPU still holds the buffer's
+    // pre-transfer contents, so a refusal is a failed read, not a warning.
+    if !cache_writeback_invalidate(buffer.as_ptr() as usize, BLOCK_BYTES) {
+        uart::log(b"SDMMC: CMD17 cache invalidate after DMA was refused\r\n");
+        return false;
+    }
     true
 }
 
-/// Reads consecutive blocks via CMD18 (`READ_MULTIPLE_BLOCK`) into `buffer`,
-/// whose length must be a nonzero multiple of 512 bytes (and small enough to
-/// fit `MAX_DESCRIPTORS` chained descriptors, i.e. at most 64 KiB).
+/// Reads consecutive blocks into `buffer`, whose length must be a nonzero
+/// multiple of 512 bytes (and small enough to fit `MAX_DESCRIPTORS` chained
+/// descriptors of `DESC_MAX_BUFFER_BYTES` each, i.e. at most 32 KiB).
+///
+/// `buffer` may have any alignment: an unaligned one is transferred through
+/// [`DmaStaging`] and copied, for the reasons on [`DMA_ALIGN`].
+///
+/// A single block goes to [`read_block`]'s CMD17 rather than to CMD18.
+/// CMD18 with hardware auto-stop is a multi-block command, and the only
+/// multi-block reads this driver has been accepted at on real hardware are
+/// four blocks and up (`docs/SD_CARD_PLAN.md` Stage 3, which verified
+/// `sdreadn 0 4`); one block through it was never exercised.
 pub fn read_blocks(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
+    if !valid_block_length(buffer) {
+        return false;
+    }
+    if is_dma_aligned(buffer) {
+        return read_aligned(card, lba, buffer);
+    }
+    let mut staging = DmaStaging([0; DMA_STAGING_BYTES]);
+    let mut lba = lba;
+    for chunk in buffer.chunks_mut(DMA_STAGING_BYTES) {
+        // A prefix of an aligned array starts where the array does.
+        let staged = &mut staging.0[..chunk.len()];
+        if !read_aligned(card, lba, staged) {
+            return false;
+        }
+        chunk.copy_from_slice(staged);
+        lba += (chunk.len() / BLOCK_BYTES) as u32;
+    }
+    true
+}
+
+/// Picks the command for an already-aligned read: CMD17 for one block,
+/// CMD18 for several.
+fn read_aligned(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
+    if let Ok(block) = <&mut [u8; BLOCK_BYTES]>::try_from(&mut buffer[..]) {
+        return read_block_aligned(card, lba, block);
+    }
     transfer_blocks(card, lba, buffer, false)
 }
 
 /// Writes consecutive blocks via CMD25 (`WRITE_MULTIPLE_BLOCK`) from
-/// `buffer`, with the same length constraints as `read_blocks`. Callers are
-/// responsible for not overwriting data they care about -- there is no
-/// partition/filesystem awareness at this layer.
+/// `buffer`, with the same length and alignment handling as `read_blocks`.
+///
+/// There is no single-block command special case on this side. CMD24
+/// (`WRITE_SINGLE_BLOCK`) is not implemented, and `sdwritetest`/`sdzero` --
+/// which write exactly one block -- are accepted on real hardware through
+/// CMD25 as they are. Swapping the command a verified write path uses risks
+/// the one kind of failure that costs data, for no read-side benefit.
+///
+/// Callers are responsible for not overwriting data they care about -- there
+/// is no partition/filesystem awareness at this layer.
 pub fn write_blocks(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
-    transfer_blocks(card, lba, buffer, true)
+    if !valid_block_length(buffer) {
+        return false;
+    }
+    if is_dma_aligned(buffer) {
+        return transfer_blocks(card, lba, buffer, true);
+    }
+    // Staging matters more here than on the read side: a refused writeback
+    // means the card is sent whatever was in RAM instead of what the caller
+    // wrote, and unlike a bad read that lands on the medium.
+    let mut staging = DmaStaging([0; DMA_STAGING_BYTES]);
+    let mut lba = lba;
+    for chunk in buffer.chunks(DMA_STAGING_BYTES) {
+        let staged = &mut staging.0[..chunk.len()];
+        staged.copy_from_slice(chunk);
+        if !transfer_blocks(card, lba, staged, true) {
+            return false;
+        }
+        lba += (chunk.len() / BLOCK_BYTES) as u32;
+    }
+    true
+}
+
+/// Shared length check, so a bad length is reported the same way whichever
+/// direction asked.
+fn valid_block_length(buffer: &[u8]) -> bool {
+    if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
+        uart::log(b"SDMMC: block transfer length must be a nonzero multiple of 512 bytes\r\n");
+        return false;
+    }
+    true
 }
 
 fn transfer_blocks(card: &SdCard, lba: u32, buffer: &mut [u8], is_write: bool) -> bool {
-    if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
-        uart::log(b"SDMMC: block transfer length must be a nonzero multiple of 512 bytes\r\n");
+    if !valid_block_length(buffer) {
         return false;
     }
     let address = if card.high_capacity {
@@ -766,12 +914,27 @@ pub fn data_transfer_on(
     if buffer.is_empty() {
         return false;
     }
+    // The raw entry point does not stage. `sdio.rs`'s CMD53 path, its only
+    // caller from outside this file, already documents that its buffers are
+    // cache-line aligned and meets it with `wifi/hosted.rs`'s aligned staging
+    // buffers; `read_blocks`/`write_blocks` stage before they get here. So an
+    // unaligned buffer at this point is a caller bug, and refusing it is what
+    // keeps it from becoming a silently wrong transfer (see `DMA_ALIGN`).
+    if !is_dma_aligned(buffer) {
+        uart::log(label);
+        uart::log(b": DMA buffer is not cache-line aligned; refusing transfer\r\n");
+        return false;
+    }
 
     // For a write this flushes the source data out to RAM before DMA reads
     // it; for a read it drops any stale dirty lines that could otherwise
     // later clobber what DMA is about to write (same reasoning as
     // `read_block`).
-    cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
+    if !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
+        uart::log(label);
+        uart::log(b": cache writeback before DMA was refused\r\n");
+        return false;
+    }
 
     let mut descriptors = [Descriptor::zeroed(); MAX_DESCRIPTORS];
     let Some(descriptor_count) = build_descriptor_chain(&mut descriptors, buffer) else {
@@ -779,10 +942,14 @@ pub fn data_transfer_on(
         return false;
     };
     let descriptors_address = descriptors.as_mut_ptr() as usize;
-    cache_writeback_invalidate(
+    if !cache_writeback_invalidate(
         descriptors_address,
         descriptor_count * size_of::<Descriptor>(),
-    );
+    ) {
+        uart::log(label);
+        uart::log(b": descriptor writeback was refused\r\n");
+        return false;
+    }
 
     unsafe {
         // Nothing may be left over from an earlier transfer: the wait below
@@ -876,8 +1043,12 @@ pub fn data_transfer_on(
     // back-to-back write/read/write calls in `sdwritetest`.
     wait_data_not_busy();
 
-    if !is_write {
-        cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len());
+    if !is_write && !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
+        // The data is in RAM but the CPU would read its own stale copy, so
+        // the transfer has not delivered anything the caller can use.
+        uart::log(label);
+        uart::log(b": cache invalidate after DMA was refused\r\n");
+        return false;
     }
     true
 }
@@ -1068,8 +1239,9 @@ fn init_dma() {
 /// last wrote there, and a later CPU read of `address` sees what DMA last
 /// wrote there. Mirrors `psram.rs`'s `writeback_range`, but for internal
 /// SRAM rather than PSRAM.
-fn cache_writeback_invalidate(address: usize, length: usize) {
-    crate::psram::writeback_invalidate(address, length);
+#[must_use]
+fn cache_writeback_invalidate(address: usize, length: usize) -> bool {
+    crate::psram::writeback_invalidate(address, length)
 }
 
 /// Programs one card's clock divider (`SDHOST_CLKDIV_REG`'s divisor is

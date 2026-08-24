@@ -17,8 +17,9 @@
   時刻源で、`uptime`とsmoltcpの再送・リースタイマが利用者。ISRは「カウンタを進めて
   `INT_CLR`を書く」だけで、表示の走査に割り込まない優先度に置く
   （[`NETWORK.md`](NETWORK.md)）
-- `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。フレームバッファと
-  ヒープ用領域（`Psram::heap`）の両方を提供
+- `src/psram.rs`: PSRAM、DQS調整、MMU、キャッシュ同期。32 MiBのマッピングを
+  フレームバッファ（`Psram::framebuffer`）、RAMディスク（`Psram::ram_disk`、
+  固定8 MiB）、ヒープ（`Psram::heap`、残り全部）の3領域へ分けて提供する
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール
@@ -29,7 +30,15 @@
     - `src/app/lsusb.rs`: `lsusb`コマンドの表示。ハブを介したツリー（全interfaceを含む）と、
       指定デバイスの主要な記述子。`UsbHost`のデバイスレコードを読むだけで、
       文字列記述子の取得以外はバスへ何も出さない
-    - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示
+    - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示。
+      読み終えたセクタをそのまま整形する`sdmbr`／`usbmbr`専用の古い表示で、
+      判定は行わない
+    - `src/app/files.rs`: `mount`／`umount`／`mounts`／`ls`／`cat`／`write`／`append`／
+      `fsverify`の表示。
+      `blockdev.rs`が「媒体が何か」を出すのに対し、こちらは「そこに何があるか」を出す
+    - `src/app/blockdev.rs`: `devices`／`blkread`コマンドの表示。`fs::mbr`の
+      判定結果（MBR、superfloppy、ambiguous、判定不能）と各entryを出す`mbr.rs`の
+      対になるモジュール
     - `src/app/membench.rs`: 内蔵SRAMとPSRAMのCPUアクセスコスト測定。`mcycle`を時間基準に、逐次スループットと1キャッシュラインあたりのレイテンシを実測する（`membench`コマンド）
     - `src/app/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
     - `src/app/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
@@ -94,6 +103,40 @@
       モード設定／開始、スキャンの実行とAPレコードの解析、STA設定と接続・
       切断、接続結果イベントの待ち受け。スレーブが返す`esp_err_t`は
       握りつぶさずそのまま返す
+- `src/fs.rs`・`src/fs/`: ファイルシステム層。`usb.rs`と同じく親ファイルは
+  サブモジュール宣言と再エクスポートだけ。現状はブロックデバイス層とMBR判定まで
+  （[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 1、現状は[STORAGE.md](STORAGE.md)）
+    - `src/fs/block.rs`: 全媒体共通の同期`BlockDevice` trait、`BlockGeometry`、
+      共通エラー`BlockError`、範囲検査。読み取り専用と読み書きでtraitを分けない
+    - `src/fs/ramdisk.rs`: PSRAM固定領域上のRAMディスク。唯一の書き込み可能な媒体で、
+      DMAが触らないのでキャッシュ操作は要らない
+    - `src/fs/sd.rs`・`src/fs/usb_msc.rs`: `sdmmc.rs`／`usb/msc.rs`の上に載る
+      adapter。媒体固有の処理は下層に残し、結果の変換・転送分割・書き込み抑止だけを持つ。
+      USB側はセッションを`UsbHost`から借りる一時的なviewである点がSD側と違う
+    - `src/fs/bootsector.rs`: FAT/exFATブートセクタの妥当性検査。MBR判定と
+      将来のFSドライバの両方が使う
+    - `src/fs/mbr.rs`: LBA 0がMBRなのかsuperfloppyなのかの判定と、primary entryの
+      検査・列挙。両方成立した場合は拒否する
+    - `src/fs/partition.rs`: パーティション範囲のデータ（`PartitionRange`）と、
+      I/Oの間だけデバイスを借りる`PartitionBlockDevice`
+    - `src/fs/registry.rs`: `DeviceId`と、名前から実デバイスを解決する`Devices`
+    - `src/fs/clock.rs`: FATのタイムスタンプ源。RTCを操作ごとに1回だけ読んで
+      atomicへ置き、ライブラリの`&'static`プロバイダがそれを読む。未設定時は0
+      （FATの「タイムスタンプ無し」）
+    - `src/fs/format.rs`: FAT16のformat。起動時にRAMディスクへ書く
+    - `src/fs/seed.rs`: 読み出し検証用ファイル（短名・LFN・複数クラスタ）を
+      RAMディスクへ直接書く。ライブラリの書き込み経路を使わないので`write`
+      featureをビルドから外したままにできる
+    - `src/fs/stream.rs`: `BlockDevice`の上のbyte単位`Read`/`Seek`と、
+      マウントあたり4 KiBの連続区間セクタキャッシュ。FATライブラリと
+      ブロック層の唯一の境界
+    - `src/fs/fingerprint.rs`: 媒体の同一性確認。SDのCID、SCSIのINQUIRYとVPD、
+      MBRのdisk signatureとパーティション表、ボリュームのブートセクタを畳み込む。
+      「どの媒体か」ではなく「さっきと同じ媒体か」に答える
+    - `src/fs/path.rs`: 絶対パスの正規化、長さと文字の検査、FAT流の名前比較
+    - `src/fs/vfs.rs`: マウント表、パス解決、ファイルハンドル、ディレクトリ列挙。
+      マウントはファイルシステムを保持せず、操作のたびに開き直す
+      （[FILESYSTEM.md](FILESYSTEM.md)）
 - `src/net.rs`・`src/net/`: smoltcpによるIPv4。`usb.rs`・`wifi.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけ。プロトコル層を自前実装しない唯一の層で、
   理由と対応範囲は[`NETWORK.md`](NETWORK.md)

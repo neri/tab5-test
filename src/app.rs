@@ -12,7 +12,9 @@
 
 mod axis_test;
 mod battery;
+mod blockdev;
 mod coord_test;
+mod files;
 mod lsusb;
 mod mbr;
 mod membench;
@@ -22,6 +24,10 @@ mod touch_test;
 mod win;
 
 use crate::delay::delay_ms;
+use crate::fs::partition::PartitionRange;
+use crate::fs::registry::{DeviceId, Devices};
+use crate::fs::vfs::{MountMode, Vfs};
+use crate::fs::{self, RamBlockDevice, SdSlot};
 use crate::input::InputManager;
 use crate::lcd::Display;
 use crate::psram::Psram;
@@ -104,9 +110,29 @@ pub fn run(psram: Psram) {
             console.write_output_line(display.framebuffer_mut(), line.as_str());
         }
     }
-    console.write_prompt(display.framebuffer_mut());
+    // The RAM disk is formatted here, once, before anything can reach it.
+    // Its PSRAM span holds whatever the last boot left behind, and a stale
+    // FAT header there would be read as a live filesystem, so the volume is
+    // rebuilt every time rather than probed. A failure leaves the device
+    // absent: there is no fallback that hands the span to the heap instead,
+    // because the fixed layout is what keeps the reservation useful.
+    let mut ram_disk = init_ram_disk(&psram, console, display.framebuffer_mut());
+    // The mount table outlives every command: `/ram` is attached once here,
+    // and whatever the user mounts later stays until they unmount it.
+    let mut vfs = Vfs::new();
 
     let mut input = InputManager::new();
+    if ram_disk.is_some() {
+        mount_ram_disk(
+            console,
+            display.framebuffer_mut(),
+            &mut vfs,
+            ram_disk.as_mut(),
+            input.usb_host_mut(),
+        );
+    }
+
+    console.write_prompt(display.framebuffer_mut());
     // The C6 link outlives a single command: connecting and then asking for
     // the connection's status are separate commands, and re-establishing the
     // link resets the co-processor.
@@ -165,6 +191,8 @@ pub fn run(psram: Psram) {
             framebuffer,
             submission.as_bytes(),
             input.usb_host_mut(),
+            ram_disk.as_mut(),
+            &mut vfs,
             &mut wifi_session,
             &mut net_stack,
         );
@@ -220,6 +248,97 @@ pub fn run(psram: Psram) {
             }
         }
         console.write_prompt(framebuffer);
+    }
+}
+
+/// Claims the PSRAM RAM disk span and puts a fresh FAT16 volume on it.
+///
+/// Both outcomes are reported on the console rather than only to the UART:
+/// whether `/ram` exists changes what the shell can do, and finding that out
+/// from a command that fails later is worse than being told at boot.
+fn init_ram_disk(
+    psram: &Psram,
+    console: &mut crate::console::Console,
+    framebuffer: &mut crate::framebuffer::Framebuffer,
+) -> Option<RamBlockDevice> {
+    let mut device = RamBlockDevice::claim(psram)?;
+    let started_ms = tick::now_ms();
+    match fs::format::fat16(&mut device) {
+        Ok(layout) => {
+            fs::format::log_layout(&layout);
+            // Without content the volume would mount and list nothing, which
+            // looks identical to a reader that cannot see entries.
+            if let Err(error) = fs::seed::test_files(&mut device, &layout) {
+                let mut line = shell::Line::new();
+                line.push_str("ram disk seed failed: ");
+                line.push_str(fs::seed::error_name(error));
+                console.write_output_line(framebuffer, line.as_str());
+                return None;
+            }
+            let mut line = shell::Line::new();
+            line.push_str("ram disk: FAT16, ");
+            line.push_u32(layout.cluster_count);
+            line.push_str(" clusters, ");
+            line.push_u32((tick::now_ms() - started_ms) as u32);
+            line.push_str(" ms");
+            console.write_output_line(framebuffer, line.as_str());
+            Some(device)
+        }
+        Err(error) => {
+            let mut line = shell::Line::new();
+            line.push_str("ram disk format failed: ");
+            line.push_str(fs::format::error_name(error));
+            console.write_output_line(framebuffer, line.as_str());
+            None
+        }
+    }
+}
+
+/// Attaches the RAM disk at `/ram`.
+///
+/// The mount is explicit even though nothing else could be at `/ram`: the
+/// VFS has no auto-mount path at all, so that a volume appearing in the tree
+/// always corresponds to something that asked for it.
+///
+/// The RAM disk is the one read-write mount. Its `MountMode` says so, but
+/// what actually keeps writes off the other media is their block adapters
+/// refusing them, so this is a statement of policy rather than the guard.
+fn mount_ram_disk(
+    console: &mut crate::console::Console,
+    framebuffer: &mut crate::framebuffer::Framebuffer,
+    vfs: &mut Vfs,
+    ram_disk: Option<&mut RamBlockDevice>,
+    usb_host: &mut crate::usb::UsbHost,
+) {
+    let mut sd = SdSlot::new();
+    let mut devices = Devices {
+        ram: ram_disk,
+        sd: &mut sd,
+        usb: usb_host,
+    };
+    // The whole device, with no partition table in front of it: the RAM disk
+    // is reached by its own mount point rather than by an entry number.
+    let range = PartitionRange {
+        start_lba: 0,
+        block_count: devices
+            .with_device(DeviceId::Ram, |device| device.geometry().block_count)
+            .unwrap_or(0),
+    };
+    // No partition: the RAM disk is reached by its own mount point rather
+    // than through an MBR entry.
+    let outcome = vfs.mount(
+        &mut devices,
+        "/ram",
+        DeviceId::Ram,
+        None,
+        range,
+        MountMode::ReadWrite,
+    );
+    if let Err(error) = outcome {
+        let mut line = shell::Line::new();
+        line.push_str("mounting /ram failed: ");
+        line.push_str(fs::vfs::error_name(error));
+        console.write_output_line(framebuffer, line.as_str());
     }
 }
 

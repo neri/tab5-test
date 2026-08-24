@@ -5,10 +5,9 @@
 > [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)、
 > [`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)
 
-ブロック単位の読み書きまでを実装しており、ファイルシステムは扱いません。
-SDカードとUSBメモリはLBA 0を読んだ後の扱いだけを共有します
-（`src/app/mbr.rs`、`sdmbr`／`usbmbr`）。この共有部分はセクタが
-どちらから来たかを知りません。
+ブロック単位の読み書きと、その上の共通ブロックデバイス層・MBR判定までを
+実装しており、ファイルシステムは扱いません。SDカードとUSBメモリは
+`src/fs/`の`BlockDevice`として同じ形で見えます。
 
 ## SDカード（`src/sdmmc.rs`）
 
@@ -35,6 +34,14 @@ IDMACのディスクリプタと転送先バッファは内蔵SRAMに置きま�
 内蔵SRAMもPSRAMと同様にL1/L2キャッシュの背後にあるため、`psram.rs`と同じ
 `Cache_WriteBack_Invalidate_Addr`が必要です（ディスクリプタを渡す前に
 write-back、DMAが書いたバッファをCPUが読む前にinvalidate）。
+
+このROM関数は**開始アドレスが64 byteのキャッシュライン境界にない範囲を拒否**し、
+拒否されるとCPUは転送前の内容を読み続けます（エラーは出ません）。`sdmmc.rs`は
+非整列のバッファを整列済みステージングバッファ経由で転送し、キャッシュ操作が
+拒否された場合は転送失敗として扱うので、呼び出し側はアラインメントを意識する
+必要がありません。経緯は[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)を参照してください。
+
+1ブロックの読み出しはCMD17、複数ブロックはCMD18を使います。
 
 CPU/APBによる`SDHOST_BUFFIFO_REG`の直接読み出しと`IDSTS`のRIビットには実機固有の
 制約があり、いずれも使用していません。詳細は
@@ -146,6 +153,55 @@ USBハブのポートに挿したUSBメモリも同じレジストリに乗り�
 `usbread`／`usbmbr`はいずれもレジストリを引くので、直結とハブ経由を
 区別しません（[`USB.md`](USB.md)）。
 
+## ブロックデバイス層（`src/fs/`）
+
+[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 1にあたる層です。SDカード、
+USB Mass Storage、PSRAM上のRAMディスクを、論理ブロック単位の共通interface
+`fs::block::BlockDevice`（`geometry`／`read_blocks`／`write_blocks`／`flush`）
+で扱えるようにします。ファイルシステムそのものはまだありません。
+
+読み取り専用と読み書きでtraitを分けていません。書き込んで良いかはVFSの
+mount policyが決めることで、転送層の性質ではないためです。物理媒体（SD・USB）の
+adapterは`write_blocks`をコマンド発行前に`WriteSuppressed`で失敗させ、LBAと
+ブロック数をUARTへ記録します。成功を偽装すると、上位層がメタデータ更新は
+届いたものとして続きを組み立ててしまいます。既存の`sdwritetest`／`usbzero`
+などのraw書き込みコマンドは`sdmmc.rs`／`usb/msc.rs`を直接呼ぶので、この方針の
+対象外のまま残ります。
+
+LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。ただしMBRと
+ファイルシステムの経路が受理する論理ブロック長は**512 byteだけ**で、それ以外は
+`UnsupportedBlockSize`として解析前に拒否します。
+
+- `src/fs/ramdisk.rs`: PSRAMの固定8 MiB領域（[PSRAM.md](PSRAM.md)）。唯一の
+  読み書き可能な媒体で、起動ごとにFAT16でformatし直します。内容はリセットで
+  消え、`flush()`は永続化を保証しません
+- `src/fs/sd.rs`・`src/fs/usb_msc.rs`: 既存ドライバの上に載る薄いadapterです。
+  IDMACのディスクリプタ制約、BOT recovery、予防的再同期といった媒体固有の処理は
+  下層に残し、ここは結果の変換と転送分割だけを行います。SDはCSD version 1.0の
+  カード（容量を復号していない）をこの層では扱いません
+- `src/fs/partition.rs`: `PartitionRange`（開始LBAと長さのデータ）と、I/Oの間
+  だけデバイスを借りる`PartitionBlockDevice`に分けてあります。マウントが
+  デバイスを所有しないので、同じディスクの`p1`と`p2`を同時に扱えます
+
+### MBRの判定
+
+`55 AA`だけではMBRと、パーティションテーブルを持たないFAT/exFATボリューム
+（superfloppy）を区別できません。そこで`src/fs/mbr.rs`は両方の読み方を試し、
+**ちょうど一方だけが成立したときにだけ**媒体を使います。
+
+- MBRとして成立する条件: `55 AA`があり、4つのboot indicatorがすべて`0x00`か
+  `0x80`で、少なくとも1つのentryが使用可能であること
+- entryの検査: 長さ0、開始LBA 0、媒体範囲外を除外します。重なり合うentryは
+  **両方**除外します。どちらが誤りかテーブルからは判断できないためです
+- ブートセクタとして成立する条件: exFATは`EXFAT   `と`MustBeZero`領域、FATは
+  jump命令・セクタ長・クラスタサイズ・FAT数・メディア記述子・ルート構成・
+  総セクタ数フィールドをそれぞれ規格が許す値かで判定します（`src/fs/bootsector.rs`）
+- 両方成立した場合は`AmbiguousLayout`として拒否します。推測して外すと、
+  生きているボリュームの途中をパーティションとして切り出すことになるためです
+
+対応するのはclassic MBRのprimary entry 4個だけで、extended partition、GPT、
+複数LUNは対象外です。
+
 ## シェルコマンド
 
 | コマンド | 内容 |
@@ -164,13 +220,23 @@ USBハブのポートに挿したUSBメモリも同じレジストリに乗り�
 | `usbmbr` | LBA 0のMBRを`sdmbr`と同じ書式で表示 |
 | `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数・予防再同期数も表示） |
 | `usbmargin [rounds]` | VBUS offから再投入し、LBA 0が読めるまでの各段階を計測（read-only、既定5回、最大20回） |
+| `devices` | ブロックデバイス（`ram`／`sd0`／`usb0`…）の容量と、LBA 0の判定結果（MBRの各entry、superfloppy、ambiguous、判定不能）を表示。USBは接続中の台数ぶん列挙し、接続位置とVID:PIDも出す |
+| `blkread <dev> [pN] <lba>` | ブロック層経由で1ブロック読み出してUARTへダンプ。`pN`を付けるとLBAはそのパーティション相対になり、末尾を越える指定は媒体へ届く前に拒否される |
+
+`sdmbr`／`usbmbr`は読み終えたセクタをそのまま整形する古い表示のままです
+（`src/app/mbr.rs`）。`devices`との違いは解析の場所で、`devices`は
+`fs::mbr`がそもそもMBRかどうかを判定してからentryを出します。
 
 SD関連は起動シーケンスに含まれず、コマンド実行時にのみ`SDMMC: `接頭辞で
 UARTへログを出します（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。
 
+この層の上のVFS、FAT読み出し、マウント規則は[FILESYSTEM.md](FILESYSTEM.md)に
+あります。計画では本文書へ追記する想定でしたが、ブロックI/Oとファイルシステムを
+1つの文書に混ぜると両方が読みにくくなるため分けました。
+
 ## 未実装
 
-- FAT/exFATファイルシステムの解析（[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)の
-  Stage 4、保留）
+- exFATの解析（[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 5）
+- SD／USBへのファイルシステム経由の書き込み。全Stageで読み取り専用です
 - GPTの解析（MBRのみ。保護MBRは種別`0xEE`として表示されるだけ）
 - SDのUHS-Iモード（SDR50/SDR104等、100 MHz以上）

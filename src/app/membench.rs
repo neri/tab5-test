@@ -92,7 +92,11 @@ pub fn run(psram_buffer: Option<(*mut u32, usize)>) -> Report {
         // The direct and cached virtual windows share the PSRAM MMU table.
         // Flush the cached view left by the preceding measurement before the
         // same physical bytes are touched through the direct view.
-        crate::psram::writeback_invalidate(cached_base as usize, bytes);
+        // `cmd_membench` aligns the span it passes, so this is not refused.
+        // A refusal would cost measurement accuracy -- a "cold" pass served
+        // from cache -- rather than correctness, which is why it is the one
+        // place here that does not treat it as a failure.
+        let _ = crate::psram::writeback_invalidate(cached_base as usize, bytes);
         let direct_base = cached_base.map_addr(|address| address + NON_CACHEABLE_OFFSET);
         measure(
             direct_base,
@@ -181,13 +185,13 @@ unsafe fn cold(bytes: usize, path: MemoryPath) {
     match path {
         MemoryPath::Internal => {}
         MemoryPath::CachedPsram { base } => {
-            crate::psram::writeback_invalidate(base as usize, bytes);
+            let _ = crate::psram::writeback_invalidate(base as usize, bytes);
         }
         MemoryPath::DirectPsram { cached_base } => {
             // Cache maintenance APIs take addresses from the cached window,
             // not the CPU-only 0x8xxx_xxxx direct window.  Evicting that alias
             // prevents a stale dirty line from later overwriting direct stores.
-            crate::psram::writeback_invalidate(cached_base as usize, bytes);
+            let _ = crate::psram::writeback_invalidate(cached_base as usize, bytes);
         }
     }
     // Internal RAM has no such operation; the buffer is sized to push itself

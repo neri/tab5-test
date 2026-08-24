@@ -176,7 +176,12 @@ impl Block<'_> {
 /// Built as explicit `u32`s because the fields cross byte boundaries at 14
 /// bits, where a bit-field struct would only be restating the same shifts less
 /// directly.
-#[repr(C, align(8))]
+/// Aligned to a cache line, not to the 8 bytes the engine itself asks for.
+/// `publish` hands the descriptor to a DMA master through a cache
+/// writeback, and the ROM cache routine refuses a span that starts mid-line
+/// -- which would leave the engine reading a stale descriptor out of RAM.
+/// The padding this costs is a few bytes per descriptor.
+#[repr(C, align(64))]
 pub struct Descriptor {
     /// `vb_size` [13:0], `hb_length` [27:14], `err_eof` [28], `dma2d_en` [29],
     /// `suc_eof` [30], `owner` [31] -- the block's own size, plus the flags.
@@ -223,7 +228,9 @@ impl Descriptor {
     /// surrounding stack and is what `sdmmc` does with its IDMAC descriptor.
     fn publish(&mut self) -> u32 {
         let address = &raw mut *self as usize;
-        psram::writeback_invalidate(address, size_of::<Self>());
+        // The type's own alignment satisfies the cache routine, so the
+        // result cannot be a refusal here.
+        let _ = psram::writeback_invalidate(address, size_of::<Self>());
         address as u32
     }
 }

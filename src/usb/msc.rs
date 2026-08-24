@@ -34,6 +34,12 @@ const READS_PER_BOT_RESYNC: u8 = 16;
 const INQUIRY_RESPONSE_LEN: usize = 36;
 const REQUEST_SENSE_RESPONSE_LEN: usize = 18;
 const READ_CAPACITY_10_RESPONSE_LEN: usize = 8;
+/// Largest VPD page this reads. The serial-number and device-identification
+/// pages are tens of bytes in practice; a longer page is truncated, which is
+/// harmless for a fingerprint as long as the truncation is consistent.
+const VPD_RESPONSE_MAX: usize = 64;
+/// Peripheral type, page code, and the 16-bit page length.
+const VPD_HEADER_LEN: usize = 4;
 const READ_CAPACITY_10_NEEDS_CAPACITY_16: u32 = 0xFFFF_FFFF;
 const READY_POLL_INTERVAL_MS: u32 = 100;
 /// SPC sense key 2, "the logical unit is not ready".
@@ -172,6 +178,52 @@ impl UsbMassStorage {
             return None;
         }
         Some(data)
+    }
+
+    /// Reads a Vital Product Data page: `0x80` is the unit serial number,
+    /// `0x83` the device identification list.
+    ///
+    /// These are the closest thing SCSI has to a medium identity, and unlike
+    /// USB's `iSerialNumber` they describe the storage device rather than the
+    /// enclosure. Both are optional, and plenty of USB sticks answer neither.
+    /// A device that does not support them answers CHECK CONDITION, which is
+    /// reported as `None` -- absence, not failure, and the caller records
+    /// that this source had nothing to say rather than treating the medium as
+    /// unidentifiable.
+    ///
+    /// Returns the page's payload, without the four-byte header.
+    pub fn vital_product_data(&mut self, page: u8, out: &mut [u8]) -> Option<usize> {
+        let mut data = [0u8; VPD_RESPONSE_MAX];
+        // EVPD set in byte 1, page code in byte 2, allocation length in 3-4.
+        let cdb = [
+            SCSI_INQUIRY,
+            1,
+            page,
+            (VPD_RESPONSE_MAX >> 8) as u8,
+            VPD_RESPONSE_MAX as u8,
+            0,
+        ];
+        let result = self.bot.execute_command(&cdb, true, &mut data)?;
+        if result.status != CSW_STATUS_PASSED {
+            // Not logged as an error: declining to answer is a legal reply,
+            // and the sense data still has to be collected so the next
+            // command does not start on top of it.
+            let _ = self.collect_sense(b"USB MSC: INQUIRY(EVPD)");
+            return None;
+        }
+        if result.transferred < VPD_HEADER_LEN {
+            return None;
+        }
+        // Byte 1 echoes the page code; a device that answered with a
+        // different page has not answered this question.
+        if data[1] != page {
+            return None;
+        }
+        let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let available = result.transferred - VPD_HEADER_LEN;
+        let length = length.min(available).min(out.len());
+        out[..length].copy_from_slice(&data[VPD_HEADER_LEN..VPD_HEADER_LEN + length]);
+        Some(length)
     }
 
     pub fn test_unit_ready(&mut self) -> Option<bool> {

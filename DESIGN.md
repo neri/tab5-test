@@ -30,7 +30,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [INPUT.md](docs/INPUT.md) | ソフトI2C、CardKB／USBキーボード、`Key`正規化、`InputManager`、ポインタ、タッチコントローラー |
 | [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、`win`デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
-| [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、MBR、シェルコマンド |
+| [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、共通ブロックデバイス層、MBR判定、シェルコマンド |
+| [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、FAT読み出し、パスの規則、読み書きの保証、RAMディスク |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
 | [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP |
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
@@ -40,7 +41,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 
 作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）:
 [DISPLAY_UNDERRUN_REFACTOR_PLAN.md](docs/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)、
+[DEVICE_TREE_PLAN.md](docs/DEVICE_TREE_PLAN.md)、
 [FLASH_XIP_MIGRATION_PLAN.md](docs/FLASH_XIP_MIGRATION_PLAN.md)、
+[FILESYSTEM_PLAN.md](docs/FILESYSTEM_PLAN.md)、
 [INPUT_MANAGER_PLAN.md](docs/INPUT_MANAGER_PLAN.md)、
 [PPA_FILL_PLAN.md](docs/PPA_FILL_PLAN.md)、
 [SD_CARD_PLAN.md](docs/SD_CARD_PLAN.md)、

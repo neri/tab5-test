@@ -58,5 +58,6 @@ pub use protocol::{
     DESCRIPTOR_TYPE_ENDPOINT, DESCRIPTOR_TYPE_INTERFACE, EndpointDescriptor, InterfaceDescriptor,
 };
 pub use registry::{
-    BusDevice, DeviceKind, DeviceRecord, DeviceSummary, Location, MAX_HUB_PORTS, UsbHost,
+    BusDevice, ConnectionEpoch, DeviceKind, DeviceRecord, DeviceSummary, Location, MAX_HUB_PORTS,
+    RescanReason, UsbHost,
 };

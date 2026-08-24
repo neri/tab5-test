@@ -139,6 +139,12 @@ pub struct InputManager {
     primary_touch_id: Option<u8>,
     usb_host: usb::UsbHost,
     usb_reconnect_frames: u32,
+    /// Frames since the last sweep for devices removed from hub ports. Kept
+    /// apart from `usb_reconnect_frames` because that one is reset by
+    /// discovery and by reconnect backoff, and a removal sweep that only ran
+    /// when discovery happened to be idle would be exactly as blind as
+    /// having no sweep.
+    usb_port_sweep_frames: u32,
     /// Rescans caused by a stale session with no settled interval between
     /// them, and the frames still to wait before the next one.
     usb_stale_rescans: u32,
@@ -192,7 +198,7 @@ impl InputManager {
         uart::log(b"USB ENUM: bounded retry v9\r\n");
         uart::log(b"USB STABILITY: phase-aligned split HID v24\r\n");
         let steady_state_connect_wait = usb::set_connect_wait_ms(BOOT_CONNECT_WAIT_MS);
-        usb_host.rescan();
+        usb_host.rescan(usb::RescanReason::Manual);
         usb::set_connect_wait_ms(steady_state_connect_wait);
         uart::log(b"USB: initial scan complete\r\n");
         log_boot_usb_timing(&mut usb_host);
@@ -208,6 +214,7 @@ impl InputManager {
             primary_touch_id: None,
             usb_host,
             usb_reconnect_frames: 0,
+            usb_port_sweep_frames: 0,
             usb_stale_rescans: 0,
             usb_stale_backoff_frames: 0,
             usb_frames_since_stale: 0,
@@ -311,14 +318,15 @@ impl InputManager {
         let root_connection_changed = self.usb_host.take_root_connection_change();
         if self.usb_host.root_disconnected() {
             let had_registered_device = !self.usb_host.is_empty();
-            self.usb_host.clear();
+            self.usb_host.clear_disconnected();
             self.usb_reconnect_frames = 0;
             if had_registered_device {
                 uart::log(b"USB: nothing connected to USB-A\r\n");
             }
         } else if root_connection_changed {
             uart::log(b"USB: root-port connection changed, rescanning...\r\n");
-            self.usb_host.rescan();
+            self.usb_host
+                .rescan(usb::RescanReason::PhysicalConnectionChange);
             self.usb_reconnect_frames = 0;
         } else if self.usb_host.needs_reinit() {
             if self.usb_host.detach_disconnected_stale_split_hid() {
@@ -326,6 +334,27 @@ impl InputManager {
                 self.usb_reconnect_frames = 0;
             } else {
                 self.rescan_stale_session();
+            }
+        }
+
+        // Occupied hub ports are swept for removals on their own timer,
+        // outside the `has_room` check below. That check is about where a
+        // *new* device could go, and it is false exactly when every port is
+        // occupied -- which is also the state a port stuck holding a device
+        // that has already been unplugged produces. Gating the sweep on it
+        // would mean the one case that needs noticing is the one case that
+        // is never looked at.
+        if self.usb_host.hub().is_some() {
+            self.usb_port_sweep_frames += 1;
+            if self.usb_port_sweep_frames >= HUB_PORT_SCAN_FRAMES {
+                self.usb_port_sweep_frames = 0;
+                if self.usb_host.detach_disconnected_hub_ports() {
+                    self.clear_pending_keys();
+                    // Let discovery run on the next tick rather than after a
+                    // full interval: the port is free now, and something is
+                    // often plugged straight back into it.
+                    self.usb_reconnect_frames = HUB_PORT_SCAN_FRAMES;
+                }
             }
         }
 
@@ -338,7 +367,7 @@ impl InputManager {
                 }
             } else if self.usb_reconnect_frames >= ROOT_RESCAN_FRAMES {
                 self.usb_reconnect_frames = 0;
-                self.usb_host.rescan();
+                self.usb_host.rescan(usb::RescanReason::Manual);
             }
         }
     }
@@ -357,7 +386,7 @@ impl InputManager {
             return;
         }
         uart::log(b"USB: a device session went stale, rescanning...\r\n");
-        self.usb_host.rescan();
+        self.usb_host.rescan(usb::RescanReason::Recovery);
         self.usb_reconnect_frames = 0;
         self.usb_stale_rescans = self.usb_stale_rescans.saturating_add(1);
         self.usb_frames_since_stale = 0;
