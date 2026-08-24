@@ -1,13 +1,15 @@
 //! Absolute path parsing and normalization for the VFS.
 //!
-//! Paths are UTF-8 and always absolute. There is no current directory, so
-//! there is nothing for a relative path to be relative to, and rejecting one
-//! is more useful than inventing a root to resolve it against.
+//! Paths are UTF-8 and always absolute. The VFS has no current directory:
+//! a relative path has nothing to be relative to down here, and rejecting
+//! one is more useful than inventing a root to resolve it against. The
+//! shell does keep one, and [`join`] is where it turns what was typed into
+//! the absolute path everything below this works on.
 //!
 //! Normalization happens once, here, at the edge. Everything below this --
 //! the mount lookup, the filesystem driver, the name comparison -- works on
 //! the canonical form, so no layer has to wonder whether it is looking at
-//! `/ram//a/./b` or `/ram/a/b`, and `..` cannot be smuggled past a mount
+//! `/tmp//a/./b` or `/tmp/a/b`, and `..` cannot be smuggled past a mount
 //! point into another volume.
 //!
 //! The length limits are fixed here rather than taken from the filesystem:
@@ -78,7 +80,7 @@ impl Path {
     ///
     /// `/a` yields the root rather than `None`: the root is a real directory
     /// that a file can sit in, and returning `None` for it would make a
-    /// caller creating `/ram/a` have to special-case the one case that is
+    /// caller creating `/tmp/a` have to special-case the one case that is
     /// most common.
     pub fn parent(&self) -> Option<Path> {
         if self.is_root() {
@@ -106,8 +108,8 @@ impl Path {
 
     /// The part of this path below `prefix`, as a canonical path.
     ///
-    /// Matching is by whole components, so `/ram` is a prefix of `/ram/a`
-    /// but not of `/ramdisk` -- comparing raw bytes would make one mount
+    /// Matching is by whole components, so `/tmp` is a prefix of `/tmp/a`
+    /// but not of `/tmpfiles` -- comparing raw bytes would make one mount
     /// point capture paths belonging to another.
     pub fn strip_prefix(&self, prefix: &Path) -> Option<Path> {
         if prefix.is_root() {
@@ -208,4 +210,38 @@ pub fn names_equal(left: &str, right: &str) -> bool {
             .bytes()
             .zip(right.bytes())
             .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+}
+
+/// Resolves `input` against `base`, which the caller keeps as its current
+/// directory.
+///
+/// This is the shell's rule, not the VFS's. Everything below [`normalize`]
+/// still sees an absolute path; a current directory is a convenience for
+/// whoever is typing, and giving one to the VFS would mean asking whose it
+/// is as soon as there are two callers.
+///
+/// No new resolution rule is needed for `.` and `..`: joining and then
+/// normalizing folds them exactly as it would in a path typed out in full,
+/// including refusing a `..` that would climb past the root.
+pub fn join(base: &Path, input: &str) -> Result<Path, PathError> {
+    if input.starts_with('/') {
+        return normalize(input);
+    }
+    // The limit applies to the joined text, before `..` has had a chance to
+    // shorten it again. `normalize` measures its input for the same reason
+    // -- its component table is sized for a path of this length -- so
+    // accepting a longer join here would only move the refusal.
+    let mut joined = [0u8; MAX_PATH_BYTES];
+    let base = base.as_str().as_bytes();
+    let input = input.as_bytes();
+    if base.len() + 1 + input.len() > joined.len() {
+        return Err(PathError::TooLong);
+    }
+    joined[..base.len()].copy_from_slice(base);
+    joined[base.len()] = b'/';
+    joined[base.len() + 1..base.len() + 1 + input.len()].copy_from_slice(input);
+    let length = base.len() + 1 + input.len();
+    // Both halves came from `&str`, and the separator is ASCII.
+    let joined = core::str::from_utf8(&joined[..length]).unwrap_or("/");
+    normalize(joined)
 }

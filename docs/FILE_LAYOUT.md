@@ -22,7 +22,8 @@
   固定8 MiB）、ヒープ（`Psram::heap`、残り全部）の3領域へ分けて提供する
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
 - `src/framebuffer/font.rs`: 5×7フォント
-- `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール
+- `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール。
+  桁数（`COLUMNS`）だけ公開していて、`ls`の桁詰めがそれを使う
 - `src/app.rs`: コンソールのフレームループ。入力、コマンド実行、全画面モードへの
   出入りだけを持つ。以下は`app`配下の、シェルコマンドを実行するためだけに存在する
   モジュール群で、クレート直下のハードウェア寄りモジュールからは参照されない
@@ -33,8 +34,9 @@
     - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示。
       読み終えたセクタをそのまま整形する`sdmbr`／`usbmbr`専用の古い表示で、
       判定は行わない
-    - `src/app/files.rs`: `mount`／`umount`／`mounts`／`ls`／`cat`／`write`／`append`／
-      `fsverify`の表示。
+    - `src/app/files.rs`: `mount`／`umount`／`mounts`／`fsverify`／`cd`／`ls`／`cat`／
+      `write`／`append`／`mkdir`の表示。`ls`の並べ替えと桁詰めもここで、
+      ソートのためにエントリを一度全部集める。
       `blockdev.rs`が「媒体が何か」を出すのに対し、こちらは「そこに何があるか」を出す
     - `src/app/blockdev.rs`: `devices`／`blkread`コマンドの表示。`fs::mbr`の
       判定結果（MBR、superfloppy、ambiguous、判定不能）と各entryを出す`mbr.rs`の
@@ -133,10 +135,11 @@
     - `src/fs/fingerprint.rs`: 媒体の同一性確認。SDのCID、SCSIのINQUIRYとVPD、
       MBRのdisk signatureとパーティション表、ボリュームのブートセクタを畳み込む。
       「どの媒体か」ではなく「さっきと同じ媒体か」に答える
-    - `src/fs/path.rs`: 絶対パスの正規化、長さと文字の検査、FAT流の名前比較
-    - `src/fs/vfs.rs`: マウント表、パス解決、ファイルハンドル、ディレクトリ列挙。
-      マウントはファイルシステムを保持せず、操作のたびに開き直す
-      （[FILESYSTEM.md](FILESYSTEM.md)）
+    - `src/fs/path.rs`: 絶対パスの正規化、長さと文字の検査、FAT流の名前比較、
+      シェルのカレントディレクトリと相対パスの連結（`join`）
+    - `src/fs/vfs.rs`: マウント表、パス解決、ファイルハンドル、ディレクトリ列挙、
+      `metadata`と`create_dir`。マウントはファイルシステムを保持せず、操作のたびに
+      開き直す（[FILESYSTEM.md](FILESYSTEM.md)）
 - `src/net.rs`・`src/net/`: smoltcpによるIPv4。`usb.rs`・`wifi.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけ。プロトコル層を自前実装しない唯一の層で、
   理由と対応範囲は[`NETWORK.md`](NETWORK.md)

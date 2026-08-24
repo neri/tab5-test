@@ -1,20 +1,26 @@
-//! Display for the VFS: the `mounts`, `ls` and `cat` commands.
+//! Display for the VFS: `mounts`, `ls`, `cat`, and the commands that change
+//! something -- `write`, `mkdir` and the current directory `cd` moves.
 //!
 //! `docs/FILESYSTEM_PLAN.md` Stage 2. These are the read-only shell the plan
-//! asks for, and they are also how the reader gets tested: `ls /ram` has to
-//! show the long name rather than its `~1` alias, and `cat /ram/CHAIN.TXT`
+//! asks for, and they are also how the reader gets tested: `ls /tmp` has to
+//! show the long name rather than its `~1` alias, and `cat /tmp/CHAIN.TXT`
 //! has to keep printing the right cluster number past the end of the first
 //! one.
 //!
 //! It sits beside `blockdev.rs` in the same way the VFS sits above the block
 //! layer -- that one shows what a medium is, this one shows what is on it.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+
 use super::shell::Line;
-use crate::console::Console;
+use crate::console::{COLUMNS, Console};
 use crate::framebuffer::Framebuffer;
+use crate::fs::path::Path;
 use crate::fs::registry::{device_name, parse_device_name};
 use crate::fs::vfs::{
-    DirEntry, EntryKind, FsError, MountMode, OpenMode, Vfs, error_name, format_name, verdict_name,
+    EntryKind, FsError, MountMode, OpenMode, Timestamp, Vfs, error_name, format_name, verdict_name,
 };
 use crate::fs::{DeviceId, Devices, mbr};
 use crate::uart;
@@ -127,32 +133,189 @@ pub fn verify(
     }
 }
 
-/// `ls [<path>]`, defaulting to the root, which lists the mount points.
+/// What `ls` was asked to show.
+#[derive(Clone, Copy, Default)]
+pub struct ListOptions {
+    /// `-l`: one entry per line with kind, size and timestamp, instead of
+    /// names packed into columns.
+    pub long: bool,
+    /// `-a`: include the entries whose names start with a dot, which on FAT
+    /// means the `.` and `..` every subdirectory carries.
+    pub all: bool,
+}
+
+/// One entry, held long enough to be sorted.
+///
+/// The name is owned. `Vfs::list` lends each name out of a directory buffer
+/// that only exists for the duration of the call -- which is what lets it
+/// avoid an allocation per listing -- so anything that has to outlive the
+/// walk, as sorting requires, must copy.
+struct Entry {
+    name: String,
+    kind: EntryKind,
+    size: u64,
+    modified: Option<Timestamp>,
+}
+
+/// `ls [-l] [-a] [<path>]`. The shell has already resolved the path against
+/// the current directory, and passes that one when the command was given
+/// none.
+///
+/// Every entry is collected before any is printed. That is the cost of
+/// sorting: a directory arrives in whatever order it sits on the medium,
+/// and there is no way to put it in name order while streaming it. The
+/// buffer is on the PSRAM heap and holds one `String` per entry, which at
+/// the sizes a FAT directory reaches is not worth avoiding.
 pub fn list(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     devices: &mut Devices,
     vfs: &Vfs,
     path: &str,
+    options: ListOptions,
 ) {
-    let mut count = 0u32;
+    let mut entries: Vec<Entry> = Vec::new();
     let outcome = vfs.list(devices, path, |entry| {
-        count += 1;
-        console.write_output_line(framebuffer, format_entry(&entry).as_str());
-    });
-    match outcome {
-        Ok(()) => {
-            let mut line = Line::new();
-            line.push_u32(count);
-            line.push_str(if count == 1 { " entry" } else { " entries" });
-            console.write_output_line(framebuffer, line.as_str());
+        // FAT gives every subdirectory a `.` and a `..`; hiding them by
+        // default is what makes a listing here look like a listing anywhere
+        // else. Nothing is lost -- `-a` shows them, and they are the only
+        // dotted names these volumes produce.
+        if !options.all && entry.name.starts_with('.') {
+            return;
         }
-        Err(error) => report(console, framebuffer, "ls", error),
+        entries.push(Entry {
+            name: String::from(entry.name),
+            kind: entry.kind,
+            size: entry.size,
+            modified: entry.modified,
+        });
+    });
+    if let Err(error) = outcome {
+        return report(console, framebuffer, "ls", error);
+    }
+
+    // Sorted by name, mount points and directories included. A listing that
+    // sorted a volume but left the tree above it in mount order would be
+    // two different commands wearing one name.
+    entries.sort_by(|left, right| compare_names(&left.name, &right.name));
+
+    if options.long {
+        for entry in &entries {
+            console.write_output_line(framebuffer, format_entry(entry).as_str());
+        }
+        let mut line = Line::new();
+        line.push_u32(entries.len() as u32);
+        line.push_str(if entries.len() == 1 {
+            " entry"
+        } else {
+            " entries"
+        });
+        console.write_output_line(framebuffer, line.as_str());
+    } else {
+        write_columns(console, framebuffer, &entries);
     }
 }
 
-fn format_entry(entry: &DirEntry<'_>) -> Line {
-    let mut line = Line::new();
+/// Orders two names the way a listing should read.
+///
+/// ASCII case is folded first, so `README.TXT` and `readme.txt` sort next to
+/// each other rather than in two blocks either side of the lower-case
+/// letters -- which is what a raw byte comparison gives, and which reads as
+/// unsorted to anyone looking for a name. Case then breaks the tie, so the
+/// order is total and two listings of the same directory agree.
+fn compare_names(left: &str, right: &str) -> Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+        .then_with(|| left.cmp(right))
+}
+
+/// Gap between one column and the next.
+const COLUMN_GAP: usize = 2;
+
+/// Packs names into as many columns as the console is wide enough for.
+///
+/// Two rules here are `ls`'s, and following them is what makes the output
+/// look like a listing rather than an approximation of one:
+///
+/// - Each column is as wide as the longest name *in that column*, not as the
+///   longest name anywhere. One global width lets a single long name push
+///   every column apart.
+/// - Names fill down each column before moving to the next. With the names
+///   in name order, reading a column top to bottom keeps neighbours
+///   together; filling across rows would scatter them along a row instead.
+///
+/// A line must stay strictly inside the console's width. One that ends
+/// exactly on the last cell wraps and then ends, which leaves a blank row
+/// behind it -- see `Console::write_output_line`.
+fn write_columns(console: &mut Console, framebuffer: &mut Framebuffer, entries: &[Entry]) {
+    if entries.is_empty() {
+        return;
+    }
+    // The widest layout that fits, tried from the most columns down. There
+    // is always a fit at one column: a name too long for the line is left to
+    // the console to wrap rather than being dropped.
+    let mut chosen = (1usize, entries.len());
+    for columns in (2..=entries.len().min(COLUMNS)).rev() {
+        let rows = entries.len().div_ceil(columns);
+        // With this many rows the last column would be empty, so the layout
+        // is not really the column count it claims to be.
+        if (columns - 1) * rows >= entries.len() {
+            continue;
+        }
+        let mut total = 0;
+        for column in 0..columns {
+            total += column_width(entries, column, rows)
+                + if column + 1 < columns { COLUMN_GAP } else { 0 };
+            if total >= COLUMNS {
+                break;
+            }
+        }
+        if total < COLUMNS {
+            chosen = (columns, rows);
+            break;
+        }
+    }
+    let (columns, rows) = chosen;
+
+    let mut line = String::with_capacity(COLUMNS);
+    for row in 0..rows {
+        line.clear();
+        let mut start = 0;
+        for column in 0..columns {
+            let Some(entry) = entries.get(column * rows + row) else {
+                continue;
+            };
+            // Padded up to where the column starts rather than after each
+            // name, so the line carries no trailing spaces to be painted
+            // and mirrored to the log.
+            for _ in line.chars().count()..start {
+                line.push(' ');
+            }
+            line.push_str(&entry.name);
+            start += column_width(entries, column, rows) + COLUMN_GAP;
+        }
+        console.write_output_line(framebuffer, &line);
+    }
+}
+
+/// The longest name in one column of a `rows`-deep column-major layout.
+fn column_width(entries: &[Entry], column: usize, rows: usize) -> usize {
+    entries[column * rows..]
+        .iter()
+        .take(rows)
+        .map(|entry| entry.name.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// One `-l` line: kind, size for a file, timestamp, name.
+///
+/// A `String` rather than a `Line`, which holds 80 bytes: a long FAT name
+/// plus the columns in front of it goes past that, and a listing that
+/// silently shortened a name would be worse than one that wraps.
+fn format_entry(entry: &Entry) -> String {
+    let mut line = String::new();
     line.push_str(match entry.kind {
         // A mount point is marked apart from a directory because it is not
         // one: it belongs to the tree rather than to any volume, and `ls` of
@@ -162,34 +325,54 @@ fn format_entry(entry: &DirEntry<'_>) -> Line {
         EntryKind::File => "file  ",
     });
     if entry.kind == EntryKind::File {
-        line.push_u64(entry.size);
-        line.push_str(" ");
+        push_u64(&mut line, entry.size);
+        line.push(' ');
     }
     match entry.modified {
         Some(stamp) => {
-            line.push_u32(stamp.year as u32);
-            push_two_digits(&mut line, "-", stamp.month);
-            push_two_digits(&mut line, "-", stamp.day);
-            push_two_digits(&mut line, " ", stamp.hour);
-            push_two_digits(&mut line, ":", stamp.minute);
-            push_two_digits(&mut line, ":", stamp.second);
+            push_u64(&mut line, stamp.year as u64);
+            push_two_digits(&mut line, '-', stamp.month);
+            push_two_digits(&mut line, '-', stamp.day);
+            push_two_digits(&mut line, ' ', stamp.hour);
+            push_two_digits(&mut line, ':', stamp.minute);
+            push_two_digits(&mut line, ':', stamp.second);
         }
         // Aligned with a dated line, so a column of entries stays readable
         // when only some of them carry a timestamp.
         None => line.push_str("       (no time)   "),
     }
-    line.push_str(" ");
-    line.push_str(entry.name);
+    line.push(' ');
+    line.push_str(&entry.name);
     line
 }
 
-/// Pushes a separator and a zero-padded two-digit field.
-fn push_two_digits(line: &mut Line, separator: &str, value: u8) {
-    line.push_str(separator);
-    if value < 10 {
-        line.push_str("0");
+/// Appends a decimal number. `core::fmt` is deliberately not linked here, so
+/// the digits are produced by hand as they are for [`Line`].
+fn push_u64(line: &mut String, value: u64) {
+    if value == 0 {
+        line.push('0');
+        return;
     }
-    line.push_u32(value as u32);
+    let mut digits = [0u8; 20];
+    let mut length = 0;
+    let mut value = value;
+    while value > 0 {
+        digits[length] = b'0' + (value % 10) as u8;
+        value /= 10;
+        length += 1;
+    }
+    for &digit in digits[..length].iter().rev() {
+        line.push(digit as char);
+    }
+}
+
+/// Pushes a separator and a zero-padded two-digit field.
+fn push_two_digits(line: &mut String, separator: char, value: u8) {
+    line.push(separator);
+    if value < 10 {
+        line.push('0');
+    }
+    push_u64(line, value as u64);
 }
 
 /// `cat <path> [offset]`: prints a file from `offset`, splitting it into
@@ -335,6 +518,53 @@ pub fn write(
     }
 }
 
+/// `cd [<path>]`: moves the shell's current directory, once the target has
+/// been confirmed to be a directory.
+///
+/// The check is the whole point of doing this here rather than in the shell:
+/// a current directory that has never been looked at would let `cd` succeed
+/// on a typo and then fail every command afterwards, at which point the
+/// message names the command instead of the mistake.
+///
+/// The VFS is not told about any of this. It has no current directory --
+/// see `fs::path` -- so what moves is a `Path` the shell owns, and what the
+/// VFS sees is still an absolute path.
+pub fn change_directory(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &Vfs,
+    cwd: &mut Path,
+    target: Path,
+) {
+    match vfs.metadata(devices, target.as_str()) {
+        Ok(metadata) if metadata.kind != EntryKind::Directory => {
+            report(console, framebuffer, "cd", FsError::NotADirectory);
+        }
+        Ok(_) => *cwd = target,
+        Err(error) => report(console, framebuffer, "cd", error),
+    }
+}
+
+/// `mkdir <path>`.
+pub fn make_directory(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    path: &str,
+) {
+    match vfs.create_dir(devices, path) {
+        Ok(()) => {
+            let mut line = Line::new();
+            line.push_str("created ");
+            line.push_str(path);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, "mkdir", error),
+    }
+}
+
 /// Resolves a `ram`/`sd0pN`/`usb0pN` name to something the VFS can mount.
 ///
 /// The mount point is derived from the name rather than given: `sd0p1` always
@@ -423,11 +653,11 @@ pub fn unmount(console: &mut Console, framebuffer: &mut Framebuffer, vfs: &mut V
     }
 }
 
-/// `/ram` for the RAM disk, `/vol/<name>` for removable media.
+/// `/tmp` for the RAM disk, `/vol/<name>` for removable media.
 fn mount_point(name: &str, device: DeviceId) -> Line {
     let mut point = Line::new();
     if device == DeviceId::Ram {
-        point.push_str("/ram");
+        point.push_str("/tmp");
     } else {
         point.push_str("/vol/");
         point.push_str(name);

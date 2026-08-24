@@ -23,7 +23,10 @@ const CELL_WIDTH: usize = 6 * SCALE;
 const CELL_HEIGHT: usize = 8 * SCALE;
 const LEFT: usize = 16;
 const TOP: usize = 8;
-const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
+/// Cells across one row. Public because `ls` lays its names out in columns
+/// and has to know how many characters reach the edge; every other caller
+/// writes a line and lets the console wrap it.
+pub const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
 const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 
 // Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt

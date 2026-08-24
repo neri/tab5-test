@@ -2,6 +2,8 @@
 
 > 索引: [`../DESIGN.md`](../DESIGN.md)
 > この文書は作業計画です。実装を開始した後の仕様は現状文書とコードを優先します。
+> **本文中の`/ram`は現在`/tmp`です**（[`FILESYSTEM_WORKFLOW_PLAN.md`](FILESYSTEM_WORKFLOW_PLAN.md)で
+> 改名。デバイス名`ram`はそのまま）。当時の記録として本文はそのままにしてあります。
 
 ## 状態
 

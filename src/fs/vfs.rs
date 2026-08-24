@@ -146,6 +146,8 @@ pub enum FsError {
     NotMounted,
     /// Something is already mounted at this point.
     AlreadyMounted,
+    /// The name a create asked for is already taken on the volume.
+    AlreadyExists,
     MountTableFull,
     TooManyOpenFiles,
     /// The mount point exists but a handle is still open on it.
@@ -175,6 +177,7 @@ pub fn error_name(error: FsError) -> &'static str {
         FsError::Path(error) => path::error_name(error),
         FsError::NotMounted => "no filesystem mounted on that path",
         FsError::AlreadyMounted => "already mounted",
+        FsError::AlreadyExists => "already exists",
         FsError::MountTableFull => "mount table full",
         FsError::TooManyOpenFiles => "too many open files",
         FsError::Busy => "busy: files are still open",
@@ -208,8 +211,11 @@ impl From<BlockError> for FsError {
 pub enum EntryKind {
     File,
     Directory,
-    /// A mount point, seen while listing the synthetic root. It is not an
-    /// object on any volume, which is why it is not simply a directory.
+    /// A mount point, seen while listing the tree above the volumes. It is
+    /// not an object on any volume, which is why it is not simply a
+    /// directory. The nodes on the way down to one -- `/vol` -- are
+    /// synthetic in the same way but report as directories: what a caller
+    /// does with them is what it does with any other directory.
     MountPoint,
 }
 
@@ -272,6 +278,18 @@ impl Timestamp {
             second: stamp.second(),
         })
     }
+}
+
+/// What [`Vfs::metadata`] reports about one path.
+///
+/// Deliberately not a `DirEntry`: that borrows a name out of a directory
+/// listing that only exists for the duration of the call, and a caller
+/// asking about a path it already named has no use for the name back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Metadata {
+    pub kind: EntryKind,
+    /// Zero for a directory, which FAT does not record a length for.
+    pub size: u64,
 }
 
 pub struct DirEntry<'a> {
@@ -599,25 +617,11 @@ impl Vfs {
     ) -> Result<(), FsError> {
         let path = path::normalize(path)?;
 
-        // The root belongs to no volume: it is the list of mount points, in
-        // table order, which is the order they were mounted in.
-        if path.is_root() {
-            for mount in self.mounts.iter().flatten() {
-                let name = mount.point.file_name().unwrap_or("/");
-                out(DirEntry {
-                    name,
-                    kind: EntryKind::MountPoint,
-                    size: 0,
-                    // A mount point is not an object on any volume, so
-                    // there is nothing whose modification time this could
-                    // be.
-                    modified: None,
-                });
-            }
-            return Ok(());
-        }
-
-        let (mount, within) = self.resolve(&path).ok_or(FsError::NotMounted)?;
+        // Above the volumes the tree belongs to no medium, so there is
+        // nothing to open: the entries are the mount table, read sideways.
+        let Some((mount, within)) = self.resolve(&path) else {
+            return self.list_tree(&path, out);
+        };
         with_volume(devices, &mount, |volume| match volume {
             AnyVolume::Fat(volume) => {
                 let directory = match lookup(volume, &within)? {
@@ -681,6 +685,165 @@ impl Vfs {
                 Ok(())
             }
         })
+    }
+
+    /// Lists a node of the tree that sits above the volumes: the root, or
+    /// one of the directories a mount point passes through on its way down.
+    ///
+    /// `/vol` is on no medium. It exists because something is mounted under
+    /// it and stops existing when the last of those goes. Synthesizing it
+    /// here is what makes the tree navigable by the names it shows: the
+    /// root used to list `sd0p1` for a volume that only answers to
+    /// `/vol/sd0p1`, so the one name a listing offered was the one a
+    /// caller could not then use.
+    fn list_tree(&self, path: &Path, mut out: impl FnMut(DirEntry<'_>)) -> Result<(), FsError> {
+        let mut found = false;
+        for (index, mount) in self.mounts.iter().enumerate() {
+            let Some(mount) = mount else {
+                continue;
+            };
+            let Some((name, is_point)) = tree_child(&mount.point, path) else {
+                continue;
+            };
+            found = true;
+            // Two volumes under one node contribute a single entry: both
+            // `/vol/sd0p1` and `/vol/usb0p1` put `vol` under the root. The
+            // earlier mount is the one that emits it, so the order stays
+            // the mount table's, which is the order things were mounted in.
+            let earlier = self.mounts[..index].iter().flatten().any(|earlier| {
+                tree_child(&earlier.point, path)
+                    .is_some_and(|(earlier, _)| path::names_equal(earlier, name))
+            });
+            if earlier {
+                continue;
+            }
+            out(DirEntry {
+                name,
+                kind: if is_point {
+                    EntryKind::MountPoint
+                } else {
+                    EntryKind::Directory
+                },
+                size: 0,
+                // Nothing here is an object on a volume, so there is
+                // nothing whose modification time this could be.
+                modified: None,
+            });
+        }
+        // The root is there with nothing mounted at all; every other node
+        // of the tree exists only for as long as something is under it.
+        if found || path.is_root() {
+            Ok(())
+        } else {
+            Err(FsError::NotMounted)
+        }
+    }
+
+    /// Whether `path` names a directory of the tree above the volumes.
+    fn is_tree_node(&self, path: &Path) -> bool {
+        path.is_root()
+            || self
+                .mounts
+                .iter()
+                .flatten()
+                .any(|mount| tree_child(&mount.point, path).is_some())
+    }
+
+    /// What is at `path`, without listing anything.
+    ///
+    /// `cd` is the caller this exists for. Asking `list` whether a path is a
+    /// directory would answer by walking every entry in it, which is a great
+    /// deal of work to establish one bit -- and gives the wrong answer for a
+    /// path that is a file, since a file simply lists as nothing.
+    pub fn metadata(&self, devices: &mut Devices, path: &str) -> Result<Metadata, FsError> {
+        let path = path::normalize(path)?;
+        let Some((mount, within)) = self.resolve(&path) else {
+            if self.is_tree_node(&path) {
+                return Ok(Metadata {
+                    kind: EntryKind::Directory,
+                    size: 0,
+                });
+            }
+            return Err(FsError::NotMounted);
+        };
+        with_volume(devices, &mount, |volume| match volume {
+            AnyVolume::Fat(volume) => match lookup(volume, &within)? {
+                // The volume's own root, which has no directory entry to
+                // report and is a directory whether or not it holds one.
+                None => Ok(Metadata {
+                    kind: EntryKind::Directory,
+                    size: 0,
+                }),
+                Some(entry) => Ok(Metadata {
+                    kind: if entry.is_directory() {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                    size: entry.len(),
+                }),
+            },
+            AnyVolume::Exfat(volume) => {
+                if within.is_root() {
+                    return Ok(Metadata {
+                        kind: EntryKind::Directory,
+                        size: 0,
+                    });
+                }
+                let entry = volume
+                    .open_path(within.as_str())
+                    .map_err(|_| FsError::NotFound)?;
+                Ok(Metadata {
+                    kind: if entry.is_directory() {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                    size: entry.valid_data_length,
+                })
+            }
+        })
+    }
+
+    /// Creates a directory at `path`, whose parent must already exist.
+    ///
+    /// Only the last component is created, which is the rule the file path
+    /// already follows. A caller naming a parent that is not there has
+    /// almost always mistyped it, and building the whole chain silently
+    /// would turn that typo into a directory tree.
+    ///
+    /// FAT only. exFAT is read-only here for the reasons in
+    /// [`VolumeFormat::Exfat`], and so is every mount that is not the RAM
+    /// disk.
+    pub fn create_dir(&mut self, devices: &mut Devices, path: &str) -> Result<(), FsError> {
+        let path = path::normalize(path)?;
+        let Some((mount, within)) = self.resolve(&path) else {
+            // Either nothing is mounted here, or this is a node of the tree
+            // above the volumes -- which is made by mounting something, not
+            // by asking for a directory.
+            return Err(FsError::NotMounted);
+        };
+        if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
+            return Err(FsError::ReadOnly);
+        }
+        if within.is_root() {
+            // The volume's root, which is already there.
+            return Err(FsError::AlreadyExists);
+        }
+
+        // One reading of the clock for the whole operation. See
+        // `super::clock`.
+        clock::sample();
+        let outcome = with_volume(devices, &mount, |volume| {
+            let AnyVolume::Fat(volume) = volume else {
+                // Unreachable: the format was checked above.
+                return Err(FsError::ReadOnly);
+            };
+            create_directory(volume, &within)?;
+            volume.sync().map_err(map_write_error)
+        });
+        clock::clear();
+        outcome
     }
 
     /// Opens a file for reading.
@@ -933,7 +1096,7 @@ fn map_write_error(error: FatError) -> FsError {
         FatError::InvalidFilename | FatError::InvalidShortFilename | FatError::InvalidPath => {
             FsError::Path(PathError::InvalidCharacter)
         }
-        FatError::AlreadyExists => FsError::AlreadyMounted,
+        FatError::AlreadyExists => FsError::AlreadyExists,
         // Everything left is either an I/O failure or the volume not being
         // what it claimed. Neither is something the caller distinguishes by
         // acting differently, and both mean the same thing: this volume did
@@ -953,6 +1116,22 @@ fn create<DATA: Read + Write + Seek>(volume: &FatVolume<DATA>, path: &Path) -> R
     let name = path.file_name().ok_or(FsError::NotAFile)?;
     let parent = parent_of(volume, path)?;
     volume.create_file(&parent, name).map_err(map_write_error)?;
+    Ok(())
+}
+
+/// Creates a directory at `path`, whose parent directory must exist.
+///
+/// The library writes the `.` and `..` entries into the new directory, so
+/// what comes back is a directory a PC will also accept -- which matters
+/// here, since the point of writing to a medium is usually to read it
+/// somewhere else.
+fn create_directory<DATA: Read + Write + Seek>(
+    volume: &FatVolume<DATA>,
+    path: &Path,
+) -> Result<(), FsError> {
+    let name = path.file_name().ok_or(FsError::NotADirectory)?;
+    let parent = parent_of(volume, path)?;
+    volume.create_dir(&parent, name).map_err(map_write_error)?;
     Ok(())
 }
 
@@ -1072,6 +1251,32 @@ fn with_volume<T>(
     outcome.ok_or(FsError::DeviceNotPresent)?
 }
 
+/// The child of `parent` that `point` lies under: the first component of
+/// `point` below `parent`, and whether that child is `point` itself.
+///
+/// `None` when `point` is not below `parent` at all, and also when the two
+/// are equal -- a node is not its own child. Matching is by whole
+/// components, so `/tmpfiles` is not below `/tmp`.
+fn tree_child<'a>(point: &'a Path, parent: &Path) -> Option<(&'a str, bool)> {
+    let text = point.as_str();
+    let below = if parent.is_root() {
+        text
+    } else {
+        let prefix = parent.as_str();
+        if !text.starts_with(prefix) || text.as_bytes().get(prefix.len()) != Some(&b'/') {
+            return None;
+        }
+        &text[prefix.len()..]
+    };
+    // A canonical non-root path starts with `/` and has no trailing one, so
+    // what is left is either empty or `/name` followed by the rest.
+    let below = below.strip_prefix('/')?;
+    match below.find('/') {
+        Some(cut) => Some((&below[..cut], false)),
+        None => Some((below, true)),
+    }
+}
+
 /// Walks `path` from the volume's root.
 ///
 /// `Ok(None)` is the root directory itself, which has no directory entry to
@@ -1089,7 +1294,7 @@ fn lookup<DATA: Read + Seek>(
 
     while let Some(component) = components.next() {
         // Anything already found has to be a directory for the walk to
-        // continue into it; this is what turns `/ram/FILE.TXT/x` into
+        // continue into it; this is what turns `/tmp/FILE.TXT/x` into
         // `NotADirectory` rather than `NotFound`.
         if let Some(entry) = &found {
             if !entry.is_directory() {

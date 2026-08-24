@@ -42,6 +42,8 @@
 | USBデバイス情報 | `lsusb` | 接続デバイスをハブ経由のツリーで表示。Composite Deviceは各interfaceを1行ずつ出す。`lsusb <アドレス>`でそのデバイスの主要な記述子（デバイス、コンフィグレーション、interfaceとendpoint、HID記述子）と、製品名・ベンダ名・シリアルの文字列記述子を表示 |
 | USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | USBスタックの診断用。ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
 | USBストレージ | `usbmsc` `usbread` `usbmbr` `usbwritetest` `usbzero` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式）、WRITE(10)での書き込み+照合+復元、ゼロ埋め |
+| ブロックデバイス | `devices` `blkread` | ram／sd0／usb0の一覧とジオメトリ、LBA 0がMBRか単体のFAT/exFATボリュームかの判定、1ブロックの読み出し（`pN`を付けるとそのMBRパーティション相対） |
+| ファイルシステム | `mount` `umount` `mounts` `fsverify` `cd` `pwd` `ls` `cat` `write` `append` `mkdir` | FAT12/16/32とexFATの読み出し。Unix型の単一ツリーへマウントし（`/tmp`がPSRAM上のRAMディスク、`/vol/<name>`がSDとUSB）、カレントディレクトリと相対パスで辿る。`ls`は名前順の桁詰めで、`-l`が詳細、`-a`が`.`と`..`。書き込みは`/tmp`だけで、SDとUSBは常に読み取り専用。`fsverify`は媒体が入れ替わっていないかをマウント時の識別情報と突き合わせる |
 | Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
 | ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
@@ -110,7 +112,10 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 ## 未対応
 
 - 日本語フォント
-- FAT/exFATファイルシステムの解釈
+- ファイルシステム経由でのSDカード・USBメモリへの書き込み。読み出しは可能で、
+  ブロック単位の`sdwritetest`などとは別の話です。exFATへの書き込みも、採用
+  ライブラリのexFAT対応が不安定なプレビューのため行いません
+- ファイルの削除・改名と、USB抜き差しの自動マウント
 - 多段USBハブ（ハブ配下のハブ）
 - IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみで、受信したデータの
   保存先はメモリだけです）。名前解決はAレコードだけで、キャッシュ・逆引き・

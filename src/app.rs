@@ -117,9 +117,14 @@ pub fn run(psram: Psram) {
     // absent: there is no fallback that hands the span to the heap instead,
     // because the fixed layout is what keeps the reservation useful.
     let mut ram_disk = init_ram_disk(&psram, console, display.framebuffer_mut());
-    // The mount table outlives every command: `/ram` is attached once here,
+    // The mount table outlives every command: `/tmp` is attached once here,
     // and whatever the user mounts later stays until they unmount it.
     let mut vfs = Vfs::new();
+
+    // The current directory outlives every command too, for the same reason
+    // the mount table does: `cd` is only useful if the next command is still
+    // there.
+    let mut shell_state = shell::State::new();
 
     let mut input = InputManager::new();
     if ram_disk.is_some() {
@@ -193,6 +198,7 @@ pub fn run(psram: Psram) {
             input.usb_host_mut(),
             ram_disk.as_mut(),
             &mut vfs,
+            &mut shell_state,
             &mut wifi_session,
             &mut net_stack,
         );
@@ -254,7 +260,7 @@ pub fn run(psram: Psram) {
 /// Claims the PSRAM RAM disk span and puts a fresh FAT16 volume on it.
 ///
 /// Both outcomes are reported on the console rather than only to the UART:
-/// whether `/ram` exists changes what the shell can do, and finding that out
+/// whether `/tmp` exists changes what the shell can do, and finding that out
 /// from a command that fails later is worse than being told at boot.
 fn init_ram_disk(
     psram: &Psram,
@@ -294,9 +300,9 @@ fn init_ram_disk(
     }
 }
 
-/// Attaches the RAM disk at `/ram`.
+/// Attaches the RAM disk at `/tmp`.
 ///
-/// The mount is explicit even though nothing else could be at `/ram`: the
+/// The mount is explicit even though nothing else could be at `/tmp`: the
 /// VFS has no auto-mount path at all, so that a volume appearing in the tree
 /// always corresponds to something that asked for it.
 ///
@@ -328,7 +334,7 @@ fn mount_ram_disk(
     // than through an MBR entry.
     let outcome = vfs.mount(
         &mut devices,
-        "/ram",
+        "/tmp",
         DeviceId::Ram,
         None,
         range,
@@ -336,7 +342,7 @@ fn mount_ram_disk(
     );
     if let Err(error) = outcome {
         let mut line = shell::Line::new();
-        line.push_str("mounting /ram failed: ");
+        line.push_str("mounting /tmp failed: ");
         line.push_str(fs::vfs::error_name(error));
         console.write_output_line(framebuffer, line.as_str());
     }

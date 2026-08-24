@@ -17,6 +17,7 @@ use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
 use crate::fs;
+use crate::fs::path::{self, Path};
 use crate::fs::vfs::Vfs;
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
 use crate::{
@@ -349,10 +350,10 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "mount [<ram|sd0pN|usbMpN>]",
         lines: &[
             "with no argument, list mounts. with one, attach that volume:",
-            "ram lands on /ram, everything else on /vol/<name>. usbM counts",
+            "ram lands on /tmp, everything else on /vol/<name>. usbM counts",
             "storage devices in bus order, as 'devices' lists them, so two",
             "sticks are usb0 and usb1. SD and USB are always read-only;",
-            "only /ram is writable",
+            "only /tmp is writable",
         ],
     },
     HelpEntry {
@@ -380,19 +381,39 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
-        name: "ls",
-        usage: "ls [<path>]",
+        name: "cd",
+        usage: "cd [<path>]",
         lines: &[
-            "list a directory. with no path, list the mount points.",
-            "paths are absolute, e.g. ls /ram, and a path containing",
-            "spaces goes in double quotes",
+            "change the current directory, which every path argument is",
+            "resolved against. with no path, go to the root. the target",
+            "has to exist and be a directory. the current directory is a",
+            "path, not a hold on a volume: unmount what it is on and the",
+            "commands using it start failing until it is mounted again",
+        ],
+    },
+    HelpEntry {
+        name: "pwd",
+        usage: "pwd",
+        lines: &["print the current directory"],
+    },
+    HelpEntry {
+        name: "ls",
+        usage: "ls [-l] [-a] [<path>]",
+        lines: &[
+            "list a directory, names only, in name order. -l adds the kind,",
+            "size and timestamp one per line; -a adds the dotted entries",
+            "(FAT gives every subdirectory a . and a ..); -la does both.",
+            "with no path, list the current one. a path not starting with /",
+            "is taken from there, and one containing spaces goes in double",
+            "quotes. / itself holds no volume: it lists /tmp and /vol, and",
+            "the mounted volumes are under /vol",
         ],
     },
     HelpEntry {
         name: "cat",
         usage: "cat <path> [offset]",
         lines: &[
-            "print a file, e.g. cat /ram/README.TXT. a path with spaces in",
+            "print a file, e.g. cat /tmp/README.TXT. a path with spaces in",
             "it goes in double quotes. reports the bytes read against the",
             "size in the directory entry, so a chain that ends early shows",
             "as SHORT READ instead of a plausible prefix",
@@ -403,7 +424,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "write <path> <text>",
         lines: &[
             "create or replace a file with one line of text, e.g.",
-            "write /ram/NOTE.TXT hello. only /ram is writable; SD and USB",
+            "write /tmp/NOTE.TXT hello. only /tmp is writable; SD and USB",
             "refuse before any command reaches the medium",
         ],
     },
@@ -411,6 +432,15 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "append",
         usage: "append <path> <text>",
         lines: &["add one line to a file, creating it if it is not there"],
+    },
+    HelpEntry {
+        name: "mkdir",
+        usage: "mkdir <path>",
+        lines: &[
+            "create a directory. only the last component is created, so a",
+            "parent that is not there is an error rather than something to",
+            "build silently. only /tmp is writable",
+        ],
     },
     HelpEntry {
         name: "sdreadpsram",
@@ -648,6 +678,37 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
 ];
 
+/// What the shell keeps between one command and the next.
+///
+/// Only the current directory so far. It lives here rather than in the
+/// `Vfs` because it is an interface convenience, not a property of any
+/// filesystem: the VFS takes absolute paths from every caller, and putting
+/// a current directory down there would raise the question of whose it is
+/// as soon as something other than this shell opened a file.
+///
+/// It is a path and nothing more. Unmounting the volume it points at, or
+/// swapping the medium under it, leaves it pointing where it pointed;
+/// commands then fail with "no filesystem mounted on that path" until
+/// something is mounted there again, at which point it works once more.
+/// The alternative -- resetting it to the root -- would mean `umount`, the
+/// media check and every future automatic unmount all reaching into the
+/// shell's state to fix up a string.
+pub struct State {
+    cwd: Path,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self { cwd: path::root() }
+    }
+}
+
 /// What the foreground application loop should do once a command has
 /// been dispatched.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -689,6 +750,7 @@ pub fn execute(
     usb_host: &mut usb::UsbHost,
     ram_disk: Option<&mut RamBlockDevice>,
     vfs: &mut Vfs,
+    state: &mut State,
     wifi_session: &mut Option<wifi::Rpc>,
     net_stack: &mut Option<net::Stack>,
 ) -> Outcome {
@@ -797,24 +859,40 @@ pub fn execute(
                 framebuffer,
                 argument,
                 "usage: umount <mount point>",
-            ) {
-                files::unmount(console, framebuffer, vfs, as_str(path));
+            )
+            .and_then(|path| absolute(console, framebuffer, state, path))
+            {
+                files::unmount(console, framebuffer, vfs, path.as_str());
             }
         }
-        b"ls" => {
-            let path = if argument.is_empty() {
-                Some(&b"/"[..])
-            } else {
-                single_argument(console, framebuffer, argument, "usage: ls [<path>]")
-            };
-            if let Some(path) = path {
-                let path = as_str(path);
-                with_devices(usb_host, ram_disk, |devices| {
-                    files::list(console, framebuffer, devices, vfs, path)
-                });
-            }
-        }
-        b"cat" => cmd_cat(console, framebuffer, argument, usb_host, ram_disk, vfs),
+        b"cd" => cmd_cd(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"pwd" => console.write_output_line(framebuffer, state.cwd.as_str()),
+        b"ls" => cmd_ls(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"cat" => cmd_cat(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
         b"write" => cmd_write(
             console,
             framebuffer,
@@ -822,6 +900,7 @@ pub fn execute(
             usb_host,
             ram_disk,
             vfs,
+            state,
             fs::vfs::OpenMode::Truncate,
         ),
         b"append" => cmd_write(
@@ -831,8 +910,19 @@ pub fn execute(
             usb_host,
             ram_disk,
             vfs,
+            state,
             fs::vfs::OpenMode::Append,
         ),
+        b"mkdir" => {
+            if let Some(path) =
+                single_argument(console, framebuffer, argument, "usage: mkdir <path>")
+                    .and_then(|path| absolute(console, framebuffer, state, path))
+            {
+                with_devices(usb_host, ram_disk, |devices| {
+                    files::make_directory(console, framebuffer, devices, vfs, path.as_str())
+                });
+            }
+        }
         b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
         b"lsusb" => cmd_lsusb(console, framebuffer, argument, usb_host),
         b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
@@ -5075,6 +5165,7 @@ fn cmd_write(
     usb_host: &mut usb::UsbHost,
     ram_disk: Option<&mut RamBlockDevice>,
     vfs: &mut Vfs,
+    state: &State,
     mode: fs::vfs::OpenMode,
 ) {
     let Some((path_text, rest)) = split_argument(argument) else {
@@ -5085,10 +5176,110 @@ fn cmd_write(
         console.write_output_line(framebuffer, "usage: write <path> <text>");
         return;
     }
-    let path = as_str(path_text);
+    let Some(path) = absolute(console, framebuffer, state, path_text) else {
+        return;
+    };
     let text = as_str(rest);
     with_devices(usb_host, ram_disk, |devices| {
-        files::write(console, framebuffer, devices, vfs, path, text, mode)
+        files::write(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            path.as_str(),
+            text,
+            mode,
+        )
+    });
+}
+
+/// `ls [-l] [-a] [<path>]`.
+///
+/// The first command here to take options, so this is also where the shell's
+/// rule for them is set: flags come before the path, each is a `-` and one
+/// or more letters, and `-la` means the same as `-l -a`. Nothing after the
+/// first non-flag word is read as a flag, which is what lets a file whose
+/// name starts with `-` be listed by quoting it.
+fn cmd_ls(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
+) {
+    const USAGE: &str = "usage: ls [-l] [-a] [<path>]";
+    let mut options = files::ListOptions::default();
+    let mut rest = trim(argument);
+    loop {
+        let (word, tail) = split_first_word(rest);
+        // A bare `-` is a path, not an empty set of flags.
+        if word.len() < 2 || word[0] != b'-' {
+            break;
+        }
+        for &flag in &word[1..] {
+            match flag {
+                b'l' => options.long = true,
+                b'a' => options.all = true,
+                _ => {
+                    // Naming the flag rather than only the usage line: the
+                    // likely cause is a flag another `ls` has and this one
+                    // does not, and the usage line alone leaves the reader
+                    // to spot which letter it refused.
+                    let mut line = Line::new();
+                    line.push_str("ls: unknown option -");
+                    line.push_ascii(&[flag]);
+                    console.write_output_line(framebuffer, line.as_str());
+                    console.write_output_line(framebuffer, USAGE);
+                    return;
+                }
+            }
+        }
+        rest = trim(tail);
+    }
+
+    // No path lists the current directory, which is the root until `cd`
+    // moves it.
+    let path = if rest.is_empty() {
+        Some(state.cwd)
+    } else {
+        single_argument(console, framebuffer, rest, USAGE)
+            .and_then(|path| absolute(console, framebuffer, state, path))
+    };
+    let Some(path) = path else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::list(console, framebuffer, devices, vfs, path.as_str(), options)
+    });
+}
+
+/// `cd [<path>]`.
+///
+/// No argument goes to the root rather than to a home directory: there is
+/// no such thing here, and the root is the one place that is always there
+/// whatever is mounted.
+fn cmd_cd(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &mut State,
+) {
+    if argument.is_empty() {
+        state.cwd = path::root();
+        return;
+    }
+    let Some(target) = single_argument(console, framebuffer, argument, "usage: cd [<path>]")
+        .and_then(|target| absolute(console, framebuffer, state, target))
+    else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::change_directory(console, framebuffer, devices, vfs, &mut state.cwd, target)
     });
 }
 
@@ -5105,6 +5296,7 @@ fn cmd_cat(
     usb_host: &mut usb::UsbHost,
     ram_disk: Option<&mut RamBlockDevice>,
     vfs: &mut Vfs,
+    state: &State,
 ) {
     const USAGE: &str = "usage: cat <path> [offset]";
     let Some((path_text, rest)) = split_argument(argument) else {
@@ -5135,9 +5327,18 @@ fn cmd_cat(
         }
     };
 
-    let path = as_str(path_text);
+    let Some(path) = absolute(console, framebuffer, state, path_text) else {
+        return;
+    };
     with_devices(usb_host, ram_disk, |devices| {
-        files::concatenate(console, framebuffer, devices, vfs, path, offset as u64)
+        files::concatenate(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            path.as_str(),
+            offset as u64,
+        )
     });
 }
 
@@ -7075,6 +7276,29 @@ fn single_argument<'a>(
         return None;
     }
     Some(argument)
+}
+
+/// Turns a path argument into the absolute path the VFS takes, resolving it
+/// against the current directory when it does not start with `/`.
+///
+/// Every command that takes a path goes through this one place, right after
+/// `split_argument`, so none of them has to know that a current directory
+/// exists -- and so a relative path means the same thing to all of them.
+/// `fs::path::join` folds `.` and `..` while it normalizes, so there is no
+/// second resolution rule here for those.
+fn absolute(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    state: &State,
+    argument: &[u8],
+) -> Option<Path> {
+    match path::join(&state.cwd, as_str(argument)) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            console.write_output_line(framebuffer, path::error_name(error));
+            None
+        }
+    }
 }
 
 /// Command-line bytes only ever hold what `Console::push` accepted (printable
