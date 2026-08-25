@@ -639,6 +639,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
     },
     HelpEntry {
+        name: "wifi",
+        usage: "wifi",
+        lines: &[
+            "open the keyboard-driven Wi-Fi setup screen: scan, select an",
+            "access point, enter its password, associate and request DHCP",
+        ],
+    },
+    HelpEntry {
         name: "wifiinfo",
         usage: "wifiinfo",
         lines: &[
@@ -916,6 +924,8 @@ pub enum Outcome {
     Battery,
     /// Hand the display over to the Windows 95 desktop mock-up.
     Win,
+    /// Hand the display over to the keyboard-driven Wi-Fi setup screen.
+    WifiMenu,
     /// Hand the display over to the hypertext viewer, on the address
     /// given or on its built-in home page.
     Browser(Option<Url>),
@@ -1184,6 +1194,12 @@ pub fn execute(
         b"usbwritetest" => cmd_usb_write_test(console, framebuffer, argument, usb_host),
         b"usbzero" => cmd_usbzero(console, framebuffer, argument, usb_host),
         b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
+        b"wifi" => {
+            if argument.is_empty() {
+                return Outcome::WifiMenu;
+            }
+            console.write_output_line(framebuffer, "usage: wifi");
+        }
         b"wifiinfo" => {
             *wifi_session = None;
             *net_stack = None;

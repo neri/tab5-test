@@ -52,6 +52,7 @@
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
+    - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード操作の最小Wi-Fi設定画面。AP scan、選択、マスク付きパスワード入力、association、メニュー専用のDHCP開始を既存のblocking処理で順に実行する
     - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
       toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件と
       戻る、アドレス欄の編集、通信を必要としない組み込みページ（`http://built-in/`）を

@@ -63,6 +63,7 @@ IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リン�
 
 | コマンド | 内容 |
 | --- | --- |
+| `wifi` | キーボード操作の全画面メニュー。APをスキャンして選択し、必要ならマスク付きでパスワードを入力して接続する。メニュー経由では接続後にDHCPも自動開始する |
 | `wifiinfo` | C6をSDIOカードとして活性化し、RCA・I/O関数数・CIS識別子・バス幅・クロックを表示（SDIO層の診断） |
 | `wifiup` | ESP-Hostedのリンクを張り、スレーブが申告するチップID・ファームウェア版・capability・キューサイズを表示 |
 | `wifimac` | RPCを1往復させてC6のSTA MACアドレスを取得（RPC層の診断） |
@@ -71,15 +72,25 @@ IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リン�
 | `wifistatus` | 接続先のSSID・BSSID・チャンネル・RSSI。未接続ならスレーブのステータスコード |
 | `wifidisconnect` | 切断 |
 
-アソシエートした先でIPアドレスを取得して通信するコマンド（`ipconfig`・`ping`・
-`tftpget`・`httpget`・`netdump`）は[`NETWORK.md`](NETWORK.md)にあります。
+`wifi`メニューは接続成功後にDHCPを自動開始し、最大15秒待って取得したIPv4アドレスを
+結果画面へ表示します。一方、コマンドラインの`wificonnect`は従来どおり
+アソシエーションだけを行い、IPアドレスは`ipconfig dhcp`で手動取得します。
+IP関連コマンド（`ipconfig`・`ping`・`tftpget`・`httpget`・`netdump`）の詳細は
+[`NETWORK.md`](NETWORK.md)にあります。
 
 `wifiscan`以降は必要に応じてリンクを張り、`esp_wifi_init`→station mode→
 `esp_wifi_start`→省電力オフまでを済ませてから本題に入ります。
 `wifiinfo`と`wifiup`は下層の診断なので、実行するとセッションを捨てて
 張り直します。
 
-パスワードはUARTログに出しません。
+メニューのAP一覧はscan結果の順で15件ずつ表示し、上下キーとEnterで選択、`R`で再scan、
+Escapeで終了します。hidden SSIDは表示しますが選択できません。OPEN以外は最大64 byteの
+パスワードを入力し、画面には同じbyte数の`*`だけを表示します。パスワードはコマンド履歴や
+UARTログに出さず、入力bufferも接続またはcancel後に消去します。スキャン、接続イベント待ち、
+DHCP待ちは既存のblocking処理を使うため途中cancelできませんが、各処理にはtimeoutがあります。
+
+この最小メニューはキーボード操作だけです。自動リトライ、自動再接続、接続先保存、起動時接続、
+Wi-Fi ON/OFF、タッチ操作は未実装です。
 
 ## 再起動をまたぐC6
 

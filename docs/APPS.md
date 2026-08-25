@@ -94,6 +94,26 @@ USB-Cの接続有無、充電中／満充電／異常の確定状態、絶対的
 セル別電圧、温度は表示しない。INA226の電流符号は基板上のシャント配線に従うため、
 充電／放電の意味付けは実機での符号確認が必要である。
 
+## Wi-Fi設定メニュー
+
+`wifi`コマンドは`src/app/wifi_menu.rs`の全画面メニューを開く。起動時に既存のblocking scanを
+1回実行し、結果を受信順のまま15件ずつ表示する。上下キーで選択を移動し、Enterで接続、
+`R`で再scan、Escapeでシェルへ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
+
+OPEN APはそのまま接続し、それ以外は最大64 byteのパスワード入力画面を開く。入力は`*`だけで
+表示し、コンソールの行編集や履歴へ渡さない。入力bufferは接続時とcancel時の両方で消去する。
+association成功後はメニュー経由に限って新しいIP stackを作り、DHCPを開始して最大15秒待つ。
+CLIの`wificonnect`は従来どおりassociationだけで、`ipconfig dhcp`を手動実行する。
+
+scan、association待ち、DHCP待ちは途中cancelできないblocking処理で、開始前に進行画面を
+書き戻し、既存timeoutで一覧または結果画面へ戻る。入力待ちの間は毎フレーム
+`InputManager::service`を呼び、接続中なら`Stack::poll`、stackがなければ
+`Rpc::discard_station_frames`を実行してC6の受信queueを溜めない。
+
+この画面にはタッチ操作、自動リトライ、自動再接続、AP／パスワード保存、起動時接続、
+Wi-Fi ON/OFFはない。これらは[`WIFI_REFACTOR_PLAN.md`](WIFI_REFACTOR_PLAN.md)の
+Stage 3以降で扱う。
+
 ## Windows 95風デスクトップ（`win`）
 
 `win`コマンドは、`src/app/win.rs`の全画面モックアップを開く。任意のCardKBまたは

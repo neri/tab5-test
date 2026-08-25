@@ -122,6 +122,9 @@ UARTへ出ます。層ごとに接頭辞が分かれており、どこで止ま�
   `RPC: timed out waiting for response id=...`が出ます
 - `WIFI: ...` — `esp_wifi_*`に対応する層。スレーブがエラーを返したときに
   リクエストIDとステータスを出します
+- `WIFI MENU: ...` — 全画面Wi-Fiメニュー。開始時の`opened`、scan成功時の
+  `access points=...`、scan経路の失敗、associationとDHCPの完了を記録します。
+  入力したパスワードは値・長さとも出しません
 - `NET: ...` — smoltcpによるIPv4の層。正常時は`NET: DHCP configured`だけで、
   それ以外は失敗の報告です。`NET: dropped an outgoing frame`はスレーブが
   スロットルを要求している間に送ろうとしたフレーム、`NET: DHCP lease lost`は

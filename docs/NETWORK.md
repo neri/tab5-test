@@ -85,7 +85,7 @@ C6は受信したフレームをホストが読むまで保持し、**溜まっ�
   `dropped`に出ます
 - `Stack::poll`は「キューを埋める→インタフェースに捌かせる」を最大4回
   繰り返します
-- **スタックがまだ無い状態**（`wificonnect`は済んだが`ipconfig`を実行して
+- **スタックがまだ無い状態**（CLIの`wificonnect`は済んだが`ipconfig`を実行して
   いない、という一番長く居る状態）では、フレームループが
   `Rpc::discard_station_frames`で読んでは捨てます。行き先が無くても、
   読まないことが最終的にリンクを殺すためです。捨てた数は同じ`dropped`に
@@ -177,6 +177,15 @@ transmitコールバックで、Wi-Fiステーション用netifが渡すのは14
 いずれも必要に応じてC6のリンクとstation modeを用意します（`wifiscan`以降と
 同じ`wifi_session`を通ります）。APへのアソシエートは別で、`wificonnect`が
 済んでいないと`ipconfig dhcp`はリースを取れません。
+
+全画面の`wifi`メニューから接続した場合は、association成功後にSTA MACで
+`net::Stack`を新しく作り、DHCPを自動開始して最大15秒待ちます。時間内にleaseを
+取得できなかった場合もDHCP clientを動かしたstackを通常フレームループへ返すため、
+画面を閉じた後も毎フレームのpollで取得を継続します。メニューでキー入力を待っている間も、
+stackがあれば`Stack::poll`、なければ`Rpc::discard_station_frames`をフレームごとに呼びます。
+
+CLIの`wificonnect`はこの自動DHCPを使いません。従来どおりassociationだけで戻り、利用者が
+`ipconfig dhcp`を実行した時点で初めてDHCPを開始します。
 
 **こちら宛のICMP echoには、アドレスが設定されていればいつでも応答します。**
 smoltcpの`auto-icmp-echo-reply`によるもので、`ping`コマンドの実行中に

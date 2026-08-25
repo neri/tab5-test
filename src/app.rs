@@ -26,6 +26,7 @@ mod paint;
 mod pointer;
 mod shell;
 mod touch_test;
+mod wifi_menu;
 mod win;
 
 use crate::delay::delay_ms;
@@ -251,6 +252,11 @@ pub fn run(psram: Psram) {
             shell::Outcome::Win => {
                 win::run(framebuffer, &mut input);
                 console.clear(framebuffer);
+            }
+            shell::Outcome::WifiMenu => {
+                wifi_menu::run(framebuffer, &mut input, &mut wifi_session, &mut net_stack);
+                console.clear(framebuffer);
+                shell::drop_dead_session(console, framebuffer, &mut wifi_session, &mut net_stack);
             }
             shell::Outcome::Browser(start) => {
                 // The viewer borrows the link and the stack for as long as
