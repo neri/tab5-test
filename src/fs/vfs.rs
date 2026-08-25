@@ -46,7 +46,7 @@ use super::partition::{PartitionBlockDevice, PartitionRange};
 use super::path::{self, Path, PathError};
 use super::registry::{DeviceId, Devices};
 use super::stream::BlockStream;
-use crate::usb::{ConnectionEpoch, Location};
+use crate::usb::{ConnectionEpoch, Location, UsbHost};
 
 /// Mount points available at once. Two SD partitions, a handful of USB
 /// volumes and the RAM disk fit comfortably; the table is fixed because a
@@ -109,6 +109,14 @@ pub fn format_name(format: VolumeFormat) -> &'static str {
     }
 }
 
+pub fn mode_name(mode: OpenMode) -> &'static str {
+    match mode {
+        OpenMode::Read => "read",
+        OpenMode::Truncate => "truncate",
+        OpenMode::Append => "append",
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Mount {
     pub point: Path,
@@ -166,6 +174,10 @@ pub enum FsError {
     DeviceNotPresent,
     /// The volume is not a filesystem this firmware can read.
     NotAFilesystem,
+    /// A rename named two different volumes. Moving between them would be a
+    /// copy followed by a delete, with a different failure mode at every
+    /// step, so it is refused rather than emulated.
+    CrossVolume,
     /// The handle refers to a mount that has gone, or to media that has been
     /// replaced since it was opened.
     StaleHandle,
@@ -189,6 +201,7 @@ pub fn error_name(error: FsError) -> &'static str {
         FsError::NoSpace => "no space left on volume",
         FsError::DeviceNotPresent => "device not present",
         FsError::NotAFilesystem => "not a readable filesystem",
+        FsError::CrossVolume => "cannot move between volumes",
         FsError::StaleHandle => "handle no longer valid",
         FsError::Block(error) => super::block::error_name(error),
     }
@@ -351,6 +364,32 @@ struct OpenFile {
 /// been closed should not still be lying around in a caller's variable.
 pub struct FileHandle(usize);
 
+/// What an open handle refers to, for a listing.
+///
+/// A copy rather than a borrow of the table entry: the entry is the VFS's
+/// own bookkeeping, and handing out references into it would make the
+/// open-file table part of the public surface.
+#[derive(Clone, Copy)]
+pub struct OpenFileInfo {
+    /// The mount point the handle was opened through.
+    pub point: Path,
+    /// Path within the volume, not within the tree.
+    pub path: Path,
+    pub volume: VolumeId,
+    pub offset: u64,
+    pub size: u64,
+    pub mode: OpenMode,
+    /// Whether the volume this was opened against is still mounted and
+    /// still the same medium.
+    ///
+    /// Once this is false every read through the handle fails with
+    /// [`FsError::StaleHandle`], and nothing brings it back -- re-mounting
+    /// the same stick gives it a new generation, which is the whole point of
+    /// generations. Answered from the mount table alone, so asking costs
+    /// nothing and works with the medium physically gone.
+    pub live: bool,
+}
+
 /// What re-checking one mount's medium concluded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
@@ -469,7 +508,7 @@ impl Vfs {
             .ok_or(FsError::DeviceNotPresent)??;
 
         let location = match device {
-            DeviceId::Usb(index) => devices.usb.mass_storage_location(index as usize),
+            DeviceId::Usb(id) => devices.usb.mass_storage_location(id),
             DeviceId::Ram | DeviceId::Sd => None,
         };
         let candidate = Mount {
@@ -515,11 +554,11 @@ impl Vfs {
             // on its own. An identity that still matches after a disconnect
             // means the same medium came back, not that it never left.
             let moved = match mount.volume.device {
-                DeviceId::Usb(index) => {
+                DeviceId::Usb(id) => {
                     // The port's own count, so unplugging a neighbour on the
                     // same hub leaves this mount alone.
                     devices.usb.connection_epoch_at(mount.location) != mount.connection_epoch
-                        || devices.usb.mass_storage_location(index as usize) != mount.location
+                        || devices.usb.mass_storage_location(id) != mount.location
                 }
                 DeviceId::Ram | DeviceId::Sd => false,
             };
@@ -548,6 +587,44 @@ impl Vfs {
                 self.mounts[slot] = None;
             }
             out(&mount, verdict);
+        }
+    }
+
+    /// Drops every mount whose medium has been physically taken away,
+    /// reporting each one through `out`.
+    ///
+    /// The cheap half of [`Self::verify`]: one pair of integers per mount
+    /// and no bus traffic at all, which is what lets automount run it off
+    /// the frame loop rather than only when a command asks.
+    ///
+    /// Only a *removal* counts. A device that is merely absent -- a session
+    /// being rebuilt, a transfer that failed -- keeps its mount, because
+    /// absence is not evidence that anything was unplugged and a rescan
+    /// often brings the same medium straight back. The connection epoch is
+    /// the one thing here that reports a physical edge rather than inferring
+    /// one from a device that did not answer.
+    ///
+    /// Open files are not consulted. `umount` refuses a busy mount because
+    /// the caller is better placed than the VFS to decide what to do with
+    /// its handles, but that argument needs the medium to still be there.
+    /// Once the drive is out there is nothing for a handle to go back to, so
+    /// the mount goes and the handles start failing -- exactly what
+    /// [`Self::verify`] does for a `Disconnected` verdict, reached the same
+    /// way.
+    pub fn prune_disconnected(&mut self, usb: &UsbHost, mut out: impl FnMut(&Mount)) {
+        for slot in 0..MAX_MOUNTS {
+            let Some(mount) = self.mounts[slot] else {
+                continue;
+            };
+            if !matches!(mount.volume.device, DeviceId::Usb(_)) {
+                continue;
+            }
+            if usb.connection_epoch_at(mount.location) == mount.connection_epoch {
+                continue;
+            }
+            self.next_generation += 1;
+            self.mounts[slot] = None;
+            out(&mount);
         }
     }
 
@@ -920,6 +997,30 @@ impl Vfs {
         Ok(self.files[handle.0].ok_or(FsError::StaleHandle)?.size)
     }
 
+    /// What `handle` names, and whether it still reaches anything.
+    ///
+    /// The liveness test is the same one [`Self::read`] applies before it
+    /// touches the medium -- the mount point still holds a volume, and that
+    /// volume is the same generation the handle was opened against -- so a
+    /// listing and the next read agree without the listing having to run a
+    /// read to find out.
+    pub fn describe(&self, handle: &FileHandle) -> Result<OpenFileInfo, FsError> {
+        let file = self.files[handle.0].ok_or(FsError::StaleHandle)?;
+        let live = self
+            .find_mount_exact(&file.point)
+            .and_then(|slot| self.mounts[slot])
+            .is_some_and(|mount| mount.volume == file.volume);
+        Ok(OpenFileInfo {
+            point: file.point,
+            path: file.path,
+            volume: file.volume,
+            offset: file.offset,
+            size: file.size,
+            mode: file.mode,
+            live,
+        })
+    }
+
     pub fn seek(&mut self, handle: &FileHandle, offset: u64) -> Result<u64, FsError> {
         let file = self.files[handle.0].as_mut().ok_or(FsError::StaleHandle)?;
         file.offset = offset;
@@ -1077,6 +1178,271 @@ impl Vfs {
         }
         Ok(count)
     }
+
+    /// Runs `body` with a sink that writes straight into `path`, keeping the
+    /// volume and one `FileWriter` open for the whole of it.
+    ///
+    /// This exists because [`Self::write`] is the wrong shape for a stream.
+    /// A handle holds no library cursor -- that is what lets it survive a
+    /// rescan -- so every `write` opens the volume, walks the directory,
+    /// builds a `FileWriter` (whose `new_append` finds the end of the file
+    /// by walking the FAT chain), commits the entry and syncs. All of that
+    /// is per call, so the cost follows the *number of writes*: writing a
+    /// file in pieces half the size takes about twice as long.
+    ///
+    /// The chain walk also makes that per-call cost grow with the file, so
+    /// the total has an `n^2` term in it. Measured on the 8 MiB RAM disk it
+    /// does not show: doubling the size doubles the time, because the fixed
+    /// part of each call dominates the walk at that many clusters. It is the
+    /// fixed part that this avoids.
+    ///
+    /// Inside one call there is nothing to survive. `ls` and `cat` already
+    /// hold a volume open for the length of one operation; what a handle has
+    /// to outlive is the gap *between* operations. So the writer is built
+    /// once, `write` is called on it repeatedly -- which is linear, and is
+    /// how the library expects to be used -- and everything is torn down at
+    /// the end.
+    ///
+    /// The bytes that arrived are committed even when `body` fails. Leaving
+    /// them uncommitted would put clusters on the medium that no directory
+    /// entry points at, and with no way to reach them there would be no way
+    /// to get them back either. Committing means the caller can look at the
+    /// partial file, or remove it and reclaim the space; both need it to
+    /// exist. What stopped the sink comes back in
+    /// [`StreamWrite::interrupted`].
+    pub fn write_stream<T>(
+        &mut self,
+        devices: &mut Devices,
+        path: &str,
+        mode: OpenMode,
+        body: impl FnOnce(&mut dyn FnMut(&[u8]) -> bool) -> T,
+    ) -> Result<StreamWrite<T>, FsError> {
+        if !mode.writable() {
+            return Err(FsError::ReadOnly);
+        }
+        let path = path::normalize(path)?;
+        let (mount, within) = self.resolve(&path).ok_or(FsError::NotMounted)?;
+        if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
+            return Err(FsError::ReadOnly);
+        }
+
+        // One reading of the clock for the whole transfer, as everywhere
+        // else that writes. See `super::clock`.
+        clock::sample();
+        let outcome = with_volume(devices, &mount, |volume| {
+            let AnyVolume::Fat(volume) = volume else {
+                return Err(FsError::ReadOnly);
+            };
+            // `lookup` reports a missing entry as `Err(NotFound)`, not as
+            // `Ok(None)` -- which it answers only for the volume's root.
+            // Creating on the `None` arm therefore never creates anything,
+            // and every write to a file that is not there yet fails.
+            let entry = match lookup(volume, &within) {
+                Ok(Some(entry)) if entry.is_directory() => return Err(FsError::NotAFile),
+                Ok(Some(entry)) => entry,
+                Ok(None) => return Err(FsError::NotAFile),
+                Err(FsError::NotFound) => {
+                    create(volume, &within)?;
+                    lookup(volume, &within)?.ok_or(FsError::NotAFile)?
+                }
+                Err(error) => return Err(error),
+            };
+            let mut writer = match mode {
+                OpenMode::Truncate => {
+                    FileWriter::new(volume, &entry).map_err(|_| FsError::NotAFile)?
+                }
+                // `Read` was refused above; this is `Append`.
+                _ => FileWriter::new_append(volume, &entry).map_err(|_| FsError::NotAFile)?,
+            };
+
+            let mut written = 0u64;
+            let mut interrupted = None;
+            // Scoped so the sink's borrow of `writer` is over before the
+            // commit below needs it.
+            let value = {
+                let mut sink = |bytes: &[u8]| {
+                    let mut offset = 0;
+                    while offset < bytes.len() {
+                        match writer.write(&bytes[offset..]) {
+                            // The library takes what it can and says so; a
+                            // zero-length take with bytes still in hand is a
+                            // volume with nowhere left to put them.
+                            Ok(0) => {
+                                interrupted = Some(FsError::NoSpace);
+                                return false;
+                            }
+                            Ok(count) => {
+                                offset += count;
+                                written += count as u64;
+                            }
+                            Err(error) => {
+                                interrupted = Some(map_write_error(error));
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                };
+                body(&mut sink)
+            };
+
+            // `finish` is what puts the size and timestamp in the directory
+            // entry, so its failure is the write's failure however many
+            // bytes reached the medium.
+            writer.finish().map_err(map_write_error)?;
+            volume.sync().map_err(map_write_error)?;
+            Ok(StreamWrite {
+                value,
+                written,
+                interrupted,
+            })
+        });
+        clock::clear();
+        outcome
+    }
+
+    /// Removes a file.
+    ///
+    /// Refuses while a handle is open on it, for the same reason `umount`
+    /// refuses a busy mount: the caller knows what its own handles are for,
+    /// and a read through one after this would fail in a way that looks like
+    /// a damaged volume rather than like a file somebody deleted.
+    pub fn remove_file(&mut self, devices: &mut Devices, path: &str) -> Result<(), FsError> {
+        self.remove(devices, path, EntryKind::File)
+    }
+
+    /// Removes an empty directory.
+    ///
+    /// Only an empty one: the library refuses the rest, and recursive
+    /// deletion is a different operation -- one whose failure halfway
+    /// through leaves a shape nobody asked for.
+    pub fn remove_dir(&mut self, devices: &mut Devices, path: &str) -> Result<(), FsError> {
+        self.remove(devices, path, EntryKind::Directory)
+    }
+
+    fn remove(
+        &mut self,
+        devices: &mut Devices,
+        path: &str,
+        kind: EntryKind,
+    ) -> Result<(), FsError> {
+        let path = path::normalize(path)?;
+        let (mount, within) = self.writable_mount(&path)?;
+        if within.is_root() {
+            // The volume's root is the mount, not an entry in it.
+            return Err(FsError::Busy);
+        }
+        if self.is_open(mount.volume, &within) {
+            return Err(FsError::Busy);
+        }
+        clock::sample();
+        let outcome = with_volume(devices, &mount, |volume| {
+            let AnyVolume::Fat(volume) = volume else {
+                return Err(FsError::ReadOnly);
+            };
+            let entry = lookup(volume, &within)?.ok_or(FsError::NotFound)?;
+            // Asked for by kind so that `rm` cannot take a directory and
+            // `rmdir` cannot take a file. The library would delete either.
+            match kind {
+                EntryKind::File if entry.is_directory() => return Err(FsError::NotAFile),
+                EntryKind::Directory if !entry.is_directory() => {
+                    return Err(FsError::NotADirectory);
+                }
+                _ => {}
+            }
+            volume.delete(&entry).map_err(map_write_error)?;
+            volume.sync().map_err(map_write_error)?;
+            Ok(())
+        });
+        clock::clear();
+        outcome
+    }
+
+    /// Renames `from` to `to`, which may move it to another directory on the
+    /// same volume.
+    ///
+    /// Only the directory entry moves; the cluster chain stays where it is.
+    /// That is what makes it cheap, and also what makes crossing volumes
+    /// impossible -- there the bytes would have to be copied, which is a
+    /// different operation with a different way of failing halfway.
+    ///
+    /// `to` must not exist. Replacing it would be a remove and a rename with
+    /// a window in between where neither name works, and a caller that wants
+    /// that is better placed to decide when to take the risk.
+    pub fn rename(&mut self, devices: &mut Devices, from: &str, to: &str) -> Result<(), FsError> {
+        let from = path::normalize(from)?;
+        let to = path::normalize(to)?;
+        let (mount, source) = self.resolve(&from).ok_or(FsError::NotMounted)?;
+        let (destination_mount, destination) = self.resolve(&to).ok_or(FsError::NotMounted)?;
+        // Asked before whether either side is writable, so that a move
+        // between volumes says so whichever of them happens to be read-only.
+        // The other order made the answer depend on that -- and since `/tmp`
+        // is the only writable volume, every cross-volume move would have
+        // been reported as `read-only` instead, which is true but is not the
+        // reason it cannot work.
+        if destination_mount.volume != mount.volume {
+            return Err(FsError::CrossVolume);
+        }
+        // One volume, so one check.
+        if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
+            return Err(FsError::ReadOnly);
+        }
+        if source.is_root() || destination.is_root() {
+            return Err(FsError::Busy);
+        }
+        if self.is_open(mount.volume, &source) {
+            return Err(FsError::Busy);
+        }
+        let name = destination.file_name().ok_or(FsError::NotAFile)?;
+        clock::sample();
+        let outcome = with_volume(devices, &mount, |volume| {
+            let AnyVolume::Fat(volume) = volume else {
+                return Err(FsError::ReadOnly);
+            };
+            let entry = lookup(volume, &source)?.ok_or(FsError::NotFound)?;
+            let parent = parent_of(volume, &destination)?;
+            volume
+                .rename(&entry, &parent, name)
+                .map_err(map_write_error)?;
+            volume.sync().map_err(map_write_error)?;
+            Ok(())
+        });
+        clock::clear();
+        outcome
+    }
+
+    /// The mount covering `path`, refusing one that cannot be written to.
+    ///
+    /// The same two-line check that opens every write path, kept in one
+    /// place so a new one cannot forget half of it.
+    fn writable_mount(&self, path: &Path) -> Result<(Mount, Path), FsError> {
+        let (mount, within) = self.resolve(path).ok_or(FsError::NotMounted)?;
+        if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
+            return Err(FsError::ReadOnly);
+        }
+        Ok((mount, within))
+    }
+
+    /// Whether a handle is open on this exact file.
+    fn is_open(&self, volume: VolumeId, path: &Path) -> bool {
+        // Both are normalized paths within the same volume, so the
+        // separators line up and only the names differ in case.
+        self.files.iter().flatten().any(|file| {
+            file.volume == volume && path::names_equal(file.path.as_str(), path.as_str())
+        })
+    }
+}
+
+/// What [`Vfs::write_stream`] did.
+pub struct StreamWrite<T> {
+    /// Whatever the body returned. The body is where the transfer lives, so
+    /// this is usually its own success or failure.
+    pub value: T,
+    /// Bytes written and committed to the directory entry.
+    pub written: u64,
+    /// What stopped the sink taking more, if anything did. The bytes before
+    /// it are still on the volume: see [`Vfs::write_stream`].
+    pub interrupted: Option<FsError>,
 }
 
 /// Turns a filesystem library error into this layer's vocabulary.
@@ -1204,13 +1570,14 @@ fn with_volume<T>(
     // A physical disconnect is free to check -- one integer -- so unlike the
     // full identity it is checked on every operation rather than only when
     // `verify` is asked for.
-    if let DeviceId::Usb(index) = mount.volume.device {
+    if let DeviceId::Usb(id) = mount.volume.device {
         if devices.usb.connection_epoch_at(mount.location) != mount.connection_epoch {
             return Err(FsError::Block(BlockError::MediaRemoved));
         }
-        // Also free, and the only thing that catches the index having been
-        // renumbered onto a device of the same size.
-        if devices.usb.mass_storage_location(index as usize) != mount.location {
+        // Also free, and what catches the drive having been moved to another
+        // port -- a physical move, and so a different mount -- even when the
+        // two ports held media of exactly the same size.
+        if devices.usb.mass_storage_location(id) != mount.location {
             return Err(FsError::Block(BlockError::MediaChanged));
         }
     }
@@ -1281,6 +1648,15 @@ fn tree_child<'a>(point: &'a Path, parent: &Path) -> Option<(&'a str, bool)> {
 ///
 /// `Ok(None)` is the root directory itself, which has no directory entry to
 /// return and is not an error.
+/// Walks `path` from the volume's root and answers with its entry.
+///
+/// The two "nothing here" answers mean different things, and callers have to
+/// keep them apart:
+///
+/// - `Err(FsError::NotFound)` -- a component of the path is not there. This
+///   is what a caller that is about to create the file looks for.
+/// - `Ok(None)` -- the path *is* the volume's root, which has no directory
+///   entry of its own. Not a missing file, and not something to create.
 fn lookup<DATA: Read + Seek>(
     volume: &FatVolume<DATA>,
     path: &Path,

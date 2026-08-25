@@ -10,6 +10,7 @@
 //! hardware-facing modules at the crate root, which is what keeps that
 //! dependency pointing one way.
 
+mod automount;
 mod axis_test;
 mod battery;
 mod blockdev;
@@ -126,6 +127,12 @@ pub fn run(psram: Psram) {
     // there.
     let mut shell_state = shell::State::new();
 
+    // Volumes appear and disappear with the media they are on unless this is
+    // turned off. Its first pass runs on the first frame below, which is what
+    // mounts a stick that was already plugged in when the power came on --
+    // the bus scan it needs has already been paid for by `InputManager::new`.
+    let mut auto_mount = automount::AutoMount::new();
+
     let mut input = InputManager::new();
     if ram_disk.is_some() {
         mount_ram_disk(
@@ -157,6 +164,17 @@ pub fn run(psram: Psram) {
         let framebuffer = display.framebuffer_mut();
 
         input.service();
+        // Reconciling the mount table sits here, beside command dispatch,
+        // rather than inside `input.service`: opening a volume is bus I/O and
+        // FAT parsing, and the input servicing above is what the console's
+        // redraw is waiting on. Nothing happens at all unless the bus moved.
+        auto_mount.service(
+            console,
+            framebuffer,
+            &mut vfs,
+            ram_disk.as_mut(),
+            input.usb_host_mut(),
+        );
         // Frames the C6 has received are held there until the host reads
         // them, and a backlog larger than the transport's staging buffer
         // cannot be resynchronized -- so the link is serviced every frame,
@@ -199,6 +217,7 @@ pub fn run(psram: Psram) {
             ram_disk.as_mut(),
             &mut vfs,
             &mut shell_state,
+            &mut auto_mount,
             &mut wifi_session,
             &mut net_stack,
         );

@@ -11,6 +11,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::automount::AutoMount;
 use super::{blockdev, files, lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
@@ -18,7 +19,7 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
 use crate::fs;
 use crate::fs::path::{self, Path};
-use crate::fs::vfs::Vfs;
+use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, Vfs};
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
 use crate::{
     delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc, startup,
@@ -350,16 +351,29 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "mount [<ram|sd0pN|usbMpN>]",
         lines: &[
             "with no argument, list mounts. with one, attach that volume:",
-            "ram lands on /tmp, everything else on /vol/<name>. usbM counts",
-            "storage devices in bus order, as 'devices' lists them, so two",
-            "sticks are usb0 and usb1. SD and USB are always read-only;",
-            "only /tmp is writable",
+            "ram lands on /tmp, everything else on /vol/<name>. usbM is the",
+            "number the host gave that drive when it attached, which 'devices'",
+            "prints; it stays with the drive until it is unplugged, so pulling",
+            "one stick never renumbers another. SD and USB are always",
+            "read-only; only /tmp is writable",
         ],
     },
     HelpEntry {
         name: "umount",
         usage: "umount <mount point>",
         lines: &["detach a volume; refused while it still has open files"],
+    },
+    HelpEntry {
+        name: "automount",
+        usage: "automount [on|off]",
+        lines: &[
+            "with no argument, report whether USB volumes mount and unmount",
+            "on their own. they do by default: a stick appears under /vol a",
+            "moment after it is plugged in and its mounts are dropped when it",
+            "is pulled, each with a line saying so. off leaves the tree to",
+            "'mount' and 'umount' alone. a volume you unmount by hand stays",
+            "unmounted until its drive is physically removed and brought back",
+        ],
     },
     HelpEntry {
         name: "mounts",
@@ -417,6 +431,70 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "it goes in double quotes. reports the bytes read against the",
             "size in the directory entry, so a chain that ends early shows",
             "as SHORT READ instead of a plausible prefix",
+        ],
+    },
+    HelpEntry {
+        name: "rm",
+        usage: "rm <path>",
+        lines: &[
+            "remove a file. refused while something has it open, and refused",
+            "on a directory -- rmdir takes those, so a mistyped path cannot",
+            "quietly take a directory away instead",
+        ],
+    },
+    HelpEntry {
+        name: "rmdir",
+        usage: "rmdir <path>",
+        lines: &["remove an empty directory; a non-empty one is refused"],
+    },
+    HelpEntry {
+        name: "mv",
+        usage: "mv <from> <to>",
+        lines: &[
+            "rename, or move within one volume. only the directory entry",
+            "moves, so crossing volumes is refused rather than copied. the",
+            "destination must not already exist",
+        ],
+    },
+    HelpEntry {
+        name: "fill",
+        usage: "fill <path> <KiB> [chunk] [repeat]",
+        lines: &[
+            "write a known pattern and report how long it took. the default",
+            "path holds one writer open for the whole file; 'repeat' takes",
+            "the old path of one open, one chain walk and one sync per",
+            "chunk. both are linear in size at these sizes -- what differs",
+            "is the chunk: halving it roughly doubles 'repeat' and leaves",
+            "the streaming path about where it was",
+        ],
+    },
+    HelpEntry {
+        name: "fsopen",
+        usage: "fsopen [<path>]",
+        lines: &[
+            "hold a file open across commands, read-only, or with no path",
+            "list what is being held. every other command closes what it",
+            "opens, so this is the only way to still have a handle open when",
+            "a drive is pulled. the listing's live/stale column is the point:",
+            "a handle goes stale the moment its volume leaves the mount table",
+            "and never recovers, since re-mounting gives a new generation",
+        ],
+    },
+    HelpEntry {
+        name: "fsread",
+        usage: "fsread <slot> [bytes]",
+        lines: &[
+            "read through a handle held by fsopen and report the outcome, not",
+            "the bytes -- 'cat' already prints contents. this is how a stale",
+            "handle is seen failing rather than inferred from the listing",
+        ],
+    },
+    HelpEntry {
+        name: "fsclose",
+        usage: "fsclose <slot>",
+        lines: &[
+            "release a handle held by fsopen. a stale one still occupies a",
+            "slot in the open-file table, so this is how the slot comes back",
         ],
     },
     HelpEntry {
@@ -657,18 +735,27 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "tftpget <host|a.b.c.d> <file>",
         lines: &[
             "read a file over TFTP (RFC 1350, 512-byte blocks, no options)",
-            "and report its size and CRC-32. there is no filesystem, so the",
-            "contents are discarded once the checksum is printed",
+            "into the current directory, under the last component of the",
+            "remote name, and report its size and CRC-32. the bytes go",
+            "straight to the volume as they arrive, so the size is not",
+            "limited by memory. it is written under a .part name and renamed",
+            "when it completes, so a file under the real name is a whole",
+            "one; a failed transfer takes its .part file with it. an",
+            "existing file of the same name is replaced. only /tmp is",
+            "writable, so cd there first",
         ],
     },
     HelpEntry {
         name: "httpget",
         usage: "httpget <host|a.b.c.d>[:port] [path]",
         lines: &[
-            "issue a minimal HTTP/1.0 GET and show the start of the reply.",
-            "a TCP smoke test rather than an HTTP client: no redirects, no",
-            "chunked decoding and no TLS. a name given here is also what",
-            "goes in the Host: header, so virtual hosts resolve correctly",
+            "issue a minimal HTTP/1.0 GET, print the status and headers, and",
+            "save the body into the current directory under the last part of",
+            "the path. a path naming no file -- / or one ending in / -- is",
+            "not saved, just reported. a status outside 2xx keeps its error",
+            "page out of the tree. still a TCP smoke test rather than an HTTP",
+            "client: no redirects, no chunked decoding and no TLS. a name",
+            "given here is also what goes in the Host: header",
         ],
     },
     HelpEntry {
@@ -695,6 +782,18 @@ const HELP_ENTRIES: &[HelpEntry] = &[
 /// shell's state to fix up a string.
 pub struct State {
     cwd: Path,
+    /// Files held open across commands by `fsopen`.
+    ///
+    /// Every other command that opens a file closes it before it returns, so
+    /// until this existed there was no way from the console to have a handle
+    /// open at the moment a drive was pulled -- and therefore no way to see
+    /// that pulling it makes the handle fail, which is the behaviour the
+    /// automatic unmount rests on. The slot index here is the number the
+    /// user types; it is not the VFS's own, which stays private.
+    ///
+    /// Sized to `MAX_OPEN_FILES` because the VFS will not give out more than
+    /// that anyway, so a longer array here could only ever hold `None`.
+    held: [Option<FileHandle>; MAX_OPEN_FILES],
 }
 
 impl Default for State {
@@ -705,7 +804,11 @@ impl Default for State {
 
 impl State {
     pub fn new() -> Self {
-        Self { cwd: path::root() }
+        const NONE_HANDLE: Option<FileHandle> = None;
+        Self {
+            cwd: path::root(),
+            held: [NONE_HANDLE; MAX_OPEN_FILES],
+        }
     }
 }
 
@@ -751,6 +854,7 @@ pub fn execute(
     ram_disk: Option<&mut RamBlockDevice>,
     vfs: &mut Vfs,
     state: &mut State,
+    auto_mount: &mut AutoMount,
     wifi_session: &mut Option<wifi::Rpc>,
     net_stack: &mut Option<net::Stack>,
 ) -> Outcome {
@@ -853,6 +957,7 @@ pub fn execute(
                 });
             }
         }
+        b"automount" => cmd_automount(console, framebuffer, argument, auto_mount),
         b"umount" => {
             if let Some(path) = single_argument(
                 console,
@@ -885,6 +990,63 @@ pub fn execute(
             state,
         ),
         b"cat" => cmd_cat(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"fsopen" => cmd_fsopen(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"fsread" => cmd_fsread(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"fsclose" => cmd_fsclose(console, framebuffer, argument, vfs, state),
+        b"rm" => cmd_remove(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+            false,
+        ),
+        b"rmdir" => cmd_remove(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+            true,
+        ),
+        b"mv" => cmd_move(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        b"fill" => cmd_fill(
             console,
             framebuffer,
             argument,
@@ -981,11 +1143,31 @@ pub fn execute(
             drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"tftpget" => {
-            cmd_tftpget(console, framebuffer, argument, wifi_session, net_stack);
+            cmd_tftpget(
+                console,
+                framebuffer,
+                argument,
+                usb_host,
+                ram_disk,
+                vfs,
+                state,
+                wifi_session,
+                net_stack,
+            );
             drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"httpget" => {
-            cmd_httpget(console, framebuffer, argument, wifi_session, net_stack);
+            cmd_httpget(
+                console,
+                framebuffer,
+                argument,
+                usb_host,
+                ram_disk,
+                vfs,
+                state,
+                wifi_session,
+                net_stack,
+            );
             drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
         b"paint" => return Outcome::Paint,
@@ -4473,6 +4655,12 @@ fn cmd_tftpget(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    // Reborrowed per use below: the download opens the volume twice, once
+    // for the transfer and once to put the result under its real name.
+    mut ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
@@ -4482,6 +4670,20 @@ fn cmd_tftpget(
         console.write_output_line(framebuffer, "usage: tftpget <host|a.b.c.d> <file>");
         return;
     }
+
+    // Worked out before the network is touched: a destination the shell
+    // cannot write to is worth finding out about now rather than after a
+    // transfer that then has nowhere to go.
+    let download = match files::download_to(&state.cwd, filename) {
+        Ok(download) => download,
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("tftpget: ");
+            line.push_str(fs::vfs::error_name(error));
+            console.write_output_line(framebuffer, line.as_str());
+            return;
+        }
+    };
 
     let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
         return;
@@ -4496,39 +4698,112 @@ fn cmd_tftpget(
 
     console.write_output_line(framebuffer, "requesting the file...");
     let started = tick::now_ms();
-    // Progress is reported by tenths of a MiB so a long transfer shows
-    // movement without one console line per 512-byte block.
-    let mut next_report = PROGRESS_STEP_BYTES;
-    let mut progress = |received: usize| {
-        if received < next_report {
+    let mut crc = net::tftp::Crc32::new();
+
+    // One `write_stream` around the whole transfer: the volume and the
+    // writer are opened once and the blocks go straight through as they
+    // arrive. TFTP is lock-step, so a write that takes a moment only makes
+    // the transfer wait.
+    let stream = with_devices(usb_host, ram_disk.as_deref_mut(), |devices| {
+        vfs.write_stream(
+            devices,
+            download.part.as_str(),
+            fs::vfs::OpenMode::Truncate,
+            |write| {
+                // Progress is reported by tenths of a MiB so a long transfer
+                // shows movement without one console line per 512-byte block.
+                let mut next_report = PROGRESS_STEP_BYTES;
+                let mut received = 0usize;
+                let mut sink = |block: &[u8]| {
+                    crc.update(block);
+                    received += block.len();
+                    if received >= next_report {
+                        next_report = received + PROGRESS_STEP_BYTES;
+                        let mut line = Line::new();
+                        line.push_u32(received as u32);
+                        line.push_str(" bytes...");
+                        console.write_output_line(framebuffer, line.as_str());
+                    }
+                    // A refused write stops the transfer here rather than
+                    // letting it run to the end with nowhere to put the rest.
+                    write(block)
+                };
+                net::tftp::get(stack, rpc, server, filename, &mut sink)
+            },
+        )
+    });
+
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("tftpget: cannot write to ");
+            line.push_str(download.part.as_str());
+            line.push_str(": ");
+            line.push_str(fs::vfs::error_name(error));
+            console.write_output_line(framebuffer, line.as_str());
+            if error == fs::vfs::FsError::ReadOnly {
+                console.write_output_line(
+                    framebuffer,
+                    "the file lands in the current directory; cd to a writable one (/tmp)",
+                );
+            }
             return;
         }
-        next_report = received + PROGRESS_STEP_BYTES;
-        let mut line = Line::new();
-        line.push_u32(received as u32);
-        line.push_str(" bytes...");
-        console.write_output_line(framebuffer, line.as_str());
+    };
+    // The write failing is the transfer failing, even when every byte
+    // arrived: a saved file that is missing its tail is worse than no file.
+    let outcome = match stream.interrupted {
+        Some(error) => Err(error),
+        None => Ok(stream.value),
     };
 
-    let outcome = net::tftp::get(stack, rpc, server, filename, &mut progress);
     match outcome {
-        Ok(file) => {
+        Ok(Ok(total)) => {
             let mut line = Line::new();
             line.push_str("got ");
-            line.push_u32(file.len() as u32);
+            line.push_u32(total as u32);
             line.push_str(" bytes, crc32 0x");
-            line.push_hex(net::tftp::crc32(&file), 8);
+            line.push_hex(crc.finish(), 8);
             console.write_output_line(framebuffer, line.as_str());
 
             let mut line = Line::new();
             line.push_str("in ");
             line.push_u32((tick::now_ms().saturating_sub(started)) as u32);
             line.push_str(" ms, ");
-            line.push_u32(net::tftp::throughput(file.len(), started) / 1024);
-            line.push_str(" KiB/s (memory only; there is no filesystem)");
+            line.push_u32(net::tftp::throughput(total, started) / 1024);
+            line.push_str(" KiB/s");
+            console.write_output_line(framebuffer, line.as_str());
+            with_devices(usb_host, ram_disk.as_deref_mut(), |devices| {
+                files::finish_download(console, framebuffer, devices, vfs, &download, true)
+            });
+            return;
+        }
+        // The volume stopped taking bytes. What the transfer would have gone
+        // on to do does not matter; there is nowhere to put the result.
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("tftpget: ");
+            line.push_str(fs::vfs::error_name(error));
+            line.push_str(" after ");
+            line.push_u64(stream.written);
+            line.push_str(" bytes");
             console.write_output_line(framebuffer, line.as_str());
         }
-        Err(net::tftp::Error::Server { code, message }) => {
+        Ok(Err(error)) => report_tftp_error(console, framebuffer, error),
+    }
+    with_devices(usb_host, ram_disk, |devices| {
+        files::finish_download(console, framebuffer, devices, vfs, &download, false)
+    });
+}
+
+fn report_tftp_error(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    error: net::tftp::Error,
+) {
+    match error {
+        net::tftp::Error::Server { code, message } => {
             let mut line = Line::new();
             line.push_str("server error ");
             line.push_u32(code as u32);
@@ -4536,17 +4811,18 @@ fn cmd_tftpget(
             line.push_ascii(&message);
             console.write_output_line(framebuffer, line.as_str());
         }
-        Err(net::tftp::Error::TimedOut) => {
+        net::tftp::Error::TimedOut => {
             console.write_output_line(framebuffer, "no answer from the TFTP server")
         }
-        Err(net::tftp::Error::LinkLost) => {
+        net::tftp::Error::LinkLost => {
             console.write_output_line(framebuffer, "the C6 link was lost during the transfer")
         }
-        Err(net::tftp::Error::TooLarge) => console.write_output_line(
-            framebuffer,
-            "the file is larger than this command will hold",
-        ),
-        Err(net::tftp::Error::Local) => {
+        // The sink only refuses when the write failed, and that is reported
+        // with the filesystem's own reason before this is reached.
+        net::tftp::Error::SinkRefused => {
+            console.write_output_line(framebuffer, "tftpget: the transfer was abandoned")
+        }
+        net::tftp::Error::Local => {
             console.write_output_line(framebuffer, "tftpget: a local socket operation failed")
         }
     }
@@ -4556,6 +4832,10 @@ fn cmd_httpget(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    mut ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
@@ -4569,6 +4849,25 @@ fn cmd_httpget(
     let Some((host, port)) = split_host_port(target) else {
         console.write_output_line(framebuffer, "usage: httpget <host|a.b.c.d>[:port] [path]");
         return;
+    };
+
+    // A path with no last component -- `/`, or one ending in `/` -- names no
+    // file, so there is nothing to save it as. That is the shape of the
+    // request this command started life as, and it still works: the headers
+    // are printed and the body is counted and dropped.
+    let download = if files::names_a_file(path) {
+        match files::download_to(&state.cwd, path) {
+            Ok(download) => Some(download),
+            Err(error) => {
+                let mut line = Line::new();
+                line.push_str("httpget: ");
+                line.push_str(fs::vfs::error_name(error));
+                console.write_output_line(framebuffer, line.as_str());
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
@@ -4586,15 +4885,92 @@ fn cmd_httpget(
     // `host` rather than `address`: a server sharing one address between
     // several sites picks the site from this header, so sending the
     // resolved address would ask for whichever one is the default.
-    match net::http::get(stack, rpc, address, port, host, path) {
+    let Some(download) = download.as_ref() else {
+        let mut discard = |_: &[u8]| true;
+        let outcome = net::http::get(stack, rpc, address, port, host, path, &mut discard);
+        report_http(console, framebuffer, outcome, None);
+        return;
+    };
+
+    let stream = with_devices(usb_host, ram_disk.as_deref_mut(), |devices| {
+        vfs.write_stream(
+            devices,
+            download.part.as_str(),
+            fs::vfs::OpenMode::Truncate,
+            |write| {
+                net::http::get(stack, rpc, address, port, host, path, &mut |body| {
+                    write(body)
+                })
+            },
+        )
+    });
+
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("httpget: cannot write to ");
+            line.push_str(download.part.as_str());
+            line.push_str(": ");
+            line.push_str(fs::vfs::error_name(error));
+            console.write_output_line(framebuffer, line.as_str());
+            if error == fs::vfs::FsError::ReadOnly {
+                console.write_output_line(
+                    framebuffer,
+                    "the body lands in the current directory; cd to a writable one (/tmp)",
+                );
+            }
+            return;
+        }
+    };
+
+    if let Some(error) = stream.interrupted {
+        let mut line = Line::new();
+        line.push_str("httpget: ");
+        line.push_str(fs::vfs::error_name(error));
+        line.push_str(" after ");
+        line.push_u64(stream.written);
+        line.push_str(" bytes");
+        console.write_output_line(framebuffer, line.as_str());
+        with_devices(usb_host, ram_disk.as_deref_mut(), |devices| {
+            files::finish_download(console, framebuffer, devices, vfs, download, false)
+        });
+        return;
+    }
+
+    // A status other than success has a body -- an error page -- and keeping
+    // it under the name the user asked for would put a file there that is
+    // not the file they wanted. The headers still get printed, so what
+    // happened is visible.
+    let keep = matches!(stream.value.as_ref().ok().and_then(|response| response.status),
+        Some(status) if (200..300).contains(&status));
+    report_http(console, framebuffer, stream.value, Some(stream.written));
+    with_devices(usb_host, ram_disk, |devices| {
+        files::finish_download(console, framebuffer, devices, vfs, download, keep)
+    });
+}
+
+/// Prints what an HTTP exchange came to. `saved` is the number of body bytes
+/// that reached a file, or `None` when the body was discarded.
+fn report_http(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    outcome: Result<net::http::Response, net::http::Error>,
+    saved: Option<u64>,
+) {
+    match outcome {
         Ok(response) => {
             let mut line = Line::new();
             line.push_u32(response.received as u32);
             line.push_str(" bytes in ");
             line.push_u32(response.elapsed_ms as u32);
-            line.push_str(" ms");
+            line.push_str(" ms, body ");
+            line.push_u32(response.body_bytes as u32);
+            if saved.is_none() {
+                line.push_str(" (not saved)");
+            }
             console.write_output_line(framebuffer, line.as_str());
-            write_response_head(console, framebuffer, &response.body);
+            write_response_head(console, framebuffer, &response.headers);
         }
         Err(net::http::Error::NotConnected) => {
             console.write_output_line(framebuffer, "the connection was refused or timed out")
@@ -4604,6 +4980,13 @@ fn cmd_httpget(
         }
         Err(net::http::Error::LinkLost) => {
             console.write_output_line(framebuffer, "the C6 link was lost during the transfer")
+        }
+        Err(net::http::Error::HeadersTooLong) => console.write_output_line(
+            framebuffer,
+            "no blank line ended the headers; this is not a response this can read",
+        ),
+        Err(net::http::Error::SinkRefused) => {
+            console.write_output_line(framebuffer, "httpget: the transfer was abandoned")
         }
         Err(net::http::Error::Local) => {
             console.write_output_line(framebuffer, "httpget: a local socket operation failed")
@@ -5289,6 +5672,238 @@ fn cmd_cd(
 /// shell needed quoting at all: with the path settled by the quote rather
 /// than by where the spaces fall, the offset can go back to being an
 /// ordinary trailing word.
+/// `rm <path>` and `rmdir <path>`.
+fn cmd_remove(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
+    directory: bool,
+) {
+    let usage = if directory {
+        "usage: rmdir <path>"
+    } else {
+        "usage: rm <path>"
+    };
+    let Some(path) = single_argument(console, framebuffer, argument, usage)
+        .and_then(|path| absolute(console, framebuffer, state, path))
+    else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::remove(console, framebuffer, devices, vfs, path.as_str(), directory)
+    });
+}
+
+/// `mv <from> <to>`.
+fn cmd_move(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
+) {
+    const USAGE: &str = "usage: mv <from> <to>";
+    // Two quoted-or-bare arguments, so a name with a space in it can be
+    // either half.
+    let Some((from_text, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    let Some(to_text) = single_argument(console, framebuffer, rest, USAGE) else {
+        return;
+    };
+    if from_text.is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let (Some(from), Some(to)) = (
+        absolute(console, framebuffer, state, from_text),
+        absolute(console, framebuffer, state, to_text),
+    ) else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::rename(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            from.as_str(),
+            to.as_str(),
+        )
+    });
+}
+
+/// `fill <path> <KiB> [chunk] [repeat]`.
+///
+/// The measurement `docs/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks for:
+/// the streaming write path against the repeated-open one it replaces, on
+/// the same volume with the same arguments.
+fn cmd_fill(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
+) {
+    const USAGE: &str = "usage: fill <path> <KiB> [chunk] [repeat]";
+    let Some((path_text, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    if path_text.is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let (kib_text, rest) = split_first_word(trim(rest));
+    let Some(kib) = parse_u32(kib_text) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    let (chunk_text, rest) = split_first_word(trim(rest));
+    let chunk = if chunk_text.is_empty() {
+        512
+    } else {
+        match parse_u32(chunk_text) {
+            Some(chunk) => chunk,
+            None => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    let rest = trim(rest);
+    let repeated = match rest {
+        b"" => false,
+        b"repeat" => true,
+        _ => {
+            console.write_output_line(framebuffer, USAGE);
+            return;
+        }
+    };
+    let Some(path) = absolute(console, framebuffer, state, path_text) else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::fill(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            path.as_str(),
+            kib as usize,
+            chunk as usize,
+            repeated,
+        )
+    });
+}
+
+/// `fsopen [<path>]`: hold a file open across commands, or list what is held.
+///
+/// Every other command closes what it opens before it returns, which left no
+/// way from the console to have a handle open at the moment a drive was
+/// pulled. That is the state the automatic unmount is defined against -- the
+/// mount goes and the handles on it start failing -- so without this the
+/// behaviour could only be reasoned about, not watched.
+fn cmd_fsopen(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &mut State,
+) {
+    if argument.is_empty() {
+        files::show_open_files(console, framebuffer, vfs, &state.held);
+        return;
+    }
+    let Some(argument) = single_argument(console, framebuffer, argument, "usage: fsopen [<path>]")
+    else {
+        return;
+    };
+    let Some(path) = absolute(console, framebuffer, state, argument) else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::open_file(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            &mut state.held,
+            path.as_str(),
+        )
+    });
+}
+
+/// `fsread <slot> [bytes]`.
+fn cmd_fsread(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &mut State,
+) {
+    const USAGE: &str = "usage: fsread <slot> [bytes]";
+    let (slot_text, rest) = split_first_word(trim(argument));
+    let Some(slot) = parse_u32(slot_text) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    let rest = trim(rest);
+    let count = if rest.is_empty() {
+        // One console line's worth: enough to move the offset visibly
+        // without filling the screen when the read succeeds.
+        64
+    } else {
+        match parse_u32(rest) {
+            Some(count) => count,
+            None => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        files::read_open_file(
+            console,
+            framebuffer,
+            devices,
+            vfs,
+            &mut state.held,
+            slot as usize,
+            count as usize,
+        )
+    });
+}
+
+/// `fsclose <slot>`.
+fn cmd_fsclose(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    vfs: &mut Vfs,
+    state: &mut State,
+) {
+    let Some(slot) = single_argument(console, framebuffer, argument, "usage: fsclose <slot>")
+        .and_then(parse_u32)
+    else {
+        return;
+    };
+    files::close_open_file(console, framebuffer, vfs, &mut state.held, slot as usize);
+}
+
 fn cmd_cat(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -5340,6 +5955,36 @@ fn cmd_cat(
             offset as u64,
         )
     });
+}
+
+/// `automount [on|off]`.
+///
+/// Reporting the state with no argument matters more here than for most
+/// settings: automount changes the tree without being asked, so "is this on"
+/// has to be answerable without plugging something in to find out.
+fn cmd_automount(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    auto_mount: &mut AutoMount,
+) {
+    match argument {
+        b"" => {}
+        b"on" => auto_mount.set_enabled(true),
+        b"off" => auto_mount.set_enabled(false),
+        _ => {
+            console.write_output_line(framebuffer, "usage: automount [on|off]");
+            return;
+        }
+    }
+    console.write_output_line(
+        framebuffer,
+        if auto_mount.enabled() {
+            "automount on: USB volumes mount and unmount with their media"
+        } else {
+            "automount off: mount and umount only"
+        },
+    );
 }
 
 /// Builds the `fs::Devices` view for one command and runs `body` on it.

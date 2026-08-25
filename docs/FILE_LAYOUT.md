@@ -35,9 +35,14 @@
       読み終えたセクタをそのまま整形する`sdmbr`／`usbmbr`専用の古い表示で、
       判定は行わない
     - `src/app/files.rs`: `mount`／`umount`／`mounts`／`fsverify`／`cd`／`ls`／`cat`／
-      `write`／`append`／`mkdir`の表示。`ls`の並べ替えと桁詰めもここで、
-      ソートのためにエントリを一度全部集める。
+      `write`／`append`／`mkdir`／`rm`／`rmdir`／`mv`／`fill`／`fsopen`／
+      `fsread`／`fsclose`の表示。`ls`の並べ替えと桁詰めもここで、
+      ソートのためにエントリを一度全部集める。ボリュームを実際に取り付ける
+      `attach`もここにあり、`mount`コマンドと`automount.rs`が共有する。
       `blockdev.rs`が「媒体が何か」を出すのに対し、こちらは「そこに何があるか」を出す
+    - `src/app/automount.rs`: USB Mass Storageの抜き差しに合わせた自動マウント／
+      アンマウント。フレームループから毎フレーム呼ばれるが、`UsbHost::topology_epoch`が
+      進んだときだけ突き合わせる。`automount`コマンドの状態もここが持つ
     - `src/app/blockdev.rs`: `devices`／`blkread`コマンドの表示。`fs::mbr`の
       判定結果（MBR、superfloppy、ambiguous、判定不能）と各entryを出す`mbr.rs`の
       対になるモジュール

@@ -20,6 +20,8 @@
   Home/End、Delete、F1〜F12も認識する
 - USB-Aの起動時スキャンと、未接続のルートポート・空いているハブポートの定期再確認。
   CardKBも未接続なら約1秒ごとに再検出する
+- USBメモリの自動マウント。挿すと`/vol/usbNpM`に現れ、抜くと外れる。そのたびに
+  コンソールへ1行出る（`automount off`で止められる）
 
 コンソール画面はPSRAMの準備が終わってから表示します。PSRAMや画面の初期化に
 失敗した場合は何も表示されないので、USBシリアルのログで切り分けます。
@@ -42,10 +44,12 @@
 | USBデバイス情報 | `lsusb` | 接続デバイスをハブ経由のツリーで表示。Composite Deviceは各interfaceを1行ずつ出す。`lsusb <アドレス>`でそのデバイスの主要な記述子（デバイス、コンフィグレーション、interfaceとendpoint、HID記述子）と、製品名・ベンダ名・シリアルの文字列記述子を表示 |
 | USB-A | `usbinfo` `usbrescan` `usbhub` `usbhw` `usbvbus` | USBスタックの診断用。ハブ配下を含む接続デバイス一覧、再スキャン、ハブのディスクリプタとポート状態、DWCコアのGHWCFG/HCSPLT、VBUSの手動制御 |
 | USBストレージ | `usbmsc` `usbread` `usbmbr` `usbwritetest` `usbzero` | SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10)、1ブロック読み出し、MBR表示（`sdmbr`と同じ形式）、WRITE(10)での書き込み+照合+復元、ゼロ埋め |
-| ブロックデバイス | `devices` `blkread` | ram／sd0／usb0の一覧とジオメトリ、LBA 0がMBRか単体のFAT/exFATボリュームかの判定、1ブロックの読み出し（`pN`を付けるとそのMBRパーティション相対） |
-| ファイルシステム | `mount` `umount` `mounts` `fsverify` `cd` `pwd` `ls` `cat` `write` `append` `mkdir` | FAT12/16/32とexFATの読み出し。Unix型の単一ツリーへマウントし（`/tmp`がPSRAM上のRAMディスク、`/vol/<name>`がSDとUSB）、カレントディレクトリと相対パスで辿る。`ls`は名前順の桁詰めで、`-l`が詳細、`-a`が`.`と`..`。書き込みは`/tmp`だけで、SDとUSBは常に読み取り専用。`fsverify`は媒体が入れ替わっていないかをマウント時の識別情報と突き合わせる |
+| ブロックデバイス | `devices` `blkread` | ram／sd0／usbNの一覧とジオメトリ、LBA 0がMBRか単体のFAT/exFATボリュームかの判定、1ブロックの読み出し（`pN`を付けるとそのMBRパーティション相対）。`usbN`の番号は接続時に振られ、そのデバイスが繋がっている間は動かないので、1本抜いても他のマウントは壊れない |
+| ファイルシステム | `mount` `umount` `automount` `mounts` `fsverify` | FAT12/16/32とexFATの読み出し。Unix型の単一ツリーへマウントし（`/tmp`がPSRAM上のRAMディスク、`/vol/<name>`がSDとUSB）、書き込みは`/tmp`だけでSDとUSBは常に読み取り専用。USBメモリは挿抜に合わせて自動でマウント・アンマウントされ、`automount off`で止まる。SDは挿抜検出線が無いので明示マウントのみ。`fsverify`は媒体が入れ替わっていないかをマウント時の識別情報と突き合わせる |
+| ファイル操作 | `cd` `pwd` `ls` `cat` `write` `append` `mkdir` `rm` `rmdir` `mv` | カレントディレクトリと相対パスで辿る。`ls`は名前順の桁詰めで、`-l`が詳細、`-a`が`.`と`..`。`rm`はファイル、`rmdir`は空のディレクトリ、`mv`は改名と同一ボリューム内の移動（ボリュームを跨ぐ移動はコピーになるので断る） |
+| ファイルシステム診断 | `fsopen` `fsread` `fsclose` `fill` | `fsopen`はコマンドを跨いでファイルを開いたまま保持する。媒体を抜くとハンドルが`stale`になり、同じものを挿し直しても復活しないことを確認できる。`fill`は既知のパターンを書いて書き込み経路の所要時間を測る |
 | Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
-| ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
+| ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。`tftpget`と`httpget`は受け取ったファイルをカレントディレクトリへ保存する（書けるのは`/tmp`だけなので`cd /tmp`してから使う）。書き込みは`.part`という名前で行い完了時に改名するので、本来の名前で現れたファイルは完全なもの。`httpget`はパスがファイルを名指していないとき（`/`や`/`で終わるパス）と、応答が2xx以外のときは保存せずヘッダだけ表示する。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
 
 `sdzero`と`usbzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`と
@@ -115,10 +119,11 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - ファイルシステム経由でのSDカード・USBメモリへの書き込み。読み出しは可能で、
   ブロック単位の`sdwritetest`などとは別の話です。exFATへの書き込みも、採用
   ライブラリのexFAT対応が不安定なプレビューのため行いません
-- ファイルの削除・改名と、USB抜き差しの自動マウント
+- SDカードの自動マウント。スロットに挿抜検出線が無く、挿さっているかは
+  コマンドのタイムアウトでしか分からないため、明示マウントのままです
+  （USBメモリは自動でマウントされます）
 - 多段USBハブ（ハブ配下のハブ）
-- IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみで、受信したデータの
-  保存先はメモリだけです）。名前解決はAレコードだけで、キャッシュ・逆引き・
-  mDNSはありません
+- IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみです）。名前解決は
+  Aレコードだけで、キャッシュ・逆引き・mDNSはありません
 - Wi-FiのSoftAPとBLE。5 GHz帯はESP32-C6が2.4 GHz専用のため使えません
 - ESP32-P4 revision v3以降での動作確認

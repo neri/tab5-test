@@ -43,11 +43,11 @@ pub fn show_devices(console: &mut Console, framebuffer: &mut Framebuffer, device
     // already borrowing it mutably to run I/O.
     let mut inventory = [None; MAX_USB_STORAGE];
     let mut attached = 0usize;
-    for (slot, (location, summary)) in devices.usb.mass_storage_inventory().enumerate() {
+    for (slot, (id, location, summary)) in devices.usb.mass_storage_inventory().enumerate() {
         if slot >= MAX_USB_STORAGE {
             break;
         }
-        inventory[slot] = Some((location, summary.vendor_id, summary.product_id));
+        inventory[slot] = Some((id, location, summary.vendor_id, summary.product_id));
         attached = slot + 1;
     }
 
@@ -57,28 +57,29 @@ pub fn show_devices(console: &mut Console, framebuffer: &mut Framebuffer, device
         console.write_output_line(framebuffer, "usb0  not present");
         return;
     }
-    for (index, entry) in inventory.iter().take(attached).enumerate() {
-        show_device(console, framebuffer, devices, DeviceId::Usb(index as u8));
+    for entry in inventory.iter().take(attached) {
+        let Some((id, location, vendor, product)) = entry else {
+            continue;
+        };
+        show_device(console, framebuffer, devices, DeviceId::Usb(*id));
         // Where it is plugged in and what it says it is. Two identical
         // sticks are otherwise indistinguishable in this listing, and which
         // one `usb0` refers to is exactly what a caller about to mount needs
         // to know.
-        if let Some((location, vendor, product)) = entry {
-            let mut line = Line::new();
-            line.push_str("  at ");
-            match location {
-                Location::Direct => line.push_str("USB-A"),
-                Location::HubPort(port) => {
-                    line.push_str("hub port ");
-                    line.push_u32(*port as u32);
-                }
+        let mut line = Line::new();
+        line.push_str("  at ");
+        match location {
+            Location::Direct => line.push_str("USB-A"),
+            Location::HubPort(port) => {
+                line.push_str("hub port ");
+                line.push_u32(*port as u32);
             }
-            line.push_str(", ");
-            line.push_hex(*vendor as u32, 4);
-            line.push_str(":");
-            line.push_hex(*product as u32, 4);
-            console.write_output_line(framebuffer, line.as_str());
         }
+        line.push_str(", ");
+        line.push_hex(*vendor as u32, 4);
+        line.push_str(":");
+        line.push_hex(*product as u32, 4);
+        console.write_output_line(framebuffer, line.as_str());
     }
 }
 

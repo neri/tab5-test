@@ -17,12 +17,14 @@ use core::cmp::Ordering;
 use super::shell::Line;
 use crate::console::{COLUMNS, Console};
 use crate::framebuffer::Framebuffer;
-use crate::fs::path::Path;
+use crate::fs::path::{self, Path, PathError};
 use crate::fs::registry::{device_name, parse_device_name};
 use crate::fs::vfs::{
-    EntryKind, FsError, MountMode, OpenMode, Timestamp, Vfs, error_name, format_name, verdict_name,
+    EntryKind, FileHandle, FsError, MountMode, OpenMode, Timestamp, Vfs, error_name, format_name,
+    mode_name, verdict_name,
 };
 use crate::fs::{DeviceId, Devices, mbr};
+use crate::tick;
 use crate::uart;
 
 /// Bytes per `read` while printing a file.
@@ -456,6 +458,435 @@ pub fn concatenate(
     console.write_output_line(framebuffer, summary.as_str());
 }
 
+/// `fsopen` with no argument: what is being held open, and whether it still
+/// reaches anything.
+///
+/// The `live`/`stale` column is the point of the command. A handle goes
+/// stale the moment its volume leaves the mount table -- which is what the
+/// automatic unmount does when a drive is pulled -- and nothing brings it
+/// back, because putting the same stick in gives it a new generation.
+pub fn show_open_files(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    vfs: &Vfs,
+    held: &[Option<FileHandle>],
+) {
+    let mut any = false;
+    for (slot, handle) in held.iter().enumerate() {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let Ok(info) = vfs.describe(handle) else {
+            continue;
+        };
+        any = true;
+        let mut line = Line::new();
+        line.push_u32(slot as u32);
+        line.push_str("  ");
+        line.push_str(if info.live { "live  " } else { "stale " });
+        line.push_str(mode_name(info.mode));
+        line.push_str("  gen ");
+        line.push_u32(info.volume.generation);
+        line.push_str("  ");
+        line.push_u64(info.offset);
+        line.push_str("/");
+        line.push_u64(info.size);
+        line.push_str("  ");
+        line.push_str(info.point.as_str());
+        // The handle keeps the path within its volume, so the tree path is
+        // put back together here rather than stored twice.
+        if !info.path.is_root() {
+            if !info.point.is_root() {
+                line.push_str("/");
+            }
+            line.push_str(info.path.as_str().trim_start_matches('/'));
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+    if !any {
+        console.write_output_line(framebuffer, "no files held open");
+    }
+}
+
+/// `fsopen <path>`: open a file and leave it open.
+pub fn open_file(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    held: &mut [Option<FileHandle>],
+    path: &str,
+) {
+    let Some(slot) = held.iter().position(Option::is_none) else {
+        console.write_output_line(
+            framebuffer,
+            "fsopen: all slots are in use; fsclose one first",
+        );
+        return;
+    };
+    // Read-only on purpose. Holding a writable handle open across commands
+    // would leave a `Truncate` half-applied for as long as the user left it
+    // there, and this exists to watch a handle go stale, not to write.
+    match vfs.open(devices, path, OpenMode::Read) {
+        Ok(handle) => {
+            let mut line = Line::new();
+            line.push_str("held open as ");
+            line.push_u32(slot as u32);
+            line.push_str(": ");
+            line.push_str(path);
+            held[slot] = Some(handle);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, "fsopen", error),
+    }
+}
+
+/// `fsread <slot> [bytes]`: read through a held handle and say what happened.
+///
+/// It prints the outcome rather than the bytes. What this is for is seeing
+/// whether the handle still works, and `cat` already prints file contents.
+pub fn read_open_file(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    held: &mut [Option<FileHandle>],
+    slot: usize,
+    count: usize,
+) {
+    let Some(handle) = held.get(slot).and_then(Option::as_ref) else {
+        console.write_output_line(framebuffer, "fsread: no file held in that slot");
+        return;
+    };
+    let mut buffer = [0u8; READ_CHUNK];
+    let count = count.min(buffer.len());
+    match vfs.read(devices, handle, &mut buffer[..count]) {
+        Ok(read) => {
+            let mut line = Line::new();
+            line.push_str("read ");
+            line.push_u64(read as u64);
+            line.push_str(" bytes, now at ");
+            line.push_u64(vfs.describe(handle).map(|info| info.offset).unwrap_or(0));
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, "fsread", error),
+    }
+}
+
+/// `fsclose <slot>`.
+///
+/// A stale handle still occupies a slot in the VFS's open-file table -- the
+/// automatic unmount drops the mount without touching handles, exactly as
+/// `fsverify` does -- so closing it is how the slot comes back.
+pub fn close_open_file(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    vfs: &mut Vfs,
+    held: &mut [Option<FileHandle>],
+    slot: usize,
+) {
+    let Some(handle) = held.get_mut(slot).and_then(Option::take) else {
+        console.write_output_line(framebuffer, "fsclose: no file held in that slot");
+        return;
+    };
+    vfs.close(handle);
+    let mut line = Line::new();
+    line.push_str("closed ");
+    line.push_u32(slot as u32);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Where a downloaded file is being put, and under what temporary name.
+///
+/// The transfer writes to `part` and only becomes `destination` once it has
+/// finished. A file that appears under the name the user asked for is
+/// therefore complete: the half-written state has a different name, and
+/// nothing that reads `destination` can find it part-way through. Losing
+/// power mid-transfer leaves the `.part` file rather than a truncated file
+/// wearing the real name.
+pub struct Download {
+    pub destination: Path,
+    pub part: Path,
+}
+
+/// Suffix for the in-progress name. Long enough to be obvious in a listing
+/// if a failure ever leaves one behind.
+const PART_SUFFIX: &str = ".part";
+
+/// Works out where `remote` should land, given the shell's current
+/// directory.
+///
+/// Only the last component of the remote name is used. A TFTP server names
+/// files in its own namespace -- `pub/images/thing.bin` is common -- and
+/// taking that as a path here would either need directories that do not
+/// exist locally or would smuggle `..` into the destination.
+pub fn download_to(cwd: &Path, remote: &[u8]) -> Result<Download, FsError> {
+    download_named(cwd, remote)
+}
+
+/// Whether a remote name has a last component to make a filename out of.
+///
+/// An HTTP path often has none -- `/`, or a directory that ends in `/` --
+/// and there is nothing to call the file then. TFTP names always have one.
+pub fn names_a_file(remote: &[u8]) -> bool {
+    !last_component(remote).is_empty()
+}
+
+fn last_component(remote: &[u8]) -> &[u8] {
+    // A query string is not part of the name, and `?` is one of the
+    // characters FAT reserves, so it would be refused later anyway.
+    let remote = match remote.iter().position(|&byte| byte == b'?') {
+        Some(cut) => &remote[..cut],
+        None => remote,
+    };
+    match remote.iter().rposition(|&byte| byte == b'/') {
+        Some(cut) => &remote[cut + 1..],
+        None => remote,
+    }
+}
+
+fn download_named(cwd: &Path, remote: &[u8]) -> Result<Download, FsError> {
+    // The remote name came off a command line, so it is already printable
+    // ASCII; anything else means the caller built it from somewhere else and
+    // the name is not one this VFS can hold.
+    let name = core::str::from_utf8(last_component(remote))
+        .map_err(|_| FsError::Path(PathError::InvalidCharacter))?;
+    if name.is_empty() {
+        return Err(FsError::NotAFile);
+    }
+    let destination = path::join(cwd, name)?;
+    let mut part_name = String::from(name);
+    part_name.push_str(PART_SUFFIX);
+    let part = path::join(cwd, &part_name)?;
+    Ok(Download { destination, part })
+}
+
+/// Puts a finished download under its real name.
+///
+/// The existing file is removed first: `rename` refuses to land on a name
+/// that is taken, and overwriting is what the caller asked for by naming a
+/// destination that already exists. The window where neither name resolves
+/// is why `Vfs::rename` does not do this itself -- here it is wanted, since
+/// the alternative is a download that cannot be repeated.
+pub fn commit_download(
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    download: &Download,
+) -> Result<(), FsError> {
+    match vfs.remove_file(devices, download.destination.as_str()) {
+        Ok(()) => {}
+        // Nothing there to replace, which is the ordinary case.
+        Err(FsError::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    vfs.rename(
+        devices,
+        download.part.as_str(),
+        download.destination.as_str(),
+    )
+}
+
+/// Reports what a download left behind, and clears it up if it failed.
+///
+/// Called for both outcomes so that the `.part` file has exactly one place
+/// it can be dealt with. A failure to remove it is worth a line of its own:
+/// the file is still there, and the next attempt at the same name will
+/// silently replace it, so saying nothing would leave the volume quietly
+/// holding something the user never asked for.
+pub fn finish_download(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    download: &Download,
+    complete: bool,
+) {
+    if !complete {
+        let mut line = Line::new();
+        match vfs.remove_file(devices, download.part.as_str()) {
+            Ok(()) => line.push_str("incomplete download discarded"),
+            Err(error) => {
+                line.push_str("incomplete download left at ");
+                line.push_str(download.part.as_str());
+                line.push_str(": ");
+                line.push_str(error_name(error));
+            }
+        }
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+    match commit_download(devices, vfs, download) {
+        Ok(()) => {
+            let mut line = Line::new();
+            line.push_str("saved ");
+            line.push_str(download.destination.as_str());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("saved as ");
+            line.push_str(download.part.as_str());
+            line.push_str(": could not rename: ");
+            line.push_str(error_name(error));
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+}
+
+/// `rm <path>` and `rmdir <path>`.
+///
+/// Two commands over one VFS call, each naming the kind it will take, so
+/// that `rm` cannot quietly remove a directory. The library would delete
+/// either, and an empty directory removed by a mistyped `rm` looks exactly
+/// like one that was never there.
+pub fn remove(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    path: &str,
+    directory: bool,
+) {
+    let command = if directory { "rmdir" } else { "rm" };
+    let outcome = if directory {
+        vfs.remove_dir(devices, path)
+    } else {
+        vfs.remove_file(devices, path)
+    };
+    match outcome {
+        Ok(()) => {
+            let mut line = Line::new();
+            line.push_str("removed ");
+            line.push_str(path);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, command, error),
+    }
+}
+
+/// `mv <from> <to>`.
+pub fn rename(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    from: &str,
+    to: &str,
+) {
+    match vfs.rename(devices, from, to) {
+        Ok(()) => {
+            let mut line = Line::new();
+            line.push_str("renamed ");
+            line.push_str(from);
+            line.push_str(" to ");
+            line.push_str(to);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, "mv", error),
+    }
+}
+
+/// Bytes generated per sink call by [`fill`].
+///
+/// The size of one call is the variable the linearity check varies, so it is
+/// a parameter of the command rather than a constant. This is only the
+/// ceiling the stack buffer sets.
+const FILL_MAX_CHUNK: usize = 4096;
+
+/// `fill <path> <KiB> [chunk]`: writes a known pattern and reports how long
+/// it took.
+///
+/// This is the measurement `docs/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks
+/// for, kept independent of the network so that "is the write path linear?"
+/// and "does the transfer work?" are two questions with two answers.
+/// `repeated` takes the old path -- one `Vfs::write` per chunk, each of
+/// which builds a `FileWriter` and walks the FAT chain to find the end --
+/// so the two shapes can be compared on the same volume with the same
+/// arguments.
+pub fn fill(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    path: &str,
+    kib: usize,
+    chunk: usize,
+    repeated: bool,
+) {
+    let chunk = chunk.clamp(1, FILL_MAX_CHUNK);
+    let total = kib * 1024;
+    // A counting pattern rather than a constant byte, so a file written by
+    // one chunk size and read back can be told from one written by another.
+    let mut buffer = [0u8; FILL_MAX_CHUNK];
+    for (index, byte) in buffer.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+
+    let started = tick::now_ms();
+    let outcome = if repeated {
+        write_repeatedly(devices, vfs, path, &buffer[..chunk], total)
+    } else {
+        let mut remaining = total;
+        let stream = vfs.write_stream(devices, path, OpenMode::Truncate, |sink| {
+            while remaining > 0 {
+                let take = chunk.min(remaining);
+                if !sink(&buffer[..take]) {
+                    return;
+                }
+                remaining -= take;
+            }
+        });
+        stream.and_then(|stream| stream.interrupted.map_or(Ok(stream.written), Err))
+    };
+    let elapsed = tick::now_ms().saturating_sub(started);
+
+    match outcome {
+        Ok(written) => {
+            let mut line = Line::new();
+            line.push_str(if repeated {
+                "write x N: "
+            } else {
+                "write_stream: "
+            });
+            line.push_u64(written);
+            line.push_str(" bytes in ");
+            line.push_u64(elapsed);
+            line.push_str(" ms, chunk ");
+            line.push_u64(chunk as u64);
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => report(console, framebuffer, "fill", error),
+    }
+}
+
+/// The pre-`write_stream` shape, kept only so `fill` can measure it.
+fn write_repeatedly(
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    path: &str,
+    chunk: &[u8],
+    total: usize,
+) -> Result<u64, FsError> {
+    let handle = vfs.open(devices, path, OpenMode::Truncate)?;
+    let mut written = 0u64;
+    let mut remaining = total;
+    while remaining > 0 {
+        let take = chunk.len().min(remaining);
+        match vfs.write(devices, &handle, &chunk[..take]) {
+            Ok(count) => {
+                written += count as u64;
+                remaining -= count;
+            }
+            Err(error) => {
+                vfs.close(handle);
+                return Err(error);
+            }
+        }
+    }
+    vfs.close(handle);
+    Ok(written)
+}
+
 /// `write <path> <text>` and `append <path> <text>`.
 ///
 /// A shell needs some way to put bytes on a volume, and this is the smallest
@@ -583,14 +1014,55 @@ pub fn mount(
         return;
     };
 
+    match attach(devices, vfs, device, partition) {
+        Ok(point) => {
+            let mut line = Line::new();
+            line.push_str("mounted ");
+            line.push_str(name);
+            line.push_str(" on ");
+            line.push_str(point.as_str());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(MountFailure::NotPresent) => {
+            console.write_output_line(framebuffer, "device not present")
+        }
+        Err(MountFailure::NoSuchPartition) => {
+            console.write_output_line(framebuffer, "no such usable partition; run 'devices'")
+        }
+        Err(MountFailure::Fs(error)) => report(console, framebuffer, "mount", error),
+    }
+}
+
+/// Why a volume could not be attached.
+///
+/// The two cases in front of [`FsError`] are about the *name* rather than
+/// the volume: the medium is not there at all, or it is but has no such
+/// entry. Neither is a filesystem error, and automount treats them
+/// differently from one -- they mean there is nothing to mount, not that
+/// mounting failed.
+pub enum MountFailure {
+    NotPresent,
+    NoSuchPartition,
+    Fs(FsError),
+}
+
+/// Attaches one volume and answers where it landed.
+///
+/// The whole of what `mount` does apart from printing, so that automount
+/// puts a volume in the tree by exactly the same route a typed command does
+/// -- fingerprint, generation and read-only policy included. A second path
+/// that agreed with this one today would only have to be kept agreeing.
+pub fn attach(
+    devices: &mut Devices,
+    vfs: &mut Vfs,
+    device: DeviceId,
+    partition: Option<u8>,
+) -> Result<Line, MountFailure> {
     let range = match partition {
         None => {
-            let Some(block_count) =
-                devices.with_device(device, |block| block.geometry().block_count)
-            else {
-                console.write_output_line(framebuffer, "device not present");
-                return;
-            };
+            let block_count = devices
+                .with_device(device, |block| block.geometry().block_count)
+                .ok_or(MountFailure::NotPresent)?;
             crate::fs::PartitionRange {
                 start_lba: 0,
                 block_count,
@@ -600,22 +1072,14 @@ pub fn mount(
             // The partition table is read now rather than remembered from a
             // previous `devices`: the medium is the authority on its own
             // layout, and it may have been swapped since.
-            let found = devices.with_device(device, |block| match mbr::inspect(block) {
-                Ok(mbr::Layout::Mbr(table)) => table.partition(number),
-                _ => None,
-            });
-            match found {
-                None => {
-                    console.write_output_line(framebuffer, "device not present");
-                    return;
-                }
-                Some(None) => {
-                    console
-                        .write_output_line(framebuffer, "no such usable partition; run 'devices'");
-                    return;
-                }
-                Some(Some(entry)) => crate::fs::PartitionRange::from_partition(&entry),
-            }
+            let found = devices
+                .with_device(device, |block| match mbr::inspect(block) {
+                    Ok(mbr::Layout::Mbr(table)) => table.partition(number),
+                    _ => None,
+                })
+                .ok_or(MountFailure::NotPresent)?
+                .ok_or(MountFailure::NoSuchPartition)?;
+            crate::fs::PartitionRange::from_partition(&found)
         }
     };
 
@@ -626,19 +1090,24 @@ pub fn mount(
     } else {
         MountMode::ReadOnly
     };
-    let point = mount_point(name, device);
+    let point = mount_point(volume_name(device, partition).as_str(), device);
 
-    match vfs.mount(devices, point.as_str(), device, partition, range, mode) {
-        Ok(()) => {
-            let mut line = Line::new();
-            line.push_str("mounted ");
-            line.push_str(name);
-            line.push_str(" on ");
-            line.push_str(point.as_str());
-            console.write_output_line(framebuffer, line.as_str());
-        }
-        Err(error) => report(console, framebuffer, "mount", error),
+    vfs.mount(devices, point.as_str(), device, partition, range, mode)
+        .map_err(MountFailure::Fs)?;
+    Ok(point)
+}
+
+/// `usb0p1` from a device and an entry number: the inverse of
+/// [`parse_volume_name`], and the name both the mount point and the shell's
+/// messages are built from.
+pub fn volume_name(device: DeviceId, partition: Option<u8>) -> Line {
+    let mut name = Line::new();
+    name.push_str(device_name(device).as_str());
+    if let Some(number) = partition {
+        name.push_str("p");
+        name.push_u32(number as u32);
     }
+    name
 }
 
 pub fn unmount(console: &mut Console, framebuffer: &mut Framebuffer, vfs: &mut Vfs, path: &str) {

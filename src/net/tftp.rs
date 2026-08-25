@@ -42,10 +42,6 @@ pub const BLOCK_BYTES: usize = 512;
 const REPLY_TIMEOUT_MS: u64 = 2000;
 const RETRIES: u32 = 5;
 
-/// Refuse anything that would eat the heap. The PSRAM heap is around
-/// 30 MiB; this leaves it room to do something with the result.
-pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
-
 const RECEIVE_PACKETS: usize = 8;
 const SEND_PACKETS: usize = 4;
 /// One datagram is four bytes of header plus a block.
@@ -58,24 +54,35 @@ pub enum Error {
     TimedOut,
     /// The server refused, with its own code and message.
     Server { code: u16, message: Vec<u8> },
-    /// The file is larger than [`MAX_FILE_BYTES`].
-    TooLarge,
+    /// The sink would not take a block, so the transfer was abandoned. What
+    /// went wrong is the sink's to report: it is the only side that knows
+    /// what it was doing with the bytes.
+    SinkRefused,
     /// A socket operation failed locally.
     Local,
 }
 
-/// Reads `filename` from `server` in octet mode and returns its contents.
+/// Reads `filename` from `server` in octet mode, handing each block to
+/// `sink` as it arrives, and answers with the number of bytes transferred.
 ///
-/// `progress` is called with the running byte count as blocks arrive, so a
-/// long transfer is visibly making progress rather than merely not
-/// finished.
+/// The bytes are not collected here. Accumulating the whole file first tied
+/// the largest transfer to the size of the heap -- which is why there used
+/// to be an 8 MiB cap, a number about this firmware's memory rather than
+/// about TFTP -- and it meant a caller that wanted the file on a volume had
+/// to have it in memory first. A sink lets the caller checksum, count, write
+/// or discard, and the transfer stays the same size whatever it picks.
+///
+/// `sink` returning `false` abandons the transfer with [`Error::SinkRefused`].
+/// It is called once per block in arrival order, and never twice for the
+/// same block: a retransmission the server sends because its acknowledgement
+/// was lost is acknowledged again but not passed on.
 pub fn get(
     stack: &mut Stack,
     rpc: &mut Rpc,
     server: Ipv4Address,
     filename: &[u8],
-    progress: &mut dyn FnMut(usize),
-) -> Result<Vec<u8>, Error> {
+    sink: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<usize, Error> {
     let receive_buffer = udp::PacketBuffer::new(
         vec![udp::PacketMetadata::EMPTY; RECEIVE_PACKETS],
         vec![0u8; RECEIVE_PACKETS * PACKET_BYTES],
@@ -98,7 +105,7 @@ pub fn get(
         return Err(Error::Local);
     }
 
-    let result = transfer(stack, rpc, handle, server, filename, progress);
+    let result = transfer(stack, rpc, handle, server, filename, sink);
     stack.sockets_mut().remove(handle);
     result
 }
@@ -109,14 +116,14 @@ fn transfer(
     handle: smoltcp::iface::SocketHandle,
     server: Ipv4Address,
     filename: &[u8],
-    progress: &mut dyn FnMut(usize),
-) -> Result<Vec<u8>, Error> {
+    sink: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<usize, Error> {
     let request = read_request(filename);
     // Until the first DATA arrives the only known endpoint is port 69.
     let mut peer = IpEndpoint::new(IpAddress::Ipv4(server), SERVER_PORT);
     let mut outgoing = request;
 
-    let mut file = Vec::new();
+    let mut received_bytes = 0usize;
     let mut expected_block = 1u16;
 
     loop {
@@ -170,11 +177,13 @@ fn transfer(
 
         let (block_number, data) = block;
         if block_number == expected_block {
-            if file.len() + data.len() > MAX_FILE_BYTES {
-                return Err(Error::TooLarge);
+            // Only a block that has not been seen before reaches the sink.
+            // A retransmission is acknowledged below like any other, but
+            // handing it on would write the same bytes twice.
+            if !sink(&data) {
+                return Err(Error::SinkRefused);
             }
-            file.extend_from_slice(&data);
-            progress(file.len());
+            received_bytes += data.len();
             expected_block = expected_block.wrapping_add(1);
         }
         // A repeat of an earlier block means our acknowledgement was lost;
@@ -186,7 +195,7 @@ fn transfer(
             // Give the last acknowledgement a moment to actually leave
             // before the socket is torn down.
             stack.pump_until(rpc, 200, |_| false);
-            return Ok(file);
+            return Ok(received_bytes);
         }
     }
 }
@@ -263,18 +272,41 @@ fn ephemeral_port() -> u16 {
     49152 + (delay::cycle_count() % 16384) as u16
 }
 
-/// CRC-32 (the zlib/PNG polynomial) of the transferred bytes, so the result
-/// can be compared with `crc32` on the machine serving the file.
-pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+/// CRC-32 (the zlib/PNG polynomial), fed a block at a time.
+///
+/// Incremental because the transfer no longer keeps the file: the bytes are
+/// only in hand while the sink has them, so anything computed over the whole
+/// file has to be computed as it goes past.
+pub struct Crc32(u32);
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
     }
-    !crc
+}
+
+impl Crc32 {
+    pub const fn new() -> Self {
+        Self(0xFFFF_FFFF)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        let mut crc = self.0;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        self.0 = crc;
+    }
+
+    /// The checksum of everything fed in so far, in the form `crc32` on the
+    /// machine serving the file prints.
+    pub fn finish(&self) -> u32 {
+        !self.0
+    }
 }
 
 /// Wall-clock helper for the transfer-rate line: bytes per second, or 0

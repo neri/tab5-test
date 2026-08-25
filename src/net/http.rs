@@ -27,9 +27,10 @@ const CONNECT_TIMEOUT_MS: u64 = 5000;
 /// How long the transfer may stall before it is called dead.
 const IDLE_TIMEOUT_MS: u64 = 5000;
 
-/// How much of the response is kept. The point is to look at the status
-/// line and the first headers, not to hold a page.
-pub const MAX_RESPONSE_BYTES: usize = 4096;
+/// How much of the header block is kept. Enough for a status line and the
+/// headers worth looking at; a server that has not finished its headers by
+/// here is not one this can work with.
+pub const MAX_HEADER_BYTES: usize = 4096;
 
 pub enum Error {
     LinkLost,
@@ -37,18 +38,38 @@ pub enum Error {
     NotConnected,
     /// Connected, but the peer stopped talking mid-response.
     TimedOut,
+    /// No blank line ended the headers within [`MAX_HEADER_BYTES`], so where
+    /// the body starts is unknown. Everything after that would be a guess.
+    HeadersTooLong,
+    /// The sink would not take the body, so the transfer was abandoned.
+    SinkRefused,
     Local,
 }
 
 pub struct Response {
-    pub body: Vec<u8>,
-    /// Total bytes received, which may exceed what `body` kept.
+    /// The status line and headers, without the blank line that ends them.
+    pub headers: Vec<u8>,
+    /// The status code, if the status line was shaped like one.
+    ///
+    /// Reported rather than acted on: whether a 404's body is worth keeping
+    /// is the caller's question, and this layer handing the body to the sink
+    /// either way keeps the decision in one place.
+    pub status: Option<u16>,
+    /// Body bytes handed to the sink.
+    pub body_bytes: usize,
+    /// Everything received, headers included.
     pub received: usize,
     pub elapsed_ms: u64,
 }
 
-/// Issues `GET <path>` against `address:port` and returns the start of the
-/// response, headers included.
+/// Issues `GET <path>` against `address:port`, keeping the headers and
+/// handing the body to `sink` as it arrives.
+///
+/// The body is not collected. It used to be, up to a 4 KiB cap, with
+/// everything past that received and dropped -- which made this a way to
+/// look at a status line rather than a way to fetch anything. The split is
+/// at the blank line that ends the headers, so what reaches the sink is the
+/// body and nothing else.
 ///
 /// `host` is what goes in the `Host:` header, and is not always `address`
 /// written out: when the destination was given as a name, the name is what
@@ -61,13 +82,14 @@ pub fn get(
     port: u16,
     host: &[u8],
     path: &[u8],
+    sink: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<Response, Error> {
     let handle = stack.sockets_mut().add(tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; BUFFER_BYTES]),
         tcp::SocketBuffer::new(vec![0u8; BUFFER_BYTES]),
     ));
 
-    let result = exchange(stack, rpc, handle, address, port, host, path);
+    let result = exchange(stack, rpc, handle, address, port, host, path, sink);
 
     // `abort` rather than `close`: the socket is going away with the
     // handle, so there is nobody left to finish a graceful shutdown.
@@ -85,6 +107,7 @@ fn exchange(
     port: u16,
     host: &[u8],
     path: &[u8],
+    sink: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<Response, Error> {
     let started = tick::now_ms();
     let local_port = 49152 + (delay::cycle_count() % 16384) as u16;
@@ -116,8 +139,14 @@ fn exchange(
         return Err(Error::Local);
     }
 
-    let mut body = Vec::new();
+    // Header bytes accumulate here until the blank line turns up. The
+    // terminator can straddle two reads, which is why the search runs over
+    // what has been collected rather than over each chunk.
+    let mut headers = Vec::new();
+    let mut body_started = false;
+    let mut body_bytes = 0usize;
     let mut received = 0usize;
+    let mut failure = None;
     let mut last_progress = tick::now_ms();
     loop {
         let mut grew = false;
@@ -129,15 +158,49 @@ fn exchange(
                     break;
                 }
                 received += count;
-                let room = MAX_RESPONSE_BYTES.saturating_sub(body.len());
-                if room > 0 {
-                    body.extend_from_slice(&chunk[..count.min(room)]);
-                }
                 grew = true;
+                let arrived = &chunk[..count];
+                if !body_started {
+                    let searched_from = headers.len().saturating_sub(3);
+                    headers.extend_from_slice(arrived);
+                    match find_header_end(&headers, searched_from) {
+                        Some(end) => {
+                            // Everything past the blank line in this chunk is
+                            // already body.
+                            let body_start = end + HEADER_TERMINATOR.len();
+                            let carried = headers.split_off(body_start);
+                            headers.truncate(end);
+                            body_started = true;
+                            // Borrowed from the chunk no longer; the split-off
+                            // tail is the body's first bytes.
+                            body_bytes += carried.len();
+                            if !carried.is_empty() && !sink(&carried) {
+                                failure = Some(Error::SinkRefused);
+                                return true;
+                            }
+                            continue;
+                        }
+                        None => {
+                            if headers.len() > MAX_HEADER_BYTES {
+                                failure = Some(Error::HeadersTooLong);
+                                return true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                body_bytes += arrived.len();
+                if !sink(arrived) {
+                    failure = Some(Error::SinkRefused);
+                    return true;
+                }
             }
             false
         });
 
+        if let Some(error) = failure {
+            return Err(error);
+        }
         if grew {
             last_progress = tick::now_ms();
         }
@@ -157,11 +220,53 @@ fn exchange(
         }
     }
 
+    if !body_started {
+        // The peer closed without ever finishing its headers.
+        return Err(Error::HeadersTooLong);
+    }
+
     Ok(Response {
-        body,
+        status: parse_status(&headers),
+        headers,
+        body_bytes,
         received,
         elapsed_ms: tick::now_ms().saturating_sub(started),
     })
+}
+
+/// The blank line between the headers and the body.
+const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+
+/// Where the header block ends, searching from `from` so that a terminator
+/// spanning two reads is still found without rescanning everything.
+fn find_header_end(buffer: &[u8], from: usize) -> Option<usize> {
+    buffer
+        .get(from..)?
+        .windows(HEADER_TERMINATOR.len())
+        .position(|window| window == HEADER_TERMINATOR)
+        .map(|offset| from + offset)
+}
+
+/// The numeric status out of `HTTP/1.x NNN Reason`.
+///
+/// `None` when the status line is not that shape, which is reported as-is
+/// rather than guessed at: a reply that does not start with a status line is
+/// not an HTTP response, and calling it 200 would be worse than saying so.
+fn parse_status(headers: &[u8]) -> Option<u16> {
+    let line = headers.split(|&byte| byte == b'\n').next()?;
+    let mut fields = line.split(|&byte| byte == b' ');
+    let version = fields.next()?;
+    if !version.starts_with(b"HTTP/") {
+        return None;
+    }
+    let code = fields.next()?;
+    if code.len() != 3 || !code.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(
+        code.iter()
+            .fold(0u16, |value, byte| value * 10 + u16::from(byte - b'0')),
+    )
 }
 
 /// HTTP/1.0 with an explicit `Host`, which every virtual host needs and

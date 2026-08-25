@@ -42,6 +42,16 @@ use crate::{tick, uart};
 pub const MAX_HUB_PORTS: u8 = 8;
 
 const SLOT_COUNT: usize = MAX_HUB_PORTS as usize + 1; // index 0 = Direct, N = HubPort(N)
+/// How far `usbM` numbering counts before it comes round again.
+///
+/// The number is handed out in order and is never taken from a drive that
+/// is still attached, so unplugging one stick cannot renumber another. It
+/// still has to stop somewhere -- a device name is a fixed-width buffer and
+/// a counter that grows forever stops being something a person can type --
+/// and this is comfortably more than the `SLOT_COUNT` drives that can be
+/// attached at once, so a number only returns after every drive that held
+/// it has gone.
+pub const STORAGE_ID_LIMIT: u8 = 16;
 const ALL_SLOT_BITS: u16 = (1u16 << SLOT_COUNT) - 1;
 /// A background port scan runs roughly once a second. Do not stop discovery
 /// for a one-off hub/host hiccup; pause only after this many consecutive
@@ -82,6 +92,33 @@ enum ScanOutcome {
 pub struct ConnectionEpoch {
     root: u32,
     port: u32,
+}
+
+/// The `usbM` number a slot's Mass Storage device holds, and the connection
+/// epoch it was given under.
+///
+/// The epoch is what separates "the same drive, seen again" from "a
+/// different drive in the same port". A rescan tears every slot down and
+/// builds it back up, and a drive that comes back has to keep its number or
+/// every mount on it would break; a drive that was taken out and replaced
+/// in between must not inherit it.
+#[derive(Clone, Copy)]
+struct StorageId {
+    id: u8,
+    epoch: ConnectionEpoch,
+}
+
+/// Where the device in `slot` is plugged in.
+///
+/// The slot index *is* the location -- see `SLOT_COUNT` -- so this is a
+/// rename rather than a lookup, and it works before `records` has been
+/// filled in.
+const fn slot_location(slot: usize) -> Location {
+    if slot == 0 {
+        Location::Direct
+    } else {
+        Location::HubPort(slot as u8)
+    }
 }
 
 /// Why a rescan is being run.
@@ -448,6 +485,21 @@ pub struct UsbHost {
     /// driver, the matching record is present too; the reverse does not
     /// hold. Display only: see `DeviceRecord`.
     records: [Option<DeviceRecord>; SLOT_COUNT],
+    /// The `usbM` number each slot's Mass Storage device answers to, kept
+    /// beside `slots` rather than inside the driver so that it survives the
+    /// teardown a rescan performs. See [`StorageId`].
+    storage_ids: [Option<StorageId>; SLOT_COUNT],
+    /// Where the next number is taken from. It counts up and wraps at
+    /// `STORAGE_ID_LIMIT`, skipping whatever is still held.
+    next_storage_id: u8,
+    /// Advances whenever the set of attached devices may have changed.
+    ///
+    /// Automount compares this one integer every frame instead of walking
+    /// the registry, because that cost is paid whether or not anything has
+    /// been plugged in. It is deliberately pessimistic: a rescan advances it
+    /// even when it finds exactly what was there before, and reconciling
+    /// against no change costs a walk of the mount table and no bus I/O.
+    topology_epoch: u32,
     /// Timing of the most recent full `rescan`.
     last_scan: Option<ScanTiming>,
     /// Tick milliseconds of the last automatic power cycle, so a device
@@ -465,6 +517,7 @@ impl UsbHost {
     pub const fn new() -> Self {
         const NONE_DRIVER: Option<DeviceKind> = None;
         const NONE_RECORD: Option<DeviceRecord> = None;
+        const NONE_STORAGE_ID: Option<StorageId> = None;
         Self {
             last_probe: None,
             hub: None,
@@ -477,6 +530,9 @@ impl UsbHost {
             port_epochs: [0; SLOT_COUNT],
             slots: [NONE_DRIVER; SLOT_COUNT],
             records: [NONE_RECORD; SLOT_COUNT],
+            storage_ids: [NONE_STORAGE_ID; SLOT_COUNT],
+            next_storage_id: 0,
+            topology_epoch: 0,
             last_scan: None,
             boot_scan: None,
             last_power_recovery_ms: None,
@@ -567,7 +623,7 @@ impl UsbHost {
     /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
     ///
     /// The single-device diagnostics keep using this. The filesystem layer
-    /// does not: it addresses storage by index through
+    /// does not: it addresses storage by number through
     /// [`Self::mass_storage_at`], because "the first one found" is not a
     /// name a mount can be recorded against.
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
@@ -577,53 +633,121 @@ impl UsbHost {
         })
     }
 
-    /// The `index`-th attached Mass Storage device in topology order.
+    /// The Mass Storage device numbered `id`, the `M` in `usbM`.
     ///
-    /// Topology order is slot order -- the direct port, then hub ports low
-    /// to high -- and not enumeration order or USB address order. Addresses
-    /// are handed out afresh on every enumeration and can be reused for a
-    /// different device after a removal, so an address makes a poor name for
-    /// something a mount has to keep referring to. Position on the bus at
-    /// least does not move on its own.
+    /// Not a position on the bus and not a USB address. Addresses are handed
+    /// out afresh on every enumeration and can go to a different device
+    /// after a removal; a position renumbers the survivors when the drive in
+    /// front of it is taken out, which would break the mounts of drives
+    /// nobody touched. This number is handed out in order and is not taken
+    /// back while its drive is attached, so a mount can keep referring to it
+    /// for as long as the drive is there.
     ///
-    /// It still is not an identity. Unplugging the first of two sticks
-    /// renumbers the second, which is why a mount records a fingerprint
-    /// beside this index rather than trusting it alone.
-    pub fn mass_storage_at(&mut self, index: usize) -> Option<&mut UsbMassStorage> {
-        self.slots
-            .iter_mut()
-            .flatten()
-            .filter_map(|slot| match slot {
-                DeviceKind::MassStorage(storage) => Some(storage),
-                DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
-            })
-            .nth(index)
+    /// It is still not an identity -- the number does come round again once
+    /// the drive that held it has gone, which is why a mount records a
+    /// fingerprint beside it.
+    pub fn mass_storage_at(&mut self, id: u8) -> Option<&mut UsbMassStorage> {
+        let slot = self.storage_slot(id)?;
+        match self.slots[slot].as_mut() {
+            Some(DeviceKind::MassStorage(storage)) => Some(storage),
+            _ => None,
+        }
     }
 
-    /// Where the `index`-th Mass Storage device is plugged in.
+    /// Where the Mass Storage device numbered `id` is plugged in.
     ///
     /// Costs nothing on the bus -- it reads the registry's own records --
     /// which is what makes it usable as a per-operation check. A mount
-    /// records the location it was made against, so the index pointing at a
-    /// different device after a re-enumeration is caught even when both
-    /// devices are the same size.
-    pub fn mass_storage_location(&self, index: usize) -> Option<Location> {
-        self.mass_storage_inventory()
-            .nth(index)
-            .map(|(location, _)| location)
+    /// records the location it was made against, so a drive that has been
+    /// moved to another port is caught even when the two ports held
+    /// identical media.
+    pub fn mass_storage_location(&self, id: u8) -> Option<Location> {
+        let slot = self.storage_slot(id)?;
+        Some(slot_location(slot))
     }
 
-    /// Read-only inventory of the attached Mass Storage devices, in the same
-    /// order [`Self::mass_storage_at`] indexes them.
+    /// Read-only inventory of the attached Mass Storage devices, each with
+    /// the number [`Self::mass_storage_at`] answers to, in slot order.
     ///
     /// Separate from the accessor because listing what is there and driving
     /// one of them are different jobs: a display walks every device, and
     /// taking a `&mut` per device to do that would mean borrowing the whole
     /// registry once per row.
-    pub fn mass_storage_inventory(&self) -> impl Iterator<Item = (Location, &DeviceSummary)> {
-        self.bus_devices().filter_map(|device| {
-            matches!(device.driver, Some(DeviceKind::MassStorage(_)))
-                .then_some((device.record.location, &device.record.summary))
+    ///
+    /// Slot order is not number order once anything has been unplugged. The
+    /// listing follows the bus rather than the numbering because that is
+    /// what a person comparing it against the ports in front of them is
+    /// reading it for.
+    pub fn mass_storage_inventory(&self) -> impl Iterator<Item = (u8, Location, &DeviceSummary)> {
+        (0..SLOT_COUNT).filter_map(move |slot| {
+            if !matches!(self.slots[slot], Some(DeviceKind::MassStorage(_))) {
+                return None;
+            }
+            let record = self.records[slot].as_ref()?;
+            Some((self.storage_ids[slot]?.id, record.location, &record.summary))
+        })
+    }
+
+    /// Advances whenever something may have attached or detached.
+    ///
+    /// One integer, read every frame by the automount reconciler. See the
+    /// field for why it is allowed to advance without anything having
+    /// actually changed.
+    pub fn topology_epoch(&self) -> u32 {
+        self.topology_epoch
+    }
+
+    /// The slot holding the drive numbered `id`, if it is still attached.
+    fn storage_slot(&self, id: u8) -> Option<usize> {
+        (0..SLOT_COUNT).find(|&slot| {
+            matches!(self.slots[slot], Some(DeviceKind::MassStorage(_)))
+                && matches!(self.storage_ids[slot], Some(held) if held.id == id)
+        })
+    }
+
+    /// Gives the Mass Storage device just bound in `slot` its `usbM` number.
+    ///
+    /// A drive that is coming back from a rescan keeps the number it had:
+    /// its port has seen no connection edge since, so the reservation still
+    /// stands and every mount made against that number stays valid. Anything
+    /// else is a drive this registry has not numbered yet.
+    fn assign_storage_id(&mut self, slot: usize) {
+        let epoch = self.connection_epoch_at(Some(slot_location(slot)));
+        if matches!(self.storage_ids[slot], Some(held) if held.epoch == epoch) {
+            return;
+        }
+        let id = self.allocate_storage_id();
+        self.storage_ids[slot] = Some(StorageId { id, epoch });
+    }
+
+    /// Takes the next free number, counting up from wherever the last one
+    /// left off and wrapping at `STORAGE_ID_LIMIT`.
+    ///
+    /// There are fewer slots than numbers, so the scan always finds one; the
+    /// fallback exists to keep the function total rather than because it can
+    /// be reached.
+    fn allocate_storage_id(&mut self) -> u8 {
+        for offset in 0..STORAGE_ID_LIMIT {
+            let candidate = (self.next_storage_id + offset) % STORAGE_ID_LIMIT;
+            if !self.storage_id_held(candidate) {
+                self.next_storage_id = (candidate + 1) % STORAGE_ID_LIMIT;
+                return candidate;
+            }
+        }
+        self.next_storage_id
+    }
+
+    /// Whether `id` still belongs to a drive.
+    ///
+    /// A reservation counts even while its slot sits empty. A rescan empties
+    /// every slot before it fills them in again, and a number given out in
+    /// that window would collide with the drive about to reclaim it.
+    fn storage_id_held(&self, id: u8) -> bool {
+        (0..SLOT_COUNT).any(|slot| match self.storage_ids[slot] {
+            Some(held) => {
+                held.id == id && held.epoch == self.connection_epoch_at(Some(slot_location(slot)))
+            }
+            None => false,
         })
     }
 
@@ -666,6 +790,7 @@ impl UsbHost {
             // bus with it. `rescan` deliberately consumes and discards the
             // edges its own reset produces, so what reaches here is real.
             self.root_epoch = self.root_epoch.wrapping_add(1);
+            self.topology_epoch = self.topology_epoch.wrapping_add(1);
         }
         changed
     }
@@ -699,6 +824,12 @@ impl UsbHost {
     /// physical root-disconnect path and re-arms diagnostics for the next
     /// attachment.
     fn clear_registry(&mut self) {
+        // Advanced here rather than only where a device is bound, so that a
+        // scan which finds nothing where something used to be still tells
+        // automount to look. The `storage_ids` reservations are deliberately
+        // left standing: a rescan is not a removal, and a drive that comes
+        // back on the next few lines has to find its number waiting.
+        self.topology_epoch = self.topology_epoch.wrapping_add(1);
         let _ = hcd::disable_periodic_hid();
         self.hub = None;
         self.hub_speed = Speed::Unknown;
@@ -850,6 +981,7 @@ impl UsbHost {
                 // Only this port's count. The devices on the other ports
                 // have not moved.
                 self.port_epochs[port as usize] = self.port_epochs[port as usize].wrapping_add(1);
+                self.topology_epoch = self.topology_epoch.wrapping_add(1);
                 detached |= bit;
                 uart::log_hex(b"USB: device disconnected from hub port ", port as u32);
             }
@@ -1149,7 +1281,9 @@ impl UsbHost {
             self.clear_unhandled_slot(0);
             let is_mass_storage = matches!(kind, DeviceKind::MassStorage(_));
             self.slots[0] = Some(kind);
+            self.topology_epoch = self.topology_epoch.wrapping_add(1);
             if is_mass_storage {
+                self.assign_storage_id(0);
                 timing.mass_storage_ms = milliseconds_since(start);
             }
         } else {
@@ -1355,7 +1489,12 @@ impl UsbHost {
                     DeviceKind::MassStorage(_) => b"USB: mass storage attached on hub port ",
                 });
                 uart::log_hex(b"", port as u32);
+                let is_mass_storage = matches!(kind, DeviceKind::MassStorage(_));
                 self.slots[port as usize] = Some(kind);
+                self.topology_epoch = self.topology_epoch.wrapping_add(1);
+                if is_mass_storage {
+                    self.assign_storage_id(port as usize);
+                }
                 true
             }
             None => {

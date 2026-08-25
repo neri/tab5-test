@@ -59,5 +59,5 @@ pub use protocol::{
 };
 pub use registry::{
     BusDevice, ConnectionEpoch, DeviceKind, DeviceRecord, DeviceSummary, Location, MAX_HUB_PORTS,
-    RescanReason, UsbHost,
+    RescanReason, STORAGE_ID_LIMIT, UsbHost,
 };

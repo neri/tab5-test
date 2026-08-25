@@ -21,12 +21,15 @@ use crate::usb::UsbHost;
 
 /// Which medium, and which one of it.
 ///
-/// The USB index is a position in the host's registry, valid only for that
-/// generation of it: USB addresses are reassigned on every enumeration and
-/// can be handed to a different device after a removal, so neither the
-/// address nor this index is a lasting identity for a piece of media. What
-/// makes a medium the same medium is the fingerprint a mount records
-/// alongside this identifier.
+/// The USB number is the one the host registry hands each Mass Storage
+/// device as it attaches. It is not a USB address and not a position on the
+/// bus: addresses are reassigned on every enumeration and can go to a
+/// different device after a removal, and a position renumbers the survivors
+/// when the drive in front of them is unplugged. The number stays with its
+/// drive for as long as the drive is attached, and only comes round again
+/// once that drive has gone -- so it is a stable *name*, but still not an
+/// identity. What makes a medium the same medium is the fingerprint a mount
+/// records alongside this identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeviceId {
     /// The PSRAM RAM disk. There is exactly one.
@@ -34,7 +37,7 @@ pub enum DeviceId {
     /// The onboard microSD slot, always `sd0`: the board has one slot, and it
     /// is soldered down, so the number never moves.
     Sd,
-    /// The `n`-th Mass Storage device in topology order.
+    /// The Mass Storage device the host registry numbered `n`.
     Usb(u8),
 }
 
@@ -181,12 +184,12 @@ impl<'a> Devices<'a> {
                 let sd = self.sd.get()?;
                 Some(body(sd))
             }
-            // Addressed by position on the bus, never by "the first one
-            // found": a mount records this identifier, and a name that means
-            // something different depending on what else is plugged in
+            // Addressed by the registry's own number, never by "the first
+            // one found": a mount records this identifier, and a name that
+            // means something different depending on what else is plugged in
             // cannot be recorded.
-            DeviceId::Usb(index) => {
-                let storage = self.usb.mass_storage_at(index as usize)?;
+            DeviceId::Usb(id) => {
+                let storage = self.usb.mass_storage_at(id)?;
                 let mut device = UsbMscBlockDevice::probe(storage).ok()?;
                 Some(body(&mut device))
             }
@@ -228,8 +231,8 @@ impl<'a> Devices<'a> {
                 let _ = fingerprint::add_volume_sources(&mut builder, sd, partition_start);
                 Some(builder.finish())
             }
-            DeviceId::Usb(index) => {
-                let storage = self.usb.mass_storage_at(index as usize)?;
+            DeviceId::Usb(id) => {
+                let storage = self.usb.mass_storage_at(id)?;
                 let mut device = UsbMscBlockDevice::probe(storage).ok()?;
                 let mut builder = fingerprint::Builder::new(&device.geometry());
                 device.add_identity(&mut builder);

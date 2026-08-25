@@ -73,6 +73,15 @@ impl Submission {
     }
 }
 
+/// A command line that was still being typed when something else needed to
+/// write to the console. See [`Console::take_input_line`].
+pub struct InputLine {
+    text: [u8; MAX_LINE],
+    len: usize,
+    /// Where the cursor was, counted from the first cell after the prompt.
+    cursor: usize,
+}
+
 struct ConsoleStorage(UnsafeCell<Console>);
 
 // The firmware owns this state from one hart and accesses it only from the
@@ -163,6 +172,59 @@ impl Console {
             | Key::Insert
             | Key::Function(_) => {}
         }
+    }
+
+    /// Lifts the line being edited off the current row and blanks it, so
+    /// that output can be written where it was.
+    ///
+    /// Every other writer of output lines runs immediately after Enter
+    /// consumed the input, on a row that is already blank. Automount does
+    /// not: it reports while the user may be halfway through typing
+    /// something, and `write_output_line` starts at column 0 and would take
+    /// the prompt and the half-typed command with it. Pair this with
+    /// [`Self::restore_input_line`] around the output.
+    pub fn take_input_line(&mut self, framebuffer: &mut Framebuffer) -> InputLine {
+        let mut text = [0u8; MAX_LINE];
+        let mut len = 0;
+        for column in PROMPT.len()..self.input_end {
+            // Only printable ASCII reaches a cell through `put`, the same
+            // narrowing `submit` relies on.
+            text[len] = self.cells[self.row][column] as u8;
+            len += 1;
+        }
+        let cursor = self.column.saturating_sub(PROMPT.len());
+        // The cursor block may be sitting past the last character, so the
+        // repaint has to cover it as well as the cells being blanked.
+        let painted = self.input_end.max(self.column + 1);
+        for column in 0..self.input_end {
+            self.cells[self.row][column] = '\0';
+        }
+        self.column = 0;
+        self.input_end = 0;
+        self.draw_span(framebuffer, self.row, 0, painted);
+        InputLine { text, len, cursor }
+    }
+
+    /// Puts the prompt and a line taken by [`Self::take_input_line`] back on
+    /// the current (assumed blank) row, cursor where it was.
+    ///
+    /// The cells are filled in directly and painted in one span rather than
+    /// replayed through `put`, which would repaint a widening span per
+    /// character and write it back each time.
+    pub fn restore_input_line(&mut self, framebuffer: &mut Framebuffer, saved: InputLine) {
+        self.set_prompt_cells();
+        for index in 0..saved.len {
+            self.cells[self.row][PROMPT.len() + index] = char::from(saved.text[index]);
+        }
+        self.input_end = PROMPT.len() + saved.len;
+        self.column = (PROMPT.len() + saved.cursor).min(self.input_end);
+        self.cursor_visible = true;
+        self.draw_span(
+            framebuffer,
+            self.row,
+            0,
+            self.input_end.max(self.column + 1),
+        );
     }
 
     /// Writes the prompt into the current (assumed blank) row, positions

@@ -31,7 +31,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、`win`デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、共通ブロックデバイス層、MBR判定、シェルコマンド |
-| [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
+| [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
 | [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP |
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
@@ -69,9 +69,13 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - 日本語フォント、省電力制御は未実装です。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
-- ストレージはブロック単位の読み書きとMBR表示までです。FAT/exFATの解析と
-  SDのUHS-Iモードは未実装です。USB MSCのWRITE(10)は実装・実機受入済みですが、
-  間欠故障の根本原因は未特定で、各WRITE前の予防的BOT再同期を必要とします
+- ストレージはブロック単位の読み書きとMBR表示に加えて、FAT12/16/32とexFATを
+  読み出すVFSがあります。**書き込めるのは`/tmp`（PSRAM上のFAT16 RAMディスク、
+  8 MiB、リセットで消える）だけ**で、SDとUSBはファイルシステム経由では常に
+  読み取り専用です。exFATは形式として読み取り専用です
+  （[FILESYSTEM.md](docs/FILESYSTEM.md)）。SDのUHS-Iモードは未実装です。
+  ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みですが、間欠故障の
+  根本原因は未特定で、各WRITE前の予防的BOT再同期を必要とします
   （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
   [STORAGE.md](docs/STORAGE.md)）。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で
@@ -80,7 +84,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、名前解決、ping、
   TFTP読み出し、最小のHTTP GETまでで、**IPv6、サーバ機能、TLSはありません**。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
-  受信データの保存先はメモリだけです（[NETWORK.md](docs/NETWORK.md)）。
+  受信したファイルは`/tmp`（8 MiB、リセットで消える）へ保存できます
+  （[NETWORK.md](docs/NETWORK.md)、[FILESYSTEM.md](docs/FILESYSTEM.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
   読み書きまで実機確認済みです。High-Speedハブ配下Low-Speed HIDのSplit経路も
   10 ms周期で実機確認済みで、同じハブ上のHigh-Speed MSCとの併用も`ut 100`を
@@ -88,3 +93,6 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   デバイス情報の表示は`lsusb`（ツリー表示と記述子表示）で、文字列記述子は
   この詳細表示のときだけ取得します。多段ハブは未実装です
   （[USB.md](docs/USB.md)）。
+- USB Mass Storageは挿抜に合わせて自動でマウント・アンマウントします
+  （`automount off`で止まります）。SDスロットには挿抜検出線が無いので対象外で、
+  従来どおり明示マウントだけです（[FILESYSTEM.md](docs/FILESYSTEM.md)）。
