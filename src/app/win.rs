@@ -26,6 +26,11 @@ use crate::input::{InputManager, PrimaryTouch};
 use crate::usb::MOUSE_BUTTON_LEFT;
 use crate::{interrupts, rtc, uart};
 
+// The pointer used to live here, which is where it had to be proved: this
+// is the screen with a window and icons under it. It moved to `pointer` so
+// the browser could use the same one; `docs/APPS.md` records the split.
+use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_union};
+
 /// The Windows 95 system palette, as close as RGB565 gets.
 ///
 /// The 3D look is entirely these four greys in a fixed order (see
@@ -103,54 +108,6 @@ const CLOSE_SIZE: usize = TITLE_HEIGHT - 10;
 /// it buys is that a mouse plugged in while this screen is up is reflected
 /// within a second rather than not at all.
 const POLL_INTERVAL_FRAMES: u32 = 57;
-
-/// The pointer sprite: `X` outline, `O` white fill, `.` transparent, with
-/// the hotspot at the top-left corner exactly as the classic arrow has it.
-/// Drawn as a bitmap rather than from primitives because the outline is
-/// what makes it legible over both the teal desktop and the grey window,
-/// and an outline is easier to be sure of by eye than by geometry.
-const CURSOR_WIDTH: usize = 12;
-const CURSOR_HEIGHT: usize = 18;
-/// Stored flat, one row after another, rather than as an array of row
-/// literals: an array of 18 row references is a shape the optimizer
-/// unrolls, and 216 unrolled `fill_rect` calls cost more instruction
-/// memory than this whole screen is worth on a part with 256 KiB of RAM
-/// for everything. Flat, it stays a loop.
-const CURSOR_PIXELS: &[u8; CURSOR_WIDTH * CURSOR_HEIGHT] = b"\
-X...........\
-XX..........\
-XOX.........\
-XOOX........\
-XOOOX.......\
-XOOOOX......\
-XOOOOOX.....\
-XOOOOOOX....\
-XOOOOOOOX...\
-XOOOOOOOOX..\
-XOOOOOOOOOX.\
-XOOOOOOXXXXX\
-XOOXOOX.....\
-XOX.XOOX....\
-XX..XOOX....\
-X....XOOX...\
-.....XOOX...\
-......XXX...";
-/// Pointer gain, as a fraction applied to the mouse's raw counts: at 1/1 one
-/// count moves the pointer one pixel, which is slow going across 1280
-/// pixels. Kept as a fraction rather than a whole multiplier so it can be
-/// tuned finely -- 3/2 and 5/2 are both reasonable, where 2 and 3 are a big
-/// jump apart -- and the leftover is carried in `Cursor` rather than
-/// truncated, so slow deliberate movement is not rounded away to nothing.
-const POINTER_SPEED_NUMERATOR: i32 = 5;
-const POINTER_SPEED_DENOMINATOR: i32 = 2;
-
-/// The panel is 1280x720 on a 5-inch module, so a 12x18 sprite at 1:1 is
-/// about 1.5 mm tall. Doubling it puts the pointer at roughly the apparent
-/// size it has on a desktop monitor.
-const CURSOR_SCALE: usize = 2;
-const CURSOR_DRAWN_WIDTH: usize = CURSOR_WIDTH * CURSOR_SCALE;
-const CURSOR_DRAWN_HEIGHT: usize = CURSOR_HEIGHT * CURSOR_SCALE;
-const CURSOR_SAVED_PIXELS: usize = CURSOR_DRAWN_WIDTH * CURSOR_DRAWN_HEIGHT;
 
 /// Runs the desktop until any managed keyboard key is pressed. As with the
 /// other full-screen modes, the framebuffer is left holding the finished
@@ -602,136 +559,6 @@ fn overlaps(first: Rect, second: Rect) -> bool {
 /// repainting whatever the pointer just left -- would mean every element on
 /// screen needing to be redrawable clipped to an arbitrary rectangle, for
 /// no gain.
-struct Cursor {
-    x: usize,
-    y: usize,
-    /// Pixels underneath, laid out exactly as `Framebuffer::read_rect`
-    /// wrote them so `blit_rgb565` puts them back unchanged -- including
-    /// when the sprite hangs off the right or bottom edge, which both
-    /// clip identically.
-    saved: [u16; CURSOR_SAVED_PIXELS],
-    visible: bool,
-    /// Sub-pixel motion left over from `POINTER_SPEED_DENOMINATOR`, carried
-    /// into the next frame. Without this, any frame whose scaled motion
-    /// lands below one pixel would be discarded, and a slow drag across the
-    /// screen would lose ground on every one of them.
-    remainder_x: i32,
-    remainder_y: i32,
-}
-
-impl Cursor {
-    fn new(x: usize, y: usize) -> Self {
-        Self {
-            x,
-            y,
-            saved: [0; CURSOR_SAVED_PIXELS],
-            visible: false,
-            remainder_x: 0,
-            remainder_y: 0,
-        }
-    }
-
-    /// Where this frame's relative motion puts the hotspot, after pointer
-    /// gain and clamped to the panel.
-    ///
-    /// The sprite itself is allowed to hang off the right and bottom edges
-    /// from there; clamping its whole box instead would stop the hotspot
-    /// short of the edge and make the taskbar's right end unreachable.
-    ///
-    /// Clamping happens after scaling, and the remainder is still carried
-    /// even when the clamp discards the movement -- so pushing the pointer
-    /// into an edge and coming back does not first have to work off a debt.
-    fn moved_to(&mut self, dx: i32, dy: i32) -> (usize, usize) {
-        let scaled_x = scale_motion(dx, &mut self.remainder_x);
-        let scaled_y = scale_motion(dy, &mut self.remainder_y);
-        let x = (self.x as i32 + scaled_x).clamp(0, WIDTH as i32 - 1) as usize;
-        let y = (self.y as i32 + scaled_y).clamp(0, HEIGHT as i32 - 1) as usize;
-        (x, y)
-    }
-
-    fn move_to(&mut self, x: usize, y: usize) {
-        debug_assert!(!self.visible);
-        self.x = x;
-        self.y = y;
-    }
-
-    #[inline(never)]
-    fn hide(&mut self, framebuffer: &mut Framebuffer) {
-        if !self.visible {
-            return;
-        }
-        framebuffer.blit_rgb565(
-            self.x,
-            self.y,
-            CURSOR_DRAWN_WIDTH,
-            CURSOR_DRAWN_HEIGHT,
-            &self.saved,
-        );
-        self.visible = false;
-    }
-
-    #[inline(never)]
-    fn show(&mut self, framebuffer: &mut Framebuffer) {
-        if self.visible {
-            return;
-        }
-        framebuffer.read_rect(
-            self.x,
-            self.y,
-            CURSOR_DRAWN_WIDTH,
-            CURSOR_DRAWN_HEIGHT,
-            &mut self.saved,
-        );
-        for (index, &cell) in CURSOR_PIXELS.iter().enumerate() {
-            let color = match cell {
-                b'X' => DARK_SHADOW,
-                b'O' => WHITE,
-                _ => continue,
-            };
-            let (column, row) = (index % CURSOR_WIDTH, index / CURSOR_WIDTH);
-            fill(
-                framebuffer,
-                self.x + column * CURSOR_SCALE,
-                self.y + row * CURSOR_SCALE,
-                CURSOR_SCALE,
-                CURSOR_SCALE,
-                color,
-            );
-        }
-        self.visible = true;
-    }
-}
-
-/// Applies pointer gain to one axis, keeping the sub-pixel leftover in
-/// `remainder` for the next frame.
-///
-/// Truncation is toward zero on both signs and `remainder` keeps the sign of
-/// the motion, so moving left and moving right accumulate their leftovers
-/// the same way instead of one direction drifting against the other.
-fn scale_motion(delta: i32, remainder: &mut i32) -> i32 {
-    let total = delta * POINTER_SPEED_NUMERATOR + *remainder;
-    let moved = total / POINTER_SPEED_DENOMINATOR;
-    *remainder = total - moved * POINTER_SPEED_DENOMINATOR;
-    moved
-}
-
-/// Writes back one rectangle covering both positions of something that just
-/// moved -- the pointer sprite, or the window.
-#[inline(never)]
-fn flush_union(
-    framebuffer: &Framebuffer,
-    from: (usize, usize),
-    to: (usize, usize),
-    width: usize,
-    height: usize,
-) {
-    let left = from.0.min(to.0);
-    let top = from.1.min(to.1);
-    let right = (from.0.max(to.0) + width).min(WIDTH);
-    let bottom = (from.1.max(to.1) + height).min(HEIGHT);
-    flush(framebuffer, left, top, right - left, bottom - top);
-}
-
 /// Paints the whole screen: desktop, icons, window, taskbar. Called once on
 /// entry; everything after that is incremental.
 #[inline(never)]

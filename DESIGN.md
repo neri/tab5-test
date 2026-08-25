@@ -34,6 +34,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
 | [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP |
+| [BROWSER.md](docs/BROWSER.md) | `browser`のハイパーテキストビューア。対応するHTML、操作、上限、エラー、平文HTTPだけであること、診断コマンド |
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
 | [FILE_LAYOUT.md](docs/FILE_LAYOUT.md) | モジュールごとの責務一覧、コーディング方針（コメントの言語、`unsafe`の粒度） |
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
@@ -57,16 +58,20 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
 [USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)、
 [WIFI_C6_PLAN.md](docs/WIFI_C6_PLAN.md)、
+[WIFI_REFACTOR_PLAN.md](docs/WIFI_REFACTOR_PLAN.md)、
 [TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
-[DNS_PLAN.md](docs/DNS_PLAN.md)。
+[DNS_PLAN.md](docs/DNS_PLAN.md)、
+[WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)。
 
 ## 制約
 
 - ECO2で確認したレジスタ値とROM APIアドレスを使用しています。
-- PSRAMは32 MiB全体を固定アドレスへMMU割り当てします。フレームバッファ以外
-  （約30.24 MiB）は`linked_list_allocator`によるグローバルアロケータのヒープです。
+- PSRAMは32 MiB全体を固定アドレスへMMU割り当てし、フレームバッファ（1,843,200
+  byte）、`/tmp`のRAMディスク（固定8 MiB）、残る23,322,624 byte（約22.24 MiB）の
+  ヒープの3つへ分けます。ヒープは`linked_list_allocator`によるグローバル
+  アロケータです（[PSRAM.md](docs/PSRAM.md)）。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
-- 日本語フォント、省電力制御は未実装です。
+- 日本語フォント、省電力制御は未実装です。`browser`の非ASCII表示もこれが理由です。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
 - ストレージはブロック単位の読み書きとMBR表示に加えて、FAT12/16/32とexFATを
@@ -82,10 +87,17 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
   （[WIFI.md](docs/WIFI.md)）。
 - TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、名前解決、ping、
-  TFTP読み出し、最小のHTTP GETまでで、**IPv6、サーバ機能、TLSはありません**。
+  TFTP読み出し、HTTP GETまでで、**IPv6、サーバ機能、TLSはありません**。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
   受信したファイルは`/tmp`（8 MiB、リセットで消える）へ保存できます
   （[NETWORK.md](docs/NETWORK.md)、[FILESYSTEM.md](docs/FILESYSTEM.md)）。
+  HTTPは同期の`httpget`と、1回のpollごとに戻る`net::http::Transaction`の
+  2つの顔がありますが、実装は1つです。
+- `browser`はHTMLから文章とリンクを取り出して読む全画面ビューアです。
+  **Webブラウザではありません**。CSS、JavaScript、画像デコード、TLSは
+  いずれもありません。`https://`は認識して未対応と表示し、httpへ落としません。
+  日本語フォントが無いので非ASCII文字は1文字1マスの四角で表示します
+  （[BROWSER.md](docs/BROWSER.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
   読み書きまで実機確認済みです。High-Speedハブ配下Low-Speed HIDのSplit経路も
   10 ms周期で実機確認済みで、同じハブ上のHigh-Speed MSCとの併用も`ut 100`を

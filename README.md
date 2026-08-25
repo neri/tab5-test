@@ -39,6 +39,7 @@
 | タッチ | `paint` `touchtest` | GT911またはST7121/ST7123タッチコントローラを使うお絵描き画面と、二本指同時入力の確認 |
 | 画面の座標確認 | `coordtest` | 100ピクセルグリッド、論理中心軸、四隅の座標、1ピクセルずつ内側へ入った4本の枠を出す全画面チャート。CW回転とクリッピングを定規で突き合わせて確認する |
 | センサー・RTC | `axistest` `battery` `rtc` | BMI270の傾きでボールを転がす、INA226でバッテリーパックの電圧・電流・電力をライブ表示、RX8130CE RTCの時刻表示・設定・レジスタダンプ・機能検査 |
+| ブラウザ | `browser` `hbase` | HTMLから文章とリンクを取り出して読む全画面ビューア。**Webブラウザではない**——CSS、JavaScript、画像デコード、TLSはいずれも無い。平文HTTPだけで、`https://`は認識して未対応と表示し、httpへは落とさない。Tabでリンク選択、Enterで移動（未選択ならアドレス欄）、Backspaceで戻る（履歴8ページ）、Escapeで読み込み中止または終了。タッチとUSBマウスでもリンクを選べる。通信を必要としない組み込みページを持つのでWi-Fiが無くても開ける。`hbase`は部分指定を補完する基準アドレスを覚える（[docs/BROWSER.md](docs/BROWSER.md)） |
 | USBマウス・画面 | `win` | Windows 95風デスクトップを表示。USB HID Bootマウスでカーソル移動とタイトルバーのドラッグを確認し、タスクバーにRTC時刻を表示 |
 | SDカード | `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` | 4bit/High Speedモード（実クロック40 MHz。ESP32-C6を使っている間は同じコントローラの入力クロックを共有するためDefault Speedの20 MHz）での生ブロックI/O。CID/CSD要約、MBR表示、1ブロック読み出し、DMAでnブロック読み出し、PSRAM宛DMA読み出しと検証、書き込み+検証+復元、ゼロ埋め |
 | USBデバイス情報 | `lsusb` | 接続デバイスをハブ経由のツリーで表示。Composite Deviceは各interfaceを1行ずつ出す。`lsusb <アドレス>`でそのデバイスの主要な記述子（デバイス、コンフィグレーション、interfaceとendpoint、HID記述子）と、製品名・ベンダ名・シリアルの文字列記述子を表示 |
@@ -49,7 +50,7 @@
 | ファイル操作 | `cd` `pwd` `ls` `cat` `write` `append` `mkdir` `rm` `rmdir` `mv` | カレントディレクトリと相対パスで辿る。`ls`は名前順の桁詰めで、`-l`が詳細、`-a`が`.`と`..`。`rm`はファイル、`rmdir`は空のディレクトリ、`mv`は改名と同一ボリューム内の移動（ボリュームを跨ぐ移動はコピーになるので断る） |
 | ファイルシステム診断 | `fsopen` `fsread` `fsclose` `fill` | `fsopen`はコマンドを跨いでファイルを開いたまま保持する。媒体を抜くとハンドルが`stale`になり、同じものを挿し直しても復活しないことを確認できる。`fill`は既知のパターンを書いて書き込み経路の所要時間を測る |
 | Wi-Fi | `wifiscan` `wificonnect` `wifistatus` `wifidisconnect` `wifiinfo` `wifiup` `wifimac` | ESP32-C6のESP-Hostedファームウェア経由でAPのスキャンと接続。接続先のSSID/BSSID/チャンネル/RSSI表示、切断。`wifiinfo`/`wifiup`/`wifimac`はSDIO活性化・リンク・RPCの各層の診断 |
-| ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、最小のHTTP/1.0 GET。`tftpget`と`httpget`は受け取ったファイルをカレントディレクトリへ保存する（書けるのは`/tmp`だけなので`cd /tmp`してから使う）。書き込みは`.part`という名前で行い完了時に改名するので、本来の名前で現れたファイルは完全なもの。`httpget`はパスがファイルを名指していないとき（`/`や`/`で終わるパス）と、応答が2xx以外のときは保存せずヘッダだけ表示する。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する |
+| ネットワーク | `ipconfig` `nslookup` `ping` `tftpget` `httpget` `hs` `bt` `netdump` | smoltcpによるIPv4。DHCPまたは手動でのアドレス設定、名前解決（Aレコード）、ICMP echoと往復時間、TFTP読み出し（サイズとCRC-32）、HTTP/1.0 GET（chunked転送の復号とリダイレクトの追跡はブラウザ側）。`tftpget`と`httpget`は受け取ったファイルをカレントディレクトリへ保存する（書けるのは`/tmp`だけなので`cd /tmp`してから使う）。書き込みは`.part`という名前で行い完了時に改名するので、本来の名前で現れたファイルは完全なもの。`httpget`はパスがファイルを名指していないとき（`/`や`/`で終わるパス）と、応答が2xx以外のときは保存せずヘッダだけ表示する。宛先はホスト名でもIPアドレスでも指定できる。`netdump`はC6とやり取りする802.3フレームのヘッダを表示する。`hs`はブラウザが使う中断可能なHTTPトランザクションを直接回して結果を数値で出し、`bt`は試験用サーバ（`tools/browser_fixture_server.py`）の全端点を巡回して期待どおりの結末になるか検査する |
 | 電源 | `shutdown` | 電源コントローラ経由で本体を切る（再開は物理電源キー） |
 
 `sdzero`と`usbzero`は指定LBAをゼロで上書きする破壊的なコマンドです。`sdwritetest`と
@@ -110,6 +111,15 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 クレート直下がハードウェアを触る層、`src/app/`がシェルコマンドを実行するための
 層です。リンカ配置と検査ツールは`memory.x`と`tools/`にあります。
 
+`browser/`だけは別クレート（ワークスペースメンバ）です。ブラウザのURL解析・
+HTML解析・文書モデル・折り返しがここにあり、ハードウェアに触らないので
+**ホストでビルドしてテストできます**。ファームウェア側は`src/browser.rs`が
+再エクスポートするだけです。
+
+```sh
+mise run test
+```
+
 ハードウェア構成、起動方式、FLASH XIP、メモリ配置、性能測定、ECO2固有の制約などの
 技術的な詳細は[DESIGN.md](DESIGN.md)を参照してください。
 
@@ -125,5 +135,8 @@ CardKBが接続されていなければ`CardKB: absent`となります。USBの�
 - 多段USBハブ（ハブ配下のハブ）
 - IPv6、TLS、サーバ機能（TCP/IPはIPv4のクライアントのみです）。名前解決は
   Aレコードだけで、キャッシュ・逆引き・mDNSはありません
+- `browser`のCSS・JavaScript・画像デコード・form送信・cookie。HTMLから文章と
+  リンクを取り出すところまでです。TLSが無いので`https://`は表示できず、
+  日本語フォントが無いので非ASCII文字は1文字1マスの四角で出ます
 - Wi-FiのSoftAPとBLE。5 GHz帯はESP32-C6が2.4 GHz専用のため使えません
 - ESP32-P4 revision v3以降での動作確認

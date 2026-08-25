@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html><head><title>Tab5 fixture index</title></head>
+<body>
+<h1>Tab5 browser fixtures</h1>
+<p>Every endpoint below is reachable from here with a relative link, which
+is itself part of what is being tested.</p>
+<h2>Documents that should render</h2>
+<ul>
+  <li><a href="simple.html">simple.html</a> - the shortest complete page</li>
+  <li><a href="long.html">long.html</a> - many paragraphs, for scrolling</li>
+  <li><a href="headings.html">headings.html</a> - h1 through h6</li>
+  <li><a href="list.html">list.html</a> - nested ul and ol</li>
+  <li><a href="pre.html">pre.html</a> - preformatted text</li>
+  <li><a href="entity.html">entity.html</a> - character references</li>
+  <li><a href="utf8.html">utf8.html</a> - non-ASCII text</li>
+  <li><a href="inline.html">inline.html</a> - strong, em, code</li>
+  <li><a href="image.html">image.html</a> - img alt handling</li>
+  <li><a href="rule.html">rule.html</a> - hr</li>
+  <li><a href="script.html">script.html</a> - script and style bodies</li>
+  <li><a href="empty.html">empty.html</a> - a document with no text</li>
+  <li><a href="links/">links/</a> - relative reference resolution</li>
+</ul>
+<h2>Malformed markup that should still render</h2>
+<ul>
+  <li><a href="broken/unclosed.html">broken/unclosed.html</a></li>
+  <li><a href="broken/deep-nest.html">broken/deep-nest.html</a></li>
+  <li><a href="broken/huge-attribute.html">broken/huge-attribute.html</a></li>
+  <li><a href="broken/bad-utf8.html">broken/bad-utf8.html</a></li>
+</ul>
+<h2>Transfers</h2>
+<ul>
+  <li><a href="slow">slow</a> - one byte at a time</li>
+  <li><a href="chunked">chunked</a> - chunk boundaries move every request</li>
+  <li><a href="chunked-trailer">chunked-trailer</a> - extensions and a trailer</li>
+  <li><a href="chunked-bad">chunked-bad</a> - a chunk size that is not hex</li>
+  <li><a href="gzip">gzip</a> - Content-Encoding this cannot decode</li>
+</ul>
+<h2>Redirects</h2>
+<ul>
+  <li><a href="redirect/301">redirect/301</a></li>
+  <li><a href="redirect/302">redirect/302</a></li>
+  <li><a href="redirect/307">redirect/307</a></li>
+  <li><a href="redirect/308">redirect/308</a></li>
+  <li><a href="redirect/relative">redirect/relative</a></li>
+  <li><a href="redirect/chain/5">redirect/chain/5</a> - inside the limit</li>
+  <li><a href="redirect/chain/6">redirect/chain/6</a> - past the limit</li>
+  <li><a href="redirect/loop">redirect/loop</a></li>
+  <li><a href="redirect/https">redirect/https</a></li>
+</ul>
+<h2>Failures</h2>
+<ul>
+  <li><a href="fail/truncate-body">fail/truncate-body</a></li>
+  <li><a href="fail/truncate-head">fail/truncate-head</a></li>
+  <li><a href="fail/big-header">fail/big-header</a></li>
+  <li><a href="fail/length-over">fail/length-over</a> - more body than promised</li>
+  <li><a href="fail/length-under">fail/length-under</a> - less body than promised</li>
+  <li><a href="fail/no-status">fail/no-status</a></li>
+  <li><a href="status/404">status/404</a></li>
+  <li><a href="status/500">status/500</a></li>
+</ul>
+<h2>Limits</h2>
+<ul>
+  <li><a href="limit/input">limit/input</a> - past MAX_DECODED_HTML_BYTES</li>
+  <li><a href="limit/input-nolength">limit/input-nolength</a> - the same without a length</li>
+  <li><a href="limit/items">limit/items</a> - past MAX_ITEMS</li>
+  <li><a href="limit/links">limit/links</a> - past MAX_LINKS</li>
+  <li><a href="limit/url">limit/url</a> - a link past MAX_URL_BYTES</li>
+  <li><a href="limit/longline">limit/longline</a> - one unbreakable line</li>
+</ul>
+<h2>Plain downloads</h2>
+<ul>
+  <li><a href="download/64k.bin">download/64k.bin</a></li>
+  <li><a href="download/512k.bin">download/512k.bin</a> - the httpget regression</li>
+</ul>
+<p><a href="manifest.txt">manifest.txt</a> lists all of this with the outcome
+each endpoint is supposed to produce, including the CRC-32 of the two
+downloads above.</p>
+</body></html>

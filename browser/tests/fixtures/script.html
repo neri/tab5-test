@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><title>script</title></head>
+<body>
+<h1>Raw text elements</h1>
+<style>
+  /* < and > and </ inside a style body */
+  body > p { content: "</style is not the end"; }
+</style>
+<p>Between the style and the script.</p>
+<script>
+  // < and > and </ inside a script body
+  if (a < b && c > d) { document.write("</scriptnot"); }
+  var s = "</script is only ended by the real tag";
+</script>
+<p>After the script. Neither block above may appear as text.</p>
+</body></html>

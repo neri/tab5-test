@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><title>links</title></head>
+<body>
+<h1>Relative references</h1>
+<ul>
+  <li><a href="target.html">target.html</a> - same directory</li>
+  <li><a href="./target.html">./target.html</a></li>
+  <li><a href="deep/target.html">deep/target.html</a> - one down</li>
+  <li><a href="deep/../target.html">deep/../target.html</a> - down and back</li>
+  <li><a href="../simple.html">../simple.html</a> - one up</li>
+  <li><a href="/simple.html">/simple.html</a> - root relative</li>
+  <li><a href="?query=only">?query=only</a> - query only</li>
+  <li><a href="#fragment">#fragment</a> - fragment only</li>
+  <li><a href="target.html?a=1&amp;b=2#part">target.html?a=1&amp;b=2#part</a></li>
+  <li><a href="http://example.invalid/absolute">absolute http</a></li>
+  <li><a href="https://example.invalid/secure">absolute https</a></li>
+  <li><a href="ftp://example.invalid/file">unsupported scheme</a></li>
+  <li><a href="">empty href</a></li>
+</ul>
+</body></html>

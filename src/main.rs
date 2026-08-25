@@ -12,6 +12,7 @@ use riscv_rt::entry;
 
 mod app;
 mod bmi270;
+mod browser;
 mod cardkb;
 mod console;
 mod delay;
@@ -107,6 +108,17 @@ static mut BOOT_BSS_MARKER: [u32; 3] = [0; 3];
 // Backed by PSRAM once `psram::init` succeeds; unused until then.
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// Bytes the global allocator currently has handed out.
+///
+/// A diagnostic reading, not a budget: a browser page counts the capacity
+/// it allocated itself, because this number moves for reasons that have
+/// nothing to do with it. What it is good for is the shape of a leak --
+/// run the same fetch a hundred times and see whether this comes back to
+/// where it started.
+pub(crate) fn heap_used() -> usize {
+    ALLOCATOR.lock().used()
+}
 
 const XIP_DROM_PRE_WORDS: [u32; 4] = [0x4452_4F4D, 0x5850_2101, 0xA55A_C33C, 0x1357_9BDF];
 const XIP_DROM_POST_WORDS: [u32; 4] = [0x504F_5354, 0x434F_4C44, 0x5AA5_3CC3, 0x2468_ACE0];

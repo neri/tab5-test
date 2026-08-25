@@ -1,0 +1,11 @@
+[package]
+name = "tab5-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# No dependencies, deliberately. URL parsing, HTML tokenizing and the
+# document model are pure byte-in/value-out code, and keeping them free of
+# the firmware's hardware crates is what lets `cargo test` build this crate
+# for the host while the firmware itself only ever builds for RISC-V.
+[dependencies]

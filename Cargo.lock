@@ -370,6 +370,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tab5-browser"
+version = "0.1.0"
+
+[[package]]
 name = "tab5-hello-world"
 version = "0.2.0"
 dependencies = [
@@ -379,6 +383,7 @@ dependencies = [
  "linked_list_allocator",
  "riscv-rt",
  "smoltcp",
+ "tab5-browser",
 ]
 
 [[package]]

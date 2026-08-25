@@ -52,7 +52,36 @@
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
+    - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
+      toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件と
+      戻る、アドレス欄の編集、通信を必要としない組み込みページ（`http://built-in/`）を
+      持つ。文書の取得そのものは持たない（[`BROWSER.md`](BROWSER.md)）
+    - `src/app/fetch.rs`: 1ページ分の取得の状態機械。名前解決→接続→応答headの判定
+      （redirect追跡・statusの判定・HTMLかどうか）→本文→文書。`step`は決まった量だけ
+      進めて戻るので、画面を持つ`browser.rs`と持たない`browsertest.rs`の両方が同じ
+      ものを回せる。DNS socketのslotとTCP socket handleを所有するので`close`が必須
+    - `src/app/browsertest.rs`: `hs`（1回の取得を数値で報告）と`bt`（fixture serverの
+      `/manifest.txt`を巡回して期待値と突き合わせ）の診断
+    - `src/app/pointer.rs`: `win`と`browser`が共有するマウスカーソル。下地の退避・
+      復元と移動量のスケーリング。描画順（cursorを外す→dirty領域を描く→cursorを
+      載せる→和集合をflush）はこのモジュールの説明に明記してある
     - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（内容を表示したまま移動）だけが動く
+- `src/browser.rs`: ハイパーテキストビューアの非UI部（URL・HTML・文書モデル・
+  折返し）の再export。実体は依存ゼロの別クレート`browser/`（パッケージ名
+  `tab5-browser`）にあり、ホストでビルドできるので`cargo test`で検査できる。
+  firmware内のパスは`crate::browser::url::Url`のようになり、呼び出し側は
+  クレート境界を意識しない
+- `browser/src/url.rs`: URL解析・検証・相対参照解決。表示するアドレスと実際に
+  接続するhost／portを同じ値から生成することがこのモジュールの存在理由
+- `browser/src/html.rs`: 増分HTML tokenizer。byte単位の状態機械で、入力の
+  chunk境界がtag名・文字参照・multi-byte文字・`</script`のどこに落ちても
+  結果が変わらない。生HTMLは保持しない
+- `browser/src/document.rs`: 文書モデル。DOMではなく、本文1本の`String`と
+  それへのbyte範囲を持つ`Run`／`Block`／`Link`のflat arena
+- `browser/src/layout.rs`: 折返しレイアウト。行・piece・当たり判定・リンク順序。
+  文書全体のbitmapは作らない
+- `browser/src/limits.rs`・`browser/src/error.rs`・`browser/src/memory.rs`:
+  上限の一覧、共通エラー、失敗を返す確保（`try_reserve`）
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、プッシュプル出力設定、low/release/level）とGPIO Matrixの入出力ルーティング（`configure_c6_sdio_pins`はSDMMCスロット1をGPIO8..13へ配線する）
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）

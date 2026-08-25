@@ -14,12 +14,16 @@ mod automount;
 mod axis_test;
 mod battery;
 mod blockdev;
+mod browser;
+mod fetch;
+mod browsertest;
 mod coord_test;
 mod files;
 mod lsusb;
 mod mbr;
 mod membench;
 mod paint;
+mod pointer;
 mod shell;
 mod touch_test;
 mod win;
@@ -247,6 +251,29 @@ pub fn run(psram: Psram) {
             shell::Outcome::Win => {
                 win::run(framebuffer, &mut input);
                 console.clear(framebuffer);
+            }
+            shell::Outcome::Browser(start) => {
+                // The viewer borrows the link and the stack for as long as
+                // it is up, and gives them back here. It polls them itself
+                // every frame, so the loop above is not servicing the C6
+                // while it runs -- which is why it has to.
+                browser::run(
+                    framebuffer,
+                    &mut input,
+                    wifi_session.as_mut(),
+                    net_stack.as_mut(),
+                    shell_state.base(),
+                    start,
+                );
+                console.clear(framebuffer);
+                // A disconnection while the viewer was up is otherwise
+                // invisible: the same check every network command makes.
+                shell::drop_dead_session(
+                    console,
+                    framebuffer,
+                    &mut wifi_session,
+                    &mut net_stack,
+                );
             }
             shell::Outcome::VisualQa => {
                 run_visual_qa(console, framebuffer, &mut input);

@@ -358,10 +358,23 @@ impl Transport {
         if length.next_multiple_of(sdio::BLOCK_BYTES) > STAGING_BYTES {
             // Reading less than the slave reported would desync the byte
             // counter for good, so the link cannot recover from here.
+            //
+            // Which is why the link is marked lost rather than simply not
+            // read. The length register does not shrink until the host
+            // reads, and the host cannot -- so leaving `link_lost` clear
+            // meant every later poll came back here and logged again,
+            // forever, with every layer above still believing it had a
+            // working link. Saying it once and going dead is worse for the
+            // next second and far better after that: `Rpc::is_alive` turns
+            // false, `Stack::poll` fails, whatever was in flight reports
+            // `LinkLost`, the shell drops the session, and `wificonnect`
+            // starts a fresh one.
             uart::log_hex(
                 b"HOSTED: slave has more data than the staging buffer holds, len=",
                 length as u32,
             );
+            uart::log(b"HOSTED: the byte counter cannot be resynchronized; link lost\r\n");
+            self.link_lost = true;
             return false;
         }
 

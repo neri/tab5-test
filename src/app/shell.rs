@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::automount::AutoMount;
-use super::{blockdev, files, lsusb, mbr, membench};
+use super::{blockdev, browsertest, files, lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
@@ -21,9 +21,10 @@ use crate::fs;
 use crate::fs::path::{self, Path};
 use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, Vfs};
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
+use crate::browser::url::Url;
 use crate::{
-    delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc, startup,
-    tick, uart, usb, wifi,
+    browser, delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc,
+    startup, tick, uart, usb, wifi,
 };
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -759,6 +760,68 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "browser",
+        usage: "browser [<url|path>]",
+        lines: &[
+            "open the hypertext viewer. with no argument it starts on its",
+            "built-in home page, which needs no network; with one it fetches",
+            "that address, completing a path against 'hbase'. Tab selects a",
+            "link and the status line shows where it goes, Enter follows it",
+            "or -- with nothing selected -- opens the address field,",
+            "Backspace goes back, the arrow keys and Page Up/Down scroll,",
+            "and Escape stops a load, closes the address field, or leaves.",
+            "touch and a USB mouse both select links. http only: an https",
+            "address is reported and never downgraded",
+        ],
+    },
+    HelpEntry {
+        name: "bt",
+        usage: "bt [rounds]   (also: browsertest)",
+        lines: &[
+            "read /manifest.txt from the address hbase names, then fetch",
+            "every endpoint in it through the same code the browser screen",
+            "uses and check each one against what the manifest says it",
+            "should do. prints one line per endpoint on the uart -- outcome,",
+            "text crc32, blocks, links, bytes, redirect hops, peak owned",
+            "memory, elapsed -- and only the failures plus a summary on the",
+            "console. 'rounds' repeats the whole walk, which is how the",
+            "socket and heap leak checks are run",
+        ],
+    },
+    HelpEntry {
+        name: "hbase",
+        usage: "hbase [<url>|off]",
+        lines: &[
+            "remember an address for httpstream and browser to complete",
+            "partial ones against, so a fixture can be reached as",
+            "'hs /simple.html' rather than by typing the whole thing. with",
+            "no argument it shows the current one; 'off' forgets it. the",
+            "completion is the same relative-reference resolution a link on",
+            "a page gets, so '/x', 'x' and '?q=1' all mean what they would",
+            "in an href",
+        ],
+    },
+    HelpEntry {
+        name: "hs",
+        usage: "hs <url|path> [r <n>|p [n]|c <n>]   (also: httpstream)",
+        lines: &[
+            "fetch a url through the interruptible transaction the browser",
+            "uses, and print what it came to: status, how the body was",
+            "framed, decoded body bytes, a crc32 of them, elapsed time and",
+            "the number of polls it took. the url is parsed by the browser's",
+            "own parser, so the host connected to, the Host: header and the",
+            "request target all come from one value. a path completes",
+            "against 'hbase'.",
+            "  p [n]  also build the document -- title, blocks, runs, links,",
+            "         text bytes and what it all costs -- without drawing",
+            "  r <n>  fetch n times",
+            "  c <n>  start and abandon n times",
+            "each reports whether the socket set and the heap came back to",
+            "where they started. http only -- an https url is reported, not",
+            "fetched",
+        ],
+    },
+    HelpEntry {
         name: "reboot",
         usage: "reboot",
         lines: &["restart the board"],
@@ -794,6 +857,15 @@ pub struct State {
     /// Sized to `MAX_OPEN_FILES` because the VFS will not give out more than
     /// that anyway, so a longer array here could only ever hold `None`.
     held: [Option<FileHandle>; MAX_OPEN_FILES],
+    /// What a partial address is completed against, set by `hbase`.
+    ///
+    /// Here rather than inside a command because it is the same kind of
+    /// convenience the current directory is: typing
+    /// `http://192.168.0.159:8080/` before every fixture on a 4x11 thumb
+    /// keyboard is the sort of thing that stops a check being run at all.
+    /// `hs /simple.html` and `cd /tmp` are the same idea applied to
+    /// different namespaces.
+    base: Option<Url>,
 }
 
 impl Default for State {
@@ -803,18 +875,28 @@ impl Default for State {
 }
 
 impl State {
+    /// What `hbase` was last set to, for the browser's address field.
+    pub(super) fn base(&self) -> Option<Url> {
+        self.base.clone()
+    }
+
     pub fn new() -> Self {
         const NONE_HANDLE: Option<FileHandle> = None;
         Self {
             cwd: path::root(),
             held: [NONE_HANDLE; MAX_OPEN_FILES],
+            base: None,
         }
     }
 }
 
 /// What the foreground application loop should do once a command has
 /// been dispatched.
-#[derive(Clone, Copy, Eq, PartialEq)]
+///
+/// Not `Copy`: `Browser` carries the address it was given, and a parsed
+/// `Url` owns its strings. Moving the outcome once, into the `match` in
+/// `app::run`, is all anything does with it.
+#[derive(Clone, Eq, PartialEq)]
 pub enum Outcome {
     /// Keep running the console; write a fresh prompt.
     Continue,
@@ -834,6 +916,9 @@ pub enum Outcome {
     Battery,
     /// Hand the display over to the Windows 95 desktop mock-up.
     Win,
+    /// Hand the display over to the hypertext viewer, on the address
+    /// given or on its built-in home page.
+    Browser(Option<Url>),
     /// Run all interactive full-screen visual checks in one sequence.
     VisualQa,
 }
@@ -1156,6 +1241,15 @@ pub fn execute(
             );
             drop_dead_session(console, framebuffer, wifi_session, net_stack);
         }
+        b"hbase" => cmd_hbase(console, framebuffer, argument, state),
+        b"browsertest" | b"bt" => {
+            cmd_browsertest(console, framebuffer, argument, state, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
+        b"httpstream" | b"hs" => {
+            cmd_httpstream(console, framebuffer, argument, state, wifi_session, net_stack);
+            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+        }
         b"httpget" => {
             cmd_httpget(
                 console,
@@ -1176,6 +1270,21 @@ pub fn execute(
         b"axistest" => return Outcome::AxisTest,
         b"battery" | b"batinfo" => return Outcome::Battery,
         b"win" => return Outcome::Win,
+        b"browser" => {
+            let argument = trim(argument);
+            // Not refused without a network: the built-in pages are in
+            // flash and are exactly what somebody wants to look at when the
+            // link is down. What is missing is said here, in the shell,
+            // where the commands that fix it are.
+            browser_readiness(console, framebuffer, net_stack);
+            if argument.is_empty() {
+                return Outcome::Browser(None);
+            }
+            match resolve_address(console, framebuffer, state, argument) {
+                Some(url) => return Outcome::Browser(Some(url)),
+                None => return Outcome::Continue,
+            }
+        }
         b"reboot" | b"reset" => {
             console.write_output_line(framebuffer, "rebooting...");
             return Outcome::Reboot;
@@ -3776,7 +3885,7 @@ fn cmd_wifimac(console: &mut Console, framebuffer: &mut Framebuffer) {
 
 /// Forgets a session whose link died, so the next command starts over
 /// instead of talking to a bus that no longer answers.
-fn drop_dead_session(
+pub(super) fn drop_dead_session(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     session: &mut Option<wifi::Rpc>,
@@ -4527,7 +4636,7 @@ fn write_dns_error(
 /// one worth being able to ping from.
 ///
 /// Reports its own failure, so a caller only has to stop.
-fn resolve_target(
+pub(super) fn resolve_target(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     rpc: &mut wifi::Rpc,
@@ -4950,6 +5059,207 @@ fn cmd_httpget(
     });
 }
 
+/// `httpstream` -- the browser's HTTP path, driven from the console.
+///
+/// Only the session and the address are arranged here; everything the
+/// command actually does is in `browsertest`, which is where the fixture
+/// walk will join it.
+fn cmd_httpstream(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    state: &State,
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    // The address is resolved before the link is brought up: a mistyped
+    // one is a usage error, and starting the C6 to report it is a slow way
+    // to say so.
+    let (target, rest) = split_first_word(trim(argument));
+    let Some(url) = resolve_address(console, framebuffer, state, target) else {
+        return;
+    };
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+    browsertest::run(console, framebuffer, &url, rest, rpc, stack);
+}
+
+/// `bt` -- walk every endpoint the fixture server lists.
+fn cmd_browsertest(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    state: &State,
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let argument = trim(argument);
+    let rounds = if argument.is_empty() {
+        1
+    } else {
+        match parse_u32(argument) {
+            Some(rounds) if rounds > 0 && rounds <= 200 => rounds,
+            _ => {
+                console.write_output_line(framebuffer, "usage: bt [rounds]   (1..200)");
+                return;
+            }
+        }
+    };
+    // The manifest's address is the base every path in it resolves against,
+    // so one `hbase` drives the whole walk.
+    let Some(base) = state.base.as_ref() else {
+        console.write_output_line(
+            framebuffer,
+            "bt: set the fixture server first, e.g. hbase http://192.168.0.2:8080",
+        );
+        return;
+    };
+    let base = base.clone();
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+    browsertest::walk(console, framebuffer, &base, rounds, rpc, stack);
+}
+
+/// Says what the browser will not be able to do, before it opens.
+///
+/// The plan asks for the preparation steps to appear in the shell rather
+/// than on the viewer's screen, and this is why: `wificonnect` and
+/// `ipconfig dhcp` are shell commands, and a message about them belongs
+/// where they can be typed.
+fn browser_readiness(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    stack: &Option<net::Stack>,
+) {
+    let ready = match stack {
+        Some(stack) => stack.has_address(),
+        None => false,
+    };
+    if ready {
+        return;
+    }
+    console.write_output_line(
+        framebuffer,
+        "no address: fetching will fail until 'wificonnect <ssid> <key>' and",
+    );
+    console.write_output_line(
+        framebuffer,
+        "'ipconfig dhcp' have run. the built-in pages work without them",
+    );
+}
+
+/// `hbase` -- set, show or clear the address partial ones complete against.
+fn cmd_hbase(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    state: &mut State,
+) {
+    let argument = trim(argument);
+    if argument.is_empty() {
+        let mut line = Line::new();
+        match &state.base {
+            Some(base) => {
+                line.push_str("base: ");
+                match base.to_text() {
+                    Ok(text) => line.push_str(text.as_str()),
+                    Err(_) => line.push_str("(out of memory)"),
+                }
+            }
+            None => line.push_str("no base; give one to hbase, or type full addresses"),
+        }
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    }
+    if argument == b"off" {
+        state.base = None;
+        console.write_output_line(framebuffer, "base cleared");
+        return;
+    }
+    let Ok(text) = core::str::from_utf8(argument) else {
+        console.write_output_line(framebuffer, "the address has to be ASCII");
+        return;
+    };
+    match Url::parse(text) {
+        Ok(base) => {
+            let shown = base.to_text();
+            state.base = Some(base);
+            let mut line = Line::new();
+            line.push_str("base: ");
+            match &shown {
+                Ok(text) => line.push_str(text.as_str()),
+                Err(_) => line.push_str("(out of memory)"),
+            }
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("hbase: ");
+            line.push_str(browser::url::error_text(error));
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+}
+
+/// Turns what was typed into an address, completing it against `hbase`.
+///
+/// A full `http://...` is taken as written. Anything else -- `/simple.html`,
+/// `simple.html`, `?q=1` -- is a reference resolved against the base, by the
+/// same `Url::resolve` that resolves a link on a page. There is no separate
+/// "shorthand" syntax to get wrong: what the shell accepts here and what a
+/// page's `href` means are the same thing.
+fn resolve_address(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    state: &State,
+    target: &[u8],
+) -> Option<Url> {
+    if target.is_empty() {
+        console.write_output_line(framebuffer, "give an address, or a path if hbase is set");
+        return None;
+    }
+    let Ok(text) = core::str::from_utf8(target) else {
+        console.write_output_line(framebuffer, "the address has to be ASCII");
+        return None;
+    };
+    let outcome = if browser::url::classify(text) == browser::url::Reference::Absolute {
+        Url::parse(text)
+    } else {
+        let Some(base) = &state.base else {
+            console.write_output_line(
+                framebuffer,
+                "that is not a full address; set one with hbase first",
+            );
+            return None;
+        };
+        base.resolve(text)
+    };
+    match outcome {
+        Ok(url) if !url.scheme().is_fetchable() => {
+            console.write_output_line(framebuffer, "HTTPS is not supported");
+            None
+        }
+        Ok(url) => Some(url),
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("bad address: ");
+            line.push_str(browser::url::error_text(error));
+            console.write_output_line(framebuffer, line.as_str());
+            None
+        }
+    }
+}
+
 /// Prints what an HTTP exchange came to. `saved` is the number of body bytes
 /// that reached a file, or `None` when the body was discarded.
 fn report_http(
@@ -4972,24 +5282,16 @@ fn report_http(
             console.write_output_line(framebuffer, line.as_str());
             write_response_head(console, framebuffer, &response.headers);
         }
-        Err(net::http::Error::NotConnected) => {
-            console.write_output_line(framebuffer, "the connection was refused or timed out")
-        }
-        Err(net::http::Error::TimedOut) => {
-            console.write_output_line(framebuffer, "the server stopped responding")
-        }
-        Err(net::http::Error::LinkLost) => {
-            console.write_output_line(framebuffer, "the C6 link was lost during the transfer")
-        }
-        Err(net::http::Error::HeadersTooLong) => console.write_output_line(
-            framebuffer,
-            "no blank line ended the headers; this is not a response this can read",
-        ),
-        Err(net::http::Error::SinkRefused) => {
-            console.write_output_line(framebuffer, "httpget: the transfer was abandoned")
-        }
-        Err(net::http::Error::Local) => {
-            console.write_output_line(framebuffer, "httpget: a local socket operation failed")
+        // One arm for every failure, taken from `net::http` rather than
+        // restated here: the errors grew when `Transaction` arrived, and a
+        // match in the shell is a second place for that list to fall
+        // behind. `httpget` shows the same sentence the browser's status
+        // line does.
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str("httpget: ");
+            line.push_str(net::http::error_text(error));
+            console.write_output_line(framebuffer, line.as_str());
         }
     }
 }
