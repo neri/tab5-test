@@ -12,11 +12,12 @@ description = "Update the dependencies"
 run = "cargo update"
 
 [tasks.test]
-description = "Run the browser crate's host-side tests"
+description = "Run the host-side tests of the browser and font crates"
 # Explicitly host-targeted: `.cargo/config.toml` points the default target at
 # `riscv32imafc-unknown-none-elf`, where there is no test harness to run. Only
-# `tab5-browser` builds for the host; the firmware package does not.
-run = "cargo test -p tab5-browser --target x86_64-unknown-linux-gnu"
+# `tab5-browser` and `tab5-font` build for the host; the firmware package does
+# not.
+run = "cargo test -p tab5-browser -p tab5-font --target x86_64-unknown-linux-gnu"
 
 # [tasks.doc]
 # description = "Generate documentation"

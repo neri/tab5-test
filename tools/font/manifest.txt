@@ -1,0 +1,65 @@
+# 16 pixel bitmap font subset manifest.
+#
+# `generate.py` reads this file and emits `font/data/tab5font16.bin`. Every
+# line is one of:
+#
+#   include <path>   another manifest fragment, relative to this file
+#   XXXX             one Unicode scalar, hexadecimal
+#   XXXX-YYYY        an inclusive range of Unicode scalars
+#
+# `#` starts a comment. The order of the lines does not matter; the generator
+# sorts and deduplicates. Code points the source font does not cover are
+# reported and dropped, and the count of dropped code points is printed, so
+# characters are never silently lost -- see `README.md`.
+#
+# The size ceiling is 512 KiB (`docs/FONT_MIGRATION_PLAN.md`). Generation fails
+# above it rather than dropping characters to fit.
+
+# ---------------------------------------------------------------- Japanese
+# JIS X 0213 plane 1 is levels 1 to 3: kana, the JIS kanji, and the symbols
+# and punctuation that come with them. This is the bulk of the subset.
+include repertoire/jisx0213-plane1.txt
+
+# The kana and CJK punctuation blocks in full, so that characters JIS X 0213
+# happens not to encode (rare small kana, the vertical-form brackets) still
+# render rather than falling back to a placeholder.
+3000-303F  # CJK Symbols and Punctuation
+3040-309F  # Hiragana
+30A0-30FF  # Katakana
+31F0-31FF  # Katakana Phonetic Extensions
+
+# Fullwidth and halfwidth forms. FF61-FF9F is also the console's halfwidth
+# katakana repertoire, so it is not optional -- see `font/src/console.rs`.
+FF01-FF60  # Fullwidth ASCII forms and fullwidth punctuation
+FF61-FF9F  # Halfwidth katakana
+FFE0-FFE6  # Fullwidth currency and sign forms
+
+# --------------------------------------------------------------- Latin etc.
+# ASCII and Latin-1 in full: these are the console's fixed repertoire, and
+# 00A0-00FF must be present and halfwidth for the console's cell IDs to work.
+0020-007E  # ASCII printable
+00A0-00FF  # Latin-1 Supplement
+0100-017F  # Latin Extended-A
+0180-024F  # Latin Extended-B
+
+# ------------------------------------------------------- Symbols used in UI
+2000-206F  # General Punctuation (quotes, dashes, ellipsis)
+20A0-20BF  # Currency Symbols
+2190-21FF  # Arrows
+2460-24FF  # Enclosed Alphanumerics
+2500-257F  # Box Drawing
+2580-259F  # Block Elements
+25A0-25FF  # Geometric Shapes
+
+# ------------------------------------------------------- Explicit additions
+# Name and place-name variants that JIS X 0213 plane 1 does not encode. The
+# renderer has no variation-selector support, so these are carried as their
+# own code points.
+9AD9       # U+9AD9 HASHIGO-DAKA, as in the surname Takahashi
+FA00-FA6D  # CJK Compatibility Ideographs: the Japanese variant forms,
+           # including U+FA11 TATSUSAKI as in the surname Miyazaki
+
+# The replacement character. `font/src/lib.rs` falls back to a drawn box when
+# a code point is missing, but text that already contains U+FFFD has to show
+# it as itself.
+FFFD       # REPLACEMENT CHARACTER

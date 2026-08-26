@@ -16,6 +16,7 @@ use core::cmp::Ordering;
 
 use super::shell::Line;
 use crate::console::{COLUMNS, Console};
+use crate::font;
 use crate::framebuffer::Framebuffer;
 use crate::fs::path::{self, Path, PathError};
 use crate::fs::registry::{device_name, parse_device_name};
@@ -291,7 +292,7 @@ fn write_columns(console: &mut Console, framebuffer: &mut Framebuffer, entries: 
             // Padded up to where the column starts rather than after each
             // name, so the line carries no trailing spaces to be painted
             // and mirrored to the log.
-            for _ in line.chars().count()..start {
+            for _ in font::console::cell_count(&line)..start {
                 line.push(' ');
             }
             line.push_str(&entry.name);
@@ -306,7 +307,7 @@ fn column_width(entries: &[Entry], column: usize, rows: usize) -> usize {
     entries[column * rows..]
         .iter()
         .take(rows)
-        .map(|entry| entry.name.chars().count())
+        .map(|entry| font::console::cell_count(&entry.name))
         .max()
         .unwrap_or(0)
 }

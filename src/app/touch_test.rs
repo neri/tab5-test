@@ -29,12 +29,12 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let touch_controller = input.touch_controller_name();
     let touch_max_points = input.touch_max_points();
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 8, "MULTITOUCH TEST", 3, CYAN, None);
+    framebuffer.draw_text(16, 8, "MULTITOUCH TEST", 2, CYAN, None);
     framebuffer.draw_text(
         16,
         48,
         "Place two or more fingers on the screen.",
-        2,
+        1,
         WHITE,
         None,
     );
@@ -42,23 +42,23 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         16,
         72,
         "A simultaneous count of 2 or more is a PASS.",
-        2,
+        1,
         WHITE,
         None,
     );
-    framebuffer.draw_text(16, 104, "Press any key to exit.", 2, YELLOW, None);
+    framebuffer.draw_text(16, 104, "Press any key to exit.", 1, YELLOW, None);
     if let Some(controller) = touch_controller {
-        framebuffer.draw_text(16, 128, controller, 2, CYAN, None);
+        framebuffer.draw_text(16, 128, controller, 1, CYAN, None);
         framebuffer.draw_text(
             16,
             152,
             configured_text(touch_max_points.unwrap_or(0)),
-            2,
+            1,
             CYAN,
             None,
         );
     } else {
-        framebuffer.draw_text(16, 128, "NO TOUCH CONTROLLER FOUND", 2, RED, None);
+        framebuffer.draw_text(16, 128, "NO TOUCH CONTROLLER FOUND", 1, RED, None);
     }
     draw_status(framebuffer, 0, 0, false);
     if !framebuffer.flush() {
@@ -134,12 +134,12 @@ fn configured_text(max_touches: usize) -> &'static str {
 
 fn draw_status(framebuffer: &mut Framebuffer, current: usize, peak: usize, passed: bool) {
     framebuffer.fill_rect(0, 176, WIDTH, HEIGHT - 176, BLACK);
-    framebuffer.draw_text(16, 192, COUNT_TEXT[current], 4, WHITE, None);
-    framebuffer.draw_text(16, 240, PEAK_TEXT[peak], 3, WHITE, None);
+    framebuffer.draw_text(16, 192, COUNT_TEXT[current], 2, WHITE, None);
+    framebuffer.draw_text(16, 240, PEAK_TEXT[peak], 2, WHITE, None);
     let (message, color) = if passed {
         ("PASS: MULTITOUCH DETECTED", GREEN)
     } else {
         ("WAITING FOR 2+ SIMULTANEOUS TOUCHES", YELLOW)
     };
-    framebuffer.draw_text(16, 288, message, 3, color, None);
+    framebuffer.draw_text(16, 288, message, 2, color, None);
 }

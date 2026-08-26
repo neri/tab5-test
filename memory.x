@@ -27,10 +27,18 @@ MEMORY
 {
     /* The P4 IDF bootloader expects exactly two XIP segments.  Fill DROM up to
      * eight bytes before the next 64 KiB page boundary: the following segment
-     * header then puts the IROM payload at image offset +0x30000, matching the
-     * virtual address below without an extra espflash padding segment. */
-    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0002ffd8
-    ROM_TEXT : ORIGIN = 0x40030000, LENGTH = 0x003d0000
+     * header then puts the IROM payload at image offset +0x90000, matching the
+     * virtual address below without an extra espflash padding segment.
+     *
+     * DROM is sized around `tab5-font`, whose generated bitmap is by far the
+     * largest thing in it -- 349.5 KiB against roughly 135 KiB of ordinary
+     * rodata (`docs/FONT_MIGRATION_PLAN.md`).  0x90000 leaves about 91 KiB of
+     * padding at the end, more than the 64 KiB page of headroom the plan asks
+     * for, and the padding is what the next move eats into.  Growing DROM
+     * costs image size rather than RAM: the segment is written to flash in
+     * full, zero padding included, and is mapped rather than loaded. */
+    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0008ffd8
+    ROM_TEXT : ORIGIN = 0x40090000, LENGTH = 0x00370000
     RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
 }
 

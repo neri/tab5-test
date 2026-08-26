@@ -21,7 +21,6 @@
   フレームバッファ（`Psram::framebuffer`）、RAMディスク（`Psram::ram_disk`、
   固定8 MiB）、ヒープ（`Psram::heap`、残り全部）の3領域へ分けて提供する
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
-- `src/framebuffer/font.rs`: 5×7フォント
 - `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール。
   桁数（`COLUMNS`）だけ公開していて、`ls`の桁詰めがそれを使う
 - `src/app.rs`: コンソールのフレームループ。入力、コマンド実行、全画面モードへの
@@ -50,6 +49,7 @@
     - `src/app/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
     - `src/app/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
+    - `src/app/font_test.rs`: `fonttest`コマンドで起動する16pxフォント診断画面。半角と全角、combining mark、未収録文字の枠、背景ありの再描画、太字、2倍、日本語の本文を1画面に並べる
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
     - `src/app/wifi_manager.rs`: ESP-Hostedの`Rpc`、IPの`Stack`、接続元、IP設定方針、接続状態、永続ON/OFFをまとめる単一所有者。毎フレームC6とsmoltcpをpollし、起動時／メニュー接続のassociation、切断後の再接続、C6リンク再構築、DHCPを状態遷移で進める。資格情報は現在の管理対象接続が有効な間だけ固定長RAMへ保持し、association成功後のC6 NVS保存、OFF時の切断・driver停止・power down、ON、forget、直近16遷移の診断も担当する
@@ -69,6 +69,16 @@
       復元と移動量のスケーリング。描画順（cursorを外す→dirty領域を描く→cursorを
       載せる→和集合をflush）はこのモジュールの説明に明記してある
     - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（内容を表示したまま移動）だけが動く
+- `src/font.rs`: 16 pixel bitmapフォントの再export。実体は依存ゼロの別クレート
+  `font/`（パッケージ名`tab5-font`）にあり、`browser/`と同じくホストでビルド
+  できるので、収録範囲と文字幅を`cargo test`で検査できる。firmware内のパスは
+  `crate::font::advance`のようになる
+- `font/src/lib.rs`: code pointからglyphを引くlookup、`advance`、combining判定、
+  未収録時のreplacement。データ`font/data/tab5font16.bin`は
+  `tools/font/generate.py`が生成してcommitしたもので、通常のbuildはBDFを解析せず
+  `include_bytes!`でDROMへ置くだけ
+- `font/src/console.rs`: コンソール専用の半角セル変換。すべてのUnicode scalarを
+  必ず1セル分の1 byte IDへ写し、表示できない文字も空白ではなくplaceholderにする
 - `src/browser.rs`: ハイパーテキストビューアの非UI部（URL・HTML・文書モデル・
   折返し）の再export。実体は依存ゼロの別クレート`browser/`（パッケージ名
   `tab5-browser`）にあり、ホストでビルドできるので`cargo test`で検査できる。

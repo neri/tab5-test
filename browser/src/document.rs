@@ -50,8 +50,9 @@ use crate::url::Url;
 /// cost of a handful of extra copies on the largest pages.
 const TEXT_GROWTH_CAP: usize = 128 * 1024;
 
-/// Style bits carried by a run. Deliberately few: the display has one
-/// 5x7 font, so these become colour and nothing else.
+/// Style bits carried by a run. Deliberately few: the font has one weight
+/// and one shape, so these become colour, or a second strike, and nothing
+/// else.
 pub const STYLE_BOLD: u8 = 1 << 0;
 pub const STYLE_ITALIC: u8 = 1 << 1;
 pub const STYLE_CODE: u8 = 1 << 2;
@@ -393,9 +394,9 @@ impl Builder {
             // blank line the source does not have.
             '\r' => Ok(()),
             // A tab is one space. Expanding to a tab stop would need a
-            // column count that the wrapping has not decided yet, and a
-            // `pre` block that relies on tab stops is already at the mercy
-            // of a 5x7 font.
+            // column count, and there is no column: characters are 8 pixels
+            // wide or 16, so a `pre` block that relies on tab stops has
+            // nothing to align to here.
             '\t' => self.push_character(' '),
             _ => self.push_character(character),
         }

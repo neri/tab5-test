@@ -1,2 +1,3 @@
 target/
 esp-idf-reference
+__pycache__/

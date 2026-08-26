@@ -203,12 +203,12 @@ fn bounce(position: &mut i32, velocity: &mut i32, low: i32, high: i32) {
 
 fn draw_scene(framebuffer: &mut Framebuffer) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 12, "AXIS SENSOR TEST", 3, CYAN, None);
+    framebuffer.draw_text(16, 8, "AXIS SENSOR TEST", 2, CYAN, None);
     framebuffer.draw_text(
         16,
         40,
         "TILT THE TAB5 - THE BALL ROLLS DOWNHILL",
-        2,
+        1,
         WHITE,
         None,
     );
@@ -229,14 +229,14 @@ fn draw_hud(framebuffer: &mut Framebuffer, sample: MotionSample) {
         acceleration.push_byte(axis);
         acceleration.push_str(": ");
         acceleration.push_g(sample.acceleration[row]);
-        framebuffer.draw_text(16, 64 + row * 20, acceleration.as_str(), 2, CYAN, None);
+        framebuffer.draw_text(16, 64 + row * 20, acceleration.as_str(), 1, CYAN, None);
 
         let mut gyroscope = AxisLine::new();
         gyroscope.push_str("GYR ");
         gyroscope.push_byte(axis);
         gyroscope.push_str(": ");
         gyroscope.push_dps(sample.gyroscope[row]);
-        framebuffer.draw_text(300, 64 + row * 20, gyroscope.as_str(), 2, CYAN, None);
+        framebuffer.draw_text(300, 64 + row * 20, gyroscope.as_str(), 1, CYAN, None);
     }
 
     let level = is_level(sample.acceleration[0], sample.acceleration[1]);
@@ -244,7 +244,7 @@ fn draw_hud(framebuffer: &mut Framebuffer, sample: MotionSample) {
         600,
         84,
         if level { "HORIZONTAL" } else { "TILTED" },
-        3,
+        2,
         if level { GREEN } else { YELLOW },
         None,
     );
@@ -297,7 +297,7 @@ fn draw_level(framebuffer: &mut Framebuffer, raw_x: i16, raw_y: i16, level: bool
     const CENTER_Y: i32 = TOP as i32 + HEIGHT as i32 / 2 + 8;
 
     framebuffer.stroke_rect(LEFT, TOP, WIDTH, HEIGHT, CYAN);
-    framebuffer.draw_text(LEFT + 8, TOP + 6, "LEVEL", 2, WHITE, None);
+    framebuffer.draw_text(LEFT + 8, TOP + 6, "LEVEL", 1, WHITE, None);
     framebuffer.draw_line(
         CENTER_X as usize - 48,
         CENTER_Y as usize,
@@ -438,9 +438,9 @@ fn ball_dirty_height(old_y: i32, new_y: i32) -> usize {
 
 fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 16, "AXIS SENSOR TEST", 3, CYAN, None);
-    framebuffer.draw_text(16, 72, error.message(), 3, RED, None);
-    framebuffer.draw_text(16, 120, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
+    framebuffer.draw_text(16, 16, "AXIS SENSOR TEST", 2, CYAN, None);
+    framebuffer.draw_text(16, 72, error.message(), 2, RED, None);
+    framebuffer.draw_text(16, 120, "PRESS ANY KEY TO EXIT", 1, YELLOW, None);
     if !framebuffer.flush() {
         uart::log(b"Axis test: unavailable-screen flush failed\r\n");
         return;

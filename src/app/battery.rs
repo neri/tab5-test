@@ -73,18 +73,22 @@ fn draw_all(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, addres
 
 fn draw_scene(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, address: u8) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 4, CYAN, None);
+    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 2, CYAN, None);
     let mut device_text = Text::new();
     device_text.push_str("TAB5 / INA226 / I2C 0X");
     device_text.push_hex_byte(address);
     device_text.push_str(" / 5 MOHM");
-    framebuffer.draw_text(34, 70, device_text.as_str(), 2, WHITE, None);
+    framebuffer.draw_text(34, 70, device_text.as_str(), 1, WHITE, None);
     framebuffer.draw_line(32, 100, WIDTH - 32, 100, CYAN);
 
     match sample {
         Some(sample) => draw_reading(framebuffer, sample),
         None => {
-            framebuffer.draw_text(380, 300, "WAITING FOR INA226 DATA", 3, YELLOW, None);
+            let waiting = "WAITING FOR INA226 DATA";
+            // Centred from the text's own width: at scale 2 the drawn width
+            // is twice the measured one, so half of it is that measurement.
+            let x = WIDTH / 2 - crate::font::text_width(waiting);
+            framebuffer.draw_text(x, 300, waiting, 2, YELLOW, None);
             draw_battery(framebuffer, 0, RED);
         }
     }
@@ -92,7 +96,7 @@ fn draw_scene(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, addr
         32,
         674,
         "LIVE UPDATE: 1 S       PRESS ANY KEY TO EXIT",
-        2,
+        1,
         WHITE,
         None,
     );
@@ -107,8 +111,8 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     text.push_str("VOLTAGE ESTIMATE  ");
     text.push_u32(percent);
     text.push_str("%");
-    framebuffer.draw_text(68, 530, text.as_str(), 2, level_color, None);
-    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 2, WHITE, None);
+    framebuffer.draw_text(68, 530, text.as_str(), 1, level_color, None);
+    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, WHITE, None);
 
     draw_value(
         framebuffer,
@@ -175,7 +179,18 @@ fn draw_battery(framebuffer: &mut Framebuffer, percent: u32, color: u16) {
     let mut text = Text::new();
     text.push_u32(percent);
     text.push_str("%");
-    framebuffer.draw_text(LEFT + 92, TOP + 136, text.as_str(), 5, WHITE, Some(BLACK));
+    // Centred in the battery body rather than offset by a fixed amount: the
+    // reading is one to four characters wide, and the old offset was only
+    // right for the widest of them.
+    let width = crate::font::text_width(text.as_str()) * 2;
+    framebuffer.draw_text(
+        LEFT + (BODY_WIDTH - width) / 2,
+        TOP + (BODY_HEIGHT - crate::font::HEIGHT * 2) / 2,
+        text.as_str(),
+        2,
+        WHITE,
+        Some(BLACK),
+    );
 }
 
 fn draw_value(
@@ -186,8 +201,8 @@ fn draw_value(
     value: &str,
     value_color: u16,
 ) {
-    framebuffer.draw_text(x, y, label, 2, WHITE, None);
-    framebuffer.draw_text(x, y + 34, value, 5, value_color, None);
+    framebuffer.draw_text(x, y, label, 1, WHITE, None);
+    framebuffer.draw_text(x, y + 34, value, 2, value_color, None);
     framebuffer.draw_line(x, y + 102, WIDTH - 54, y + 102, 0x39E7);
 }
 
@@ -212,9 +227,9 @@ fn level_color(percent: u32) -> u16 {
 
 fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 4, CYAN, None);
-    framebuffer.draw_text(32, 160, error.message(), 3, RED, None);
-    framebuffer.draw_text(32, 220, "PRESS ANY KEY TO EXIT", 2, YELLOW, None);
+    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 2, CYAN, None);
+    framebuffer.draw_text(32, 160, error.message(), 2, RED, None);
+    framebuffer.draw_text(32, 220, "PRESS ANY KEY TO EXIT", 1, YELLOW, None);
     if !framebuffer.flush() {
         uart::log(b"Battery: unavailable-screen flush failed\r\n");
         return;

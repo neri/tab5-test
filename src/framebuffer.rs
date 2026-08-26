@@ -1,10 +1,9 @@
 //! CW-rotated RGB565 drawing primitives backed by external PSRAM.
 
 use crate::dma2d;
+use crate::font;
 use crate::ppa;
 use crate::psram::{HEIGHT as NATIVE_HEIGHT, Psram, WIDTH as NATIVE_WIDTH};
-
-mod font;
 
 /// Landscape logical dimensions. DSI and PSRAM retain the native 720x1280
 /// scan layout.
@@ -22,18 +21,21 @@ const WRITEBACK_CHUNK_BYTES: usize = 64 * 1024;
 /// microseconds per fill on this hardware:
 ///
 /// ```text
-///   12x16 (one console cell)      19 ppa     36 cpu
+///   12x16                         19 ppa     36 cpu
 ///   24x32                         22 ppa     44 cpu
 ///   48x64                         52 ppa    273 cpu
 ///   96x128                       334 ppa   1351 cpu
 ///   1280x720 (full screen)     13267 ppa  93548 cpu
 /// ```
 ///
-/// PPA is faster even for one cell in this run, but the absolute saving there
-/// is only 17 us and every DMA write competes with scanout. 24x32 is therefore
-/// kept as the conservative threshold: the console's per-cell repaints -- by
-/// far the most frequent fills, and the ones on the cursor-blink path -- stay
-/// on the CPU, while larger repaints take the increasingly decisive DMA gain.
+/// The smallest rectangle measured was the console cell of the time, 12x16;
+/// a cell is 8x16 now, which is smaller still and on the same side of the
+/// threshold. PPA is faster even at that size in this run, but the absolute
+/// saving there is only 17 us and every DMA write competes with scanout.
+/// 24x32 is therefore kept as the conservative threshold: the console's
+/// per-cell repaints -- by far the most frequent fills, and the ones on the
+/// cursor-blink path -- stay on the CPU, while larger repaints take the
+/// increasingly decisive DMA gain.
 ///
 /// Area is the test rather than width or height, which is an approximation: a
 /// wide, short rectangle covers a large native span for few pixels, because
@@ -50,13 +52,6 @@ pub const BLUE: u16 = 0x001F;
 pub const CYAN: u16 = 0x07FF;
 pub const MAGENTA: u16 = 0xF81F;
 pub const YELLOW: u16 = 0xFFE0;
-
-/// Maps a `char` onto the 5x7 ASCII font's byte-indexed glyph table. Only
-/// ASCII is defined there today, so anything outside that range falls back
-/// to a blank space; real non-ASCII glyph rendering is future work.
-fn ascii_or_space(ch: char) -> u8 {
-    if ch.is_ascii() { ch as u8 } else { b' ' }
-}
 
 pub struct Framebuffer {
     memory: Psram,
@@ -351,76 +346,30 @@ impl Framebuffer {
         true
     }
 
-    /// Draws scaled 5x7 ASCII, upper and lower case each with their own
-    /// glyphs. Non-ASCII is drawn as a space; ASCII the table has no glyph
-    /// for (control codes, a few punctuation marks) is drawn as '?'.
-    pub fn draw_text(
-        &mut self,
-        x: usize,
-        y: usize,
-        text: &str,
-        scale: usize,
-        foreground: u16,
-        background: Option<u16>,
-    ) {
-        let scale = scale.max(1);
-        let origin_x = x;
-        let (mut cursor_x, mut cursor_y) = (x, y);
-        for ch in text.chars() {
-            if ch == '\n' {
-                cursor_x = origin_x;
-                cursor_y = cursor_y.saturating_add(8 * scale);
-                continue;
-            }
-            let glyph = font::glyph(ascii_or_space(ch));
-            for column in 0..6 {
-                let bits = if column < 5 { glyph[column] } else { 0 };
-                for row in 0..7 {
-                    let color = if bits & (1 << row) != 0 {
-                        Some(foreground)
-                    } else {
-                        background
-                    };
-                    if let Some(color) = color {
-                        // Text consists of many tiny cells. Write those pixels
-                        // directly rather than repeatedly entering fill_rect;
-                        // this keeps PSRAM accesses predictable on ECO2.
-                        for offset_x in 0..scale {
-                            for offset_y in 0..scale {
-                                self.draw_pixel(
-                                    cursor_x + column * scale + offset_x,
-                                    cursor_y + row * scale + offset_y,
-                                    color,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            cursor_x = cursor_x.saturating_add(6 * scale);
-        }
-    }
-
-    /// Draws one scaled 5x7 ASCII glyph without the general text iterator.
+    /// Draws one 16 pixel glyph, scaled by a whole number.
     ///
-    /// `background` covers the glyph's whole 6x8 advance box -- one column of
-    /// letter spacing and one row of line spacing wider than the glyph itself,
-    /// i.e. exactly one console cell. Passing it lets the console repaint a
-    /// cell in this one call: without it a caller has to `fill_rect` the cell
-    /// first, because only foreground pixels are written and whatever stood
-    /// there (a glyph, or the cursor block's white) would show through.
-    /// `None` writes foreground pixels only, for callers drawing onto a
-    /// background they have already established.
+    /// This does no lookup and knows nothing about text: it paints the pixels
+    /// of the glyph it is handed, in the box that glyph's own width describes
+    /// -- 8 columns wide for half-width, 16 for full-width, and 16 for a
+    /// combining mark, which has no advance but still covers the character it
+    /// is painted over.
     ///
-    /// The two cases share nothing but this entry: opaque writes every pixel
-    /// of a fixed box, transparent writes a sparse subset of it, and the work
-    /// worth avoiding is the opposite in each. They are separate loops below.
+    /// `background` fills the rest of that box, which is what lets a caller
+    /// repaint a cell in one call rather than clearing it first. `None` writes
+    /// only the glyph's own pixels, onto whatever is already there. Combining
+    /// marks have to use `None`: their box overlaps the character before them
+    /// on one side and the character after them on the other, so an opaque
+    /// paint would erase a neighbour.
+    ///
+    /// The two cases share nothing but this entry. Opaque writes every pixel
+    /// of a fixed box, so each column is one contiguous native run; sparse
+    /// writes a sparse subset and skips empty columns and rows outright.
     #[inline(never)]
-    pub fn draw_ascii_char(
+    pub fn draw_glyph(
         &mut self,
         x: usize,
         y: usize,
-        ch: char,
+        glyph: &font::Glyph,
         scale: usize,
         foreground: u16,
         background: Option<u16>,
@@ -429,26 +378,89 @@ impl Framebuffer {
             return;
         };
         let scale = scale.max(1);
-        let bits = font::glyph(ascii_or_space(ch));
         // Clip the box's pixel rows once. Increasing logical Y is increasing
         // native address, so this is also the length of each column's run.
-        let run = y.saturating_add(8 * scale).min(HEIGHT).saturating_sub(y);
+        let run = y
+            .saturating_add(font::HEIGHT * scale)
+            .min(HEIGHT)
+            .saturating_sub(y);
         if run == 0 {
             return;
         }
-        let glyph = Glyph {
+        let painter = WideGlyph {
             pointer,
             x,
             y,
             run,
-            bits: &bits,
+            columns: &glyph.columns,
+            width: glyph.width(),
             scale,
             foreground,
         };
         match background {
-            Some(background) => unsafe { glyph.paint_opaque(background) },
-            None => unsafe { glyph.paint_sparse() },
+            Some(background) => unsafe { painter.paint_opaque(background) },
+            None => unsafe { painter.paint_sparse() },
         }
+    }
+
+    /// Draws UTF-8 text and returns the width it occupied, in pixels.
+    ///
+    /// Every character advances by [`font::advance`], the same function the
+    /// browser's line breaking and hit testing measure with, so what is drawn
+    /// and what was measured cannot disagree. Characters the font does not
+    /// cover are drawn as a box of that same width rather than skipped: a
+    /// blank would claim the text ended there.
+    ///
+    /// Combining marks are painted over the character before them and take no
+    /// width of their own. One that arrives with no character before it --
+    /// leading a string, or after a newline -- has nothing to combine with, so
+    /// it is drawn as a full-width box instead of vanishing.
+    ///
+    /// `\n` returns to the starting x and moves down one 16 pixel line. The
+    /// returned width is the widest line, which for the single-line case every
+    /// caller here uses is just the pen movement.
+    pub fn draw_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        scale: usize,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        let scale = scale.max(1);
+        let origin_x = x;
+        let (mut cursor_x, mut cursor_y) = (x, y);
+        let mut widest = 0;
+        // In pixels, already scaled: how far back a combining mark has to go
+        // to land on the character it belongs to. Zero means there is none.
+        let mut previous_advance = 0;
+        for character in text.chars() {
+            if character == '\n' {
+                widest = widest.max(cursor_x - origin_x);
+                cursor_x = origin_x;
+                cursor_y = cursor_y.saturating_add(font::HEIGHT * scale);
+                previous_advance = 0;
+                continue;
+            }
+            let glyph = font::glyph_or_replacement(character);
+            if glyph.advance == 0 {
+                if previous_advance == 0 {
+                    let orphan = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
+                    self.draw_glyph(cursor_x, cursor_y, &orphan, scale, foreground, background);
+                    previous_advance = orphan.advance as usize * scale;
+                    cursor_x = cursor_x.saturating_add(previous_advance);
+                    continue;
+                }
+                let over = cursor_x.saturating_sub(previous_advance);
+                self.draw_glyph(over, cursor_y, &glyph, scale, foreground, None);
+                continue;
+            }
+            self.draw_glyph(cursor_x, cursor_y, &glyph, scale, foreground, background);
+            previous_advance = glyph.advance as usize * scale;
+            cursor_x = cursor_x.saturating_add(previous_advance);
+        }
+        widest.max(cursor_x - origin_x)
     }
 
     /// Writes back the complete framebuffer in chunks rather than one
@@ -654,6 +666,13 @@ impl Framebuffer {
     /// against a ruler on the panel is what verifies the CW rotation, the
     /// clipping at each edge, and the logical-to-native mapping. The caller
     /// flushes; nothing here writes back the cache.
+    /// One of the two right-hand corner labels, pushed in from the edge by
+    /// the same margin its left-hand partner sits at.
+    fn draw_corner_label(&mut self, y: usize, text: &str) {
+        let x = WIDTH.saturating_sub(font::text_width(text) + 20);
+        self.draw_text(x, y, text, 1, WHITE, Some(BLACK));
+    }
+
     pub fn draw_coordinate_chart(&mut self) {
         const DARK_A: u16 = 0x0841;
         const GRID: u16 = 0x7BEF;
@@ -680,27 +699,34 @@ impl Framebuffer {
             let bytes = coordinate_label(b'X', x);
             // coordinate_label emits ASCII only.
             let label = unsafe { core::str::from_utf8_unchecked(&bytes) };
-            let label_width = bytes.len() * 12;
+            let label_width = font::text_width(label);
             let label_x = x
                 .saturating_sub(label_width / 2)
                 .min(WIDTH.saturating_sub(label_width + 4))
                 .max(4);
-            self.draw_text(label_x, 8, label, 2, WHITE, Some(BLACK));
+            self.draw_text(label_x, 8, label, 1, WHITE, Some(BLACK));
         }
 
         for y in (100..HEIGHT - 100).step_by(100) {
             let bytes = coordinate_label(b'Y', y);
             // coordinate_label emits ASCII only.
             let label = unsafe { core::str::from_utf8_unchecked(&bytes) };
-            self.draw_text(8, y.saturating_sub(7), label, 2, WHITE, Some(BLACK));
+            self.draw_text(8, y.saturating_sub(font::HEIGHT / 2), label, 1, WHITE, Some(BLACK));
         }
 
-        self.draw_text(452, 52, "LOGICAL 1280X720 CW", 3, CYAN, Some(BLACK));
-        self.draw_text(674, 378, "CENTER (640,360)", 3, YELLOW, Some(BLACK));
-        self.draw_text(20, 42, "(0,0)", 2, WHITE, Some(BLACK));
-        self.draw_text(1160, 42, "(1279,0)", 2, WHITE, Some(BLACK));
-        self.draw_text(20, 686, "(0,719)", 2, WHITE, Some(BLACK));
-        self.draw_text(1140, 686, "(1279,719)", 2, WHITE, Some(BLACK));
+        // Centred and corner-aligned from the text's own width rather than
+        // from a hand-counted cell count, which is what let the old fixed
+        // coordinates go stale every time a string changed.
+        let title = "LOGICAL 1280X720 CW";
+        // At scale 2 the drawn width is twice the measured one, so half of it
+        // is the measured width itself.
+        let title_x = WIDTH / 2 - font::text_width(title);
+        self.draw_text(title_x, 52, title, 2, CYAN, Some(BLACK));
+        self.draw_text(674, 378, "CENTER (640,360)", 2, YELLOW, Some(BLACK));
+        self.draw_text(20, 42, "(0,0)", 1, WHITE, Some(BLACK));
+        self.draw_corner_label(42, "(1279,0)");
+        self.draw_text(20, 686, "(0,719)", 1, WHITE, Some(BLACK));
+        self.draw_corner_label(686, "(1279,719)");
 
         let center_marker = [RED, GREEN, BLUE, WHITE];
         let _ = self.blit_rgb565(WIDTH / 2 - 1, HEIGHT / 2 - 1, 2, 2, &center_marker);
@@ -714,32 +740,35 @@ impl Framebuffer {
     }
 }
 
-/// One glyph placed on the screen, as the two painters below need it. They
-/// take identical placement and differ only in what they do with the pixels
-/// the glyph does not cover, so it is worth naming once.
-struct Glyph<'a> {
+/// One 16 pixel glyph placed on the screen, as the two painters below need
+/// it.
+///
+/// They take identical placement and differ only in what they do with the
+/// pixels the glyph does not cover, so it is worth naming once. The box's
+/// width comes from the caller rather than being fixed, because a glyph is
+/// 8 pixels wide, 16, or -- for a combining mark -- 16 with no advance.
+struct WideGlyph<'a> {
     /// Framebuffer base, held raw so the rotation can be resolved once per
     /// column rather than once per pixel.
     pointer: *mut u16,
     x: usize,
     y: usize,
-    /// Height of the 6x8 advance box in pixels, already clipped to the
-    /// screen. Increasing logical Y is increasing native address, so this is
-    /// also the length of each column's contiguous native run.
+    /// Height of the box in pixels, already clipped to the screen. Increasing
+    /// logical Y is increasing native address, so this is also the length of
+    /// each column's contiguous native run.
     run: usize,
-    bits: &'a [u8; 5],
+    columns: &'a [u16; font::MAX_WIDTH],
+    /// Columns to paint: the glyph's advance, or the full 16 for a combining
+    /// mark. Columns past this are zero in the data, but an opaque paint would
+    /// still fill them with background, so the box has to stop here.
+    width: usize,
     scale: usize,
     foreground: u16,
 }
 
-impl Glyph<'_> {
+impl WideGlyph<'_> {
     /// Native address of the top pixel of one box column, or `None` if that
     /// column falls off the right edge.
-    ///
-    /// Columns are walked backwards by both painters for the same reason
-    /// `fill_rect` does it: CW rotation maps increasing logical X onto
-    /// decreasing native rows, so this order leaves the box as a single
-    /// forward write stream.
     ///
     /// # Safety
     /// `self.pointer` must be the base of a mapped framebuffer.
@@ -751,31 +780,28 @@ impl Glyph<'_> {
         Some(unsafe { self.pointer.add(native_offset(pixel_x, self.y)) })
     }
 
-    /// Paints the complete 6x8 advance box: the glyph in `foreground`, the
-    /// rest -- including the letter-spacing column and the line-spacing row --
-    /// in `background`.
+    /// Paints the complete box: the glyph in `foreground`, the rest in
+    /// `background`.
     ///
-    /// Every pixel is written, so each column of the box is one contiguous
-    /// native run and the rotation costs one multiply per column instead of
-    /// one per pixel: 12 for a scale-2 cell rather than 192.
+    /// Columns are walked backwards for the same reason `fill_rect` does it:
+    /// CW rotation maps increasing logical X onto decreasing native rows, so
+    /// this order leaves the box as a single forward write stream.
     ///
     /// # Safety
     /// `self.pointer` must be the base of a mapped framebuffer.
     unsafe fn paint_opaque(&self, background: u16) {
-        for column in (0..6).rev() {
-            // Column 5 is the letter spacing: background for its full height.
-            let bits = if column < 5 { self.bits[column] } else { 0 };
+        for column in (0..self.width).rev() {
+            let bits = self.columns[column];
             for offset_x in (0..self.scale).rev() {
                 let Some(base) = (unsafe { self.column_base(column, offset_x) }) else {
                     continue;
                 };
-                for row in 0..8 {
+                for row in 0..font::HEIGHT {
                     let start = row * self.scale;
                     if start >= self.run {
                         break;
                     }
-                    // Row 7 is the line spacing, matching column 5 above.
-                    let color = if row < 7 && bits & (1 << row) != 0 {
+                    let color = if bits & (1 << row) != 0 {
                         self.foreground
                     } else {
                         background
@@ -789,19 +815,13 @@ impl Glyph<'_> {
     }
 
     /// Paints only the glyph's own pixels, leaving whatever is under the rest
-    /// of the box. For callers that have established the background
-    /// themselves, typically by clearing the screen in one pass.
-    ///
-    /// What is written here is a sparse subset -- a third of the box at most,
-    /// and nothing at all for a space -- so this skips rather than writes:
-    /// an empty glyph column drops out before any address is computed, and
-    /// the spacing column and row are never visited.
+    /// of the box.
     ///
     /// # Safety
     /// `self.pointer` must be the base of a mapped framebuffer.
     unsafe fn paint_sparse(&self) {
-        for column in (0..5).rev() {
-            let bits = self.bits[column];
+        for column in (0..self.width).rev() {
+            let bits = self.columns[column];
             if bits == 0 {
                 continue;
             }
@@ -809,7 +829,7 @@ impl Glyph<'_> {
                 let Some(base) = (unsafe { self.column_base(column, offset_x) }) else {
                     continue;
                 };
-                for row in 0..7 {
+                for row in 0..font::HEIGHT {
                     if bits & (1 << row) == 0 {
                         continue;
                     }

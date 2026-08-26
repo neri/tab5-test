@@ -372,6 +372,13 @@ dependencies = [
 [[package]]
 name = "tab5-browser"
 version = "0.1.0"
+dependencies = [
+ "tab5-font",
+]
+
+[[package]]
+name = "tab5-font"
+version = "0.1.0"
 
 [[package]]
 name = "tab5-hello-world"
@@ -384,6 +391,7 @@ dependencies = [
  "riscv-rt",
  "smoltcp",
  "tab5-browser",
+ "tab5-font",
 ]
 
 [[package]]

@@ -396,7 +396,7 @@ fn finish_document(parser: Parser, failure: Option<error::Error>) -> DocumentOut
 }
 
 /// Copies the start of `text` into a fixed buffer, one byte per character
-/// and `.` for anything the 5x7 font cannot show.
+/// and `.` for anything outside printable ASCII.
 ///
 /// Non-ASCII collapses to a single `.` rather than to its UTF-8 bytes, so
 /// the count on screen matches the characters rather than the encoding.

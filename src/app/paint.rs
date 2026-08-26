@@ -17,7 +17,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     }
 
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 8, HINT, 2, CYAN, None);
+    framebuffer.draw_text(16, 8, HINT, 1, CYAN, None);
     if !framebuffer.flush() {
         uart::log(b"Paint: initial flush failed\r\n");
         return;

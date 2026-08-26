@@ -60,14 +60,19 @@ use super::wifi_manager::Manager as WifiManager;
 
 use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_union};
 
-/// The 5x7 font in its 6x8 advance box, which is what the layout measures
-/// against.
+/// One half-width cell of the 16 pixel font: the unit the chrome and the
+/// list markers are laid out in.
+///
+/// Page text is not laid out in cells -- `layout` measures every character's
+/// own advance, and half of them are twice this wide. This is for the parts
+/// that are ASCII by contract (the address bar, the counters) and for the
+/// indentation the layout reserves.
 ///
 /// `CELL_HEIGHT` is the glyph's box, not a line's: the layout adds a gap
 /// below every line (`layout::LINE_GAP_PERCENT`), so `Line::height` is the
 /// larger of the two and is what the viewport steps by.
-const CELL_WIDTH: usize = 6;
-const CELL_HEIGHT: usize = 8;
+const CELL_WIDTH: usize = crate::browser::layout::CELL_WIDTH as usize;
+const CELL_HEIGHT: usize = crate::font::HEIGHT;
 
 const TOOLBAR_HEIGHT: usize = 40;
 const STATUS_HEIGHT: usize = 32;
@@ -80,7 +85,7 @@ const PAGE_WIDTH: usize = WIDTH - 2 * MARGIN;
 
 /// Toolbar and status text scale. The same as body text: chrome that is
 /// harder to read than the page is chrome nobody reads.
-const CHROME_SCALE: usize = 2;
+const CHROME_SCALE: usize = 1;
 const CHROME_CELL: usize = CELL_WIDTH * CHROME_SCALE;
 const CHROME_TEXT_Y: usize = (TOOLBAR_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
 const STATUS_TEXT_Y: usize = VIEWPORT_BOTTOM + (STATUS_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
@@ -99,7 +104,7 @@ const TEXT_COLOR: u16 = BLACK;
 const LINK_COLOR: u16 = 0x001F;
 const CODE_COLOR: u16 = 0x0320;
 /// Dark red. A grey was tried first and could not be told from black at
-/// this size: two near-blacks in a 5x7 font read as a rendering fault
+/// this size: two near-blacks in a bitmap font read as a rendering fault
 /// rather than as emphasis. Emphasis has to differ in hue, not in
 /// brightness.
 const ITALIC_COLOR: u16 = 0x9000;
@@ -118,10 +123,6 @@ const EDIT_CARET: u16 = 0x001F;
 
 /// The path the viewer's own error page lives at, under the built-in host.
 const ERROR_PATH: &str = "/error";
-
-/// Non-ASCII characters have no glyph in the 5x7 font and are drawn as a
-/// hollow box; this is its inset inside the cell, in unscaled pixels.
-const PLACEHOLDER_INSET: usize = 1;
 
 /// Lines one wheel detent scrolls.
 const WHEEL_LINES: i32 = 3;
@@ -1149,7 +1150,7 @@ impl Viewer {
                 ADDRESS_LEFT,
                 CHROME_TEXT_Y,
                 &loading.url,
-                ADDRESS_CELLS,
+                ADDRESS_RIGHT - ADDRESS_LEFT,
                 CHROME_TEXT,
             ),
             (None, None) => {
@@ -1159,7 +1160,7 @@ impl Viewer {
                         ADDRESS_LEFT,
                         CHROME_TEXT_Y,
                         &text,
-                        ADDRESS_CELLS,
+                        ADDRESS_RIGHT - ADDRESS_LEFT,
                         CHROME_TEXT,
                     );
                 }
@@ -1231,7 +1232,7 @@ impl Viewer {
 
     fn draw_status(&self, framebuffer: &mut Framebuffer) {
         framebuffer.fill_rect(0, VIEWPORT_BOTTOM, WIDTH, STATUS_HEIGHT, CHROME_BACKGROUND);
-        let columns = (WIDTH - 2 * MARGIN) / CHROME_CELL;
+        let budget = WIDTH - 2 * MARGIN;
         if self.loading.is_some() && self.message.is_none() {
             draw_ascii(
                 framebuffer,
@@ -1256,7 +1257,7 @@ impl Viewer {
                 MARGIN,
                 STATUS_TEXT_Y,
                 message,
-                columns,
+                budget,
                 MESSAGE_COLOR,
             );
             return;
@@ -1270,7 +1271,7 @@ impl Viewer {
                 MARGIN,
                 STATUS_TEXT_Y,
                 &text,
-                columns,
+                budget,
                 CHROME_TEXT,
             );
         }
@@ -1400,10 +1401,9 @@ impl Viewer {
                 // not a large contrast step.
                 //
                 // Drawn in the line's gap rather than against the glyphs.
-                // The 5x7 font has descenders that reach the bottom of its
-                // box, so a rule at the box's edge touches every `g` and
-                // `y`; the gap the line spacing adds is exactly the room
-                // this needs.
+                // The font's descenders reach the bottom of its box, so a
+                // rule at the box's edge touches every `g` and `y`; the gap
+                // the line spacing adds is exactly the room this needs.
                 let glyph_box = CELL_HEIGHT * scale;
                 let underline = screen_y + glyph_box.min(line.height as usize - scale);
                 framebuffer.fill_rect(x, underline, piece.width as usize, scale, LINK_COLOR);
@@ -1470,10 +1470,12 @@ fn piece_color(style: u8, is_link: bool) -> u16 {
     }
 }
 
-/// Draws one run, one cell per character.
+/// Draws one run of page text.
 ///
 /// Transparent: the caller has already laid down the background, so only
-/// inked pixels are written.
+/// inked pixels are written. Widths, combining marks and the boxes drawn for
+/// characters the font does not cover are all `draw_text`'s business, which
+/// is the same function `layout` measured this run with.
 #[inline(never)]
 fn draw_text_run(
     framebuffer: &mut Framebuffer,
@@ -1484,46 +1486,18 @@ fn draw_text_run(
     color: u16,
     bold: bool,
 ) {
-    let advance = CELL_WIDTH * scale;
-    let mut cursor = x;
-    for character in text.chars() {
-        if cursor >= WIDTH {
-            break;
-        }
-        if character.is_ascii() {
-            framebuffer.draw_ascii_char(cursor, y, character, scale, color, None);
-            if bold {
-                // Struck twice, one pixel apart. The 5x7 font has one
-                // weight, so bold has to be synthesised or dropped -- and
-                // dropping it means `<b>` renders as nothing at all. One
-                // physical pixel rather than one glyph pixel (`scale`): at
-                // scale 2 a full-cell offset would smear into the next
-                // column.
-                framebuffer.draw_ascii_char(cursor + 1, y, character, scale, color, None);
-            }
-        } else {
-            draw_placeholder(framebuffer, cursor, y, scale, color);
-        }
-        cursor += advance;
+    framebuffer.draw_text(x, y, text, scale, color, None);
+    if bold {
+        // Struck twice, one pixel apart. The font has one weight, so bold
+        // has to be synthesised or dropped -- and dropping it means `<b>`
+        // renders as nothing at all. One physical pixel rather than one
+        // glyph pixel (`scale`): at scale 2 a full-cell offset would smear
+        // into the next column.
+        framebuffer.draw_text(x + 1, y, text, scale, color, None);
     }
 }
 
-/// A hollow box, for a character the 5x7 font has no glyph for.
-///
-/// Deliberately not a space and not a `?`. A space would make a page of
-/// Japanese look blank, and a `?` is indistinguishable from one the author
-/// typed. A box says "there is a character here that this cannot draw",
-/// which is the true statement, and it is one box per character so the line
-/// still measures correctly.
-#[inline(never)]
-fn draw_placeholder(framebuffer: &mut Framebuffer, x: usize, y: usize, scale: usize, color: u16) {
-    let width = (CELL_WIDTH - 1) * scale;
-    let height = (CELL_HEIGHT - 1) * scale;
-    let inset = PLACEHOLDER_INSET * scale;
-    framebuffer.stroke_rect(x + inset, y + inset, width - inset, height - inset, color);
-}
-
-/// Draws ASCII chrome text and returns where it ended.
+/// Draws chrome text and returns where it ended.
 #[inline(never)]
 fn draw_ascii(
     framebuffer: &mut Framebuffer,
@@ -1533,32 +1507,33 @@ fn draw_ascii(
     scale: usize,
     color: u16,
 ) -> usize {
-    framebuffer.draw_text(x, y, text, scale, color, None);
-    x + text.chars().count() * CELL_WIDTH * scale
+    x + framebuffer.draw_text(x, y, text, scale, color, None)
 }
 
-/// Draws at most `cells` characters, so a long URL cannot run into the
-/// counters at the other end of the bar.
+/// Draws as much of `text` as fits in `budget` pixels, so a long URL or a
+/// long message cannot run into whatever is at the other end of the bar.
+///
+/// Measured in pixels rather than characters because a status message is no
+/// longer guaranteed to be ASCII: a page's title or a host name can carry
+/// full-width characters, and those take two cells each.
 #[inline(never)]
 fn draw_clipped(
     framebuffer: &mut Framebuffer,
     x: usize,
     y: usize,
     text: &str,
-    cells: usize,
+    budget: usize,
     color: u16,
 ) {
     let mut cursor = x;
-    let advance = CELL_WIDTH * CHROME_SCALE;
-    for (index, character) in text.chars().enumerate() {
-        if index >= cells {
+    let end = x + budget;
+    for character in text.chars() {
+        let advance = crate::font::advance(character) as usize * CHROME_SCALE;
+        if cursor + advance > end {
             break;
         }
-        if character.is_ascii() {
-            framebuffer.draw_ascii_char(cursor, y, character, CHROME_SCALE, color, None);
-        } else {
-            draw_placeholder(framebuffer, cursor, y, CHROME_SCALE, color);
-        }
+        let glyph = crate::font::glyph_or_replacement(character);
+        framebuffer.draw_glyph(cursor, y, &glyph, CHROME_SCALE, color, None);
         cursor += advance;
     }
 }
@@ -1569,7 +1544,6 @@ fn build_page(document: Document) -> Result<Page, Error> {
         &document,
         PAGE_WIDTH as u16,
         Metrics {
-            char_width: CELL_WIDTH as u16,
             glyph_height: CELL_HEIGHT as u16,
             line_gap_percent: crate::browser::layout::LINE_GAP_PERCENT,
         },
@@ -1829,10 +1803,11 @@ mod builtin {
              <li><a href=\"/sample\">Everything it can display</a></li>\
              <li><a href=\"/long\">A long document, for scrolling</a></li>\
              <li><a href=\"/wide\">One line as long as a URL may be</a></li>\
+             <li><a href=\"/japanese\">Japanese text, mixed widths</a></li>\
              <li><a href=\"/empty\">A document with nothing in it</a></li>\
              </ul>\
              <hr>\
-             <p>These four are in flash and need no network. Fetching anything \
+             <p>These five are in flash and need no network. Fetching anything \
              else needs <code>wificonnect</code> and <code>ipconfig dhcp</code> \
              first; <code>browser &lt;url&gt;</code> opens one directly, and \
              a path completes against <code>hbase</code>.</p>",
@@ -1869,8 +1844,9 @@ mod builtin {
              <p>Character references: &amp; &lt; &gt; &quot; &nbsp; &#65; \
              &#x42;. An unresolvable one, &notareference;, is shown as \
              written.</p>\
-             <p>Non-ASCII has no glyph and is drawn as a box, one per \
-             character: \u{65e5}\u{672c}\u{8a9e}.</p>\
+             <p>Non-ASCII is drawn from the same font: \u{65e5}\u{672c}\u{8a9e}. \
+             Only what the subset leaves out becomes a box -- see the \
+             <a href=\"/japanese\">Japanese page</a>.</p>\
              <p>An image is its alt text: <img src=\"x.png\" alt=\"a red \
              square\"> and one without: <img src=\"y.png\">.</p>\
              <p><a href=\"https://example.invalid/\">An https link</a> is \
@@ -1889,6 +1865,55 @@ mod builtin {
         body: Body::WideLine,
     };
 
+    /// Japanese text, for the cases that only appear once glyphs have two
+    /// widths.
+    ///
+    /// Not a demo. Line breaking, piece widths, underlines and hit testing
+    /// all changed when characters stopped being one cell each
+    /// (`docs/FONT_MIGRATION_PLAN.md`), and this is the page that shows
+    /// whether they agree with each other -- with no network involved, so it
+    /// can be looked at on a board that has never associated.
+    pub const JAPANESE: &Page = &Page {
+        url: "http://built-in/japanese",
+        body: Body::Fixed(
+            "<title>\u{65E5}\u{672C}\u{8A9E}</title>\
+             <h1>\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{8868}\u{793A}</h1>\
+             <p>\u{534A}\u{89D2}\u{306F}8\u{30D4}\u{30AF}\u{30BB}\u{30EB}\u{3001}\
+             \u{5168}\u{89D2}\u{306F}16\u{30D4}\u{30AF}\u{30BB}\u{30EB}\u{9001}\u{308A}\u{3067}\u{3059}\u{3002}\
+             ASCII\u{3068}\u{6DF7}\u{3056}\u{3063}\u{305F}text\u{3082}\u{3001}\
+             \u{6298}\u{8FD4}\u{3057}\u{306F}\u{6587}\u{5B57}\u{6570}\u{3067}\u{306F}\u{306A}\u{304F}\
+             pixel\u{3067}\u{6C7A}\u{307E}\u{308A}\u{307E}\u{3059}\u{3002}\
+             \u{53E5}\u{8AAD}\u{70B9}\u{3084}\u{9589}\u{3058}\u{62EC}\u{5F27}\u{304C}\
+             \u{884C}\u{982D}\u{3078}\u{6765}\u{306A}\u{3044}\u{3053}\u{3068}\u{3082}\
+             \u{78BA}\u{304B}\u{3081}\u{3089}\u{308C}\u{307E}\u{3059}\u{3002}</p>\
+             <h2>\u{7D50}\u{5408}\u{6587}\u{5B57}\u{3068}\u{7570}\u{4F53}\u{5B57}</h2>\
+             <p>\u{5206}\u{89E3}\u{3055}\u{308C}\u{305F}\u{6FC1}\u{70B9}\u{FF1A}\
+             \u{304B}\u{3099} \u{304D}\u{309A} e\u{301} \u{2014} \
+             \u{5E45}\u{3092}\u{5897}\u{3084}\u{3055}\u{305A}\u{76F4}\u{524D}\u{306E}\
+             \u{5B57}\u{3078}\u{91CD}\u{306A}\u{308A}\u{307E}\u{3059}\u{3002}\
+             \u{4EBA}\u{540D}\u{306E}\u{7570}\u{4F53}\u{5B57}\u{FF1A}\u{9AD9}\u{FA11}\u{3002}\
+             \u{53CE}\u{9332}\u{3057}\u{3066}\u{3044}\u{306A}\u{3044}\u{6587}\u{5B57}\u{FF1A}\
+             \u{20BB7} \u{1F600} \u{FDFD} \u{2014} \
+             \u{7A7A}\u{767D}\u{3067}\u{306F}\u{306A}\u{304F}\u{4E2D}\u{7A7A}\u{306E}\
+             \u{67A0}\u{306B}\u{306A}\u{308A}\u{307E}\u{3059}\u{3002}</p>\
+             <h3>\u{30EA}\u{30F3}\u{30AF}\u{306E}\u{6298}\u{8FD4}\u{3057}</h3>\
+             <p>\u{9577}\u{3044}\u{6587}\u{306E}\u{9014}\u{4E2D}\u{306B}\
+             <a href=\"/\">\u{884C}\u{3092}\u{307E}\u{305F}\u{3050}\u{307B}\u{3069}\
+             \u{9577}\u{3044}\u{30EA}\u{30F3}\u{30AF}\u{3092}\u{7F6E}\u{3044}\u{3066}\
+             \u{3042}\u{308A}\u{307E}\u{3059}\u{3002}\u{4E0B}\u{7DDA}\u{3068}\
+             \u{9078}\u{629E}\u{80CC}\u{666F}\u{3001}touch\u{306E}\u{5F53}\u{305F}\u{308A}\
+             \u{5224}\u{5B9A}\u{304C}\u{63CF}\u{753B}\u{3068}\u{4E00}\u{81F4}\u{3059}\u{308B}\u{304B}\
+             \u{898B}\u{3066}\u{304F}\u{3060}\u{3055}\u{3044}\u{3002}\u{884C}\u{3092}\u{307E}\u{305F}\u{3044}\u{3060}\u{5F8C}\u{534A}\u{306B}\u{3082}\u{540C}\u{3058}\u{4E0B}\u{7DDA}\u{304C}\u{4ED8}\u{304D}\u{3001}\u{9078}\u{629E}\u{3057}\u{305F}\u{3068}\u{304D}\u{306B}\u{4E21}\u{65B9}\u{306E}\u{884C}\u{304C}\u{53CD}\u{8EE2}\u{3059}\u{308B}\u{306F}\u{305A}\u{3067}\u{3059}</a>\u{3002}\
+             \u{3053}\u{306E}\u{5F8C}\u{308D}\u{306B}\u{3082}\u{6587}\u{7AE0}\u{304C}\
+             \u{7D9A}\u{304D}\u{307E}\u{3059}\u{3002}</p>\
+             <ul><li>\u{534A}\u{89D2}\u{30AB}\u{30CA}\u{FF1A}\u{FF76}\u{FF9E}\u{FF77}\u{FF9E}\u{FF78}\u{FF9E}\u{FF80}\u{FF9E}</li>\
+             <li>Latin-1\u{FF1A}r\u{E9}sum\u{E9} \u{FC}ber Stra\u{DF}e</li>\
+             <li>\u{5168}\u{89D2}\u{82F1}\u{6570}\u{FF1A}\u{FF21}\u{FF22}\u{FF23}\u{FF10}\u{FF11}\u{FF12}</li></ul>\
+             <pre>pre \u{3067}\u{3082} \u{6298}\u{8FD4}\u{3057}\u{306F} pixel \u{5358}\u{4F4D}\n\u{7A7A}\u{767D}\u{3068}   \u{6539}\u{884C}\u{306F}\u{305D}\u{306E}\u{307E}\u{307E}\n</pre>\
+             <p><a href=\"/\">Home</a></p>",
+        ),
+    };
+
     pub const EMPTY: &Page = &Page {
         url: "http://built-in/empty",
         body: Body::Fixed(
@@ -1903,6 +1928,7 @@ mod builtin {
             "/sample" => Some(SAMPLE),
             "/long" => Some(LONG),
             "/wide" => Some(WIDE),
+            "/japanese" => Some(JAPANESE),
             "/empty" => Some(EMPTY),
             _ => None,
         }

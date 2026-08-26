@@ -18,6 +18,7 @@ mod browser;
 mod browsertest;
 mod coord_test;
 mod fetch;
+mod font_test;
 mod files;
 mod lsusb;
 mod mbr;
@@ -236,6 +237,10 @@ pub fn run(psram: Psram) {
                 coord_test::run(framebuffer, &mut input);
                 console.clear(framebuffer);
             }
+            shell::Outcome::FontTest => {
+                font_test::run(framebuffer, &mut input);
+                console.clear(framebuffer);
+            }
             shell::Outcome::AxisTest => {
                 axis_test::run(framebuffer, &mut input);
                 console.clear(framebuffer);
@@ -409,6 +414,11 @@ fn run_visual_qa(
     coord_test::run(framebuffer, input);
     console.clear(framebuffer);
     previous_underruns = finish_visual_stage(b"coordinate", previous_underruns);
+
+    uart::log(b"UI visual: font sheet; any key advances\r\n");
+    font_test::run(framebuffer, input);
+    console.clear(framebuffer);
+    previous_underruns = finish_visual_stage(b"font", previous_underruns);
 
     uart::log(b"UI visual: paint; draw, then any key advances\r\n");
     paint::run(framebuffer, input);

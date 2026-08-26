@@ -24,12 +24,14 @@
 //! line breaker, and the styles are applied afterwards by cutting each line
 //! at the run boundaries it crosses.
 //!
-//! Character widths are counted in `char`s, not bytes and not glyph
-//! advances: the display has one fixed-width 5x7 font and draws anything it
-//! has no glyph for as a single placeholder, so one `char` is one cell.
-//! That is a real limitation -- Japanese text will be one box per character
-//! until there is a font for it -- but it is a limitation of the font, and
-//! the layout is honest about it rather than mismeasuring.
+//! Widths are pixels, and they come from [`tab5_font::advance`] -- the same
+//! function the renderer paints with. Half-width characters take 8 pixels,
+//! full-width ones 16, and a combining mark none at all. Nothing here counts
+//! characters and multiplies: a line of Japanese, a line of ASCII and a line
+//! that mixes them all break where they actually reach the edge, and the
+//! underline under a link, the background behind a selection and the hit
+//! rectangle for a tap are the width the text was drawn at rather than an
+//! estimate of it.
 
 use alloc::vec::Vec;
 
@@ -38,15 +40,36 @@ use crate::error::Error;
 use crate::limits::MAX_LAYOUT_LINES;
 use crate::memory;
 
-/// The font's size at scale 1, in pixels.
+/// One half-width advance, which is the unit indentation is measured in.
 ///
-/// Passed in rather than assumed: the layout crate has no framebuffer, and
-/// the 6x8 advance box of the 5x7 font is the renderer's fact, not this
-/// one's.
+/// Indentation is the one measurement that is not text: a list marker column
+/// and a `pre` block's inset are asked for in characters, and this is what a
+/// character is worth when the text could be any width.
+pub const CELL_WIDTH: u16 = 8;
+
+/// The advance of `character` at `scale`, in pixels.
+///
+/// The single place widths come from. A combining mark returns 0: it is
+/// painted over the character before it and adds nothing to the line.
+pub fn advance(character: char, scale: u8) -> u16 {
+    tab5_font::advance(character) as u16 * scale as u16
+}
+
+/// The advance of `text` at `scale`, in pixels.
+pub fn text_width(text: &str, scale: u8) -> u16 {
+    text.chars()
+        .fold(0u16, |total, character| {
+            total.saturating_add(advance(character, scale))
+        })
+}
+
+/// The vertical part of the font's size, at scale 1.
+///
+/// Passed in rather than assumed: the glyph box's height and the space
+/// between lines are the renderer's business. Widths are not -- those come
+/// from [`advance`], so that what is measured is what gets drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Metrics {
-    /// Horizontal advance of one character, including its letter spacing.
-    pub char_width: u16,
     /// Height of the box one glyph is drawn into.
     pub glyph_height: u16,
     /// Extra space below each line, as a percentage of the glyph box.
@@ -81,22 +104,22 @@ impl Metrics {
     }
 }
 
-/// Body text and the smaller headings.
-pub const BODY_SCALE: u8 = 2;
-/// `h1` and `h2`. Two sizes is what the plan allows, and two is enough to
-/// see the shape of a page from across a desk.
-pub const HEADING_SCALE: u8 = 3;
+/// Body text and the smaller headings: the 16 pixel font at its own size.
+pub const BODY_SCALE: u8 = 1;
+/// `h1` and `h2`, at 32 pixels. Bitmaps scale by whole numbers only, so two
+/// sizes is what there is -- and two is enough to see the shape of a page
+/// from across a desk. `h3` and below stay body-sized and are drawn heavier.
+pub const HEADING_SCALE: u8 = 2;
 
 /// Extra space below every line, as a percentage of the glyph box.
 ///
-/// The 5x7 font in its 6x8 box leaves one blank row between lines, which at
-/// scale 2 is two pixels for sixteen of type. Set solid like that a page
-/// reads as a wall.
+/// The 16 pixel font fills its box, so lines set solid touch each other and
+/// a page reads as a wall.
 ///
 /// A fifth was tried first, on the reasoning that it is roughly what a book
 /// uses. On the panel it was still tight, so this is a quarter: four pixels
-/// at body scale and six at heading scale, against glyph boxes of sixteen
-/// and twenty-four. The number is a percentage rather than a pixel count so
+/// at body scale and eight at heading scale, against glyph boxes of sixteen
+/// and thirty-two. The number is a percentage rather than a pixel count so
 /// that raising it stays a single decision instead of one per size.
 pub const LINE_GAP_PERCENT: u16 = 25;
 
@@ -299,7 +322,6 @@ impl Layout {
         block: &Block,
         top: u32,
     ) -> Result<u32, Error> {
-        let cell = self.metrics.char_width;
         let (scale, indent_cells, gap_before, gap_after) = self.block_metrics(block.kind);
         let mut y = top + gap_before as u32;
 
@@ -327,16 +349,12 @@ impl Layout {
         // measured in unscaled cells would be half the character widths it
         // claims to be, so a list item would sit two characters in where
         // four were asked for.
-        let indent = indent_cells * cell * scale as u16;
+        let indent = indent_cells * CELL_WIDTH * scale as u16;
         let line_height = self.metrics.line_box(scale);
-        // How many characters fit. At least one, so a viewport narrower
-        // than the indentation still makes progress instead of looping.
-        let columns = self
-            .width
-            .saturating_sub(indent)
-            .checked_div(cell * scale as u16)
-            .unwrap_or(1)
-            .max(1) as usize;
+        // Pixels of text a line may hold. It can reach zero on a viewport
+        // narrower than its own indentation; `next_line` still takes one
+        // character in that case rather than looping forever.
+        let budget = self.width.saturating_sub(indent);
 
         let span = first.start as usize..last.end as usize;
         let text = document.text().get(span.clone()).unwrap_or("");
@@ -350,7 +368,7 @@ impl Layout {
         let mut cursor = 0usize;
         let mut first_line = true;
         loop {
-            let (line_end, next) = next_line(text, cursor, columns, preformatted);
+            let (line_end, next) = next_line(text, cursor, budget, scale, preformatted);
             let start = span.start + cursor;
             let end = span.start + line_end;
             let first_piece = self.pieces.len() as u32;
@@ -378,10 +396,10 @@ impl Layout {
 
     /// Cuts `[start, end)` at the run boundaries it crosses.
     ///
-    /// Widths are counted in `char`s of the document's text, not in bytes:
-    /// the font draws one cell per character whatever its encoding takes,
-    /// so a line of Japanese is measured by its characters even though it
-    /// is three times as many bytes.
+    /// Each piece's width is the sum of its characters' advances, the same
+    /// sum the renderer will walk when it draws them. That is what makes the
+    /// underline under a link, the background behind a selection and the
+    /// rectangle a tap is tested against agree with the pixels on screen.
     fn push_pieces(
         &mut self,
         text: &str,
@@ -390,7 +408,6 @@ impl Layout {
         end: usize,
         scale: u8,
     ) -> Result<u16, Error> {
-        let advance = self.metrics.char_width * scale as u16;
         let mut count = 0u16;
         let mut x = 0u16;
         for run in runs {
@@ -399,8 +416,7 @@ impl Layout {
             if from >= to {
                 continue;
             }
-            let characters = text.get(from..to).map_or(0, |slice| slice.chars().count());
-            let width = (characters as u16).saturating_mul(advance);
+            let width = text.get(from..to).map_or(0, |slice| text_width(slice, scale));
             memory::push(
                 &mut self.pieces,
                 Piece {
@@ -447,21 +463,60 @@ impl Layout {
     }
 }
 
+/// Characters that may not begin a line.
+///
+/// Japanese has no spaces, so a line breaks wherever it reaches the edge --
+/// which without this puts a closing bracket or a comma at the head of the
+/// next line, where a reader trips over it. The minimum set: closing
+/// brackets, the two full stops, and the small kana and the long vowel mark,
+/// which belong to the character before them.
+const NO_LINE_START: &str = concat!(
+    "、。，．・：；？！\u{309B}\u{309C}",
+    "）」』】〉》〕］｝＞",
+    ")]},.:;?!",
+    "ぁぃぅぇぉっゃゅょゎヵヶ",
+    "ァィゥェォッャュョヮ",
+    "ーゝゞヽヾ々〜～",
+    "｡､･｣ﾞﾟ",
+);
+
+/// Characters that may not end a line: the opening halves of the pairs
+/// above, which otherwise sit alone at the right edge.
+const NO_LINE_END: &str = concat!("（「『【〈《〔［｛＜", "([{", "｢");
+
+/// How far back a break may be pulled to satisfy the rules above.
+///
+/// A run of closing brackets longer than this is not worth dragging a whole
+/// line for; the break stays where the width put it. Bounded rather than
+/// unbounded so that this cannot walk back to the start of a line.
+const MAX_KINSOKU_SHIFT: usize = 4;
+
 /// Where the next line ends and where the one after it starts.
 ///
 /// Returns `(end, next)`. They differ when the break falls on a space: the
 /// space belongs to neither line.
 ///
-/// Greedy and one pass. The alternative -- a proper line breaker with
-/// penalties -- would look better on a page of prose and would cost a pass
-/// per paragraph and a table of break classes, on a screen that is 106
-/// characters wide in a font with no kerning.
-fn next_line(text: &str, from: usize, columns: usize, preformatted: bool) -> (usize, usize) {
+/// Greedy and one pass, measured in pixels: characters are added until the
+/// next one would not fit in `budget`. The alternative -- a proper line
+/// breaker with penalties -- would look better on a page of prose and would
+/// cost a pass per paragraph, on a panel with no kerning and no hyphenation.
+///
+/// Always consumes at least one character. A viewport narrower than a single
+/// glyph would otherwise place nothing and be asked again from the same
+/// place, forever.
+fn next_line(
+    text: &str,
+    from: usize,
+    budget: u16,
+    scale: u8,
+    preformatted: bool,
+) -> (usize, usize) {
     if from >= text.len() {
         return (text.len(), text.len());
     }
     let rest = &text[from..];
-    let mut count = 0usize;
+    let mut used = 0u16;
+    let mut placed = 0usize;
     let mut last_space: Option<usize> = None;
     let mut limit = text.len();
     for (offset, character) in rest.char_indices() {
@@ -470,7 +525,8 @@ fn next_line(text: &str, from: usize, columns: usize, preformatted: bool) -> (us
             // A hard break: `<br>`, or a newline inside `pre`.
             return (absolute, absolute + 1);
         }
-        if count == columns {
+        let width = advance(character, scale);
+        if placed > 0 && used.saturating_add(width) > budget {
             // One character past the line. If it is a space, the line is
             // exactly full and the space is the break -- taking it here
             // rather than rewinding keeps a word that ends on the boundary.
@@ -483,19 +539,65 @@ fn next_line(text: &str, from: usize, columns: usize, preformatted: bool) -> (us
         if !preformatted && character == ' ' && absolute > from {
             last_space = Some(absolute);
         }
-        count += 1;
+        used = used.saturating_add(width);
+        placed += 1;
     }
     if limit >= text.len() {
         return (text.len(), text.len());
     }
-    match last_space {
+    let (end, next) = match last_space {
         // Break at the last space that fits, dropping it.
         Some(space) => (space, space + 1),
         // One word longer than the whole line, or preformatted text: cut it
         // at the edge. Losing the end of a very long URL off the side of the
         // screen would be worse than breaking it.
         None => (limit, limit),
+    };
+    if preformatted {
+        // `pre` is shown as written. Moving a break to tidy the punctuation
+        // would misrepresent the source.
+        return (end, next);
     }
+    kinsoku(text, from, end, next)
+}
+
+/// Pulls a break back off a character that may not start or end a line.
+///
+/// Gives up rather than looping: if no allowed break exists within
+/// [`MAX_KINSOKU_SHIFT`] characters, or pulling back would leave the line
+/// empty, the width's own break stands. A tidier line is not worth a page
+/// that never finishes laying out.
+fn kinsoku(text: &str, from: usize, end: usize, next: usize) -> (usize, usize) {
+    if !forbidden(text, from, end, next) {
+        return (end, next);
+    }
+    let mut candidate = end;
+    for _ in 0..MAX_KINSOKU_SHIFT {
+        let Some(previous) = text.get(from..candidate).and_then(|s| s.chars().next_back()) else {
+            break;
+        };
+        candidate -= previous.len_utf8();
+        if candidate <= from {
+            break;
+        }
+        // Pulled back to a character boundary, so nothing is dropped and the
+        // next line starts exactly where this one ended.
+        if !forbidden(text, from, candidate, candidate) {
+            return (candidate, candidate);
+        }
+    }
+    (end, next)
+}
+
+/// Whether breaking at `end`/`next` would strand a character on the wrong
+/// side of the break.
+fn forbidden(text: &str, from: usize, end: usize, next: usize) -> bool {
+    let starts_next = text.get(next..).and_then(|rest| rest.chars().next());
+    let ends_line = text
+        .get(from..end)
+        .and_then(|line| line.chars().next_back());
+    starts_next.is_some_and(|character| NO_LINE_START.contains(character))
+        || ends_line.is_some_and(|character| NO_LINE_END.contains(character))
 }
 
 #[cfg(test)]
@@ -508,17 +610,19 @@ mod tests {
     use crate::document::Parser;
     use crate::url::Url;
 
-    /// The panel's real numbers: the 5x7 font in its 6x8 advance box, on a
-    /// 1280-pixel-wide landscape screen.
+    /// The panel's real numbers: the 16 pixel font, on a 1280-pixel-wide
+    /// landscape screen.
     fn metrics() -> Metrics {
         Metrics {
-            char_width: 6,
-            glyph_height: 8,
+            glyph_height: tab5_font::HEIGHT as u16,
             line_gap_percent: LINE_GAP_PERCENT,
         }
     }
 
     const WIDTH: u16 = 1280;
+    /// Half-width characters that fit on one unindented line, which is what
+    /// the ASCII wrapping tests below are measured against.
+    const ASCII_COLUMNS: usize = (WIDTH / CELL_WIDTH) as usize;
 
     fn document(markup: &str) -> crate::document::Document {
         let url = Url::parse("http://example.com/a/page.html").unwrap();
@@ -566,15 +670,17 @@ mod tests {
 
     #[test]
     fn long_text_wraps_at_word_boundaries() {
-        // Body scale 2 in a 6-pixel cell is 12 pixels per character, so a
-        // 1280-pixel viewport holds 106.
         let word = "abcdefghij";
         let markup = format!("<p>{}</p>", (0..30).map(|_| word).collect::<Vec<_>>().join(" "));
         let (document, layout) = layout_of(&markup);
         let lines = rendered(&document, &layout);
         assert!(lines.len() > 1);
         for line in &lines {
-            assert!(line.chars().count() <= 106, "{line:?} is {} wide", line.len());
+            assert!(
+                line.chars().count() <= ASCII_COLUMNS,
+                "{line:?} is {} wide",
+                line.chars().count()
+            );
             // No line starts or ends on the space that broke it.
             assert!(!line.starts_with(' '), "{line:?}");
             assert!(!line.ends_with(' '), "{line:?}");
@@ -585,12 +691,13 @@ mod tests {
 
     #[test]
     fn a_word_longer_than_the_line_is_broken_at_the_edge() {
-        let long = "x".repeat(300);
+        // Two full lines and a remainder, whatever the width happens to be.
+        let long = "x".repeat(ASCII_COLUMNS * 2 + 10);
         let (document, layout) = layout_of(&format!("<p>{long}</p>"));
         let lines = rendered(&document, &layout);
         assert!(lines.len() >= 3, "{lines:?}");
         assert_eq!(lines.concat(), long);
-        assert_eq!(lines[0].chars().count(), 106);
+        assert_eq!(lines[0].chars().count(), ASCII_COLUMNS);
     }
 
     #[test]
@@ -615,8 +722,165 @@ mod tests {
         let lines = rendered(&document, &layout);
         assert_eq!(lines[0], "  a   b");
         // The long line is broken at the width rather than not at all.
-        assert!(lines[1].chars().count() <= 106);
+        assert!(lines[1].chars().count() <= ASCII_COLUMNS);
         assert!(lines[1].chars().all(|character| character == 'y'));
+    }
+
+    // --- mixed widths -----------------------------------------------------
+
+    /// Half-width and full-width alternating, so a line that was measured by
+    /// counting characters would be half again as wide as the viewport.
+    const MIXED: &str = "aあiいuうeえoお";
+
+    #[test]
+    fn a_full_width_character_is_twice_a_half_width_one() {
+        assert_eq!(advance('a', BODY_SCALE), 8);
+        assert_eq!(advance('あ', BODY_SCALE), 16);
+        assert_eq!(advance('a', HEADING_SCALE), 16);
+        assert_eq!(advance('あ', HEADING_SCALE), 32);
+        assert_eq!(text_width(MIXED, BODY_SCALE), 5 * 8 + 5 * 16);
+    }
+
+    #[test]
+    fn combining_marks_add_no_width() {
+        // The mark rides on the kana before it, so this is one full-width
+        // character, not two.
+        assert_eq!(text_width("か\u{3099}", BODY_SCALE), 16);
+        assert_eq!(text_width("e\u{301}", BODY_SCALE), 8);
+    }
+
+    #[test]
+    fn mixed_width_lines_stop_at_the_pixel_edge() {
+        let markup = format!("<p>{}</p>", MIXED.repeat(60));
+        let (document, layout) = layout_of(&markup);
+        let lines = rendered(&document, &layout);
+        assert!(lines.len() > 1);
+        for (index, line) in lines.iter().enumerate() {
+            let width = text_width(line, BODY_SCALE);
+            assert!(width <= WIDTH, "{line:?} is {width} pixels wide");
+            // Every line but the last is full, to within the one character
+            // that did not fit. Counting characters instead of measuring them
+            // would have overrun this by half again.
+            if index + 1 < lines.len() {
+                assert!(width + 16 > WIDTH, "{line:?} is only {width} pixels wide");
+            }
+        }
+        assert_eq!(lines.concat(), document.text());
+    }
+
+    #[test]
+    fn piece_width_is_what_the_renderer_will_draw() {
+        let (document, layout) = layout_of("<p>ASCII と<b>日本語</b>の混在</p>");
+        for line in layout.lines() {
+            for piece in layout.pieces(line) {
+                let text = document
+                    .text()
+                    .get(piece.start as usize..piece.end as usize)
+                    .unwrap();
+                assert_eq!(
+                    piece.width,
+                    text_width(text, line.scale),
+                    "piece {text:?} measured differently from its own text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pieces_of_a_line_abut_without_gaps() {
+        let (document, layout) = layout_of("<p>a<b>あ</b>i<code>い</code>u</p>");
+        let line = &layout.lines()[0];
+        let mut expected = 0;
+        for piece in layout.pieces(line) {
+            assert_eq!(piece.x, expected);
+            expected += piece.width;
+        }
+        assert_eq!(expected, text_width(document.text(), line.scale));
+    }
+
+    #[test]
+    fn a_link_after_full_width_text_is_hit_where_it_is_drawn() {
+        let (_, layout) = layout_of("<p>日本語の<a href=\"/t\">リンク</a>です</p>");
+        let line = &layout.lines()[0];
+        let piece = layout
+            .pieces(line)
+            .iter()
+            .find(|piece| piece.link.is_some())
+            .expect("the link is a piece of its own");
+        let link = piece.link.unwrap();
+        // Both edges of the drawn rectangle, and just outside each of them.
+        assert_eq!(layout.hit(line.x + piece.x, line.y), Some(link));
+        assert_eq!(
+            layout.hit(line.x + piece.x + piece.width - 1, line.y),
+            Some(link)
+        );
+        assert_ne!(layout.hit(line.x + piece.x - 1, line.y), Some(link));
+        assert_ne!(
+            layout.hit(line.x + piece.x + piece.width, line.y),
+            Some(link)
+        );
+    }
+
+    // --- kinsoku ----------------------------------------------------------
+
+    /// Lays out `text` in a viewport `columns` full-width characters wide.
+    fn wrapped_at(text: &str, columns: u16) -> Vec<String> {
+        let document = document(&format!("<p>{text}</p>"));
+        let layout = Layout::build(&document, columns * 16, metrics()).unwrap();
+        rendered(&document, &layout)
+    }
+
+    #[test]
+    fn a_closing_bracket_does_not_start_a_line() {
+        // Without the rule the break falls after the fourth character and
+        // the closing bracket leads the second line.
+        let lines = wrapped_at("あいう「え」おかき", 4);
+        assert!(!lines[1].starts_with('」'), "{lines:?}");
+        assert_eq!(lines.concat(), "あいう「え」おかき");
+    }
+
+    #[test]
+    fn a_full_stop_does_not_start_a_line() {
+        let lines = wrapped_at("あいうえ。おかきく", 4);
+        assert!(!lines[1].starts_with('。'), "{lines:?}");
+        assert_eq!(lines.concat(), "あいうえ。おかきく");
+    }
+
+    #[test]
+    fn an_opening_bracket_does_not_end_a_line() {
+        let lines = wrapped_at("あいう「えおかき", 4);
+        assert!(!lines[0].ends_with('「'), "{lines:?}");
+        assert_eq!(lines.concat(), "あいう「えおかき");
+    }
+
+    #[test]
+    fn kinsoku_gives_up_before_it_empties_a_line() {
+        // Every break is forbidden and the viewport is one character wide.
+        // The rule has to yield: a line that placed nothing would be asked
+        // for again from the same place, forever.
+        let lines = wrapped_at("。。。。。", 1);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines.concat(), "。。。。。");
+    }
+
+    #[test]
+    fn pre_is_never_retouched_by_kinsoku() {
+        // `pre` is shown as written, so the break stays at the edge even
+        // though it strands a full stop.
+        let markup = format!("<pre>{}</pre>", "あいうえ。おかきく");
+        let document = document(&markup);
+        // Four full-width characters of text, past `pre`'s own indent.
+        let width = 4 * 16 + PRE_INDENT_CELLS * CELL_WIDTH;
+        let layout = Layout::build(&document, width, metrics()).unwrap();
+        let lines = rendered(&document, &layout);
+        assert!(lines[1].starts_with('。'), "{lines:?}");
+    }
+
+    #[test]
+    fn a_viewport_narrower_than_one_glyph_still_makes_progress() {
+        let document = document("<p>あいう</p>");
+        let layout = Layout::build(&document, 4, metrics()).unwrap();
+        assert_eq!(rendered(&document, &layout), ["あ", "い", "う"]);
     }
 
     // --- geometry ---------------------------------------------------------

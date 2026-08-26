@@ -264,6 +264,18 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "fonttest",
+        usage: "fonttest",
+        lines: &[
+            "full-screen 16 pixel font sheet: ASCII, kana, kanji, symbols,",
+            "half-width katakana, Latin, combining marks, and characters the",
+            "subset does not cover, which have to appear as boxes rather than",
+            "blanks. also an opaque repaint over wider text, bold, 2x, and a",
+            "paragraph of Japanese long enough to judge legibility. any key",
+            "exits.",
+        ],
+    },
+    HelpEntry {
         name: "axistest",
         usage: "axistest",
         lines: &["tilt-controlled BMI270 ball test; any key exits"],
@@ -941,6 +953,8 @@ pub enum Outcome {
     TouchTest,
     /// Hand the display over to the coordinate calibration chart.
     CoordTest,
+    /// Hand the display over to the 16 pixel font sheet.
+    FontTest,
     /// Hand the display over to the BMI270 tilt diagnostic screen.
     AxisTest,
     /// Hand the display over to the INA226 battery monitor.
@@ -1412,6 +1426,7 @@ pub fn execute(
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
         b"coordtest" => return Outcome::CoordTest,
+        b"fonttest" => return Outcome::FontTest,
         b"axistest" => return Outcome::AxisTest,
         b"battery" | b"batinfo" => return Outcome::Battery,
         b"win" => return Outcome::Win,

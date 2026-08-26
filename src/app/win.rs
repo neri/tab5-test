@@ -57,23 +57,27 @@ const START_WIDTH: usize = 150;
 const TRAY_WIDTH: usize = 140;
 const TRAY_LEFT: usize = WIDTH - 6 - TRAY_WIDTH;
 
-/// "HH:MM" at text scale 3, centred in the tray.
-const CLOCK_TEXT_WIDTH: usize = 5 * 6 * 3;
+/// One half-width cell of the 16 pixel font, which every measurement on this
+/// screen is a multiple of.
+const CELL_WIDTH: usize = 8;
+const CELL_HEIGHT: usize = crate::font::HEIGHT;
+
+/// "HH:MM" centred in the tray.
+const CLOCK_TEXT_WIDTH: usize = 5 * CELL_WIDTH;
 const CLOCK_LEFT: usize = TRAY_LEFT + (TRAY_WIDTH - CLOCK_TEXT_WIDTH) / 2;
-const CLOCK_TOP: usize = BUTTON_TOP + (BUTTON_HEIGHT - 7 * 3) / 2;
+const CLOCK_TOP: usize = BUTTON_TOP + (BUTTON_HEIGHT - CELL_HEIGHT) / 2;
 
 /// The two desktop icons. Their captions are wider than the 48-pixel icons
 /// themselves and so are what set the box a repaint has to test the window
-/// against; both are 11 characters at text scale 2, which
-/// `draw_icon_label` asserts.
+/// against; both are 11 characters wide, which `draw_icon_label` asserts.
 const ICON_LEFT: usize = 44;
 const COMPUTER_ICON_TOP: usize = 44;
 const BIN_ICON_TOP: usize = 176;
 const ICON_WIDTH: usize = 48;
-const ICON_LABEL_WIDTH: usize = 11 * 6 * 2;
+const ICON_LABEL_WIDTH: usize = 11 * CELL_WIDTH;
 const ICON_LABEL_OFFSET_Y: usize = 54;
 const ICON_BOUNDS_LEFT: usize = ICON_LEFT + ICON_WIDTH / 2 - ICON_LABEL_WIDTH / 2;
-const ICON_BOUNDS_HEIGHT: usize = ICON_LABEL_OFFSET_Y + 7 * 2;
+const ICON_BOUNDS_HEIGHT: usize = ICON_LABEL_OFFSET_Y + CELL_HEIGHT;
 
 const WINDOW_INITIAL_LEFT: usize = 340;
 const WINDOW_INITIAL_TOP: usize = 210;
@@ -91,9 +95,8 @@ const WINDOW_MAX_TOP: usize = TASKBAR_TOP - WINDOW_HEIGHT;
 /// own whenever a mouse is plugged in or pulled out mid-screen.
 const STATUS_OFFSET_X: usize = 16;
 const STATUS_OFFSET_Y: usize = TITLE_HEIGHT + 118;
-/// Height of one text-scale-2 line, which `draw_text` paints as 7 rows per
-/// character cell.
-const STATUS_LINE_HEIGHT: usize = 7 * 2;
+/// Height of one line, which is the glyph box `draw_text` paints into.
+const STATUS_LINE_HEIGHT: usize = CELL_HEIGHT;
 
 /// The close box, which does not close: the pointer's only meaning so far
 /// is dragging, and deciding what "closing" means for a screen whose only
@@ -646,9 +649,9 @@ fn draw_taskbar(framebuffer: &mut Framebuffer, clock: Option<(u8, u8)>) {
     draw_string(
         framebuffer,
         START_LEFT + 46,
-        BUTTON_TOP + 6,
+        BUTTON_TOP + 8,
         "Start",
-        3,
+        1,
         BLACK,
         None,
     );
@@ -700,7 +703,7 @@ fn draw_clock(framebuffer: &mut Framebuffer, clock: Option<(u8, u8)>) {
         CLOCK_LEFT,
         CLOCK_TOP,
         text,
-        3,
+        1,
         BLACK,
         Some(FACE),
     );
@@ -718,17 +721,17 @@ fn draw_window(framebuffer: &mut Framebuffer, window: Window, mouse_present: boo
         TITLE_HEIGHT - 4,
         TITLE_BAR,
     );
-    draw_string(framebuffer, left + 12, top + 8, "Welcome", 3, WHITE, None);
+    draw_string(framebuffer, left + 12, top + 8, "Welcome", 1, WHITE, None);
 
     let close_left = left + WINDOW_WIDTH - 8 - CLOSE_SIZE;
     let close_top = top + 7;
     draw_raised(framebuffer, close_left, close_top, CLOSE_SIZE, CLOSE_SIZE);
     draw_string(
         framebuffer,
-        close_left + 5,
-        close_top + 4,
+        close_left + (CLOSE_SIZE - CELL_WIDTH) / 2,
+        close_top + 2,
         "x",
-        2,
+        1,
         BLACK,
         None,
     );
@@ -740,7 +743,7 @@ fn draw_window(framebuffer: &mut Framebuffer, window: Window, mouse_present: boo
         "Boot Mouse driver to have something to",
         "move a pointer across.",
     ] {
-        draw_string(framebuffer, body_left, line_top, line, 2, BLACK, None);
+        draw_string(framebuffer, body_left, line_top, line, 1, BLACK, None);
         line_top += 24;
     }
     draw_mouse_status(framebuffer, window, mouse_present);
@@ -750,7 +753,7 @@ fn draw_window(framebuffer: &mut Framebuffer, window: Window, mouse_present: boo
         body_left,
         status_top + 44,
         "Drag the title bar to move this window.",
-        2,
+        1,
         BLACK,
         None,
     );
@@ -759,7 +762,7 @@ fn draw_window(framebuffer: &mut Framebuffer, window: Window, mouse_present: boo
         body_left,
         status_top + 68,
         "Press any key to return to the shell.",
-        2,
+        1,
         BLACK,
         None,
     );
@@ -779,7 +782,7 @@ fn draw_mouse_status(framebuffer: &mut Framebuffer, window: Window, mouse_presen
         "USB mouse: not detected  "
     };
     let (x, y) = window.status_origin();
-    draw_string(framebuffer, x, y, text, 2, BLACK, Some(FACE));
+    draw_string(framebuffer, x, y, text, 1, BLACK, Some(FACE));
 }
 
 /// "My Computer": a CRT on a stand, near enough at 48 pixels.
@@ -805,15 +808,15 @@ fn draw_bin_icon(framebuffer: &mut Framebuffer, x: usize, y: usize) {
 }
 
 /// Desktop icon captions: white on the teal desktop, centred under a
-/// 48-pixel icon at text scale 2 (6 pixels per character cell).
+/// 48-pixel icon.
 #[inline(never)]
 fn draw_icon_label(framebuffer: &mut Framebuffer, icon_x: usize, y: usize, text: &str) {
-    let width = text.len() * 6 * 2;
+    let width = text.len() * CELL_WIDTH;
     // `ICON_LABEL_WIDTH` is the box `draw_desktop_patch` tests the window
     // against, and a caption wider than it would be left unrepainted.
     debug_assert!(width <= ICON_LABEL_WIDTH);
     let left = (icon_x + 24).saturating_sub(width / 2);
-    draw_string(framebuffer, left, y, text, 2, WHITE, None);
+    draw_string(framebuffer, left, y, text, 1, WHITE, None);
 }
 
 /// Reads the wall clock, or `None` if the RTC did not answer with a valid

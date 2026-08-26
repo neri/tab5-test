@@ -717,11 +717,11 @@ fn draw_access_points(
     count.push_u32(access_points.len() as u32);
     count.push_str(" NETWORKS  ");
     count.push_str(if enabled { "ON" } else { "OFF" });
-    framebuffer.draw_text(930, 30, count.as_str(), 2, MUTED, None);
+    framebuffer.draw_text(930, 30, count.as_str(), 1, MUTED, None);
 
     if access_points.is_empty() {
-        framebuffer.draw_text(350, 285, "NO ACCESS POINTS FOUND", 3, YELLOW, None);
-        framebuffer.draw_text(400, 335, "PRESS R TO RESCAN", 2, WHITE, None);
+        centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, YELLOW);
+        centred(framebuffer, 335, "PRESS R TO RESCAN", 1, WHITE);
     }
 
     for (visible, network) in access_points
@@ -737,25 +737,25 @@ fn draw_access_points(
         let foreground = if selected_row { BLACK } else { WHITE };
         framebuffer.fill_rect(24, y, WIDTH - 48, ROW_HEIGHT - 3, background);
         let line = access_point_line(network);
-        framebuffer.draw_text(36, y + 6, line.as_str(), 2, foreground, None);
+        framebuffer.draw_text(36, y + 6, line.as_str(), 1, foreground, None);
     }
 
     framebuffer.draw_text(
         28,
         FOOTER_TOP,
         "UP/DOWN/PAGE SELECT   ENTER/TOUCH CONNECT   O OFF   F FORGET",
-        2,
+        1,
         CYAN,
         None,
     );
     if let Some(message) = message {
-        framebuffer.draw_text(28, FOOTER_TOP + 32, message, 2, YELLOW, None);
+        framebuffer.draw_text(28, FOOTER_TOP + 32, message, 1, YELLOW, None);
     } else {
         framebuffer.draw_text(
             28,
             FOOTER_TOP + 32,
             "R RESCAN   ESC EXIT   MENU CONNECTIONS REQUEST DHCP AUTOMATICALLY",
-            2,
+            1,
             MUTED,
             None,
         );
@@ -801,25 +801,25 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
     let mut network = Line::new();
     network.push_str("NETWORK  ");
     network.push_ascii(ssid);
-    framebuffer.draw_text(90, 150, network.as_str(), 3, WHITE, None);
-    framebuffer.draw_text(90, 226, "PASSWORD", 2, MUTED, None);
+    framebuffer.draw_text(90, 150, network.as_str(), 2, WHITE, None);
+    framebuffer.draw_text(90, 226, "PASSWORD", 1, MUTED, None);
     framebuffer.fill_rect(90, 258, 900, 64, WHITE);
 
     let mut masked = [b'*'; wifi::station::PASSWORD_MAX_BYTES];
     let masked_text = core::str::from_utf8(&masked[..length]).unwrap_or("");
-    framebuffer.draw_text(106, 276, masked_text, 2, BLACK, Some(WHITE));
+    framebuffer.draw_text(106, 276, masked_text, 1, BLACK, Some(WHITE));
     // Do not let the display copy be mistaken for credential storage either.
     zeroize(&mut masked);
 
     let mut count = Line::new();
     count.push_u32(length as u32);
     count.push_str(" / 64 BYTES");
-    framebuffer.draw_text(1010, 279, count.as_str(), 2, CYAN, None);
+    framebuffer.draw_text(1010, 279, count.as_str(), 1, CYAN, None);
     framebuffer.draw_text(
         90,
         370,
         "ENTER CONNECT    BACKSPACE DELETE    ESC CANCEL",
-        2,
+        1,
         CYAN,
         None,
     );
@@ -827,7 +827,7 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
         90,
         414,
         "THE PASSWORD IS NOT WRITTEN TO THE CONSOLE OR UART LOG",
-        2,
+        1,
         MUTED,
         None,
     );
@@ -839,7 +839,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
     let mut network = Line::new();
     network.push_str("NETWORK  ");
     network.push_ascii(ssid);
-    framebuffer.draw_text(90, 140, network.as_str(), 3, WHITE, None);
+    framebuffer.draw_text(90, 140, network.as_str(), 2, WHITE, None);
 
     let save_selected = choice == ProfileChoice::SaveAndAutoConnect;
     framebuffer.fill_rect(
@@ -853,7 +853,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         110,
         248,
         "SAVE AND AUTO-CONNECT",
-        3,
+        2,
         if save_selected { BLACK } else { WHITE },
         None,
     );
@@ -868,7 +868,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         110,
         330,
         "CONNECT ONCE",
-        3,
+        2,
         if save_selected { WHITE } else { BLACK },
         None,
     );
@@ -876,7 +876,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         90,
         420,
         "UP/DOWN SELECT    ENTER CONFIRM    ESC CANCEL",
-        2,
+        1,
         CYAN,
         None,
     );
@@ -884,7 +884,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         90,
         464,
         "THE PROFILE IS SAVED ONLY AFTER ASSOCIATION SUCCEEDS",
-        2,
+        1,
         MUTED,
         None,
     );
@@ -893,8 +893,8 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
 
 fn draw_off_screen(framebuffer: &mut Framebuffer, saved_profile: bool, message: Option<&str>) {
     draw_chrome(framebuffer, "WI-FI NETWORKS");
-    framebuffer.draw_text(1030, 30, "OFF", 2, YELLOW, None);
-    framebuffer.draw_text(500, 155, "WI-FI IS OFF", 4, YELLOW, None);
+    framebuffer.draw_text(1030, 30, "OFF", 1, YELLOW, None);
+    framebuffer.draw_text(500, 155, "WI-FI IS OFF", 2, YELLOW, None);
     framebuffer.draw_text(
         405,
         220,
@@ -903,27 +903,51 @@ fn draw_off_screen(framebuffer: &mut Framebuffer, saved_profile: bool, message: 
         } else {
             "SAVED PROFILE: NO"
         },
-        2,
+        1,
         WHITE,
         None,
     );
     framebuffer.fill_rect(220, 290, 370, 100, SELECTED);
-    framebuffer.draw_text(328, 326, "O  TURN ON", 3, BLACK, None);
+    framebuffer.draw_text(328, 326, "O  TURN ON", 2, BLACK, None);
     framebuffer.fill_rect(690, 290, 370, 100, PANEL);
-    framebuffer.draw_text(760, 326, "F  FORGET PROFILE", 3, WHITE, None);
+    framebuffer.draw_text(760, 326, "F  FORGET PROFILE", 2, WHITE, None);
     framebuffer.draw_text(
         430,
         FOOTER_TOP,
         "TOUCH A BUTTON OR PRESS O/F",
-        2,
+        1,
         CYAN,
         None,
     );
-    framebuffer.draw_text(550, FOOTER_TOP + 32, "ESC EXIT", 2, MUTED, None);
+    framebuffer.draw_text(550, FOOTER_TOP + 32, "ESC EXIT", 1, MUTED, None);
     if let Some(message) = message {
-        framebuffer.draw_text(90, 450, message, 2, RED, None);
+        framebuffer.draw_text(90, 450, message, 1, RED, None);
     }
     flush(framebuffer, b"WIFI MENU: off-screen flush failed\r\n");
+}
+
+/// Draws `text` centred inside `left..left + width`.
+///
+/// Placed from the text's own measured width rather than from a counted cell
+/// count: half the strings on these screens are meant to sit in the middle of
+/// something, and a fixed x is only ever right for one string at one size.
+fn centred_in(
+    framebuffer: &mut Framebuffer,
+    left: usize,
+    width: usize,
+    y: usize,
+    text: &str,
+    scale: usize,
+    color: u16,
+) {
+    let drawn = crate::font::text_width(text) * scale;
+    let x = left + width.saturating_sub(drawn) / 2;
+    framebuffer.draw_text(x, y, text, scale, color, None);
+}
+
+/// Centred across the whole screen.
+fn centred(framebuffer: &mut Framebuffer, y: usize, text: &str, scale: usize, color: u16) {
+    centred_in(framebuffer, 0, WIDTH, y, text, scale, color);
 }
 
 fn confirm_forget(
@@ -932,26 +956,18 @@ fn confirm_forget(
     manager: &mut Manager,
 ) -> bool {
     draw_chrome(framebuffer, "FORGET WI-FI PROFILE?");
-    framebuffer.draw_text(
-        260,
+    centred(
+        framebuffer,
         180,
         "THE SAVED SSID AND PASSWORD WILL BE DELETED",
-        2,
+        1,
         YELLOW,
-        None,
     );
     framebuffer.fill_rect(100, 300, 470, 90, RED);
-    framebuffer.draw_text(255, 332, "Y  FORGET", 3, WHITE, None);
+    centred_in(framebuffer, 100, 470, 332, "Y  FORGET", 2, WHITE);
     framebuffer.fill_rect(700, 300, 470, 90, PANEL);
-    framebuffer.draw_text(875, 332, "N  CANCEL", 3, WHITE, None);
-    framebuffer.draw_text(
-        430,
-        FOOTER_TOP,
-        "TOUCH A BUTTON OR PRESS Y/N",
-        2,
-        CYAN,
-        None,
-    );
+    centred_in(framebuffer, 700, 470, 332, "N  CANCEL", 2, WHITE);
+    centred(framebuffer, FOOTER_TOP, "TOUCH A BUTTON OR PRESS Y/N", 1, CYAN);
     flush(framebuffer, b"WIFI MENU: forget-confirm flush failed\r\n");
 
     loop {
@@ -977,22 +993,22 @@ fn confirm_forget(
 fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
     framebuffer.fill(BACKGROUND);
     framebuffer.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, HEADER);
-    framebuffer.draw_text(28, 24, title, 3, WHITE, None);
+    framebuffer.draw_text(28, 24, title, 2, WHITE, None);
     framebuffer.fill_rect(0, FOOTER_TOP - 16, WIDTH, HEIGHT - (FOOTER_TOP - 16), BLACK);
 }
 
 fn show_progress(framebuffer: &mut Framebuffer, title: &str, detail: &str) {
     draw_chrome(framebuffer, "WI-FI SETUP");
-    framebuffer.draw_text(90, 235, title, 4, CYAN, None);
-    framebuffer.draw_text(90, 318, detail, 2, WHITE, None);
+    framebuffer.draw_text(90, 235, title, 2, CYAN, None);
+    framebuffer.draw_text(90, 318, detail, 1, WHITE, None);
     flush(framebuffer, b"WIFI MENU: progress-screen flush failed\r\n");
 }
 
 fn show_error(framebuffer: &mut Framebuffer, title: &str, detail: &Line, instruction: &str) {
     draw_chrome(framebuffer, "WI-FI SETUP");
-    framebuffer.draw_text(90, 220, title, 4, RED, None);
-    framebuffer.draw_text(90, 304, detail.as_str(), 2, WHITE, None);
-    framebuffer.draw_text(90, 382, instruction, 2, CYAN, None);
+    framebuffer.draw_text(90, 220, title, 2, RED, None);
+    framebuffer.draw_text(90, 304, detail.as_str(), 1, WHITE, None);
+    framebuffer.draw_text(90, 382, instruction, 1, CYAN, None);
     flush(framebuffer, b"WIFI MENU: error-screen flush failed\r\n");
 }
 
@@ -1003,13 +1019,13 @@ fn show_result(framebuffer: &mut Framebuffer, result: &ConnectionResult) {
         ResultKind::Warning => YELLOW,
         ResultKind::Error => RED,
     };
-    framebuffer.draw_text(90, 220, result.title, 4, color, None);
-    framebuffer.draw_text(90, 304, result.detail.as_str(), 2, WHITE, None);
+    framebuffer.draw_text(90, 220, result.title, 2, color, None);
+    framebuffer.draw_text(90, 304, result.detail.as_str(), 1, WHITE, None);
     framebuffer.draw_text(
         90,
         382,
         "ENTER AP LIST    R RESCAN    ESC EXIT",
-        2,
+        1,
         CYAN,
         None,
     );

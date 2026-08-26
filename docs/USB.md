@@ -468,7 +468,7 @@ HID記述子です。文字列記述子（`iManufacturer`／`iProduct`／`iSeria
 ストレージ選択の判断時間に直結しており（[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)）、
 そこへ制御転送を増やさないためです。文字列を持たないデバイスは`(none)`、LANGIDを
 返さないデバイスは`strings: device reports none`と表示します。取得した文字列は
-5×7 ASCIIフォントしか無いのでASCIIへ畳み、非ASCIIは`?`にします。
+表示先はコンソールの半角固定セルなのでASCIIへ畳み、非ASCIIは`?`にします。
 
 ```
 device 2 on hub port 1, Low-Speed

@@ -4,9 +4,38 @@
 
 ## コンソール
 
-`src/console.rs` は 104 列 × 44 行の固定サイズ端末としてキーボードからのASCII入力を保持します。
+`src/console.rs` は 156 列 × 44 行の固定サイズ端末です。1セルは8×16 pixelで、
+16px bitmapフォントの半角glyphそのまま（拡大なし）です。
 各行の先頭には半角`"> "`プロンプトを自動で書き込み、Backspaceはプロンプトより前へは
-戻りません（5×7 ASCIIフォントのみのため、全角`＞`ではなく半角`>`を使用しています）。
+戻りません（コンソールは1文字1セルの半角固定端末なので、全角`＞`ではなく半角`>`を
+使用しています）。
+
+### セルは文字ではなく表示glyph ID
+
+セルは`char`ではなく1 byteの表示用glyph ID（`font::console::Id`）を持ちます。
+フォント側の契約は[`FONT.md`](FONT.md)にあります。
+出力はbyte単位ではなくUnicode scalar単位で走査し、**どのscalarも必ず1セル**へ写します。
+
+- ASCII、Latin-1、半角カナはそのglyph
+- 空白は空セル
+- それ以外——全角文字、combining mark、フォントに無い文字、制御文字——は
+  8×16の可視placeholder
+
+空白へは落としません。空白にすると、そこで文字列が終わったように見えるためです。
+LCD上で読めなくても、文字が存在することと、おおよその文字数は分かります。元の
+UTF-8は`write_output_line`が従来どおりUARTへそのまま出すので、内容はそちらで
+確認できます。この変換はLCD表示だけの都合で、UART側を置き換えません。
+
+コマンド入力はASCIIのままです。`Submission`、引数parser、CardKB／USBキーボードの
+入力契約は変えていません。cursor、Backspace、Delete、Home／End、入力行の退避と復元は
+常に1セル単位で扱い、全角のlead／continuationやUnicode表示幅の状態はコンソールへ
+持ち込みません。
+
+`ls`の複数列配置のように桁を揃える側は、UTF-8のbyte数ではなく
+`font::console::cell_count`が返すセル数を使います。
+
+104列×44行の`char`セル配列（18,304 byte）から156列×44行の`u8`セル配列
+（6,864 byte）になり、静的RAMは11,388 byte減りました。
 CardKB v1.1のEscとカーソル（`0xB5`=↑、`0xB6`=↓、`0xB4`=←、`0xB7`=→）、およびUSB HID
 BootキーボードのEsc、カーソル、Home/End、Page Up/Down、Insert/Delete、F1〜F12は`input::Key`へ
 正規化します。コンソールではEscで現在行を消去し、Left/Right/Home/EndとDeleteで
@@ -42,7 +71,7 @@ PSRAM範囲1本になります（逆に、1行の全列を書き戻すとフレ�
 空セル（次の書き込み位置、またはBackspaceが直前に消した位置）なので、`render_cell`は
 そのセルだけカーソルブロックかセル本来の内容かを選んで描画すれば、他のセルに手を
 入れずに済みます。直前までカーソルだった空セルにグリフの前景ピクセルだけを
-重ねると背景の白が残るため、`render_cell`は`draw_ascii_char`に背景色BLACKを
+重ねると背景の白が残るため、`render_cell`は`draw_glyph`に背景色BLACKを
 渡し、セル全体を1回で塗り替えて「カーソルの塗り残し」を防いでいます
 （カーソルブロック自体は塗り分けのないベタ塗りなので`fill_rect`のままです）。
 キー入力のたびに移動前後の
@@ -180,7 +209,7 @@ phase 0 ms、DMA2D burst 128 byte、ICM 15/15だけを実行します。`db`に�
 画面遷移の受入試験は`ui`だけで開始します。最初に通常のconsole cell配列を使って画面を
 埋め、実際のDMA2D scroll＋露出行再描画を100回繰り返し、各操作後のunderrunを回収します。
 試験用行はUARTへmirrorせず、serial出力のbackpressureを表示負荷へ混ぜません。その後、
-coordinate chart、paint、multi-touch、axis、desktopを順に開きます。各画面で指示された
+coordinate chart、font sheet、paint、multi-touch、axis、desktopを順に開きます。各画面で指示された
 操作を行い、任意キーを押すと次へ進みます。各画面の初期描画とconsoleへの復帰後にsticky
 underrunを回収し、最後にvisual全体のunderrun数とDMA errorを表示します。
 

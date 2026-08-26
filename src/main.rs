@@ -17,6 +17,7 @@ mod cardkb;
 mod console;
 mod delay;
 mod dma2d;
+mod font;
 mod framebuffer;
 mod fs;
 mod gpio;

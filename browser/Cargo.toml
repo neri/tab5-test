@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-# No dependencies, deliberately. URL parsing, HTML tokenizing and the
-# document model are pure byte-in/value-out code, and keeping them free of
-# the firmware's hardware crates is what lets `cargo test` build this crate
-# for the host while the firmware itself only ever builds for RISC-V.
+# One dependency, and it is not a hardware crate: `tab5-font` is the glyph
+# data and the `advance` lookup, and it builds for the host exactly like this
+# one does. Line breaking has to measure text in the same pixels the renderer
+# draws it in, and the only way to guarantee that is for both to call the same
+# function -- see `docs/FONT_MIGRATION_PLAN.md`. URL parsing, HTML tokenizing
+# and the document model remain pure byte-in/value-out code, which is what
+# lets `cargo test` build this crate for the host while the firmware itself
+# only ever builds for RISC-V.
 [dependencies]
+tab5-font = { path = "../font" }

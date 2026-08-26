@@ -14,13 +14,16 @@
 
 use core::cell::UnsafeCell;
 
+use crate::font;
+use crate::font::console::{BLANK, Id};
 use crate::framebuffer::{BLACK, Framebuffer, HEIGHT, WHITE, WIDTH};
 use crate::input::Key;
 use crate::uart;
 
-const SCALE: usize = 2;
-const CELL_WIDTH: usize = 6 * SCALE;
-const CELL_HEIGHT: usize = 8 * SCALE;
+/// One cell is one half-width glyph at its natural size: no scaling, and the
+/// same 8x16 box `font::console::cell_glyph` always returns.
+const CELL_WIDTH: usize = 8;
+const CELL_HEIGHT: usize = font::HEIGHT;
 const LEFT: usize = 16;
 const TOP: usize = 8;
 /// Cells across one row. Public because `ls` lays its names out in columns
@@ -29,9 +32,16 @@ const TOP: usize = 8;
 pub const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
 const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 
-// Only the 5x7 ASCII font is available (no Japanese glyphs), so the prompt
-// uses a half-width '>' rather than the full-width '＞' a shell would show.
-const PROMPT: [char; 2] = ['>', ' '];
+// The grid `docs/FONT_MIGRATION_PLAN.md` sizes everything else against. The
+// arithmetic above is what defines it; this is here so that a change to the
+// margins or the cell size has to be a deliberate one rather than a quiet
+// reshaping of every screen that counts columns.
+const _: () = assert!(COLUMNS == 156 && ROWS == 44);
+
+// The console is a half-width fixed terminal by design -- every cell is one
+// 8x16 glyph -- so the prompt is a half-width '>' rather than the full-width
+// '＞' a shell would show. See `docs/FONT_MIGRATION_PLAN.md`.
+const PROMPT: [Id; 2] = [font::console::id('>'), font::console::id(' ')];
 
 /// Longest command line `submit` can capture: one row minus the prompt. This
 /// is the hard limit on input, not a buffer that happens to be this size --
@@ -40,7 +50,12 @@ const MAX_LINE: usize = COLUMNS - PROMPT.len();
 
 /// Terminal-like text storage for the keyboard input echo display.
 pub struct Console {
-    cells: [[char; COLUMNS]; ROWS],
+    /// One byte per cell: the glyph to paint, not the character that produced
+    /// it. Every Unicode scalar written to the console maps to exactly one of
+    /// these (`font::console::id`), so a full-width character or one the font
+    /// does not have occupies a single cell holding a visible placeholder
+    /// rather than splitting the row or vanishing into a blank.
+    cells: [[Id; COLUMNS]; ROWS],
     column: usize,
     row: usize,
     /// First unused cell on the current editable line.  It is distinct from
@@ -100,7 +115,7 @@ pub unsafe fn singleton() -> &'static mut Console {
 
 impl Console {
     pub const fn new() -> Self {
-        let mut cells = [['\0'; COLUMNS]; ROWS];
+        let mut cells = [[BLANK; COLUMNS]; ROWS];
         let mut i = 0;
         while i < PROMPT.len() {
             cells[0][i] = PROMPT[i];
@@ -124,7 +139,7 @@ impl Console {
     /// and the other full-screen modes: they leave their own drawing in the
     /// framebuffer, and this puts the console back over it.
     pub fn clear(&mut self, framebuffer: &mut Framebuffer) {
-        self.cells = [['\0'; COLUMNS]; ROWS];
+        self.cells = [[BLANK; COLUMNS]; ROWS];
         self.column = 0;
         self.row = 0;
         self.input_end = 0;
@@ -189,7 +204,7 @@ impl Console {
         for column in PROMPT.len()..self.input_end {
             // Only printable ASCII reaches a cell through `put`, the same
             // narrowing `submit` relies on.
-            text[len] = self.cells[self.row][column] as u8;
+            text[len] = ascii_of(self.cells[self.row][column]);
             len += 1;
         }
         let cursor = self.column.saturating_sub(PROMPT.len());
@@ -197,7 +212,7 @@ impl Console {
         // repaint has to cover it as well as the cells being blanked.
         let painted = self.input_end.max(self.column + 1);
         for column in 0..self.input_end {
-            self.cells[self.row][column] = '\0';
+            self.cells[self.row][column] = BLANK;
         }
         self.column = 0;
         self.input_end = 0;
@@ -214,7 +229,8 @@ impl Console {
     pub fn restore_input_line(&mut self, framebuffer: &mut Framebuffer, saved: InputLine) {
         self.set_prompt_cells();
         for index in 0..saved.len {
-            self.cells[self.row][PROMPT.len() + index] = char::from(saved.text[index]);
+            self.cells[self.row][PROMPT.len() + index] =
+                font::console::id(char::from(saved.text[index]));
         }
         self.input_end = PROMPT.len() + saved.len;
         self.column = (PROMPT.len() + saved.cursor).min(self.input_end);
@@ -272,9 +288,12 @@ impl Console {
         // column span (CW rotation makes that a run of native rows), so a
         // short line must not pay for the full row width.
         let mut widest = 0;
-        for ch in text.chars() {
-            let ch = if (' '..='~').contains(&ch) { ch } else { ' ' };
-            self.cells[self.row][self.column] = ch;
+        for character in text.chars() {
+            // One cell per scalar, whatever the scalar is. Full-width
+            // characters, combining marks and characters outside the font all
+            // become a visible placeholder here rather than a blank; the UART
+            // mirror above still carries the original UTF-8.
+            self.cells[self.row][self.column] = font::console::id(character);
             self.column += 1;
             widest = widest.max(self.column);
             if self.column == COLUMNS {
@@ -346,7 +365,7 @@ impl Console {
         for index in (self.column..self.input_end).rev() {
             self.cells[row][index + 1] = self.cells[row][index];
         }
-        self.cells[row][self.column] = ch;
+        self.cells[row][self.column] = font::console::id(ch);
         self.column += 1;
         self.input_end += 1;
         self.draw_edit(framebuffer, previous_column, self.input_end);
@@ -381,7 +400,7 @@ impl Console {
             self.cells[self.row][index] = self.cells[self.row][index + 1];
         }
         self.input_end -= 1;
-        self.cells[self.row][self.input_end] = '\0';
+        self.cells[self.row][self.input_end] = BLANK;
     }
 
     fn clear_input_line(&mut self, framebuffer: &mut Framebuffer) {
@@ -391,7 +410,7 @@ impl Console {
         let previous_column = self.column;
         let old_end = self.input_end;
         for column in PROMPT.len()..old_end {
-            self.cells[self.row][column] = '\0';
+            self.cells[self.row][column] = BLANK;
         }
         self.column = PROMPT.len();
         self.input_end = PROMPT.len();
@@ -420,8 +439,8 @@ impl Console {
         let mut len = 0;
         for column in PROMPT.len()..self.input_end {
             // Only ASCII printable chars (or blanks) ever land in a cell via
-            // `put`, so this narrowing cast never loses information.
-            text[len] = self.cells[self.row][column] as u8;
+            // `put`, so this narrowing never loses information.
+            text[len] = ascii_of(self.cells[self.row][column]);
             len += 1;
         }
         let submitted_row = self.row;
@@ -457,7 +476,7 @@ impl Console {
             for row in 1..ROWS {
                 self.cells[row - 1] = self.cells[row];
             }
-            self.cells[ROWS - 1] = ['\0'; COLUMNS];
+            self.cells[ROWS - 1] = [BLANK; COLUMNS];
             self.row = ROWS - 1;
         }
         self.column = 0;
@@ -503,8 +522,8 @@ impl Console {
     /// Fills the current row's prompt cells and positions `column` after
     /// them, without drawing.
     fn set_prompt_cells(&mut self) {
-        for (column, &ch) in PROMPT.iter().enumerate() {
-            self.cells[self.row][column] = ch;
+        for (column, &id) in PROMPT.iter().enumerate() {
+            self.cells[self.row][column] = id;
         }
         self.column = PROMPT.len();
         self.input_end = PROMPT.len();
@@ -565,12 +584,11 @@ impl Console {
     /// Paints one text cell. Pixels only: `draw_span` owns the writeback so
     /// a run of cells costs one.
     ///
-    /// A cell's glyph box is exactly `draw_ascii_char`'s advance box, so
-    /// passing the background there paints the whole cell in one call. That
-    /// matters because every repaint has to overwrite the cell's previous
-    /// contents -- another glyph, or the cursor block's white -- and doing it
-    /// with a separate `fill_rect` first wrote a third of the cell's pixels
-    /// twice.
+    /// A cell is exactly one half-width glyph box, so passing the background
+    /// to `draw_glyph` paints the whole cell in one call. That matters because
+    /// every repaint has to overwrite the cell's previous contents -- another
+    /// glyph, or the cursor block's white -- and doing it with a separate
+    /// `fill_rect` first wrote a third of the cell's pixels twice.
     fn render_cell(&self, framebuffer: &mut Framebuffer, column: usize, row: usize) {
         let x = LEFT + column * CELL_WIDTH;
         let y = TOP + row * CELL_HEIGHT;
@@ -582,16 +600,8 @@ impl Console {
             framebuffer.fill_rect(x, y, CELL_WIDTH, CELL_HEIGHT, WHITE);
             return;
         }
-        framebuffer.draw_ascii_char(x, y, self.glyph(column, row), SCALE, WHITE, Some(BLACK));
-    }
-
-    /// The character to draw for one cell. `'\0'` is this module's empty-cell
-    /// marker, not a glyph the font should be asked for.
-    fn glyph(&self, column: usize, row: usize) -> char {
-        match self.cells[row][column] {
-            '\0' => ' ',
-            ch => ch,
-        }
+        let glyph = font::console::cell_glyph(self.cells[row][column]);
+        framebuffer.draw_glyph(x, y, &glyph, 1, WHITE, Some(BLACK));
     }
 
     /// Repaints the whole screen from the cell array and writes all of it
@@ -615,13 +625,13 @@ impl Console {
         framebuffer.fill(BLACK);
         for row in 0..ROWS {
             for column in 0..COLUMNS {
-                let ch = self.cells[row][column];
-                if ch != '\0' && ch != ' ' {
-                    framebuffer.draw_ascii_char(
+                let id = self.cells[row][column];
+                if id != BLANK {
+                    framebuffer.draw_glyph(
                         LEFT + column * CELL_WIDTH,
                         TOP + row * CELL_HEIGHT,
-                        ch,
-                        SCALE,
+                        &font::console::cell_glyph(id),
+                        1,
                         WHITE,
                         // `fill` has already blanked the screen, so only the
                         // glyph's own pixels are left to write.
@@ -642,6 +652,16 @@ impl Console {
         if !framebuffer.flush() {
             uart::log(b"Console: full writeback failed\r\n");
         }
+    }
+}
+
+/// The ASCII byte a cell stands for, for recovering a typed line from the
+/// grid. Input reaches a cell only through `put`, which takes printable ASCII,
+/// so anything else here is a blank.
+fn ascii_of(id: Id) -> u8 {
+    match font::console::character(id) {
+        Some(character) if character.is_ascii() => character as u8,
+        _ => b' ',
     }
 }
 

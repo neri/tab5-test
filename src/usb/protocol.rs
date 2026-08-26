@@ -306,10 +306,11 @@ pub fn read_string_language(pipe: &ControlPipe) -> Option<u16> {
 /// Reads string descriptor `index` in `language` and folds its UTF-16LE
 /// text into `out` as ASCII, returning how many bytes were written.
 ///
-/// Only ASCII survives: this firmware has a 5x7 ASCII font and no way to
-/// draw anything else, so a non-ASCII code unit becomes `?` rather than
-/// silently disappearing. Text longer than the buffer or than `out` is
-/// truncated -- callers display names, they do not act on them.
+/// Only ASCII survives. The callers are `lsusb` and the device listings,
+/// which print into the console's fixed half-width cells, so a non-ASCII
+/// code unit becomes `?` rather than silently disappearing. Text longer than
+/// the buffer or than `out` is truncated -- callers display names, they do
+/// not act on them.
 ///
 /// Index 0 is rejected: that is the language list above, not a string.
 /// Like it, this runs quietly, since a device is free to refuse.
