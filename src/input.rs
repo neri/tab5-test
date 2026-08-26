@@ -71,6 +71,16 @@ const MAX_TOUCH_POINTS: usize = 10;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Key {
     Ascii(u8),
+    /// A letter held with Ctrl, as the lowercase letter itself.
+    ///
+    /// A variant rather than the C0 control code the letter stands for
+    /// (`Ctrl+Q` as `Ascii(0x11)`). The control codes are not free: three of
+    /// them are keys of their own -- `Ctrl+H` is 0x08, `Ctrl+I` is 0x09,
+    /// `Ctrl+M` is 0x0D -- so an application binding one of those to a
+    /// command would silently bind Backspace, Tab or Enter with it. Keeping
+    /// them apart means the aliasing is decided once, where the bytes are
+    /// translated, instead of in every `match` on a key.
+    Control(u8),
     Escape,
     ArrowUp,
     ArrowDown,
@@ -649,6 +659,12 @@ const fn source_after(source: KeySource) -> KeySource {
     }
 }
 
+/// Translates one CardKB byte into the application-wide key representation.
+///
+/// There is no `Key::Control` arm here: CardKB v1.1 has no Ctrl key, so no
+/// C0 code for a letter can arrive on this path. `Control` comes from the
+/// HID conversion below and nowhere else, which is why the browser keeps a
+/// plain `q` and `F2` beside its `Ctrl+Q` and `Ctrl+L`.
 const fn key_from_ascii(byte: u8) -> Key {
     match byte {
         0x1B => Key::Escape,
@@ -667,6 +683,14 @@ const fn key_from_ascii(byte: u8) -> Key {
 /// this one conversion so their printable and navigation keys stay identical.
 pub(crate) fn key_from_hid_usage(keycode: u8, modifiers: u8) -> Option<Key> {
     let shift = modifiers & ((1 << 1) | (1 << 5)) != 0;
+    // Left Ctrl is bit 0 and right Ctrl bit 4 (HID 1.11 section 8.3).
+    let control = modifiers & (1 | (1 << 4)) != 0;
+    // Only letters. Ctrl with a digit or a punctuation key keeps producing
+    // the character it prints, which is what it did before this existed:
+    // nothing binds those, and dropping them would only lose input.
+    if control && (0x04..=0x1D).contains(&keycode) {
+        return Some(Key::Control(b'a' + (keycode - 0x04)));
+    }
     match keycode {
         0x04..=0x1D => {
             let letter = b'a' + (keycode - 0x04);

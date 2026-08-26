@@ -366,6 +366,8 @@ Stage 0の全fixtureを実機から巡回する`browsertest`診断を追加す�
 network counters、display countersをUARTへ出す。
 
 コマンドは`bt [rounds]`（別名`browsertest`）。`hbase`が指すサーバから
+（現在は`bt <url> [rounds]`で、引数に渡したサーバから——「完了後:
+`hbase`を廃止し、schemeの無いアドレスに`http://`を補う」）
 `/manifest.txt`を読み、その中の各pathを`app::fetch::Fetch`——ブラウザ画面と
 同じもの——で取得して、manifestの期待値と突き合わせる。UARTへは1 endpoint
 1行、コンソールへは失敗と要約だけを出す。
@@ -603,6 +605,73 @@ LAN上の同名ホストへ問い合わせが飛ぶことはない。
 - `/long` scroll用の長い文書
 - `/wide` URL上限と同じ長さの1行
 - `/empty` 空文書
+
+### 完了後: 終了は`Ctrl+Q`、アドレス欄は`Ctrl+L`（利用者の指摘）
+
+**観測**: `Escape`が終了なのは邪魔。読んでいたページを捨てる操作が、どの
+キーボードでもいちばん単独で押しやすいキーに乗っている。アドレス欄も
+`Enter`／`F2`より`Ctrl+L`で開きたい。
+
+**前提が1つ足りなかった**: Ctrlは`input::Key`まで届いていなかった。
+`key_from_hid_usage`が見ていたmodifierはshift（bit 1／bit 5）だけで、
+`Ctrl+Q`は素の`q`と区別できない。ブラウザ側だけでは実装できず、入力層から
+手を入れている。
+
+**採用**: `Key::Control(u8)`を足し、持たせるのは小文字の英字そのものにした。
+C0制御コードを`Ascii`で流す案は採らない。`Ctrl+H`＝0x08、`Ctrl+I`＝0x09、
+`Ctrl+M`＝0x0Dは既にBackspace・Tab・Enterの席で、割り当てた画面が気づかずに
+それらも割り当てることになる。別の型にしておけば、重なりの扱いはバイトを
+変換する場所（`key_from_hid_usage`と`key_from_ascii`）だけで決まる。
+
+| キー | 変更後 |
+| --- | --- |
+| `Ctrl+Q`、`q` | 終了。`Ctrl+Q`はアドレス欄が開いていても読み込み中でも効く |
+| `Ctrl+L` | アドレス欄（`F2`とクリックと`Enter`未選択時は据え置き） |
+| `Escape` | 中止／アドレス欄を閉じる／リンク選択とメッセージの解除。終了しない |
+
+`Ctrl+Q`は`handle_key`の先頭、アドレス編集への分岐より前で処理する。
+「出られない画面の状態」を作らないため。
+
+**実機確認済み**: HID経路（Tab5 Keyboard／USB）でCtrlが届き、`Ctrl+Q`と
+`Ctrl+L`が効く。あわせて**CardKB v1.1にCtrlキーが無い**ことも確認した。
+`q`（終了）と`F2`（アドレス欄）は「Ctrlの無いキーボードのための保険」では
+なく、CardKBで操作するときの唯一の経路である。割り当てられるのは、アドレス欄
+以外に文字入力が無いからで、その前提はこの版でも変わっていない。
+
+### 完了後: `hbase`を廃止し、schemeの無いアドレスに`http://`を補う（利用者の指摘）
+
+**観測**: `hbase`は最初期の試験用で、もう要らない。代わりに、渡された
+アドレスにschemeが無ければ`http://`を補ってほしい。
+
+**採用**: `Url::parse_typed`を`browser/src/url.rs`に足し、`browser`・`hs`・
+`bt`の引数とビューアのアドレス欄が全部そこを通る。`Url::parse`はscheme必須
+のまま——`href`や`Location`のscheme無しは省略ではなく壊れた文書。
+
+**判定を`classify`でやると外す**（ホスト側テストで確認）:
+
+```text
+example.com:8080/x  classify=Absolute  parse=Err(UnsupportedScheme)
+localhost:8080      classify=Absolute  parse=Err(UnsupportedScheme)
+192.168.0.2:8080/x  classify=Relative
+```
+
+URLの文法ではコロンの前がschemeなので、`host:port`はschemeを持つように
+見える。fixture serverを叩くときにいちばん普通に打つ形がこれで、Stage 5で
+入れたアドレス欄の`http://`補完（`classify == Relative`かつドットを含む）も
+この形には効いていなかった。判定は`has_scheme`——**`scheme://`の形か、
+`http:`／`https:`で始まるか**——に分けた。`ftp://x`は補完せずそのまま拒否、
+`http:example.com`は「hostが無い」のまま。
+
+`bt`は基準アドレスを失うので`bt <url> [rounds]`にした。scheme補完のおかげで
+`bt 192.168.0.2:8080`で済み、`hbase http://…`＋`bt`より短い。覚えている値と
+打った値の2つが基準になりうる状態も消えた。
+
+アドレス欄では、ページの隣でしか意味を持たない参照（`/path`、`?q=1`、
+`#part`、先頭がドットの相対参照）だけを今のページに`Url::resolve`で解決し、
+それ以外は`parse_typed`へ回す。Stage 5で「組み込みページの上では`hbase`を
+基準にする」としていた分岐は消えた。組み込みページで`/simple.html`と打つと
+`http://built-in/simple.html`＝「そんな組み込みページはない」になる。
+ホスト付きで打てば通るので、`hbase`が埋めていた穴はscheme補完が塞いでいる。
 
 ### 完了後: C6のバックログ溢れでリンクが死ぬ（実機で発覚）
 
@@ -881,6 +950,9 @@ builder・layoutに通してページとして表示する。手書きで描か�
 
 ### Stage 5: アドレス欄は組み込みページ上では`hbase`を基準にする
 
+> この判断は「完了後: `hbase`を廃止し、schemeの無いアドレスに`http://`を
+> 補う」で撤回済みです。以下は当時の記録です。
+
 アドレス欄に打った文字列は現在のページのURLに対して解決する。ただし現在のページが
 `http://built-in/`のときだけは`hbase`を基準にする。組み込みページは実在のサイトでは
 ないので、`/simple.html`を`http://built-in/`に対して解決しても存在しないページに
@@ -888,6 +960,9 @@ builder・layoutに通してページとして表示する。手書きで描か�
 「ドットを含み先頭がドットでない相対参照」は`http://`を補う。
 
 ### Stage 5: キー割り当て
+
+> `Escape`での終了は「完了後: 終了は`Ctrl+Q`、アドレス欄は`Ctrl+L`」で
+> 変更済みです。以下は当時の記録です。
 
 - `Enter`は「リンク選択中なら遷移、未選択ならアドレス欄を開く」。1つのキーで2つの
   意味だが、両方が同時に可能になることはない（Tabを押していない読み手には辿る先が
@@ -947,6 +1022,10 @@ builder・layoutに通してページとして表示する。手書きで描か�
 打ち切る（1 MiBの散文でおよそ1万行なので3倍の余裕）。
 
 ### Stage 3: 診断コマンドを短く打てるようにした
+
+> `hbase`は「完了後: `hbase`を廃止し、schemeの無いアドレスに`http://`を
+> 補う」で廃止済みです。打鍵を短くする役目はscheme補完が引き継ぎました。
+> 以下は当時の記録です。
 
 **観測**: `httpstream http://192.168.0.159:8080/simple.html parse`は、Tab5の
 親指キーボードで打つには長すぎる。長さ自体が「確認しない理由」になる。

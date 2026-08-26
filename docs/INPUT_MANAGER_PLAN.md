@@ -221,6 +221,32 @@ USB ホストを複製・再生成していないことがコードレビュー�
 **完了条件:** 上表の利用可能な実機ケースを確認し、未保有機材（例: USBキーボード2台）の
 項目は未確認理由を明記する。`cargo check` とリリースビルドを通す。
 
+### 完了後: Ctrl＋英字を`Key::Control`として通す
+
+`Key`にはmodifierの席が無く、`key_from_hid_usage`が見ていたのはshiftだけ
+だった。ブラウザの終了を`Escape`から`Ctrl+Q`へ移す
+（[`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md)の完了後エントリ）には、
+まず入力層でCtrlが区別できる必要があった。
+
+**採用**: `Key::Control(u8)`。持つのは小文字の英字そのもので、その英字が表す
+C0制御コードではない。`Ascii(0x11)`のように流す案を採らなかったのは、
+`Ctrl+H`＝0x08、`Ctrl+I`＝0x09、`Ctrl+M`＝0x0Dが既にBackspace・Tab・Enterの
+席だからで、`Ctrl+H`に何かを割り当てた画面が気づかないままBackspaceにも
+同じものを割り当てることになる。別variantなら、その重なりをどうするかは
+バイトを変換する2か所（`key_from_hid_usage`と`key_from_ascii`）だけで決まる。
+
+- HID: modifierのbit 0／bit 4が立ったusage ID 0x04〜0x1D。数字・記号キーは
+  Ctrl付きでも印字どおりの文字のまま（割り当てが無く、落とすと入力が減るだけ）
+- CardKB: 変換なし。実機で確かめた結果、**CardKB v1.1にCtrlキーは無い**ので、
+  制御コードを`Control`にする分岐は押せないキーのためのコードになる。当初は
+  0x01〜0x1A（0x08・0x09・0x0A・0x0Dを除く）を変換していたが外した
+- コンソールは`Control`を明示的に無視する。網羅matchなのでvariant追加で
+  コンパイルが割れ、各consumerが判断を迫られる形にしてある
+
+**実機確認済み**: HID経路（Tab5 Keyboard／USB）でCtrlが届き、ブラウザの
+`Ctrl+Q`／`Ctrl+L`が効く。CardKBにCtrlキーが無いことも確認したので、
+ブラウザの`q`と`F2`はCardKBのための現実の経路であって保険ではない。
+
 ## 互換性と移行上の注意
 
 - 最初の変更では ASCII 以外のキーを勝手にコンソール動作へ割り当てず、USB HID の

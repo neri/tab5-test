@@ -180,7 +180,12 @@ impl Console {
             Key::Home => self.move_cursor(framebuffer, PROMPT.len()),
             Key::End => self.move_cursor(framebuffer, self.input_end),
             Key::Delete => self.delete(framebuffer),
-            Key::ArrowUp
+            // Ctrl with a letter is listed rather than left to a wildcard:
+            // the shell has no command bound to one, and a line editor that
+            // silently inserted something for it would be worse than a key
+            // that does nothing.
+            Key::Control(_)
+            | Key::ArrowUp
             | Key::ArrowDown
             | Key::PageUp
             | Key::PageDown

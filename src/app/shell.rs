@@ -804,57 +804,47 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "browser",
-        usage: "browser [<url|path>]",
+        usage: "browser [<url>]",
         lines: &[
             "open the hypertext viewer. with no argument it starts on its",
             "built-in home page, which needs no network; with one it fetches",
-            "that address, completing a path against 'hbase'. Tab selects a",
-            "link and the status line shows where it goes, Enter follows it",
-            "or -- with nothing selected -- opens the address field,",
-            "Backspace goes back, the arrow keys and Page Up/Down scroll,",
-            "and Escape stops a load, closes the address field, or leaves.",
-            "touch and a USB mouse both select links. http only: an https",
-            "address is reported and never downgraded",
+            "that address, which gets 'http://' if no scheme was typed. Tab",
+            "selects a link and the status line shows where it goes, Enter",
+            "follows it or -- with nothing selected -- opens the address",
+            "field, Ctrl+L opens that field outright, Backspace goes back,",
+            "the arrow keys and Page Up/Down scroll, Escape stops a load or",
+            "closes the field, and Ctrl+Q (or 'q') leaves. touch and a USB",
+            "mouse both select links. http only: an https address is",
+            "reported and never downgraded",
         ],
     },
     HelpEntry {
         name: "bt",
-        usage: "bt [rounds]   (also: browsertest)",
+        usage: "bt <url> [rounds]   (also: browsertest)",
         lines: &[
-            "read /manifest.txt from the address hbase names, then fetch",
-            "every endpoint in it through the same code the browser screen",
-            "uses and check each one against what the manifest says it",
-            "should do. prints one line per endpoint on the uart -- outcome,",
-            "text crc32, blocks, links, bytes, redirect hops, peak owned",
-            "memory, elapsed -- and only the failures plus a summary on the",
-            "console. 'rounds' repeats the whole walk, which is how the",
-            "socket and heap leak checks are run",
-        ],
-    },
-    HelpEntry {
-        name: "hbase",
-        usage: "hbase [<url>|off]",
-        lines: &[
-            "remember an address for httpstream and browser to complete",
-            "partial ones against, so a fixture can be reached as",
-            "'hs /simple.html' rather than by typing the whole thing. with",
-            "no argument it shows the current one; 'off' forgets it. the",
-            "completion is the same relative-reference resolution a link on",
-            "a page gets, so '/x', 'x' and '?q=1' all mean what they would",
-            "in an href",
+            "read /manifest.txt from the fixture server named here, then",
+            "fetch every endpoint in it through the same code the browser",
+            "screen uses and check each one against what the manifest says",
+            "it should do. the url gets 'http://' when no scheme is typed,",
+            "so 'bt 192.168.0.2:8080' is the whole of it. prints one line",
+            "per endpoint on the uart -- outcome, text crc32, blocks, links,",
+            "bytes, redirect hops, peak owned memory, elapsed -- and only",
+            "the failures plus a summary on the console. 'rounds' repeats",
+            "the whole walk, which is how the socket and heap leak checks",
+            "are run",
         ],
     },
     HelpEntry {
         name: "hs",
-        usage: "hs <url|path> [r <n>|p [n]|c <n>]   (also: httpstream)",
+        usage: "hs <url> [r <n>|p [n]|c <n>]   (also: httpstream)",
         lines: &[
             "fetch a url through the interruptible transaction the browser",
             "uses, and print what it came to: status, how the body was",
             "framed, decoded body bytes, a crc32 of them, elapsed time and",
             "the number of polls it took. the url is parsed by the browser's",
             "own parser, so the host connected to, the Host: header and the",
-            "request target all come from one value. a path completes",
-            "against 'hbase'.",
+            "request target all come from one value. 'http://' is supplied",
+            "when no scheme was typed.",
             "  p [n]  also build the document -- title, blocks, runs, links,",
             "         text bytes and what it all costs -- without drawing",
             "  r <n>  fetch n times",
@@ -900,15 +890,6 @@ pub struct State {
     /// Sized to `MAX_OPEN_FILES` because the VFS will not give out more than
     /// that anyway, so a longer array here could only ever hold `None`.
     held: [Option<FileHandle>; MAX_OPEN_FILES],
-    /// What a partial address is completed against, set by `hbase`.
-    ///
-    /// Here rather than inside a command because it is the same kind of
-    /// convenience the current directory is: typing
-    /// `http://192.168.0.159:8080/` before every fixture on a 4x11 thumb
-    /// keyboard is the sort of thing that stops a check being run at all.
-    /// `hs /simple.html` and `cd /tmp` are the same idea applied to
-    /// different namespaces.
-    base: Option<Url>,
 }
 
 impl Default for State {
@@ -918,17 +899,11 @@ impl Default for State {
 }
 
 impl State {
-    /// What `hbase` was last set to, for the browser's address field.
-    pub(super) fn base(&self) -> Option<Url> {
-        self.base.clone()
-    }
-
     pub fn new() -> Self {
         const NONE_HANDLE: Option<FileHandle> = None;
         Self {
             cwd: path::root(),
             held: [NONE_HANDLE; MAX_OPEN_FILES],
-            base: None,
         }
     }
 }
@@ -1377,32 +1352,17 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"hbase" => cmd_hbase(console, framebuffer, argument, state),
         b"browsertest" | b"bt" => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
-                cmd_browsertest(
-                    console,
-                    framebuffer,
-                    argument,
-                    state,
-                    wifi_session,
-                    net_stack,
-                );
+                cmd_browsertest(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
         b"httpstream" | b"hs" => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
-                cmd_httpstream(
-                    console,
-                    framebuffer,
-                    argument,
-                    state,
-                    wifi_session,
-                    net_stack,
-                );
+                cmd_httpstream(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
@@ -1440,7 +1400,7 @@ pub fn execute(
             if argument.is_empty() {
                 return Outcome::Browser(None);
             }
-            match resolve_address(console, framebuffer, state, argument) {
+            match resolve_address(console, framebuffer, argument) {
                 Some(url) => return Outcome::Browser(Some(url)),
                 None => return Outcome::Continue,
             }
@@ -5539,7 +5499,6 @@ fn cmd_httpstream(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
-    state: &State,
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
@@ -5547,7 +5506,7 @@ fn cmd_httpstream(
     // one is a usage error, and starting the C6 to report it is a slow way
     // to say so.
     let (target, rest) = split_first_word(trim(argument));
-    let Some(url) = resolve_address(console, framebuffer, state, target) else {
+    let Some(url) = resolve_address(console, framebuffer, target) else {
         return;
     };
     let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
@@ -5565,32 +5524,29 @@ fn cmd_browsertest(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
-    state: &State,
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
 ) {
-    let argument = trim(argument);
-    let rounds = if argument.is_empty() {
+    // The fixture server's address is the base every path in the manifest
+    // resolves against, so the walk needs it before anything else. It is
+    // typed rather than remembered: `bt 192.168.0.2:8080` is short enough
+    // once a missing scheme is supplied.
+    let (target, rest) = split_first_word(trim(argument));
+    let Some(base) = resolve_address(console, framebuffer, target) else {
+        return;
+    };
+    let rest = trim(rest);
+    let rounds = if rest.is_empty() {
         1
     } else {
-        match parse_u32(argument) {
+        match parse_u32(rest) {
             Some(rounds) if rounds > 0 && rounds <= 200 => rounds,
             _ => {
-                console.write_output_line(framebuffer, "usage: bt [rounds]   (1..200)");
+                console.write_output_line(framebuffer, "usage: bt <url> [rounds]   (1..200)");
                 return;
             }
         }
     };
-    // The manifest's address is the base every path in it resolves against,
-    // so one `hbase` drives the whole walk.
-    let Some(base) = state.base.as_ref() else {
-        console.write_output_line(
-            framebuffer,
-            "bt: set the fixture server first, e.g. hbase http://192.168.0.2:8080",
-        );
-        return;
-    };
-    let base = base.clone();
     let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
         return;
     };
@@ -5629,93 +5585,28 @@ fn browser_readiness(
     );
 }
 
-/// `hbase` -- set, show or clear the address partial ones complete against.
-fn cmd_hbase(
-    console: &mut Console,
-    framebuffer: &mut Framebuffer,
-    argument: &[u8],
-    state: &mut State,
-) {
-    let argument = trim(argument);
-    if argument.is_empty() {
-        let mut line = Line::new();
-        match &state.base {
-            Some(base) => {
-                line.push_str("base: ");
-                match base.to_text() {
-                    Ok(text) => line.push_str(text.as_str()),
-                    Err(_) => line.push_str("(out of memory)"),
-                }
-            }
-            None => line.push_str("no base; give one to hbase, or type full addresses"),
-        }
-        console.write_output_line(framebuffer, line.as_str());
-        return;
-    }
-    if argument == b"off" {
-        state.base = None;
-        console.write_output_line(framebuffer, "base cleared");
-        return;
-    }
-    let Ok(text) = core::str::from_utf8(argument) else {
-        console.write_output_line(framebuffer, "the address has to be ASCII");
-        return;
-    };
-    match Url::parse(text) {
-        Ok(base) => {
-            let shown = base.to_text();
-            state.base = Some(base);
-            let mut line = Line::new();
-            line.push_str("base: ");
-            match &shown {
-                Ok(text) => line.push_str(text.as_str()),
-                Err(_) => line.push_str("(out of memory)"),
-            }
-            console.write_output_line(framebuffer, line.as_str());
-        }
-        Err(error) => {
-            let mut line = Line::new();
-            line.push_str("hbase: ");
-            line.push_str(browser::url::error_text(error));
-            console.write_output_line(framebuffer, line.as_str());
-        }
-    }
-}
-
-/// Turns what was typed into an address, completing it against `hbase`.
+/// Turns what was typed into an address, supplying `http://` if it has no
+/// scheme.
 ///
-/// A full `http://...` is taken as written. Anything else -- `/simple.html`,
-/// `simple.html`, `?q=1` -- is a reference resolved against the base, by the
-/// same `Url::resolve` that resolves a link on a page. There is no separate
-/// "shorthand" syntax to get wrong: what the shell accepts here and what a
-/// page's `href` means are the same thing.
+/// The completion is `Url::parse_typed`, which the viewer's address field
+/// uses as well, so the shell and the field accept exactly the same
+/// spellings. What it does *not* do is complete against a remembered base.
+/// `hbase` did, and removing it leaves one answer to "which server was
+/// meant" instead of two -- the argument, and nothing else.
 fn resolve_address(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
-    state: &State,
     target: &[u8],
 ) -> Option<Url> {
     if target.is_empty() {
-        console.write_output_line(framebuffer, "give an address, or a path if hbase is set");
+        console.write_output_line(framebuffer, "give an address, e.g. 192.168.0.2:8080/x");
         return None;
     }
     let Ok(text) = core::str::from_utf8(target) else {
         console.write_output_line(framebuffer, "the address has to be ASCII");
         return None;
     };
-    let outcome = if browser::url::classify(text) == browser::url::Reference::Absolute {
-        Url::parse(text)
-    } else {
-        let Some(base) = &state.base else {
-            console.write_output_line(
-                framebuffer,
-                "that is not a full address; set one with hbase first",
-            );
-            return None;
-        };
-        base.resolve(text)
-    };
-    match outcome {
+    match Url::parse_typed(text) {
         Ok(url) if !url.scheme().is_fetchable() => {
             console.write_output_line(framebuffer, "HTTPS is not supported");
             None

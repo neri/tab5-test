@@ -138,7 +138,7 @@ const LINES_PER_SERVICE: usize = 8;
 /// Width of one band of the viewport writeback, in logical pixels.
 const FLUSH_BAND_WIDTH: usize = 128;
 
-/// Runs the viewer until Escape is pressed on a page.
+/// Runs the viewer until Ctrl+Q (or `q`) is pressed.
 ///
 /// The manager remains the owner for the whole screen. Individual fetch
 /// steps borrow its link and stack only for that step, allowing connection
@@ -147,10 +147,9 @@ pub fn run(
     framebuffer: &mut Framebuffer,
     input: &mut InputManager,
     wifi: &mut WifiManager,
-    base: Option<Url>,
     start: Option<Url>,
 ) {
-    let mut viewer = match Viewer::new(base) {
+    let mut viewer = match Viewer::new() {
         Ok(viewer) => viewer,
         Err(failure) => {
             uart::log(b"Browser: the built-in home page did not parse: ");
@@ -527,15 +526,6 @@ struct Loading {
 
 struct Viewer {
     page: Page,
-    /// What a partial address typed into the field completes against while
-    /// a built-in page is showing -- the shell's `hbase`.
-    ///
-    /// Needed because the built-in pages are not a real site: resolving
-    /// `/simple.html` against `http://built-in/` gives a built-in page that
-    /// does not exist, which is never what somebody typing a path meant.
-    /// On a fetched page the page's own address is the base, as it should
-    /// be.
-    base: Option<Url>,
     history: Vec<HistoryEntry>,
     editing: Option<Editing>,
     loading: Option<Loading>,
@@ -567,11 +557,10 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(base: Option<Url>) -> Result<Viewer, Error> {
+    fn new() -> Result<Viewer, Error> {
         let page = load_builtin(builtin::HOME)?;
         Ok(Viewer {
             page,
-            base,
             history: Vec::new(),
             editing: None,
             loading: None,
@@ -797,20 +786,40 @@ impl Viewer {
     // --- input --------------------------------------------------------
 
     fn handle_key(&mut self, key: Key, loading: bool) -> Action {
+        // Ctrl+Q is the way out from anywhere: mid-load, and with the
+        // address field open on half-typed text. Checked before the field
+        // gets the key so that leaving never depends on what is on screen,
+        // which is the property Escape used to have and lost below. The
+        // loop's own cleanup closes a transfer that is still running.
+        if key == Key::Control(b'q') {
+            return Action::Leave;
+        }
         if self.editing.is_some() {
             return self.handle_editing_key(key);
         }
         match key {
-            // While a page is arriving Escape stops it; otherwise it
-            // leaves. One key, and which it means is exactly what the
-            // toolbar is showing at the time.
+            // Escape no longer leaves. It was the single most reachable key
+            // on every keyboard here and it threw the page away, which is
+            // exactly the accident it invited. What is left is stopping a
+            // load, and otherwise undoing the two things that change the
+            // screen without moving the page: the selected link and the
+            // status line's answer.
             Key::Escape => {
-                return if loading {
-                    Action::Cancel
-                } else {
-                    Action::Leave
-                };
+                if loading {
+                    return Action::Cancel;
+                }
+                if self.page.focus.is_some() {
+                    self.page.focus = None;
+                    self.dirty.viewport = true;
+                    self.dirty.status = true;
+                }
+                self.clear_message();
             }
+            // A plain `q` as well as Ctrl+Q, because CardKB v1.1 has no
+            // Ctrl key: on that keyboard this is the only way out, not a
+            // fallback. Free to bind because nothing outside the address
+            // field takes typed text, and it is what every pager does.
+            Key::Ascii(b'q') | Key::Ascii(b'Q') => return Action::Leave,
             Key::ArrowDown => self.scroll_by(1),
             Key::ArrowUp => self.scroll_by(-1),
             Key::PageDown => self.scroll_by(self.lines_per_screen()),
@@ -832,7 +841,11 @@ impl Viewer {
                 }
             }
             Key::Ascii(0x08) | Key::Ascii(0x7F) => self.go_back(),
-            Key::Function(2) => self.start_editing(),
+            // Three ways into the address field: Ctrl+L as on a desktop
+            // browser, F2 for CardKB (which has no Ctrl key), and Enter
+            // with nothing selected. The last is not redundant with the
+            // first -- it is the one a reader finds without being told.
+            Key::Control(b'l') | Key::Function(2) => self.start_editing(),
             _ => {}
         }
         Action::Continue
@@ -890,37 +903,44 @@ impl Viewer {
 
     /// Takes what was typed and turns it into a navigation.
     ///
-    /// Resolved against the current page, so a bare path works the same way
-    /// it does in a link. Something that looks like a host -- it has a dot
-    /// and does not start with one -- is given `http://` first, because
-    /// `example.com/page` typed into an address field is an address and not
-    /// a file in the current directory.
+    /// Two readings, and which one applies is decided by the shape of the
+    /// text alone. A reference that only means something beside a page --
+    /// `/path`, `?q=1`, `#part`, `../up` -- is resolved against the page
+    /// showing, by the same `Url::resolve` a link on it would get. Anything
+    /// else is an address in its own right and goes through
+    /// `Url::parse_typed`, which supplies `http://` when no scheme was
+    /// typed: `example.com/page` and `192.168.0.2:8080/x` are addresses,
+    /// not files beside the current one.
+    ///
+    /// The split matters most for the host-and-port spelling. `Url` reads
+    /// `localhost:8080` as a scheme called `localhost`, because that is what
+    /// the grammar says; asking `parse_typed` instead of `classify` is what
+    /// keeps the field from answering "only http:// and https:// addresses
+    /// are understood" to the most ordinary thing anybody types into it.
     fn navigate_to_text(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             self.say("no address typed");
             return;
         }
-        let mut buffer = String::new();
-        let looks_like_a_host = url::classify(trimmed) == url::Reference::Relative
-            && trimmed.contains('.')
-            && !trimmed.starts_with('.');
-        let candidate = if looks_like_a_host {
-            if memory::push_str(&mut buffer, "http://").is_err()
-                || memory::push_str(&mut buffer, trimmed).is_err()
-            {
-                self.say("out of memory");
-                return;
-            }
-            buffer.as_str()
+        let page_relative = match url::classify(trimmed) {
+            url::Reference::Root
+            | url::Reference::Query
+            | url::Reference::Fragment
+            | url::Reference::Same => true,
+            // A leading dot is the only thing that makes a bare word a
+            // path rather than a host: `./page.html` is beside this page,
+            // `page.html` is a host nobody can reach, and both readings
+            // have to belong to somebody.
+            url::Reference::Relative => trimmed.starts_with('.'),
+            url::Reference::Absolute | url::Reference::SchemeRelative => false,
+        };
+        let outcome = if page_relative {
+            self.page.document.url().resolve(trimmed)
         } else {
-            trimmed
+            Url::parse_typed(trimmed)
         };
-        let base = match (&self.base, self.page.document.url()) {
-            (Some(base), current) if current.host() == builtin::HOST => base,
-            (_, current) => current,
-        };
-        match base.resolve(candidate) {
+        match outcome {
             Ok(target) => self.request(Navigation::fresh(target)),
             Err(error) => self.say(url::error_text(error)),
         }
@@ -1784,7 +1804,8 @@ mod builtin {
              it goes</li>\
              <li><b>Enter</b> follows the selected link, or -- with nothing \
              selected -- opens the address field on the address already \
-             showing, with the caret at the end</li>\
+             showing, with the caret at the end; <b>Ctrl+L</b> and <b>F2</b> \
+             open it whether or not a link is selected</li>\
              <li>in the address field, <b>Left</b> and <b>Right</b> move the \
              caret, <b>Home</b> and <b>End</b> jump to either end, and \
              <b>Backspace</b> and <b>Delete</b> remove a character</li>\
@@ -1796,7 +1817,10 @@ mod builtin {
              <li>A touch or a click selects and follows a link; a click on the \
              address field opens it; a mouse wheel scrolls</li>\
              <li><b>Escape</b> stops a page that is loading, closes the address \
-             field, and otherwise leaves</li>\
+             field, and otherwise drops the selected link. It does not \
+             leave</li>\
+             <li><b>Ctrl+Q</b> leaves, from anywhere. So does <b>q</b> when \
+             the address field is closed</li>\
              </ul>\
              <h2>Built-in pages</h2>\
              <ul>\
@@ -1809,8 +1833,9 @@ mod builtin {
              <hr>\
              <p>These five are in flash and need no network. Fetching anything \
              else needs <code>wificonnect</code> and <code>ipconfig dhcp</code> \
-             first; <code>browser &lt;url&gt;</code> opens one directly, and \
-             a path completes against <code>hbase</code>.</p>",
+             first. <code>browser &lt;url&gt;</code> opens one directly, and an \
+             address typed without a scheme -- here or in the address field -- \
+             is read as <code>http://</code>.</p>",
         ),
     };
 

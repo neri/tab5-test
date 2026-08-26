@@ -39,8 +39,11 @@ UTF-8は`write_output_line`が従来どおりUARTへそのまま出すので、�
 CardKB v1.1のEscとカーソル（`0xB5`=↑、`0xB6`=↓、`0xB4`=←、`0xB7`=→）、およびUSB HID
 BootキーボードのEsc、カーソル、Home/End、Page Up/Down、Insert/Delete、F1〜F12は`input::Key`へ
 正規化します。コンソールではEscで現在行を消去し、Left/Right/Home/EndとDeleteで
-現在のコマンド行を編集します。Up/Down、ページ、Insert、Fキーはイベントとして取得するだけで、
-コマンド履歴などの機能が未実装のため現時点では動作を割り当てません。
+現在のコマンド行を編集します。Up/Down、ページ、Insert、Fキー、およびHIDキーボード
+から来るCtrl＋英字（`Key::Control`）はイベントとして取得するだけで、コマンド履歴などの
+機能が未実装のため現時点では動作を割り当てません。Ctrl＋英字を無視する側もワイルドカードではなく
+明示的に列挙してあります——シェルに割り当てが無いキーで行編集に文字が入るほうが、
+何も起きないより悪いためです。
 Carriage Return、Line Feed、Backspace、Tabと末尾スクロールを処理します。
 
 **セル配列が状態、フレームバッファはその表示**という分担にしています。

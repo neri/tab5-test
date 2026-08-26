@@ -39,12 +39,31 @@
   [`USB.md`](USB.md)。
 
 3種とも`src/input.rs`の`Key`へ正規化します。Tab5 KeyboardとUSBは同じHID usage
-ID変換を共有します。`Key`は`Ascii(u8)`と、Escape、
+ID変換を共有します。`Key`は`Ascii(u8)`、`Control(u8)`と、Escape、
 カーソル4方向、Home/End、PageUp/PageDown、Insert、Delete、`Function(u8)`を
 持ちます。入力を受け取る側は、キーがどのキーボードから来たかを知る必要が
 ありません（`KeyEvent`の`source`で区別できますが、コンソールは使いません）。
 コンソールがどのキーに何を割り当てているかは
 [`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)を参照してください。
+
+### Ctrlは制御コードではなく`Control(letter)`
+
+`Control(u8)`が持つのは小文字の英字そのもので、その英字が表すC0制御コードでは
+ありません。制御コードには既に別のキーの席があり——`Ctrl+H`は0x08、`Ctrl+I`は
+0x09、`Ctrl+M`は0x0D——`Ascii`で流すと、`Ctrl+H`に何かを割り当てた画面が
+Backspaceにも同じものを割り当ててしまいます。別扱いにしておけば、この重なりを
+どうするかはバイトを変換する場所1つで決まります。
+
+- HID（Tab5 KeyboardとUSB）: modifierのleft Ctrl（bit 0）／right Ctrl（bit 4）が
+  立ったusage ID 0x04〜0x1Dを`Control`にします。数字や記号キーはCtrlが付いても
+  印字どおりの文字のままです（割り当てが無く、落とすと入力が減るだけのため）
+- CardKB: **CardKB v1.1にCtrlキーはありません。** `key_from_ascii`に`Control`へ
+  の変換は置いていません。制御コードを`Control`として拾う分岐を書くことは
+  できますが、押せないキーのための分岐になります
+
+**実機確認済み**: HID経路（Tab5 Keyboard／USB）でCtrlが届き、ブラウザの
+`Ctrl+Q`と`Ctrl+L`が効きます。CardKBにはCtrlキーが無いので、CardKBだけで
+操作するときはブラウザの`q`（終了）と`F2`（アドレス欄）を使います。
 
 ## InputManager
 

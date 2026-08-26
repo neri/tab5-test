@@ -63,10 +63,10 @@ const FETCH_DEADLINE_MS: u64 = 30_000;
 /// an hour.
 const MAX_REPEAT: u32 = 1000;
 
-/// `hs <url|path> [r <n>|p [n]|c <n>]`
+/// `hs <url> [r <n>|p [n]|c <n>]`
 ///
-/// The address arrives already parsed: the shell completes a partial one
-/// against `hbase` before the link is brought up, so a typo is reported
+/// The address arrives already parsed: the shell supplies a missing scheme
+/// and parses it before the link is brought up, so a typo is reported
 /// without starting the C6.
 pub fn run(
     console: &mut Console,
@@ -155,7 +155,7 @@ pub fn run(
 }
 
 fn usage(console: &mut Console, framebuffer: &mut Framebuffer) {
-    console.write_output_line(framebuffer, "usage: hs <url|path> [r <n>|p [n]|c <n>]");
+    console.write_output_line(framebuffer, "usage: hs <url> [r <n>|p [n]|c <n>]");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -751,8 +751,9 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 
 /// Walks every endpoint the fixture server lists.
 ///
-/// `base` is the manifest's own address; every path in it is resolved
-/// against that, so one `hbase` drives the whole thing.
+/// `base` is the manifest's own address -- the one word `bt` is given --
+/// and every path in the manifest is resolved against it, so the whole walk
+/// follows from that single address.
 pub fn walk(
     console: &mut Console,
     framebuffer: &mut Framebuffer,

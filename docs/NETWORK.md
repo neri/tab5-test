@@ -189,7 +189,7 @@ transmitコールバックで、Wi-Fiステーション用netifが渡すのは14
 | `ping <host\|a.b.c.d> [count]` | ICMP echoの送信と往復時間。既定4回 |
 | `tftpget <host\|a.b.c.d> <file>` | TFTPで読み出してカレントディレクトリへ保存し、サイズとCRC-32と速度を表示 |
 | `httpget <host\|a.b.c.d>[:port] [path]` | HTTP/1.0 GET。ヘッダの先頭数行を表示し、本文をカレントディレクトリへ保存 |
-| `hs <url\|path> [r <n>\|p [n]\|c <n>]` | `Transaction`を直接回して結果を数値で報告（[`BROWSER.md`](BROWSER.md)） |
+| `hs <url> [r <n>\|p [n]\|c <n>]` | `Transaction`を直接回して結果を数値で報告。schemeを省くと`http://`を補う（[`BROWSER.md`](BROWSER.md)） |
 
 Wi-FiがONなら、いずれも必要に応じてC6のリンクとstation modeを用意します（`wifiscan`以降と
 同じ`wifi_session`を通ります）。OFF中はC6を起動せず`wifi on`を案内します。APへのアソシエートは別で、`wificonnect`が

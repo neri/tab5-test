@@ -227,6 +227,43 @@ impl Url {
         Ok(url)
     }
 
+    /// Parses an address a person typed, supplying `http://` when they did
+    /// not.
+    ///
+    /// Separate from [`Url::parse`] because the two have different callers
+    /// and must keep different rules. `parse` is what an `href`, a
+    /// `Location:` header and a redirect target go through, and a missing
+    /// scheme there is a broken document that must stay an error. This one
+    /// is only ever reached from a keyboard -- the shell's `browser` and
+    /// `hs` commands, and the viewer's address field -- where a scheme is
+    /// seven characters of ceremony on a thumb keyboard and no other scheme
+    /// could have been meant.
+    ///
+    /// What counts as "already has a scheme" is [`has_scheme`], and the
+    /// distinction it draws is the whole reason this is not a `starts_with`
+    /// at each call site.
+    pub fn parse_typed(text: &str) -> Result<Url, Error> {
+        let text = text.trim_matches(is_ascii_whitespace);
+        if text.is_empty() {
+            return Err(Error::Empty);
+        }
+        if has_scheme(text) {
+            return Url::parse(text);
+        }
+        // `//host/path` says "the scheme of wherever this came from", and
+        // what it came from here is a keyboard. Only the scheme is added,
+        // so the `//` it already has is the one that gets used.
+        let prefix = if text.starts_with("//") {
+            "http:"
+        } else {
+            "http://"
+        };
+        let mut completed = memory::string_with_capacity(prefix.len() + text.len())?;
+        memory::push_str(&mut completed, prefix)?;
+        memory::push_str(&mut completed, text)?;
+        Url::parse(&completed)
+    }
+
     /// Resolves `reference` against this URL, following RFC 3986's rules
     /// for every shape in [`Reference`].
     ///
@@ -509,6 +546,26 @@ fn reject_forbidden(text: &str) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Whether `text` begins with something that has to be read as a scheme.
+///
+/// Not the same question as "does it contain a colon", and not the same
+/// answer as [`classify`] gives either. `localhost:8080/x` splits exactly
+/// like a scheme does -- `split_scheme` returns `("localhost", "8080/x")`,
+/// so `classify` calls it [`Reference::Absolute`] -- but nobody typing it
+/// meant a scheme called `localhost`. The `//` is what separates the two
+/// cases, because a URL that names an authority always has it.
+///
+/// `http:` and `https:` count as schemes with or without the `//`, so
+/// `http:example.com` keeps its own "no host" error instead of being
+/// completed into an address nobody typed.
+pub fn has_scheme(text: &str) -> bool {
+    let text = text.trim_matches(is_ascii_whitespace);
+    match split_scheme(text) {
+        Some((scheme, rest)) => rest.starts_with("//") || match_scheme(scheme).is_ok(),
+        None => false,
+    }
 }
 
 /// Splits `scheme:` off the front, if the text starts with a valid one.
@@ -1358,6 +1415,91 @@ mod tests {
         for (reference, expected) in cases {
             assert_eq!(classify(reference), expected, "{reference:?}");
         }
+    }
+
+    // --- typed addresses ----------------------------------------------------
+
+    #[test]
+    fn a_typed_address_without_a_scheme_gets_http() {
+        let cases = [
+            ("example.com", "http://example.com/"),
+            ("example.com/page.html", "http://example.com/page.html"),
+            ("192.168.0.159:8080", "http://192.168.0.159:8080/"),
+            (
+                "192.168.0.159:8080/simple.html",
+                "http://192.168.0.159:8080/simple.html",
+            ),
+            // The case `classify` calls Absolute and nobody means that way.
+            ("localhost:8080", "http://localhost:8080/"),
+            ("example.com:8080/x", "http://example.com:8080/x"),
+            // Scheme-relative: only the scheme is missing, so only the
+            // scheme is added.
+            ("//example.com/x", "http://example.com/x"),
+            ("built-in/", "http://built-in/"),
+        ];
+        for (typed, expected) in cases {
+            let url = Url::parse_typed(typed).unwrap_or_else(|e| panic!("{typed}: {e:?}"));
+            assert_eq!(text_of(&url), expected, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn a_typed_address_that_has_a_scheme_keeps_it() {
+        assert_eq!(
+            text_of(&Url::parse_typed("http://example.com/x").unwrap()),
+            "http://example.com/x"
+        );
+        // Recognised, refused later by the fetch path -- never completed
+        // into an http address, which would be the downgrade this browser
+        // does not do.
+        assert_eq!(
+            Url::parse_typed("https://example.com/x").unwrap().scheme(),
+            Scheme::Https
+        );
+        // Another scheme stays its own error rather than becoming
+        // `http://ftp://...`.
+        assert_eq!(
+            Url::parse_typed("ftp://example.com/x"),
+            Err(Error::UnsupportedScheme)
+        );
+        // `http:` without the slashes is a typo, and it keeps saying so.
+        assert_eq!(Url::parse_typed("http:example.com"), Err(Error::MissingHost));
+    }
+
+    #[test]
+    fn typing_nothing_is_still_empty() {
+        assert_eq!(Url::parse_typed(""), Err(Error::Empty));
+        assert_eq!(Url::parse_typed("   "), Err(Error::Empty));
+    }
+
+    #[test]
+    fn completion_does_not_rescue_a_bad_address() {
+        // The host is checked after the scheme is added, the same way it
+        // would have been if the scheme had been typed.
+        assert_eq!(
+            Url::parse_typed("0177.0.0.1/x"),
+            Err(Error::InvalidHost),
+            "a non-dotted-quad numeric host stays refused"
+        );
+        assert_eq!(
+            Url::parse_typed("user@example.com/x"),
+            Err(Error::HasUserinfo)
+        );
+    }
+
+    #[test]
+    fn what_counts_as_a_scheme() {
+        assert!(has_scheme("http://example.com"));
+        assert!(has_scheme("HTTPS://example.com"));
+        assert!(has_scheme("http:example.com"));
+        assert!(has_scheme("ftp://example.com"));
+        // A colon that is a port, not a scheme.
+        assert!(!has_scheme("localhost:8080"));
+        assert!(!has_scheme("example.com:8080/x"));
+        assert!(!has_scheme("example.com"));
+        assert!(!has_scheme("/path"));
+        assert!(!has_scheme("//example.com/x"));
+        assert!(!has_scheme(""));
     }
 
     #[test]
