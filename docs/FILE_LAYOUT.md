@@ -52,7 +52,9 @@
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
-    - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード操作の最小Wi-Fi設定画面。AP scan、選択、マスク付きパスワード入力、association、メニュー専用のDHCP開始を既存のblocking処理で順に実行する
+    - `src/app/wifi_manager.rs`: ESP-Hostedの`Rpc`、IPの`Stack`、接続元、IP設定方針、接続状態、永続ON/OFFをまとめる単一所有者。毎フレームC6とsmoltcpをpollし、起動時／メニュー接続のassociation、切断後の再接続、C6リンク再構築、DHCPを状態遷移で進める。資格情報は現在の管理対象接続が有効な間だけ固定長RAMへ保持し、association成功後のC6 NVS保存、OFF時の切断・driver停止・power down、ON、forget、直近16遷移の診断も担当する
+    - `src/app/wifi_retry.rs`: association失敗のreason、timeout、RPC結果を、停止または待ち時間へ変換する副作用のないpolicy。reason 4の短い再試行、一般の指数backoff、10分安定後の失敗回数resetをホスト単体testで検査する
+    - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する
     - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
       toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件と
       戻る、アドレス欄の編集、通信を必要としない組み込みページ（`http://built-in/`）を
@@ -137,8 +139,9 @@
       フレーム長を超えるメッセージの分割と再結合、応答待ちの間に届いた
       イベントの保持
     - `src/wifi/station.rs`: RPCの上に載るWi-Fi操作。`esp_wifi_init`／
-      モード設定／開始、スキャンの実行とAPレコードの解析、STA設定と接続・
-      切断、接続結果イベントの待ち受け。スレーブが返す`esp_err_t`は
+      モード設定／開始、スキャンの実行とAPレコードの解析、STA設定のRAM／Flash保存と
+      読み出し、永続設定のrestore、接続・切断、接続結果イベントの待ち受け。設定取得RPCの応答bufferは
+      passwordを含むためcopy直後に消去する。スレーブが返す`esp_err_t`は
       握りつぶさずそのまま返す
 - `src/fs.rs`・`src/fs/`: ファイルシステム層。`usb.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけ。現状はブロックデバイス層とMBR判定まで

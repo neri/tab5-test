@@ -96,23 +96,42 @@ USB-Cの接続有無、充電中／満充電／異常の確定状態、絶対的
 
 ## Wi-Fi設定メニュー
 
-`wifi`コマンドは`src/app/wifi_menu.rs`の全画面メニューを開く。起動時に既存のblocking scanを
-1回実行し、結果を受信順のまま15件ずつ表示する。上下キーで選択を移動し、Enterで接続、
-`R`で再scan、Escapeでシェルへ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
+`wifi`コマンドは`src/app/wifi_menu.rs`の全画面メニューを開く。Wi-FiがONなら既存のblocking
+scanを実行し、同じSSIDの結果を最も強いRSSIの1行へ統合して検出BSSID数とともに15件ずつ
+表示する。上下／Page Up／Page Downで選択を移動し、Enterまたは一覧行のtapで接続、`R`で
+再scan、Escapeでシェルへ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
 
-OPEN APはそのまま接続し、それ以外は最大64 byteのパスワード入力画面を開く。入力は`*`だけで
-表示し、コンソールの行編集や履歴へ渡さない。入力bufferは接続時とcancel時の両方で消去する。
-association成功後はメニュー経由に限って新しいIP stackを作り、DHCPを開始して最大15秒待つ。
-CLIの`wificonnect`は従来どおりassociationだけで、`ipconfig dhcp`を手動実行する。
+OPEN APはそのまま、それ以外は最大64 byteのパスワード入力画面を開き、その後に
+`SAVE AND AUTO-CONNECT`または`CONNECT ONCE`を選ぶ。入力は`*`だけで
+表示し、コンソールの行編集や履歴へ渡さない。入力bufferはconnect要求の直後またはcancel時に
+消去する。接続管理器は初回接続と接続後の自動再接続に使うため、現在のメニュー接続が有効な
+間だけ固定長RAM bufferへ保持する。認証系停止、別AP／CLI接続への置換、明示disconnect、
+低層sessionの明示破棄、HP core reboot時にvolatile writeで消去する。値や長さはログへ出さない。
+保存を選んだ場合も最初の試行はC6 RAM設定で行い、association成功後だけC6 NVSへ書く。
+一回接続はRAMのままで、既存の保存profileを置換しない。association成功後はメニュー経由に
+限って新しいIP stackを作り、DHCPを開始する。CLIの`wificonnect`もC6 RAM設定へ固定し、
+従来どおりassociationだけで、`ipconfig dhcp`を手動実行する。
 
-scan、association待ち、DHCP待ちは途中cancelできないblocking処理で、開始前に進行画面を
-書き戻し、既存timeoutで一覧または結果画面へ戻る。入力待ちの間は毎フレーム
-`InputManager::service`を呼び、接続中なら`Stack::poll`、stackがなければ
-`Rpc::discard_station_frames`を実行してC6の受信queueを溜めない。
+scanとconnect要求は同期処理で、開始前に進行画面を書き戻す。associationイベントとDHCPは
+`src/app/wifi_manager.rs`の状態機械がフレームごとに進めるため、待機中も
+`InputManager::service`とC6のpollが続く。Escapeでシェルへ戻っても開始済みの処理は管理器が
+続行する。associationは20秒で失敗、DHCPは15秒で`ASSOCIATED, NO LEASE YET`を表示するが、
+DHCP client自体は止めず、後のフレームでleaseを取得すれば`Online`へ移る。
 
-この画面にはタッチ操作、自動リトライ、自動再接続、AP／パスワード保存、起動時接続、
-Wi-Fi ON/OFFはない。これらは[`WIFI_REFACTOR_PLAN.md`](WIFI_REFACTOR_PLAN.md)の
-Stage 3以降で扱う。
+初回接続に失敗すると理由別に自動再試行する。reason 4は500 msの短い待ちを3回、それ以外の
+回復可能な失敗は最大30秒の指数backoffを使う。画面は試行番号と次の試行待ちを表示する。
+認証系の失敗は連打せず`PASSWORD REQUIRED`で停止し、APを選び直して再入力する。CLI接続は
+対象外である。
+
+接続成功後にSTA切断またはC6リンク喪失を検出した場合も、同じRAM内資格情報で最大30秒の
+backoffを使って自動再接続する。古いIP stackは切断時に捨て、再association後に新しいstackで
+DHCPを取り直す。10分安定するとbackoffの失敗回数をresetする。画面を閉じてシェルやbrowserへ
+戻っていてもフレームループが処理を続ける。
+
+保存profileがありWi-FiがONなら、起動時に画面を開かずassociationとDHCPを開始する。
+`O`はWi-Fi全体のON/OFFを切り替え、OFF画面ではscanも接続も開始しない。`F`は確認画面を
+経て保存profileを削除する。ON/OFFとforgetのボタン、確認画面、AP一覧行はtapでも操作できる。
+同じ操作はシェルの`wifi on|off|status|forget`からも共通の接続管理器へ依頼する。
 
 ## Windows 95風デスクトップ（`win`）
 

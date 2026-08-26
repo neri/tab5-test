@@ -1,17 +1,17 @@
 //! Minimal keyboard-driven Wi-Fi setup screen.
 //!
-//! This deliberately reuses the existing blocking station and DHCP calls.
-//! The first milestone is only the repetitive setup path -- scan, choose,
-//! enter a password, associate, obtain a lease -- not the background
-//! connection manager planned in `docs/WIFI_REFACTOR_PLAN.md` Stage 3.
+//! Scanning and the short RPC request remain synchronous. Association events
+//! and DHCP are advanced once per frame by the connection manager, so input
+//! and link servicing continue while the AP or DHCP server is slow.
 
 use alloc::vec::Vec;
 
 use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
-use crate::input::{InputManager, Key};
-use crate::{interrupts, net, tick, uart, wifi};
+use crate::input::{InputManager, Key, PrimaryTouch};
+use crate::{interrupts, uart, wifi};
 
 use super::shell::Line;
+use super::wifi_manager::{Failure, Manager, ProfileChoice, ProfileSaveState, State};
 
 const BACKGROUND: u16 = 0x1082;
 const HEADER: u16 = 0x0010;
@@ -26,31 +26,85 @@ const ROW_HEIGHT: usize = 32;
 const VISIBLE_ROWS: usize = (LIST_BOTTOM - LIST_TOP) / ROW_HEIGHT;
 const FOOTER_TOP: usize = 620;
 
-const CONNECT_TIMEOUT_MS: u32 = 20_000;
-const DHCP_TIMEOUT_MS: u64 = 15_000;
+struct Network {
+    access_point: wifi::station::AccessPoint,
+    bssid_count: u32,
+}
+
+enum ListAction {
+    Exit,
+    Rescan,
+    Toggle,
+    Forget,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Activate(usize),
+}
 
 /// Runs until Escape leaves the screen.
 ///
-/// The session and stack are borrowed from `app::run`, so a connection made
-/// here remains usable by the shell after this function returns.
-pub fn run(
-    framebuffer: &mut Framebuffer,
-    input: &mut InputManager,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
-) {
+/// The manager is borrowed from `app::run`, so a connection made here
+/// remains usable by the shell after this function returns.
+pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mut Manager) {
     uart::log(b"WIFI MENU: opened\r\n");
+    input.reset_primary_touch();
     let mut selected = 0usize;
     let mut first = 0usize;
 
     'scan: loop {
+        if !manager.is_enabled() {
+            draw_off_screen(framebuffer, manager.has_saved_profile(), None);
+            loop {
+                match wait_off_action(input, manager) {
+                    Some(ListAction::Toggle) => {
+                        show_progress(framebuffer, "ENABLING WI-FI", "RESTORING C6 RADIO STATE");
+                        match manager.set_enabled(true) {
+                            Ok(true) => {
+                                show_progress(
+                                    framebuffer,
+                                    "WI-FI ENABLED",
+                                    "AUTO-CONNECT STARTED - ESC RETURNS TO SHELL",
+                                );
+                                let _ = wait_key(input, manager);
+                                return;
+                            }
+                            Ok(false) => continue 'scan,
+                            Err(failure) => draw_off_screen(
+                                framebuffer,
+                                manager.has_saved_profile(),
+                                Some(failure_line(failure).as_str()),
+                            ),
+                        }
+                    }
+                    Some(ListAction::Forget) => {
+                        if confirm_forget(framebuffer, input, manager)
+                            && let Err(failure) = manager.forget_saved_profile()
+                        {
+                            let line = failure_line(failure);
+                            draw_off_screen(
+                                framebuffer,
+                                manager.has_saved_profile(),
+                                Some(line.as_str()),
+                            );
+                        } else {
+                            draw_off_screen(framebuffer, manager.has_saved_profile(), None);
+                        }
+                    }
+                    Some(ListAction::Exit) | None => return,
+                    _ => {}
+                }
+            }
+        }
+
         let access_points = loop {
             show_progress(
                 framebuffer,
                 "SCANNING FOR ACCESS POINTS",
                 "THIS MAY TAKE A FEW SECONDS",
             );
-            match scan(session, stack) {
+            match scan(manager) {
                 Ok(access_points) => break access_points,
                 Err(error) => {
                     uart::log(b"WIFI MENU: scan path failed\r\n");
@@ -61,7 +115,7 @@ pub fn run(
                         "R RETRY    ESC EXIT",
                     );
                     loop {
-                        match wait_key(input, session, stack) {
+                        match wait_key(input, manager) {
                             Some(Key::Ascii(b'r' | b'R')) => break,
                             Some(Key::Escape) | None => return,
                             _ => {}
@@ -76,27 +130,77 @@ pub fn run(
         keep_visible(selected, access_points.len(), &mut first);
 
         loop {
-            draw_access_points(framebuffer, &access_points, selected, first, None);
-            let Some(key) = wait_key(input, session, stack) else {
+            draw_access_points(
+                framebuffer,
+                &access_points,
+                selected,
+                first,
+                None,
+                manager.is_enabled(),
+            );
+            let Some(action) =
+                wait_list_action(input, manager, selected, first, access_points.len())
+            else {
                 return;
             };
-            match key {
-                Key::Escape => return,
-                Key::Ascii(b'r' | b'R') => {
+            match action {
+                ListAction::Exit => return,
+                ListAction::Rescan => {
                     selected = 0;
                     first = 0;
                     continue 'scan;
                 }
-                Key::ArrowUp if !access_points.is_empty() => {
+                ListAction::Toggle => {
+                    show_progress(
+                        framebuffer,
+                        "DISABLING WI-FI",
+                        "LEAVING AP AND POWERING DOWN C6",
+                    );
+                    let message = manager.set_enabled(false).err().map(failure_line);
+                    draw_off_screen(
+                        framebuffer,
+                        manager.has_saved_profile(),
+                        message.as_ref().map(Line::as_str),
+                    );
+                    continue 'scan;
+                }
+                ListAction::Forget => {
+                    if confirm_forget(framebuffer, input, manager) {
+                        let message = manager.forget_saved_profile().err().map(failure_line);
+                        draw_access_points(
+                            framebuffer,
+                            &access_points,
+                            selected,
+                            first,
+                            message
+                                .as_ref()
+                                .map(Line::as_str)
+                                .or(Some("SAVED PROFILE DELETED")),
+                            manager.is_enabled(),
+                        );
+                        let _ = wait_key(input, manager);
+                    }
+                }
+                ListAction::Up if !access_points.is_empty() => {
                     selected = selected.saturating_sub(1);
                     keep_visible(selected, access_points.len(), &mut first);
                 }
-                Key::ArrowDown if !access_points.is_empty() => {
+                ListAction::Down if !access_points.is_empty() => {
                     selected = (selected + 1).min(access_points.len() - 1);
                     keep_visible(selected, access_points.len(), &mut first);
                 }
-                Key::Ascii(b'\r' | b'\n') if !access_points.is_empty() => {
-                    let access_point = &access_points[selected];
+                ListAction::PageUp if !access_points.is_empty() => {
+                    selected = selected.saturating_sub(VISIBLE_ROWS);
+                    keep_visible(selected, access_points.len(), &mut first);
+                }
+                ListAction::PageDown if !access_points.is_empty() => {
+                    selected = (selected + VISIBLE_ROWS).min(access_points.len() - 1);
+                    keep_visible(selected, access_points.len(), &mut first);
+                }
+                ListAction::Activate(index) if index < access_points.len() => {
+                    selected = index;
+                    keep_visible(selected, access_points.len(), &mut first);
+                    let access_point = &access_points[selected].access_point;
                     if access_point.ssid().is_empty() {
                         draw_access_points(
                             framebuffer,
@@ -104,8 +208,9 @@ pub fn run(
                             selected,
                             first,
                             Some("HIDDEN SSIDS CANNOT BE SELECTED IN THIS VERSION"),
+                            manager.is_enabled(),
                         );
-                        let _ = wait_key(input, session, stack);
+                        let _ = wait_key(input, manager);
                         continue;
                     }
 
@@ -120,8 +225,7 @@ pub fn run(
                         edit_password(
                             framebuffer,
                             input,
-                            session,
-                            stack,
+                            manager,
                             &ssid[..ssid_length],
                             &mut password,
                         )
@@ -131,16 +235,26 @@ pub fn run(
                         zeroize(&mut password);
                         continue;
                     };
+                    let Some(profile) =
+                        choose_profile(framebuffer, input, manager, &ssid[..ssid_length])
+                    else {
+                        zeroize(&mut password);
+                        continue;
+                    };
                     let result = connect_and_configure(
                         framebuffer,
-                        session,
-                        stack,
+                        input,
+                        manager,
                         &ssid[..ssid_length],
-                        &password[..password_length],
+                        &mut password[..password_length],
+                        profile,
                     );
                     zeroize(&mut password);
+                    let Some(result) = result else {
+                        return;
+                    };
                     show_result(framebuffer, &result);
-                    match wait_result_action(input, session, stack) {
+                    match wait_result_action(input, manager) {
                         ResultAction::Exit => return,
                         ResultAction::Rescan => {
                             selected = 0;
@@ -156,11 +270,8 @@ pub fn run(
     }
 }
 
-fn scan(
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
-) -> Result<Vec<wifi::station::AccessPoint>, MenuError> {
-    let rpc = ensure_session(session, stack)?;
+fn scan(manager: &mut Manager) -> Result<Vec<Network>, MenuError> {
+    let rpc = manager.ensure_station().map_err(MenuError::Manager)?;
     let Some((status, access_points)) = wifi::station::scan(rpc) else {
         return Err(MenuError::ScanRpc);
     };
@@ -168,44 +279,42 @@ fn scan(
         return Err(MenuError::ScanStatus(status));
     }
     uart::log_u32(b"WIFI MENU: access points=", access_points.len() as u32);
-    Ok(access_points)
+    Ok(consolidate_access_points(access_points))
 }
 
-fn ensure_session<'a>(
-    session: &'a mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
-) -> Result<&'a mut wifi::Rpc, MenuError> {
-    if session.as_ref().is_some_and(|rpc| !rpc.is_alive()) {
-        *session = None;
-        *stack = None;
-    }
-    if session.is_none() {
-        let Some((transport, _)) = wifi::bring_up() else {
-            return Err(MenuError::LinkBringUp);
-        };
-        let mut rpc = wifi::Rpc::new(transport);
-        match wifi::station::start(&mut rpc) {
-            Some(0) => {}
-            Some(status) => return Err(MenuError::StartStatus(status)),
-            None => return Err(MenuError::StartRpc),
+fn consolidate_access_points(access_points: Vec<wifi::station::AccessPoint>) -> Vec<Network> {
+    let mut networks: Vec<Network> = Vec::new();
+    for access_point in access_points {
+        if let Some(existing) = networks
+            .iter_mut()
+            .find(|network| network.access_point.ssid() == access_point.ssid())
+        {
+            existing.bssid_count = existing.bssid_count.saturating_add(1);
+            if access_point.rssi > existing.access_point.rssi {
+                existing.access_point = access_point;
+            }
+        } else {
+            networks.push(Network {
+                access_point,
+                bssid_count: 1,
+            });
         }
-        *session = Some(rpc);
     }
-    session.as_mut().ok_or(MenuError::LinkBringUp)
+    networks.sort_by(|left, right| right.access_point.rssi.cmp(&left.access_point.rssi));
+    networks
 }
 
 fn edit_password(
     framebuffer: &mut Framebuffer,
     input: &mut InputManager,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
+    manager: &mut Manager,
     ssid: &[u8],
     password: &mut [u8; wifi::station::PASSWORD_MAX_BYTES],
 ) -> Option<usize> {
     let mut length = 0usize;
     draw_password_screen(framebuffer, ssid, length);
     loop {
-        let key = wait_key(input, session, stack)?;
+        let key = wait_key(input, manager)?;
         let changed = match key {
             Key::Escape => return None,
             Key::Ascii(b'\r' | b'\n') => return Some(length),
@@ -227,135 +336,57 @@ fn edit_password(
     }
 }
 
+fn choose_profile(
+    framebuffer: &mut Framebuffer,
+    input: &mut InputManager,
+    manager: &mut Manager,
+    ssid: &[u8],
+) -> Option<ProfileChoice> {
+    let mut choice = ProfileChoice::SaveAndAutoConnect;
+    loop {
+        draw_profile_choice(framebuffer, ssid, choice);
+        match wait_key(input, manager)? {
+            Key::Escape => return None,
+            Key::ArrowUp | Key::ArrowDown => {
+                choice = match choice {
+                    ProfileChoice::SaveAndAutoConnect => ProfileChoice::ConnectOnce,
+                    ProfileChoice::ConnectOnce => ProfileChoice::SaveAndAutoConnect,
+                };
+            }
+            Key::Ascii(b's' | b'S') => return Some(ProfileChoice::SaveAndAutoConnect),
+            Key::Ascii(b'o' | b'O') => return Some(ProfileChoice::ConnectOnce),
+            Key::Ascii(b'\r' | b'\n') => return Some(choice),
+            _ => {}
+        }
+    }
+}
+
 fn connect_and_configure(
     framebuffer: &mut Framebuffer,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
+    input: &mut InputManager,
+    manager: &mut Manager,
     ssid: &[u8],
-    password: &[u8],
-) -> ConnectionResult {
+    password: &mut [u8],
+    profile: ProfileChoice,
+) -> Option<ConnectionResult> {
     let mut detail = Line::new();
     detail.push_str("SSID ");
     detail.push_ascii(ssid);
     show_progress(framebuffer, "ASSOCIATING", detail.as_str());
 
-    // Once a new association is attempted, an address from the old network
-    // must not survive even if this attempt fails halfway through.
-    *stack = None;
-    let Some(rpc) = session.as_mut() else {
-        return ConnectionResult::error("NO C6 SESSION", "RETURN TO THE LIST AND RESCAN");
-    };
-    match wifi::station::connect(rpc, ssid, password) {
-        Some(0) => {}
-        Some(status) => {
-            return ConnectionResult::status("CONNECT REFUSED", status);
-        }
-        None => return ConnectionResult::error("CONNECT RPC FAILED", "SEE UART LOG"),
+    let started = manager.begin_menu_connect(ssid, password, profile);
+    // The manager has its own fixed retry buffer now. Erase the UI's copy
+    // before waiting for a station event; the manager erases its copy on
+    // success or a non-retryable failure.
+    zeroize(password);
+    if let Err(failure) = started {
+        return Some(failure_result(failure));
     }
 
-    let connected = match wifi::station::wait_for_connection(rpc, CONNECT_TIMEOUT_MS) {
-        wifi::station::Outcome::Connected {
-            ssid,
-            ssid_length,
-            channel,
-            ..
-        } => {
-            let mut line = Line::new();
-            line.push_str("SSID ");
-            line.push_ascii(&ssid[..ssid_length]);
-            line.push_str("  CHANNEL ");
-            line.push_u32(channel);
-            line
-        }
-        wifi::station::Outcome::Disconnected { reason } => {
-            let mut line = Line::new();
-            line.push_str("REASON ");
-            line.push_u32(reason);
-            if let Some(name) = wifi::station::disconnect_reason_name(reason) {
-                line.push_str("  ");
-                line.push_str(name);
-            }
-            return ConnectionResult {
-                kind: ResultKind::Error,
-                title: "ASSOCIATION FAILED",
-                detail: line,
-            };
-        }
-        wifi::station::Outcome::TimedOut => {
-            return ConnectionResult::error("ASSOCIATION TIMED OUT", "NO EVENT FROM THE C6");
-        }
-    };
-
-    if !tick::is_running() {
-        return ConnectionResult::error(
-            "ASSOCIATED, NO IP STACK",
-            "MILLISECOND TICK IS NOT RUNNING",
-        );
-    }
-    let Some((status, mac)) = wifi::rpc::get_mac_address(rpc, wifi::rpc::WIFI_IF_STA) else {
-        return ConnectionResult::error("ASSOCIATED, NO IP STACK", "STATION MAC RPC FAILED");
-    };
-    if status != 0 {
-        return ConnectionResult::status("STATION MAC REFUSED", status);
-    }
-
-    show_progress(framebuffer, "REQUESTING DHCP LEASE", connected.as_str());
-    let mut candidate = net::Stack::new(rpc, mac);
-    candidate.start_dhcp();
-    let acquired = candidate.pump_until(rpc, DHCP_TIMEOUT_MS, |stack| stack.has_address());
-    let alive = rpc.is_alive();
-
-    if !alive {
-        *session = None;
-        return ConnectionResult::error("C6 LINK LOST", "DHCP DID NOT COMPLETE");
-    }
-
-    if acquired {
-        let mut line = connected;
-        if let Some(config) = candidate.config() {
-            line.push_str("  IP ");
-            push_ipv4(&mut line, config.address.address());
-        }
-        *stack = Some(candidate);
-        uart::log(b"WIFI MENU: associated and DHCP configured\r\n");
-        ConnectionResult {
-            kind: ResultKind::Success,
-            title: "ONLINE",
-            detail: line,
-        }
-    } else {
-        *stack = Some(candidate);
-        let mut line = connected;
-        line.push_str("  DHCP STILL PENDING");
-        ConnectionResult {
-            kind: ResultKind::Warning,
-            title: "ASSOCIATED, NO LEASE YET",
-            detail: line,
-        }
-    }
-}
-
-fn service_link(session: &mut Option<wifi::Rpc>, stack: &mut Option<net::Stack>) {
-    if session.as_ref().is_some_and(|rpc| !rpc.is_alive()) {
-        *session = None;
-        *stack = None;
-        return;
-    }
-    match (session.as_mut(), stack.as_mut()) {
-        (Some(rpc), Some(stack)) => {
-            stack.poll(rpc);
-        }
-        (Some(rpc), None) => rpc.discard_station_frames(),
-        _ => {}
-    }
-}
-
-fn wait_key(
-    input: &mut InputManager,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
-) -> Option<Key> {
     let mut sequence = interrupts::frame_sequence();
+    let mut dhcp_screen_drawn = false;
+    let mut shown_attempt = 0u32;
+    let mut shown_retry: Option<(u32, u32)> = None;
     loop {
         if interrupts::dma_error() != 0 {
             uart::log(b"WIFI MENU: DMA interrupt error\r\n");
@@ -369,20 +400,293 @@ fn wait_key(
         }
         sequence = next_sequence;
         input.service();
-        service_link(session, stack);
-        if let Some(event) = input.poll_key() {
-            return Some(event.key);
+        manager.service();
+
+        while let Some(event) = input.poll_key() {
+            if event.key == Key::Escape {
+                // The manager owns the in-flight request, so leaving the
+                // screen does not lose or duplicate it.
+                return None;
+            }
+        }
+
+        match manager.state() {
+            State::Associating { attempt, .. } => {
+                if attempt != shown_attempt {
+                    let mut title = Line::new();
+                    title.push_str("ASSOCIATING - ATTEMPT ");
+                    title.push_u32(attempt);
+                    show_progress(framebuffer, title.as_str(), detail.as_str());
+                    shown_attempt = attempt;
+                    shown_retry = None;
+                }
+            }
+            State::RetryWaiting {
+                next_attempt,
+                generation,
+                failure,
+                ..
+            } => {
+                if shown_retry != Some((generation, next_attempt)) {
+                    let mut retry = failure_line(failure);
+                    retry.push_str("  NEXT ATTEMPT ");
+                    retry.push_u32(next_attempt);
+                    show_progress(framebuffer, "RETRY WAITING", retry.as_str());
+                    shown_retry = Some((generation, next_attempt));
+                }
+            }
+            State::NeedsPassword(reason) => {
+                let mut line = failure_line(Failure::Disconnected(reason));
+                line.push_str("  SELECT THE AP TO TRY AGAIN");
+                return Some(ConnectionResult {
+                    kind: ResultKind::Error,
+                    title: "PASSWORD REQUIRED",
+                    detail: line,
+                });
+            }
+            State::RequestingDhcp { association, .. } => {
+                if !dhcp_screen_drawn {
+                    show_progress(
+                        framebuffer,
+                        "REQUESTING DHCP LEASE",
+                        association_line(&association).as_str(),
+                    );
+                    dhcp_screen_drawn = true;
+                }
+            }
+            State::Online(association) => {
+                let mut line = association_line(&association);
+                if let Some(config) = manager.stack().and_then(|stack| stack.config()) {
+                    line.push_str("  IP ");
+                    push_ipv4(&mut line, config.address.address());
+                }
+                uart::log(b"WIFI MENU: associated and DHCP configured\r\n");
+                let (kind, title) = match manager.profile_save_state() {
+                    ProfileSaveState::Saved => (ResultKind::Success, "ONLINE - PROFILE SAVED"),
+                    ProfileSaveState::Failed => {
+                        line.push_str("  PROFILE SAVE FAILED");
+                        (ResultKind::Warning, "ONLINE - SAVE FAILED")
+                    }
+                    ProfileSaveState::NotRequested | ProfileSaveState::Pending => {
+                        (ResultKind::Success, "ONLINE")
+                    }
+                };
+                return Some(ConnectionResult {
+                    kind,
+                    title,
+                    detail: line,
+                });
+            }
+            State::AssociatedNoLease(association) => {
+                let mut line = association_line(&association);
+                line.push_str("  DHCP STILL PENDING");
+                return Some(ConnectionResult {
+                    kind: ResultKind::Warning,
+                    title: "ASSOCIATED, NO LEASE YET",
+                    detail: line,
+                });
+            }
+            State::Failed(failure) => return Some(failure_result(failure)),
+            State::Associated(association) => {
+                return Some(ConnectionResult {
+                    kind: ResultKind::Warning,
+                    title: "ASSOCIATED, IP UNCONFIGURED",
+                    detail: association_line(&association),
+                });
+            }
+            State::Off => {
+                return Some(ConnectionResult::error(
+                    "WI-FI IS OFF",
+                    "ENABLE WI-FI BEFORE CONNECTING",
+                ));
+            }
+            State::LinkDown | State::Idle => {
+                return Some(ConnectionResult::error(
+                    "CONNECTION STOPPED",
+                    "THE CONNECTION MANAGER RETURNED IDLE",
+                ));
+            }
         }
     }
 }
 
-fn wait_result_action(
-    input: &mut InputManager,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
-) -> ResultAction {
+fn association_line(association: &super::wifi_manager::Association) -> Line {
+    let mut line = Line::new();
+    line.push_str("SSID ");
+    line.push_ascii(association.ssid());
+    line.push_str("  CHANNEL ");
+    line.push_u32(association.channel);
+    line
+}
+
+fn failure_result(failure: Failure) -> ConnectionResult {
+    match failure {
+        Failure::Disabled => ConnectionResult::error("WI-FI IS OFF", "ENABLE WI-FI FIRST"),
+        Failure::LinkBringUp => ConnectionResult::error("LINK BRING-UP FAILED", "SEE UART LOG"),
+        Failure::StartRpc => ConnectionResult::error("WI-FI START RPC FAILED", "SEE UART LOG"),
+        Failure::StartStatus(status) => ConnectionResult::status("WI-FI START REFUSED", status),
+        Failure::ConnectRpc => ConnectionResult::error("CONNECT RPC FAILED", "SEE UART LOG"),
+        Failure::ConnectStatus(status) => ConnectionResult::status("CONNECT REFUSED", status),
+        Failure::Disconnected(reason) => {
+            let mut line = Line::new();
+            line.push_str("REASON ");
+            line.push_u32(reason);
+            if let Some(name) = wifi::station::disconnect_reason_name(reason) {
+                line.push_str("  ");
+                line.push_str(name);
+            }
+            ConnectionResult {
+                kind: ResultKind::Error,
+                title: "ASSOCIATION FAILED",
+                detail: line,
+            }
+        }
+        Failure::AssociationTimedOut => {
+            ConnectionResult::error("ASSOCIATION TIMED OUT", "NO EVENT FROM THE C6")
+        }
+        Failure::TickUnavailable => {
+            ConnectionResult::error("ASSOCIATED, NO IP STACK", "MILLISECOND TICK IS NOT RUNNING")
+        }
+        Failure::MacRpc => {
+            ConnectionResult::error("ASSOCIATED, NO IP STACK", "STATION MAC RPC FAILED")
+        }
+        Failure::MacStatus(status) => ConnectionResult::status("STATION MAC REFUSED", status),
+        Failure::LinkLost => ConnectionResult::error("C6 LINK LOST", "CONNECTION DID NOT COMPLETE"),
+        Failure::ConfigRpc => ConnectionResult::error("CONFIG RPC FAILED", "SEE UART LOG"),
+        Failure::ConfigStatus(status) => ConnectionResult::status("CONFIG REFUSED", status),
+        Failure::StorageRpc => ConnectionResult::error("STORAGE RPC FAILED", "SEE UART LOG"),
+        Failure::StorageStatus(status) => ConnectionResult::status("STORAGE REFUSED", status),
+        Failure::DisconnectRpc => {
+            ConnectionResult::error("OLD CONNECTION DISCONNECT FAILED", "SEE UART LOG")
+        }
+        Failure::DisconnectStatus(status) => {
+            ConnectionResult::status("OLD CONNECTION DISCONNECT REFUSED", status)
+        }
+        Failure::DisconnectTimedOut => ConnectionResult::error(
+            "OLD CONNECTION DISCONNECT TIMED OUT",
+            "NO EVENT FROM THE C6",
+        ),
+        Failure::ModeRpc => ConnectionResult::error("WI-FI MODE RPC FAILED", "SEE UART LOG"),
+        Failure::ModeStatus(status) => ConnectionResult::status("WI-FI MODE REFUSED", status),
+        Failure::StopRpc => ConnectionResult::error("WI-FI STOP RPC FAILED", "SEE UART LOG"),
+        Failure::StopStatus(status) => ConnectionResult::status("WI-FI STOP REFUSED", status),
+    }
+}
+
+fn failure_line(failure: Failure) -> Line {
+    let result = failure_result(failure);
+    let mut line = Line::new();
+    line.push_str(result.title);
+    line.push_str("  ");
+    line.push_str(result.detail.as_str());
+    line
+}
+
+fn wait_key(input: &mut InputManager, manager: &mut Manager) -> Option<Key> {
     loop {
-        match wait_key(input, session, stack) {
+        let (key, _) = wait_input_frame(input, manager)?;
+        if key.is_some() {
+            return key;
+        }
+    }
+}
+
+fn wait_input_frame(
+    input: &mut InputManager,
+    manager: &mut Manager,
+) -> Option<(Option<Key>, PrimaryTouch)> {
+    let sequence = interrupts::frame_sequence();
+    loop {
+        if interrupts::dma_error() != 0 {
+            uart::log(b"WIFI MENU: DMA interrupt error\r\n");
+            return None;
+        }
+        interrupts::wait_for_interrupt();
+        let next_sequence = interrupts::frame_sequence();
+        if next_sequence == sequence {
+            input.service_fast();
+            continue;
+        }
+        input.service();
+        manager.service();
+        return Some((
+            input.poll_key().map(|event| event.key),
+            input.poll_primary_touch(),
+        ));
+    }
+}
+
+fn wait_list_action(
+    input: &mut InputManager,
+    manager: &mut Manager,
+    selected: usize,
+    first: usize,
+    count: usize,
+) -> Option<ListAction> {
+    loop {
+        let (key, touch) = wait_input_frame(input, manager)?;
+        let keyboard = match key {
+            Some(Key::Escape) => Some(ListAction::Exit),
+            Some(Key::Ascii(b'r' | b'R')) => Some(ListAction::Rescan),
+            Some(Key::Ascii(b'o' | b'O')) => Some(ListAction::Toggle),
+            Some(Key::Ascii(b'f' | b'F')) => Some(ListAction::Forget),
+            Some(Key::ArrowUp) => Some(ListAction::Up),
+            Some(Key::ArrowDown) => Some(ListAction::Down),
+            Some(Key::PageUp) => Some(ListAction::PageUp),
+            Some(Key::PageDown) => Some(ListAction::PageDown),
+            Some(Key::Ascii(b'\r' | b'\n')) => {
+                Some(ListAction::Activate(selected.min(count.saturating_sub(1))))
+            }
+            _ => None,
+        };
+        if keyboard.is_some() {
+            return keyboard;
+        }
+        if let PrimaryTouch::Pressed(point) = touch {
+            if point.x >= 24 && point.x < WIDTH - 24 && (LIST_TOP..LIST_BOTTOM).contains(&point.y) {
+                let index = first + (point.y - LIST_TOP) / ROW_HEIGHT;
+                if index < count {
+                    return Some(ListAction::Activate(index));
+                }
+            }
+            if point.y >= FOOTER_TOP {
+                return Some(match point.x {
+                    0..=239 => ListAction::Toggle,
+                    240..=479 => ListAction::Forget,
+                    480..=799 => ListAction::Rescan,
+                    _ => ListAction::Exit,
+                });
+            }
+        }
+    }
+}
+
+fn wait_off_action(input: &mut InputManager, manager: &mut Manager) -> Option<ListAction> {
+    loop {
+        let (key, touch) = wait_input_frame(input, manager)?;
+        match key {
+            Some(Key::Escape) => return Some(ListAction::Exit),
+            Some(Key::Ascii(b'o' | b'O')) => return Some(ListAction::Toggle),
+            Some(Key::Ascii(b'f' | b'F')) => return Some(ListAction::Forget),
+            _ => {}
+        }
+        if let PrimaryTouch::Pressed(point) = touch {
+            if (220..=590).contains(&point.x) && (290..=390).contains(&point.y) {
+                return Some(ListAction::Toggle);
+            }
+            if (690..=1060).contains(&point.x) && (290..=390).contains(&point.y) {
+                return Some(ListAction::Forget);
+            }
+            if point.y >= FOOTER_TOP {
+                return Some(ListAction::Exit);
+            }
+        }
+    }
+}
+
+fn wait_result_action(input: &mut InputManager, manager: &mut Manager) -> ResultAction {
+    loop {
+        match wait_key(input, manager) {
             Some(Key::Escape) | None => return ResultAction::Exit,
             Some(Key::Ascii(b'r' | b'R')) => return ResultAction::Rescan,
             Some(Key::Ascii(b'\r' | b'\n')) => return ResultAction::List,
@@ -402,15 +706,17 @@ fn keep_visible(selected: usize, count: usize, first: &mut usize) {
 
 fn draw_access_points(
     framebuffer: &mut Framebuffer,
-    access_points: &[wifi::station::AccessPoint],
+    access_points: &[Network],
     selected: usize,
     first: usize,
     message: Option<&str>,
+    enabled: bool,
 ) {
     draw_chrome(framebuffer, "WI-FI NETWORKS");
     let mut count = Line::new();
     count.push_u32(access_points.len() as u32);
-    count.push_str(" ACCESS POINTS");
+    count.push_str(" NETWORKS  ");
+    count.push_str(if enabled { "ON" } else { "OFF" });
     framebuffer.draw_text(930, 30, count.as_str(), 2, MUTED, None);
 
     if access_points.is_empty() {
@@ -418,7 +724,7 @@ fn draw_access_points(
         framebuffer.draw_text(400, 335, "PRESS R TO RESCAN", 2, WHITE, None);
     }
 
-    for (visible, access_point) in access_points
+    for (visible, network) in access_points
         .iter()
         .skip(first)
         .take(VISIBLE_ROWS)
@@ -430,14 +736,14 @@ fn draw_access_points(
         let background = if selected_row { SELECTED } else { PANEL };
         let foreground = if selected_row { BLACK } else { WHITE };
         framebuffer.fill_rect(24, y, WIDTH - 48, ROW_HEIGHT - 3, background);
-        let line = access_point_line(access_point);
+        let line = access_point_line(network);
         framebuffer.draw_text(36, y + 6, line.as_str(), 2, foreground, None);
     }
 
     framebuffer.draw_text(
         28,
         FOOTER_TOP,
-        "UP/DOWN SELECT    ENTER CONNECT    R RESCAN    ESC EXIT",
+        "UP/DOWN/PAGE SELECT   ENTER/TOUCH CONNECT   O OFF   F FORGET",
         2,
         CYAN,
         None,
@@ -448,7 +754,7 @@ fn draw_access_points(
         framebuffer.draw_text(
             28,
             FOOTER_TOP + 32,
-            "MENU CONNECTIONS REQUEST DHCP AUTOMATICALLY",
+            "R RESCAN   ESC EXIT   MENU CONNECTIONS REQUEST DHCP AUTOMATICALLY",
             2,
             MUTED,
             None,
@@ -457,7 +763,8 @@ fn draw_access_points(
     flush(framebuffer, b"WIFI MENU: list flush failed\r\n");
 }
 
-fn access_point_line(access_point: &wifi::station::AccessPoint) -> Line {
+fn access_point_line(network: &Network) -> Line {
+    let access_point = &network.access_point;
     let mut line = Line::new();
     if access_point.rssi > -100 {
         line.push_str(" ");
@@ -477,6 +784,10 @@ fn access_point_line(access_point: &wifi::station::AccessPoint) -> Line {
         }
     }
     line.push_str("  ");
+    if network.bssid_count > 1 {
+        line.push_u32(network.bssid_count);
+        line.push_str(" APS  ");
+    }
     if access_point.ssid().is_empty() {
         line.push_str("(HIDDEN - UNAVAILABLE)");
     } else {
@@ -521,6 +832,146 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
         None,
     );
     flush(framebuffer, b"WIFI MENU: password-screen flush failed\r\n");
+}
+
+fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: ProfileChoice) {
+    draw_chrome(framebuffer, "WI-FI PROFILE");
+    let mut network = Line::new();
+    network.push_str("NETWORK  ");
+    network.push_ascii(ssid);
+    framebuffer.draw_text(90, 140, network.as_str(), 3, WHITE, None);
+
+    let save_selected = choice == ProfileChoice::SaveAndAutoConnect;
+    framebuffer.fill_rect(
+        90,
+        230,
+        1050,
+        62,
+        if save_selected { SELECTED } else { PANEL },
+    );
+    framebuffer.draw_text(
+        110,
+        248,
+        "SAVE AND AUTO-CONNECT",
+        3,
+        if save_selected { BLACK } else { WHITE },
+        None,
+    );
+    framebuffer.fill_rect(
+        90,
+        312,
+        1050,
+        62,
+        if save_selected { PANEL } else { SELECTED },
+    );
+    framebuffer.draw_text(
+        110,
+        330,
+        "CONNECT ONCE",
+        3,
+        if save_selected { WHITE } else { BLACK },
+        None,
+    );
+    framebuffer.draw_text(
+        90,
+        420,
+        "UP/DOWN SELECT    ENTER CONFIRM    ESC CANCEL",
+        2,
+        CYAN,
+        None,
+    );
+    framebuffer.draw_text(
+        90,
+        464,
+        "THE PROFILE IS SAVED ONLY AFTER ASSOCIATION SUCCEEDS",
+        2,
+        MUTED,
+        None,
+    );
+    flush(framebuffer, b"WIFI MENU: profile-screen flush failed\r\n");
+}
+
+fn draw_off_screen(framebuffer: &mut Framebuffer, saved_profile: bool, message: Option<&str>) {
+    draw_chrome(framebuffer, "WI-FI NETWORKS");
+    framebuffer.draw_text(1030, 30, "OFF", 2, YELLOW, None);
+    framebuffer.draw_text(500, 155, "WI-FI IS OFF", 4, YELLOW, None);
+    framebuffer.draw_text(
+        405,
+        220,
+        if saved_profile {
+            "SAVED PROFILE: YES"
+        } else {
+            "SAVED PROFILE: NO"
+        },
+        2,
+        WHITE,
+        None,
+    );
+    framebuffer.fill_rect(220, 290, 370, 100, SELECTED);
+    framebuffer.draw_text(328, 326, "O  TURN ON", 3, BLACK, None);
+    framebuffer.fill_rect(690, 290, 370, 100, PANEL);
+    framebuffer.draw_text(760, 326, "F  FORGET PROFILE", 3, WHITE, None);
+    framebuffer.draw_text(
+        430,
+        FOOTER_TOP,
+        "TOUCH A BUTTON OR PRESS O/F",
+        2,
+        CYAN,
+        None,
+    );
+    framebuffer.draw_text(550, FOOTER_TOP + 32, "ESC EXIT", 2, MUTED, None);
+    if let Some(message) = message {
+        framebuffer.draw_text(90, 450, message, 2, RED, None);
+    }
+    flush(framebuffer, b"WIFI MENU: off-screen flush failed\r\n");
+}
+
+fn confirm_forget(
+    framebuffer: &mut Framebuffer,
+    input: &mut InputManager,
+    manager: &mut Manager,
+) -> bool {
+    draw_chrome(framebuffer, "FORGET WI-FI PROFILE?");
+    framebuffer.draw_text(
+        260,
+        180,
+        "THE SAVED SSID AND PASSWORD WILL BE DELETED",
+        2,
+        YELLOW,
+        None,
+    );
+    framebuffer.fill_rect(100, 300, 470, 90, RED);
+    framebuffer.draw_text(255, 332, "Y  FORGET", 3, WHITE, None);
+    framebuffer.fill_rect(700, 300, 470, 90, PANEL);
+    framebuffer.draw_text(875, 332, "N  CANCEL", 3, WHITE, None);
+    framebuffer.draw_text(
+        430,
+        FOOTER_TOP,
+        "TOUCH A BUTTON OR PRESS Y/N",
+        2,
+        CYAN,
+        None,
+    );
+    flush(framebuffer, b"WIFI MENU: forget-confirm flush failed\r\n");
+
+    loop {
+        let Some((key, touch)) = wait_input_frame(input, manager) else {
+            return false;
+        };
+        match key {
+            Some(Key::Ascii(b'y' | b'Y')) => return true,
+            Some(Key::Ascii(b'n' | b'N')) | Some(Key::Escape) => return false,
+            _ => {}
+        }
+        if let PrimaryTouch::Pressed(point) = touch {
+            if (100..=570).contains(&point.x) && (300..=390).contains(&point.y) {
+                return true;
+            }
+            if (700..=1170).contains(&point.x) && (300..=390).contains(&point.y) {
+                return false;
+            }
+        }
+    }
 }
 
 fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
@@ -588,9 +1039,7 @@ fn zeroize(bytes: &mut [u8]) {
 }
 
 enum MenuError {
-    LinkBringUp,
-    StartRpc,
-    StartStatus(i32),
+    Manager(Failure),
     ScanRpc,
     ScanStatus(i32),
 }
@@ -599,9 +1048,16 @@ impl MenuError {
     fn line(&self) -> Line {
         let mut line = Line::new();
         match *self {
-            Self::LinkBringUp => line.push_str("ESP-HOSTED LINK BRING-UP FAILED; SEE UART LOG"),
-            Self::StartRpc => line.push_str("WI-FI START RPC FAILED; SEE UART LOG"),
-            Self::StartStatus(status) => push_status(&mut line, "WI-FI START", status),
+            Self::Manager(Failure::LinkBringUp) => {
+                line.push_str("ESP-HOSTED LINK BRING-UP FAILED; SEE UART LOG")
+            }
+            Self::Manager(Failure::StartRpc) => {
+                line.push_str("WI-FI START RPC FAILED; SEE UART LOG")
+            }
+            Self::Manager(Failure::StartStatus(status)) => {
+                push_status(&mut line, "WI-FI START", status)
+            }
+            Self::Manager(_) => line.push_str("WI-FI MANAGER FAILED; SEE UART LOG"),
             Self::ScanRpc => line.push_str("SCAN RPC FAILED; SEE UART LOG"),
             Self::ScanStatus(status) => push_status(&mut line, "SCAN", status),
         }

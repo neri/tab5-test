@@ -44,22 +44,6 @@ pub struct Network<'a> {
     pub stack: &'a mut net::Stack,
 }
 
-impl<'a> Network<'a> {
-    /// Pairs the link with the stack, if both are present and addressed.
-    ///
-    /// `None` is not an error anywhere it is used: the browser's built-in
-    /// pages work without a network, and the diagnostic says so and stops.
-    pub fn new(
-        rpc: Option<&'a mut wifi::Rpc>,
-        stack: Option<&'a mut net::Stack>,
-    ) -> Option<Network<'a>> {
-        match (rpc, stack) {
-            (Some(rpc), Some(stack)) if stack.has_address() => Some(Network { rpc, stack }),
-            _ => None,
-        }
-    }
-}
-
 /// Why a page was not shown.
 ///
 /// `name` is the stable one-word form the fixture manifest and the UART use
@@ -477,11 +461,7 @@ pub const NOT_HTML: Failure = Failure::new(
     "Not a page",
     "This is not HTML, and this viewer shows nothing else.",
 );
-pub const EMPTY: Failure = Failure::new(
-    "empty",
-    "Empty response",
-    "The server sent no page.",
-);
+pub const EMPTY: Failure = Failure::new("empty", "Empty response", "The server sent no page.");
 pub const OUT_OF_MEMORY: Failure = Failure::new(
     "out-of-memory",
     "Out of memory",

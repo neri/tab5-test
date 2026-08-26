@@ -21,9 +21,9 @@ CPLLの新規有効化やregi2cキャリブレーションを行わず、ブー�
 ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では次の配置を
 定義しています。
 
-- `0x40000020..0x4001fff8`: アプリケーション記述子、通常の読み取り専用データ、
+- `0x40000020..0x4002fff8`: アプリケーション記述子、通常の読み取り専用データ、
   `.eh_frame`、IROMとの位置関係を固定するパディング（DROM）
-- `0x40020000`以降: 通常の実行コード（IROM）
+- `0x40030000`以降: 通常の実行コード（IROM）
 - `0x4ff40000..0x4ff80000`: FLASH停止中にも必要なコードと定数、`.data`、
   `.bss`、スタック（内部L2MEM）
 
@@ -48,6 +48,10 @@ ESP-IDF v5.5.3のESP32-P4ブートローダーは、XIP領域にあるセグメ�
 `memory.x`のリンク時ASSERTと`tools/check_esp_image.py`の変換後イメージ検査を
 併用します。最終イメージはDROM/IROMのXIP 2本とRAMロード2本です。
 
+読み取り専用データが128 KiB枠を越えたため、DROM終端とIROM開始をともに次の64 KiB境界へ
+1ページ移しています。XIP窓の総終端`0x40400000`、セグメント数、物理／仮想ページ内offsetの
+一致は変えず、releaseごとに同じ検査で確認します。
+
 PSRAM初期化前後には、互いに別の64 byteキャッシュラインにあるDROM/IROMプローブを
 実行します。初期実装ではPSRAM用dual-MSPIリセットのbit 23/25ではなくFLASH側の
 bit 22/24を操作していたため、初期化後の最初の通常DROM参照で停止しました。
@@ -56,7 +60,7 @@ ESP-IDF v5.5.3と同じbit 23/25へ修正し、キャッシュヒットで誤通
 
 ## Flashパーティションと書き込み
 
-Flash書き込みはファームウェア本体では行いません。`.cargo/config.toml`の
+P4のSPI Flash書き込みはファームウェア本体では行いません。`.cargo/config.toml`の
 `espflash flash` runnerが、ESP-IDF互換の[`../partitions.csv`](../partitions.csv)を
 標準オフセット`0x8000`へ書き込み、アプリイメージを`factory`パーティション
 （`0x10000..0x400000`）に配置します。したがって、書き込み先は固定アドレスを
@@ -68,6 +72,13 @@ Tab5の16 MiB Flashでは、標準の`nvs`（`0x9000..0xf000`）と`phy_init`
 `storage`パーティションです。現状はESP-IDFやファイルシステムをリンクしておらず、
 この予約領域をアプリから読み書きしません。`cargo run --release`による書き込みでは
 `storage`は更新対象に含まれないため、既存内容を保持します。
+
+Wi-Fiの永続profileはP4のこれらのpartitionではなく、ESP32-C6上のESP-IDF NVSへ
+ESP-Hosted RPC経由で保存します。永続ON/OFFもC6のWi-Fi modeとして同じNVSへ置き、P4側Flashは
+使いません。アプリの対話ループ開始時にC6を一時的に起動してmodeと保存設定を読み、OFFなら
+sessionを残さずC6をpower downします。ONでprofileがあればassociationを要求します。
+associationとDHCPはその後の通常フレームループで進むため、起動処理はAP応答やDHCP leaseを
+待ちません。
 
 ## RAMの範囲
 

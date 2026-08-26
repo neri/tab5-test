@@ -27,10 +27,10 @@ MEMORY
 {
     /* The P4 IDF bootloader expects exactly two XIP segments.  Fill DROM up to
      * eight bytes before the next 64 KiB page boundary: the following segment
-     * header then puts the IROM payload at image offset +0x20000, matching the
+     * header then puts the IROM payload at image offset +0x30000, matching the
      * virtual address below without an extra espflash padding segment. */
-    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0001ffd8
-    ROM_TEXT : ORIGIN = 0x40020000, LENGTH = 0x003e0000
+    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0002ffd8
+    ROM_TEXT : ORIGIN = 0x40030000, LENGTH = 0x003d0000
     RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
 }
 

@@ -12,19 +12,28 @@ use alloc::vec::Vec;
 
 use crate::uart;
 use crate::wifi::proto::{Reader, Writer};
-use crate::wifi::rpc::{Rpc, Status};
+use crate::wifi::rpc::{Event, Rpc, Status};
 
 /// Request ids (`RpcId` in `esp_hosted_rpc.proto`).
+const REQ_GET_WIFI_MODE: u32 = 259;
 const REQ_SET_WIFI_MODE: u32 = 260;
 const REQ_SET_POWER_SAVE: u32 = 270;
 const REQ_WIFI_INIT: u32 = 278;
 const REQ_WIFI_START: u32 = 280;
+const REQ_WIFI_STOP: u32 = 281;
 const REQ_WIFI_SCAN_START: u32 = 286;
 const REQ_WIFI_SCAN_GET_AP_NUM: u32 = 288;
 const REQ_WIFI_SCAN_GET_AP_RECORDS: u32 = 289;
 
 /// `wifi_mode_t`.
-const WIFI_MODE_STA: i32 = 1;
+pub const WIFI_MODE_NULL: i32 = 0;
+pub const WIFI_MODE_STA: i32 = 1;
+
+/// Marker stored in an otherwise unused station retry-count byte when Wi-Fi
+/// is disabled before any AP profile has been saved. With a real profile the
+/// persisted `WIFI_MODE_NULL` alone carries the OFF state; the marker removes
+/// the ambiguity with a factory-default C6 whose mode and SSID are both empty.
+const DISABLED_WITHOUT_PROFILE_MARKER: u32 = 0xA5;
 
 /// `wifi_ps_type_t`.
 const WIFI_PS_NONE: i32 = 0;
@@ -80,16 +89,18 @@ pub fn auth_mode_name(mode: i32) -> Option<&'static str> {
 /// `magic`, which `esp_wifi_init` validates -- so this has to send a
 /// complete and self-consistent configuration rather than zeros.
 pub fn start(rpc: &mut Rpc) -> Option<Status> {
-    let status = init(rpc)?;
+    let status = initialize(rpc)?;
     if status != 0 {
         return Some(status);
     }
 
-    let mut body = [0u8; 16];
-    let mut writer = Writer::new(&mut body);
-    writer.int32_field(1, WIFI_MODE_STA);
-    let length = writer.finish()?;
-    let status = simple_status(rpc, REQ_SET_WIFI_MODE, &body[..length])?;
+    start_initialized(rpc)
+}
+
+/// Completes station startup after [`initialize`] has been used to inspect
+/// persistent mode/configuration at boot.
+pub fn start_initialized(rpc: &mut Rpc) -> Option<Status> {
+    let status = set_mode(rpc, WIFI_MODE_STA)?;
     if status != 0 {
         return Some(status);
     }
@@ -112,7 +123,7 @@ pub fn start(rpc: &mut Rpc) -> Option<Status> {
 }
 
 /// Sends `esp_wifi_init` with ESP-IDF's default configuration.
-fn init(rpc: &mut Rpc) -> Option<Status> {
+pub fn initialize(rpc: &mut Rpc) -> Option<Status> {
     // `WIFI_INIT_CONFIG_DEFAULT()` from ESP-IDF v5.5.3's `esp_wifi.h`, with
     // the Kconfig-derived numbers at their defaults. `feature_caps` is left
     // at zero on purpose: when it differs from the slave's own build the
@@ -149,6 +160,37 @@ fn init(rpc: &mut Rpc) -> Option<Status> {
     let length = writer.finish()?;
 
     simple_status(rpc, REQ_WIFI_INIT, &body[..length])
+}
+
+/// Reads the mode which the C6 loaded from its Wi-Fi NVS.
+pub fn mode(rpc: &mut Rpc) -> Option<(Status, i32)> {
+    let payload = rpc.call(REQ_GET_WIFI_MODE, &[])?;
+    let mut mode = WIFI_MODE_NULL;
+    let mut status = 0;
+    let mut reader = Reader::new(&payload);
+    while let Some((field, value)) = reader.next_field() {
+        match field {
+            1 => mode = value.as_i32(),
+            2 => status = value.as_i32(),
+            _ => {}
+        }
+    }
+    Some((status, mode))
+}
+
+/// Changes the C6 Wi-Fi mode. With NVS enabled this is persistent, which is
+/// the ON/OFF bit while the station profile remains stored separately.
+pub fn set_mode(rpc: &mut Rpc, mode: i32) -> Option<Status> {
+    let mut body = [0u8; 16];
+    let mut writer = Writer::new(&mut body);
+    writer.int32_field(1, mode);
+    let length = writer.finish()?;
+    simple_status(rpc, REQ_SET_WIFI_MODE, &body[..length])
+}
+
+/// Stops the Wi-Fi driver before the C6 is powered down.
+pub fn stop(rpc: &mut Rpc) -> Option<Status> {
+    simple_status(rpc, REQ_WIFI_STOP, &[])
 }
 
 /// Runs one scan and returns what the slave found.
@@ -290,7 +332,10 @@ fn simple_status(rpc: &mut Rpc, request_id: u32, body: &[u8]) -> Option<Status> 
 const REQ_WIFI_CONNECT: u32 = 282;
 const REQ_WIFI_DISCONNECT: u32 = 283;
 const REQ_WIFI_SET_CONFIG: u32 = 284;
+const REQ_WIFI_GET_CONFIG: u32 = 285;
+const REQ_WIFI_RESTORE: u32 = 291;
 const REQ_WIFI_STA_GET_AP_INFO: u32 = 294;
+const REQ_WIFI_SET_STORAGE: u32 = 313;
 
 /// Event ids the connect path waits on (`RpcId`, event range).
 pub const EVENT_STA_CONNECTED: u32 = 775;
@@ -302,6 +347,70 @@ const WIFI_IF_STA: i32 = 0;
 
 /// SSIDs are 32 bytes and passwords 64, both without a terminator.
 pub const PASSWORD_MAX_BYTES: usize = 64;
+
+/// Where the C6's ESP-IDF Wi-Fi driver writes subsequent configurations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Storage {
+    /// C6 NVS; survives reset and power loss.
+    Flash = 0,
+    /// C6 RAM; discarded when the C6 resets.
+    Ram = 1,
+}
+
+/// A copy of the C6 station configuration returned by `esp_wifi_get_config`.
+///
+/// It is fixed-size and scrubs itself on drop because the response contains
+/// the plaintext credential. Callers may inspect the SSID and only whether a
+/// password exists; the password bytes stay private to this module until the
+/// connection manager needs to consume them in a later Stage 6 step.
+pub struct StationConfig {
+    ssid: [u8; SSID_MAX_BYTES],
+    ssid_length: usize,
+    password: [u8; PASSWORD_MAX_BYTES],
+    password_length: usize,
+    disabled_without_profile: bool,
+}
+
+impl StationConfig {
+    fn new() -> Self {
+        Self {
+            ssid: [0; SSID_MAX_BYTES],
+            ssid_length: 0,
+            password: [0; PASSWORD_MAX_BYTES],
+            password_length: 0,
+            disabled_without_profile: false,
+        }
+    }
+
+    pub fn ssid(&self) -> &[u8] {
+        &self.ssid[..self.ssid_length]
+    }
+
+    pub fn has_password(&self) -> bool {
+        self.password_length != 0
+    }
+
+    pub fn disabled_without_profile(&self) -> bool {
+        self.disabled_without_profile
+    }
+
+    pub(crate) fn password(&self) -> &[u8] {
+        &self.password[..self.password_length]
+    }
+
+    fn erase(&mut self) {
+        zeroize(&mut self.ssid);
+        zeroize(&mut self.password);
+        self.ssid_length = 0;
+        self.password_length = 0;
+    }
+}
+
+impl Drop for StationConfig {
+    fn drop(&mut self) {
+        self.erase();
+    }
+}
 
 /// How the slave answered a connection attempt.
 pub enum Outcome {
@@ -344,12 +453,32 @@ pub fn disconnect_reason_name(reason: u32) -> Option<&'static str> {
     })
 }
 
-/// Sets the station configuration and asks the slave to connect.
-///
-/// A zero status only means the slave accepted the request: association
-/// happens afterwards and is reported by an event, so callers follow this
-/// with [`wait_for_connection`].
-pub fn connect(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
+/// Selects whether later `esp_wifi_set_config` calls update C6 NVS or RAM.
+pub fn set_storage(rpc: &mut Rpc, storage: Storage) -> Option<Status> {
+    let mut body = [0u8; 8];
+    let mut writer = Writer::new(&mut body);
+    writer.int32_field(1, storage as i32);
+    let length = writer.finish()?;
+    simple_status(rpc, REQ_WIFI_SET_STORAGE, &body[..length])
+}
+
+/// Writes one station configuration to the C6's currently selected storage.
+pub fn set_station_config(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
+    set_station_config_with_marker(rpc, ssid, password, false)
+}
+
+/// Persists an OFF marker when there is no real profile whose Wi-Fi mode can
+/// distinguish an intentional OFF from the C6's factory-default empty state.
+pub fn set_disabled_without_profile(rpc: &mut Rpc) -> Option<Status> {
+    set_station_config_with_marker(rpc, &[], &[], true)
+}
+
+fn set_station_config_with_marker(
+    rpc: &mut Rpc,
+    ssid: &[u8],
+    password: &[u8],
+    disabled_without_profile: bool,
+) -> Option<Status> {
     // `wifi_pmf_config { capable = 1 }`. The field is deprecated in recent
     // IDF (a station always uses PMF when the AP offers it), but an older
     // slave may still read it, and refusing PMF would rule out WPA3 APs.
@@ -384,6 +513,12 @@ pub fn connect(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
     writer.bytes_field(2, password);
     writer.bytes_field(9, &threshold[..threshold_length]);
     writer.bytes_field(10, &pmf[..pmf_length]);
+    if disabled_without_profile {
+        // `failure_retry_cnt` is ignored with the default FAST scan method.
+        // Its protobuf field maps to the C structure's u8, making this a
+        // stable one-byte marker that does not alter an actual connection.
+        writer.uint32_field(13, DISABLED_WITHOUT_PROFILE_MARKER);
+    }
     let sta_length = writer.finish()?;
 
     // `wifi_config { sta = 2 }`.
@@ -402,13 +537,112 @@ pub fn connect(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
     // These two are logged because a link that dies mid-connect needs to be
     // pinned to one of them.
     uart::log(b"WIFI: sending the station configuration\r\n");
-    let status = simple_status(rpc, REQ_WIFI_SET_CONFIG, &body[..length])?;
+    let result = simple_status(rpc, REQ_WIFI_SET_CONFIG, &body[..length]);
+    // All three messages contain the plaintext credential. Do not leave
+    // copies in this stack frame after the synchronous RPC returns.
+    zeroize(&mut sta);
+    zeroize(&mut config);
+    zeroize(&mut body);
+    result
+}
+
+/// Asks the C6 to associate using its currently loaded station config.
+pub fn connect_current(rpc: &mut Rpc) -> Option<Status> {
+    uart::log(b"WIFI: sending connect\r\n");
+    simple_status(rpc, REQ_WIFI_CONNECT, &[])
+}
+
+/// Sets the station configuration and asks the slave to connect.
+///
+/// A zero status only means the slave accepted the request: association
+/// happens afterwards and is reported by an event, so callers follow this
+/// with [`wait_for_connection`]. The caller chooses FLASH or RAM storage
+/// explicitly before using this convenience function.
+pub fn connect(rpc: &mut Rpc, ssid: &[u8], password: &[u8]) -> Option<Status> {
+    let status = set_station_config(rpc, ssid, password)?;
     if status != 0 {
         return Some(status);
     }
+    connect_current(rpc)
+}
 
-    uart::log(b"WIFI: sending connect\r\n");
-    simple_status(rpc, REQ_WIFI_CONNECT, &[])
+/// Restores the C6 Wi-Fi driver's persistent settings to their defaults.
+/// This is the ESP-Hosted wrapper around `esp_wifi_restore`.
+pub fn restore_persistent_settings(rpc: &mut Rpc) -> Option<Status> {
+    simple_status(rpc, REQ_WIFI_RESTORE, &[])
+}
+
+/// Reads the station configuration currently loaded by the C6.
+///
+/// With the C6's default FLASH storage this is also the probe Stage 6 uses
+/// immediately after a reboot to determine whether NVS retained a profile.
+/// The RPC response itself contains the plaintext password, so its heap
+/// buffer is scrubbed immediately after the bounded fields are copied.
+pub fn station_config(rpc: &mut Rpc) -> Option<(Status, StationConfig)> {
+    let mut body = [0u8; 8];
+    let mut writer = Writer::new(&mut body);
+    writer.int32_field(1, WIFI_IF_STA);
+    let length = writer.finish()?;
+
+    let mut payload = rpc.call(REQ_WIFI_GET_CONFIG, &body[..length])?;
+    let result = parse_station_config_response(&payload);
+    zeroize(&mut payload);
+    result
+}
+
+fn parse_station_config_response(payload: &[u8]) -> Option<(Status, StationConfig)> {
+    // `resp` is an int32 in a proto3 message. Success is zero, so a normal
+    // encoder omits field 1 entirely; absence must therefore decode as zero
+    // just like it does in the other response parsers in this module.
+    let mut status = 0;
+    let mut config_payload = &[][..];
+    let mut reader = Reader::new(payload);
+    while let Some((field, value)) = reader.next_field() {
+        match field {
+            1 => status = value.as_i32(),
+            3 => config_payload = value.as_bytes(),
+            _ => {}
+        }
+    }
+
+    let mut station_payload = &[][..];
+    let mut reader = Reader::new(config_payload);
+    while let Some((field, value)) = reader.next_field() {
+        if field == 2 {
+            station_payload = value.as_bytes();
+        }
+    }
+
+    let mut config = StationConfig::new();
+    let mut reader = Reader::new(station_payload);
+    while let Some((field, value)) = reader.next_field() {
+        let bytes = value.as_bytes();
+        match field {
+            1 => {
+                config.ssid_length = bytes
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(bytes.len())
+                    .min(SSID_MAX_BYTES);
+                config.ssid[..config.ssid_length].copy_from_slice(&bytes[..config.ssid_length]);
+            }
+            2 => {
+                config.password_length = bytes
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(bytes.len())
+                    .min(PASSWORD_MAX_BYTES);
+                config.password[..config.password_length]
+                    .copy_from_slice(&bytes[..config.password_length]);
+            }
+            13 => {
+                config.disabled_without_profile = value.as_u32() == DISABLED_WITHOUT_PROFILE_MARKER
+            }
+            _ => {}
+        }
+    }
+
+    Some((status, config))
 }
 
 /// Waits for the slave to report the outcome of a connection attempt.
@@ -446,13 +680,43 @@ pub fn wait_for_connection(rpc: &mut Rpc, timeout_ms: u32) -> Outcome {
         return Outcome::TimedOut;
     };
 
-    let details = event_details(&event.payload);
+    outcome_from_event(&event).unwrap_or(Outcome::TimedOut)
+}
 
-    if event.msg_id == EVENT_STA_DISCONNECTED {
-        return Outcome::Disconnected {
-            reason: disconnect_reason(&event.payload),
-        };
+/// Waits until an accepted `esp_wifi_disconnect` has completed.
+///
+/// A connected event can still be in flight while one association is being
+/// replaced. Waiting only for the disconnected event prevents that stale
+/// event from being mistaken for the result of the next connect request.
+pub fn wait_for_disconnection(rpc: &mut Rpc, timeout_ms: u32) -> Option<u32> {
+    // The event may have arrived before the synchronous disconnect response;
+    // Rpc::call keeps such events in this queue.
+    for event in rpc.take_events() {
+        if event.msg_id == EVENT_STA_DISCONNECTED {
+            return Some(disconnect_reason(&event.payload));
+        }
     }
+    let wanted = [EVENT_STA_DISCONNECTED];
+    let event = rpc.wait_for_event(timeout_ms, &wanted)?;
+    Some(disconnect_reason(&event.payload))
+}
+
+/// Decodes one station connection event without waiting for another frame.
+///
+/// The shell's compatibility path still uses [`wait_for_connection`], while
+/// the foreground connection manager feeds events collected by `Rpc::service`
+/// through this function once per display frame.
+pub fn outcome_from_event(event: &Event) -> Option<Outcome> {
+    if event.msg_id == EVENT_STA_DISCONNECTED {
+        return Some(Outcome::Disconnected {
+            reason: disconnect_reason(&event.payload),
+        });
+    }
+    if event.msg_id != EVENT_STA_CONNECTED {
+        return None;
+    }
+
+    let details = event_details(&event.payload);
 
     let mut ssid = [0u8; SSID_MAX_BYTES];
     let mut ssid_length = 0;
@@ -480,13 +744,13 @@ pub fn wait_for_connection(rpc: &mut Rpc, timeout_ms: u32) -> Outcome {
         }
     }
 
-    Outcome::Connected {
+    Some(Outcome::Connected {
         ssid,
         ssid_length,
         bssid,
         channel,
         auth_mode,
-    }
+    })
 }
 
 /// `esp_wifi_sta_get_ap_info`: what the station is currently associated
@@ -511,4 +775,11 @@ pub fn connected_access_point(rpc: &mut Rpc) -> Option<(Status, Option<AccessPoi
 /// `esp_wifi_disconnect`.
 pub fn disconnect(rpc: &mut Rpc) -> Option<Status> {
     simple_status(rpc, REQ_WIFI_DISCONNECT, &[])
+}
+
+fn zeroize(bytes: &mut [u8]) {
+    for byte in bytes {
+        // This buffer can contain the plaintext station credential.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
 }

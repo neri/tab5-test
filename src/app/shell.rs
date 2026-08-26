@@ -12,16 +12,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::automount::AutoMount;
+use super::wifi_manager::{self, IpPolicy, Manager as WifiManager};
 use super::{blockdev, browsertest, files, lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 
+use crate::browser::url::Url;
 use crate::fs;
 use crate::fs::path::{self, Path};
 use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, Vfs};
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
-use crate::browser::url::Url;
 use crate::{
     browser, delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc,
     startup, tick, uart, usb, wifi,
@@ -640,10 +641,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifi",
-        usage: "wifi",
+        usage: "wifi [on|off|status|forget]",
         lines: &[
-            "open the keyboard-driven Wi-Fi setup screen: scan, select an",
-            "access point, enter its password, associate and request DHCP",
+            "without an argument, open the Wi-Fi setup screen; on/off is",
+            "persistent, status reports manager state, and forget deletes",
+            "the saved profile. menu connections request DHCP automatically",
         ],
     },
     HelpEntry {
@@ -692,9 +694,30 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &["show the access point the C6 is associated with"],
     },
     HelpEntry {
+        name: "wifisaved",
+        usage: "wifisaved",
+        lines: &[
+            "show whether the C6 currently has a station configuration;",
+            "never prints the password or its length",
+        ],
+    },
+    HelpEntry {
+        name: "wififorget",
+        usage: "wififorget",
+        lines: &["delete the station profile saved in C6 flash"],
+    },
+    HelpEntry {
+        name: "wifilog",
+        usage: "wifilog",
+        lines: &["show the last 16 Wi-Fi manager transitions and retry decisions"],
+    },
+    HelpEntry {
         name: "wifidisconnect",
         usage: "wifidisconnect",
-        lines: &["leave the current access point"],
+        lines: &[
+            "leave the current access point for this boot; unlike 'wifi off',",
+            "Wi-Fi remains enabled and a saved profile remains in C6 flash",
+        ],
     },
     HelpEntry {
         name: "netdump",
@@ -950,8 +973,7 @@ pub fn execute(
     vfs: &mut Vfs,
     state: &mut State,
     auto_mount: &mut AutoMount,
-    wifi_session: &mut Option<wifi::Rpc>,
-    net_stack: &mut Option<net::Stack>,
+    wifi_manager: &mut WifiManager,
 ) -> Outcome {
     let line = trim(line);
     if line.is_empty() {
@@ -1198,87 +1220,194 @@ pub fn execute(
             if argument.is_empty() {
                 return Outcome::WifiMenu;
             }
-            console.write_output_line(framebuffer, "usage: wifi");
+            cmd_wifi_control(console, framebuffer, argument, wifi_manager);
+            drop_dead_session(console, framebuffer, wifi_manager);
         }
         b"wifiinfo" => {
-            *wifi_session = None;
-            *net_stack = None;
+            let was_enabled = wifi_manager.is_enabled();
+            wifi_manager.clear_link();
             cmd_wifiinfo(console, framebuffer);
+            restore_after_wifi_diagnostic(console, framebuffer, wifi_manager, was_enabled);
         }
         b"wifiup" => {
-            *wifi_session = None;
-            *net_stack = None;
+            let was_enabled = wifi_manager.is_enabled();
+            wifi_manager.clear_link();
             cmd_wifiup(console, framebuffer);
+            restore_after_wifi_diagnostic(console, framebuffer, wifi_manager, was_enabled);
         }
-        b"wifimac" => cmd_wifimac(console, framebuffer),
+        b"wifimac" => {
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, _) = wifi_manager.options_mut();
+                cmd_wifimac(console, framebuffer, wifi_session);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
+        }
         b"wifiscan" => {
-            cmd_wifiscan(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, _) = wifi_manager.options_mut();
+                cmd_wifiscan(console, framebuffer, wifi_session);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"wificonnect" => {
-            cmd_wificonnect(console, framebuffer, argument, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let result = cmd_wificonnect(console, framebuffer, argument, wifi_manager);
+                match result {
+                    ShellConnect::Associated(association) => {
+                        wifi_manager.begin_shell_attempt();
+                        wifi_manager.mark_shell_associated(association)
+                    }
+                    ShellConnect::Failed(failure) => {
+                        wifi_manager.begin_shell_attempt();
+                        wifi_manager.mark_failed(failure)
+                    }
+                    ShellConnect::NotStarted => {}
+                }
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"wifistatus" => {
-            cmd_wifistatus(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, _) = wifi_manager.options_mut();
+                cmd_wifistatus(console, framebuffer, wifi_session);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
+        }
+        b"wifisaved" => {
+            if wifi_manager.is_enabled() {
+                cmd_wifisaved(console, framebuffer, wifi_manager);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            } else {
+                console.write_output_line(
+                    framebuffer,
+                    if wifi_manager.has_saved_profile() {
+                        "Wi-Fi is off; a saved profile is present"
+                    } else {
+                        "Wi-Fi is off; no saved profile is present"
+                    },
+                );
+            }
+        }
+        b"wififorget" => {
+            cmd_wififorget(console, framebuffer, wifi_manager);
+            drop_dead_session(console, framebuffer, wifi_manager);
+        }
+        b"wifilog" => {
+            wifi_manager.service();
+            cmd_wifilog(console, framebuffer, wifi_manager);
+            drop_dead_session(console, framebuffer, wifi_manager);
         }
         b"wifidisconnect" => {
-            cmd_wifidisconnect(console, framebuffer, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let disconnected = {
+                    let (wifi_session, _) = wifi_manager.options_mut();
+                    cmd_wifidisconnect(console, framebuffer, wifi_session)
+                };
+                if disconnected {
+                    wifi_manager.mark_disconnected();
+                    console.write_output_line(
+                        framebuffer,
+                        "Wi-Fi remains on; saved auto-connect resumes after reboot",
+                    );
+                }
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"netdump" => {
-            cmd_netdump(console, framebuffer, argument, wifi_session);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, _) = wifi_manager.options_mut();
+                cmd_netdump(console, framebuffer, argument, wifi_session);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"ipconfig" => {
-            cmd_ipconfig(console, framebuffer, argument, wifi_session, net_stack);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let policy = {
+                    let (wifi_session, net_stack) = wifi_manager.options_mut();
+                    cmd_ipconfig(console, framebuffer, argument, wifi_session, net_stack)
+                };
+                if let Some(policy) = policy {
+                    wifi_manager.set_ip_policy(policy);
+                }
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"nslookup" => {
-            cmd_nslookup(console, framebuffer, argument, wifi_session, net_stack);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_nslookup(console, framebuffer, argument, wifi_session, net_stack);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"ping" => {
-            cmd_ping(console, framebuffer, argument, wifi_session, net_stack);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_ping(console, framebuffer, argument, wifi_session, net_stack);
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"tftpget" => {
-            cmd_tftpget(
-                console,
-                framebuffer,
-                argument,
-                usb_host,
-                ram_disk,
-                vfs,
-                state,
-                wifi_session,
-                net_stack,
-            );
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_tftpget(
+                    console,
+                    framebuffer,
+                    argument,
+                    usb_host,
+                    ram_disk,
+                    vfs,
+                    state,
+                    wifi_session,
+                    net_stack,
+                );
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"hbase" => cmd_hbase(console, framebuffer, argument, state),
         b"browsertest" | b"bt" => {
-            cmd_browsertest(console, framebuffer, argument, state, wifi_session, net_stack);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_browsertest(
+                    console,
+                    framebuffer,
+                    argument,
+                    state,
+                    wifi_session,
+                    net_stack,
+                );
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"httpstream" | b"hs" => {
-            cmd_httpstream(console, framebuffer, argument, state, wifi_session, net_stack);
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_httpstream(
+                    console,
+                    framebuffer,
+                    argument,
+                    state,
+                    wifi_session,
+                    net_stack,
+                );
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"httpget" => {
-            cmd_httpget(
-                console,
-                framebuffer,
-                argument,
-                usb_host,
-                ram_disk,
-                vfs,
-                state,
-                wifi_session,
-                net_stack,
-            );
-            drop_dead_session(console, framebuffer, wifi_session, net_stack);
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_httpget(
+                    console,
+                    framebuffer,
+                    argument,
+                    usb_host,
+                    ram_disk,
+                    vfs,
+                    state,
+                    wifi_session,
+                    net_stack,
+                );
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
         }
         b"paint" => return Outcome::Paint,
         b"touchtest" => return Outcome::TouchTest,
@@ -1292,7 +1421,7 @@ pub fn execute(
             // flash and are exactly what somebody wants to look at when the
             // link is down. What is missing is said here, in the shell,
             // where the commands that fix it are.
-            browser_readiness(console, framebuffer, net_stack);
+            browser_readiness(console, framebuffer, wifi_manager.stack());
             if argument.is_empty() {
                 return Outcome::Browser(None);
             }
@@ -3730,6 +3859,138 @@ fn cmd_sdinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
     console.write_output_line(framebuffer, "full CID/CSD dump: see UART log");
 }
 
+fn wifi_command_allowed(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    manager: &WifiManager,
+) -> bool {
+    if manager.is_enabled() {
+        true
+    } else {
+        console.write_output_line(framebuffer, "Wi-Fi is off; run 'wifi on' first");
+        false
+    }
+}
+
+fn cmd_wifi_control(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    manager: &mut WifiManager,
+) {
+    match trim(argument) {
+        b"on" => {
+            if manager.is_enabled() {
+                console.write_output_line(framebuffer, "Wi-Fi is already on");
+                return;
+            }
+            match manager.set_enabled(true) {
+                Ok(true) => console.write_output_line(
+                    framebuffer,
+                    "Wi-Fi enabled; connecting to the saved profile",
+                ),
+                Ok(false) => console.write_output_line(
+                    framebuffer,
+                    "Wi-Fi enabled; no saved profile to auto-connect",
+                ),
+                Err(failure) => {
+                    write_wifi_control_failure(console, framebuffer, "enable failed", failure)
+                }
+            }
+        }
+        b"off" => {
+            if !manager.is_enabled() {
+                console.write_output_line(framebuffer, "Wi-Fi is already off");
+                return;
+            }
+            match manager.set_enabled(false) {
+                Ok(_) => console.write_output_line(
+                    framebuffer,
+                    "Wi-Fi disabled and C6 powered down; setting saved for next boot",
+                ),
+                Err(failure) => {
+                    console.write_output_line(
+                        framebuffer,
+                        "Wi-Fi is off for this boot, but saving OFF failed",
+                    );
+                    write_wifi_control_failure(console, framebuffer, "OFF persistence", failure);
+                }
+            }
+        }
+        b"status" => {
+            manager.service();
+            let mut line = Line::new();
+            line.push_str("Wi-Fi: ");
+            line.push_str(if manager.is_enabled() { "ON" } else { "OFF" });
+            line.push_str("  state: ");
+            line.push_str(wifi_phase_name(manager.state().phase()));
+            console.write_output_line(framebuffer, line.as_str());
+
+            console.write_output_line(
+                framebuffer,
+                if manager.has_saved_profile() {
+                    "saved profile: yes"
+                } else {
+                    "saved profile: no"
+                },
+            );
+            if let Some(config) = manager.stack().and_then(|stack| stack.config()) {
+                let mut line = Line::new();
+                line.push_str("IPv4: ");
+                push_ipv4(&mut line, config.address.address());
+                console.write_output_line(framebuffer, line.as_str());
+            }
+        }
+        b"forget" => cmd_wififorget(console, framebuffer, manager),
+        _ => console.write_output_line(framebuffer, "usage: wifi [on|off|status|forget]"),
+    }
+}
+
+fn write_wifi_control_failure(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    operation: &str,
+    failure: wifi_manager::Failure,
+) {
+    match failure {
+        wifi_manager::Failure::StartStatus(status)
+        | wifi_manager::Failure::ConfigStatus(status)
+        | wifi_manager::Failure::StorageStatus(status)
+        | wifi_manager::Failure::ModeStatus(status)
+        | wifi_manager::Failure::StopStatus(status)
+        | wifi_manager::Failure::DisconnectStatus(status) => {
+            write_slave_status(console, framebuffer, operation, status)
+        }
+        _ => {
+            let mut line = Line::new();
+            line.push_str(operation);
+            line.push_str(": RPC or link failure; see UART log");
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+}
+
+fn restore_after_wifi_diagnostic(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    manager: &mut WifiManager,
+    was_enabled: bool,
+) {
+    if !was_enabled {
+        manager.finish_disabled_diagnostic();
+        console.write_output_line(framebuffer, "diagnostic complete; Wi-Fi remains off");
+        return;
+    }
+    if let Err(failure) = manager.begin_startup_auto_connect() {
+        write_wifi_control_failure(
+            console,
+            framebuffer,
+            "restore after diagnostic failed",
+            failure,
+        );
+    }
+}
+
 fn cmd_wifiinfo(console: &mut Console, framebuffer: &mut Framebuffer) {
     console.write_output_line(framebuffer, "activating ESP32-C6 (SDIO card 1)...");
     let Some(card) = sdio::init() else {
@@ -3844,16 +4105,16 @@ fn cmd_wifiup(console: &mut Console, framebuffer: &mut Framebuffer) {
     console.write_output_line(framebuffer, "RPC (scan/connect) is the next stage");
 }
 
-fn cmd_wifimac(console: &mut Console, framebuffer: &mut Framebuffer) {
-    console.write_output_line(framebuffer, "bringing up the ESP-Hosted link...");
-    let Some((transport, _)) = wifi::bring_up() else {
-        console.write_output_line(framebuffer, "link bring-up failed, see UART log");
+fn cmd_wifimac(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    session: &mut Option<wifi::Rpc>,
+) {
+    let Some(rpc) = wifi_session(console, framebuffer, session) else {
         return;
     };
-
-    let mut rpc = wifi::Rpc::new(transport);
     console.write_output_line(framebuffer, "calling GetMacAddress...");
-    let Some((status, mac)) = wifi::rpc::get_mac_address(&mut rpc, wifi::rpc::WIFI_IF_STA) else {
+    let Some((status, mac)) = wifi::rpc::get_mac_address(rpc, wifi::rpc::WIFI_IF_STA) else {
         console.write_output_line(framebuffer, "RPC call failed, see UART log");
         return;
     };
@@ -3904,59 +4165,33 @@ fn cmd_wifimac(console: &mut Console, framebuffer: &mut Framebuffer) {
 pub(super) fn drop_dead_session(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
-    session: &mut Option<wifi::Rpc>,
-    stack: &mut Option<net::Stack>,
+    manager: &mut WifiManager,
 ) {
-    // Whatever the slave pushed while the command ran has to go somewhere,
-    // and the next command should not find a backlog waiting for it. With
-    // a stack present that means one more poll, so received frames are
-    // consumed by the interface rather than piling up in the queue.
-    match (session.as_mut(), stack.as_mut()) {
-        (Some(rpc), Some(stack)) => {
-            stack.poll(rpc);
-        }
-        (Some(rpc), None) => rpc.discard_station_frames(),
-        _ => {}
-    }
-    // A disconnection that happened while the command ran is otherwise
-    // invisible: the slave drops station traffic silently when it is not
-    // associated, so from up here it looks like a network that has stopped
-    // answering. Report it before the command's own result is judged.
-    if let Some(rpc) = session.as_mut() {
-        for event in rpc.take_events() {
-            match event.msg_id {
-                wifi::station::EVENT_STA_DISCONNECTED => {
-                    let reason = wifi::station::disconnect_reason(&event.payload);
-                    let mut line = Line::new();
-                    line.push_str("the station was disconnected, reason ");
-                    line.push_u32(reason);
-                    if let Some(name) = wifi::station::disconnect_reason_name(reason) {
-                        line.push_str(" ");
-                        line.push_str(name);
-                    }
-                    console.write_output_line(framebuffer, line.as_str());
-                    console.write_output_line(
-                        framebuffer,
-                        "nothing can be sent until it associates again",
-                    );
+    manager.service();
+    for notice in manager.take_notices() {
+        match notice {
+            wifi_manager::Notice::Disconnected(reason) => {
+                let mut line = Line::new();
+                line.push_str("the station was disconnected, reason ");
+                line.push_u32(reason);
+                if let Some(name) = wifi::station::disconnect_reason_name(reason) {
+                    line.push_str(" ");
+                    line.push_str(name);
                 }
-                wifi::station::EVENT_STA_CONNECTED => {
-                    console.write_output_line(framebuffer, "the station (re)associated")
-                }
-                _ => {}
+                console.write_output_line(framebuffer, line.as_str());
+                console.write_output_line(
+                    framebuffer,
+                    "nothing can be sent until it associates again",
+                );
             }
+            wifi_manager::Notice::Reassociated => {
+                console.write_output_line(framebuffer, "the station (re)associated")
+            }
+            wifi_manager::Notice::LinkLost => console.write_output_line(
+                framebuffer,
+                "the C6 link was lost; it will be rebuilt next time",
+            ),
         }
-    }
-
-    let died = session.as_ref().is_some_and(|rpc| !rpc.is_alive());
-    if died {
-        *session = None;
-        // The address belonged to a link that no longer exists.
-        *stack = None;
-        console.write_output_line(
-            framebuffer,
-            "the C6 link was lost; it will be rebuilt next time",
-        );
     }
 }
 
@@ -4067,36 +4302,73 @@ fn cmd_wificonnect(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
-    session: &mut Option<wifi::Rpc>,
-) {
+    manager: &mut WifiManager,
+) -> ShellConnect {
     // The password keeps everything after the first gap, spaces included.
     let (ssid, password) = split_first_word(trim(argument));
     let password = trim(password);
     if ssid.is_empty() {
         console.write_output_line(framebuffer, "usage: wificonnect <ssid> [password]");
-        return;
+        return ShellConnect::NotStarted;
     }
     if ssid.len() > wifi::station::SSID_MAX_BYTES
         || password.len() > wifi::station::PASSWORD_MAX_BYTES
     {
         console.write_output_line(framebuffer, "SSID or password is too long");
-        return;
+        return ShellConnect::NotStarted;
     }
 
+    if let Err(failure) = manager.prepare_connection_replacement() {
+        match failure {
+            wifi_manager::Failure::DisconnectStatus(status) => write_slave_status(
+                console,
+                framebuffer,
+                "old connection disconnect refused",
+                status,
+            ),
+            wifi_manager::Failure::DisconnectTimedOut => console.write_output_line(
+                framebuffer,
+                "old connection disconnect timed out; new connection not started",
+            ),
+            _ => console.write_output_line(
+                framebuffer,
+                "old connection disconnect failed; see UART log",
+            ),
+        }
+        // The manager has already recorded the preparation failure. Do not
+        // add a connect attempt to the history because no connect was sent.
+        return ShellConnect::NotStarted;
+    }
+
+    let (session, _) = manager.options_mut();
     let Some(rpc) = wifi_session(console, framebuffer, session) else {
-        return;
+        return ShellConnect::NotStarted;
     };
+
+    // The CLI contract is one transient association. Selecting RAM before
+    // set_config prevents this command from replacing a saved menu profile.
+    match wifi::station::set_storage(rpc, wifi::station::Storage::Ram) {
+        Some(0) => {}
+        Some(status) => {
+            write_slave_status(console, framebuffer, "RAM storage refused", status);
+            return ShellConnect::Failed(wifi_manager::Failure::StorageStatus(status));
+        }
+        None => {
+            console.write_output_line(framebuffer, "set RAM storage: RPC failed, see UART log");
+            return ShellConnect::Failed(wifi_manager::Failure::StorageRpc);
+        }
+    }
 
     console.write_output_line(framebuffer, "connecting...");
     match wifi::station::connect(rpc, ssid, password) {
         Some(0) => {}
         Some(status) => {
             write_slave_status(console, framebuffer, "connect refused", status);
-            return;
+            return ShellConnect::Failed(wifi_manager::Failure::ConnectStatus(status));
         }
         None => {
             console.write_output_line(framebuffer, "connect: RPC failed, see UART log");
-            return;
+            return ShellConnect::Failed(wifi_manager::Failure::ConnectRpc);
         }
     }
 
@@ -4138,6 +4410,11 @@ fn cmd_wificonnect(
             }
             console.write_output_line(framebuffer, line.as_str());
             console.write_output_line(framebuffer, "run 'ipconfig dhcp' to get an address");
+            ShellConnect::Associated(wifi_manager::Association {
+                ssid,
+                ssid_length,
+                channel,
+            })
         }
         wifi::station::Outcome::Disconnected { reason } => {
             let mut line = Line::new();
@@ -4148,11 +4425,19 @@ fn cmd_wificonnect(
                 line.push_str(name);
             }
             console.write_output_line(framebuffer, line.as_str());
+            ShellConnect::Failed(wifi_manager::Failure::Disconnected(reason))
         }
         wifi::station::Outcome::TimedOut => {
             console.write_output_line(framebuffer, "no answer from the slave in time");
+            ShellConnect::Failed(wifi_manager::Failure::AssociationTimedOut)
         }
     }
+}
+
+enum ShellConnect {
+    NotStarted,
+    Associated(wifi_manager::Association),
+    Failed(wifi_manager::Failure),
 }
 
 fn cmd_wifistatus(
@@ -4220,14 +4505,157 @@ fn cmd_wifistatus(
     }
 }
 
+fn cmd_wifilog(console: &mut Console, framebuffer: &mut Framebuffer, manager: &WifiManager) {
+    if manager.history().is_empty() {
+        console.write_output_line(framebuffer, "no Wi-Fi manager transitions recorded");
+        return;
+    }
+
+    for transition in manager.history() {
+        let mut line = Line::new();
+        line.push_u64(transition.at_ms);
+        line.push_str("ms g");
+        line.push_u32(transition.generation);
+        line.push_str(" a");
+        line.push_u32(transition.attempt);
+        line.push_str(" ");
+        line.push_str(wifi_phase_name(transition.from));
+        line.push_str("->");
+        line.push_str(wifi_phase_name(transition.to));
+        line.push_str(" ");
+        push_wifi_cause(&mut line, transition.cause);
+        console.write_output_line(framebuffer, line.as_str());
+    }
+}
+
+fn cmd_wifisaved(console: &mut Console, framebuffer: &mut Framebuffer, manager: &mut WifiManager) {
+    let rpc = match manager.ensure_station() {
+        Ok(rpc) => rpc,
+        Err(_) => {
+            console.write_output_line(framebuffer, "cannot start the C6 station; see UART log");
+            return;
+        }
+    };
+
+    let Some((status, config)) = wifi::station::station_config(rpc) else {
+        console.write_output_line(framebuffer, "station config RPC failed; see UART log");
+        return;
+    };
+    if status != 0 {
+        write_slave_status(console, framebuffer, "get station config refused", status);
+        return;
+    }
+    if config.ssid().is_empty() {
+        console.write_output_line(framebuffer, "C6 station configuration: empty");
+    } else {
+        let mut line = Line::new();
+        line.push_str("C6 station SSID: ");
+        push_ssid(&mut line, config.ssid());
+        console.write_output_line(framebuffer, line.as_str());
+        console.write_output_line(
+            framebuffer,
+            if config.has_password() {
+                "security credential present: yes"
+            } else {
+                "security credential present: no (open or empty)"
+            },
+        );
+    }
+    let (writes, failures, forgets) = manager.profile_diagnostics();
+    let mut line = Line::new();
+    line.push_str("profile writes this boot: ");
+    line.push_u32(writes);
+    line.push_str(", failed ");
+    line.push_u32(failures);
+    line.push_str(", forgets ");
+    line.push_u32(forgets);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn cmd_wififorget(console: &mut Console, framebuffer: &mut Framebuffer, manager: &mut WifiManager) {
+    let was_enabled = manager.is_enabled();
+    match manager.forget_saved_profile() {
+        Ok(()) => console.write_output_line(
+            framebuffer,
+            if was_enabled {
+                "saved Wi-Fi profile deleted; current connection may remain active"
+            } else {
+                "saved Wi-Fi profile deleted; Wi-Fi remains off"
+            },
+        ),
+        Err(wifi_manager::Failure::ConfigStatus(status)) => {
+            write_slave_status(console, framebuffer, "forget refused", status)
+        }
+        Err(_) => console.write_output_line(framebuffer, "forget: RPC failed, see UART log"),
+    }
+}
+
+fn wifi_phase_name(phase: wifi_manager::Phase) -> &'static str {
+    match phase {
+        wifi_manager::Phase::Off => "off",
+        wifi_manager::Phase::LinkDown => "link-down",
+        wifi_manager::Phase::Idle => "idle",
+        wifi_manager::Phase::Associating => "associating",
+        wifi_manager::Phase::RetryWaiting => "retry-wait",
+        wifi_manager::Phase::NeedsPassword => "needs-password",
+        wifi_manager::Phase::Associated => "associated",
+        wifi_manager::Phase::RequestingDhcp => "dhcp",
+        wifi_manager::Phase::AssociatedNoLease => "no-lease",
+        wifi_manager::Phase::Online => "online",
+        wifi_manager::Phase::Failed => "failed",
+    }
+}
+
+fn push_wifi_cause(line: &mut Line, cause: wifi_manager::Cause) {
+    match cause {
+        wifi_manager::Cause::Enabled => line.push_str("enabled"),
+        wifi_manager::Cause::Disabled => line.push_str("disabled"),
+        wifi_manager::Cause::Manual => line.push_str("manual"),
+        wifi_manager::Cause::LinkReady => line.push_str("link-ready"),
+        wifi_manager::Cause::ConnectRequested => line.push_str("connect"),
+        wifi_manager::Cause::Connected => line.push_str("connected"),
+        wifi_manager::Cause::Disconnected(reason) => {
+            line.push_str("reason=");
+            line.push_u32(reason);
+        }
+        wifi_manager::Cause::AssociationTimeout => line.push_str("association-timeout"),
+        wifi_manager::Cause::RetryScheduled(delay_ms) => {
+            line.push_str("retry-ms=");
+            line.push_u32(delay_ms);
+        }
+        wifi_manager::Cause::RetryTimer => line.push_str("retry-timer"),
+        wifi_manager::Cause::StaleEvent(event) => {
+            line.push_str("stale-event=");
+            line.push_u32(event);
+        }
+        wifi_manager::Cause::RpcFailed => line.push_str("rpc-failed"),
+        wifi_manager::Cause::RpcStatus(status) => {
+            line.push_str("rpc-status=0x");
+            line.push_hex(status as u32, 8);
+        }
+        wifi_manager::Cause::DhcpStarted => line.push_str("dhcp-start"),
+        wifi_manager::Cause::DhcpConfigured => line.push_str("dhcp-configured"),
+        wifi_manager::Cause::DhcpTimeout => line.push_str("dhcp-timeout"),
+        wifi_manager::Cause::DhcpLost => line.push_str("dhcp-lost"),
+        wifi_manager::Cause::StableConnection => line.push_str("stable-reset"),
+        wifi_manager::Cause::LinkLost => line.push_str("link-lost"),
+        wifi_manager::Cause::StartupProfile => line.push_str("startup-profile"),
+        wifi_manager::Cause::ProfileSaved => line.push_str("profile-saved"),
+        wifi_manager::Cause::ProfileSaveFailed => line.push_str("profile-save-failed"),
+        wifi_manager::Cause::ProfileForgotten => line.push_str("profile-forgotten"),
+        wifi_manager::Cause::ReplacementDisconnected => line.push_str("replace-disconnect"),
+        wifi_manager::Cause::DisconnectTimeout => line.push_str("disconnect-timeout"),
+    }
+}
+
 fn cmd_wifidisconnect(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     session: &mut Option<wifi::Rpc>,
-) {
+) -> bool {
     let Some(rpc) = session.as_mut() else {
         console.write_output_line(framebuffer, "no C6 link (nothing to disconnect)");
-        return;
+        return false;
     };
 
     match wifi::station::disconnect(rpc) {
@@ -4242,9 +4670,16 @@ fn cmd_wifidisconnect(
                 }
                 _ => console.write_output_line(framebuffer, "disconnect requested"),
             }
+            true
         }
-        Some(status) => write_slave_status(console, framebuffer, "disconnect refused", status),
-        None => console.write_output_line(framebuffer, "disconnect: RPC failed, see UART log"),
+        Some(status) => {
+            write_slave_status(console, framebuffer, "disconnect refused", status);
+            false
+        }
+        None => {
+            console.write_output_line(framebuffer, "disconnect: RPC failed, see UART log");
+            false
+        }
     }
 }
 
@@ -4348,17 +4783,19 @@ fn cmd_ipconfig(
     argument: &[u8],
     session: &mut Option<wifi::Rpc>,
     stack: &mut Option<net::Stack>,
-) {
+) -> Option<IpPolicy> {
     let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
-        return;
+        return None;
     };
 
+    let mut policy = None;
     let (verb, rest) = split_first_word(trim(argument));
     match verb {
         b"" => {}
         b"release" => {
             stack.release();
             console.write_output_line(framebuffer, "address released, DHCP stopped");
+            policy = Some(IpPolicy::Unconfigured);
         }
         b"dns" => {
             let mut servers = Vec::new();
@@ -4367,7 +4804,7 @@ fn cmd_ipconfig(
                 let (word, next) = split_first_word(remaining);
                 let Some(server) = parse_ipv4(word) else {
                     console.write_output_line(framebuffer, "each resolver must be an IPv4 address");
-                    return;
+                    return None;
                 };
                 servers.push(server);
                 remaining = trim(next);
@@ -4377,11 +4814,12 @@ fn cmd_ipconfig(
             // thrown away by the next lease anyway.
             if !stack.set_dns_servers(servers) {
                 console.write_output_line(framebuffer, "no address; set one before the resolvers");
-                return;
+                return None;
             }
         }
         b"dhcp" => {
             stack.start_dhcp();
+            policy = Some(IpPolicy::Dhcp);
             console.write_output_line(framebuffer, "requesting a lease...");
             let acquired = stack.pump_until(rpc, DHCP_TIMEOUT_MS, |stack| stack.has_address());
             if !acquired {
@@ -4391,7 +4829,7 @@ fn cmd_ipconfig(
                     "the C6 link was lost while waiting for DHCP"
                 };
                 console.write_output_line(framebuffer, reason);
-                return;
+                return policy;
             }
         }
         _ => {
@@ -4400,7 +4838,7 @@ fn cmd_ipconfig(
                     framebuffer,
                     "usage: ipconfig [dhcp|release|dns <a.b.c.d>...|<a.b.c.d/len> [gw]]",
                 );
-                return;
+                return None;
             };
             let gateway = trim(rest);
             let gateway = if gateway.is_empty() {
@@ -4411,7 +4849,7 @@ fn cmd_ipconfig(
                     None => {
                         console
                             .write_output_line(framebuffer, "the gateway is not an IPv4 address");
-                        return;
+                        return None;
                     }
                 }
             };
@@ -4420,10 +4858,12 @@ fn cmd_ipconfig(
             // wanted. Carrying the previous lease's resolvers over would
             // point at servers this configuration never promised.
             stack.set_static(Ipv4Cidr::new(address, prefix), gateway, Vec::new());
+            policy = Some(IpPolicy::Static);
         }
     }
 
     write_ipconfig(console, framebuffer, rpc, stack);
+    policy
 }
 
 /// Reports whether the radio is still associated.
@@ -5155,7 +5595,7 @@ fn cmd_browsertest(
 fn browser_readiness(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
-    stack: &Option<net::Stack>,
+    stack: Option<&net::Stack>,
 ) {
     let ready = match stack {
         Some(stack) => stack.has_address(),

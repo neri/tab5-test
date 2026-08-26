@@ -106,8 +106,10 @@ UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値�
 対応範囲は[`STORAGE.md`](STORAGE.md)、失敗パターンの詳細は
 [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
 
-Wi-Fi（ESP32-C6）も起動シーケンスには含まれず、`wifi`系コマンド実行時のみ
-UARTへ出ます。層ごとに接頭辞が分かれており、どこで止まったかがそのまま分かります。
+Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起動します。保存設定があれば
+`WIFI: saved profile auto-connect started`、なければ`WIFI: no saved profile`、設定取得までに
+失敗しても起動を続けて`WIFI: saved profile probe failed; continuing boot`と出します。
+以後も層ごとに接頭辞が分かれており、どこで止まったかがそのまま分かります。
 
 - `SDIO: ...` — C6をSDIOカードとして活性化する層。正常時は
   `SDIO: C6 activated`とRCA・CIS識別子が続きます。E2の各レジスタと
@@ -124,7 +126,9 @@ UARTへ出ます。層ごとに接頭辞が分かれており、どこで止ま�
   リクエストIDとステータスを出します
 - `WIFI MENU: ...` — 全画面Wi-Fiメニュー。開始時の`opened`、scan成功時の
   `access points=...`、scan経路の失敗、associationとDHCPの完了を記録します。
-  入力したパスワードは値・長さとも出しません
+  入力したパスワードは値・長さとも出しません。association／DHCP待ちは接続管理器が
+  フレームごとに進め、初回接続と接続後切断の再試行も理由別backoffで進めます。切断通知は
+  シェルやbrowserへ戻った後も`wifilog`へ残ります
 - `NET: ...` — smoltcpによるIPv4の層。正常時は`NET: DHCP configured`だけで、
   それ以外は失敗の報告です。`NET: dropped an outgoing frame`はスレーブが
   スロットルを要求している間に送ろうとしたフレーム、`NET: DHCP lease lost`は
@@ -142,6 +146,38 @@ IP層が答えない場合の切り分けはUARTログよりコマンドの出�
 `uptime`はSYSTIMERティック秒とフレーム数からの概算秒を並べて出すので、
 2つが離れていればティックを取りこぼしています（smoltcpのタイマの基準が
 狂うので、ネットワークの不調がここに出ることがあります）。
+
+`wifilog`は接続管理器の直近16件を古い順に表示します。各行は単調時刻、接続世代`g`、
+試行番号`a`、旧状態→新状態、reason、RPC status、または`retry-ms`を持ちます。
+同じ状態が続く行は、再試行を決めた元のreasonや期限前に届いて拒否した古いイベントの記録です。
+`stable-reset`はassociationが10分安定してbackoffの失敗回数を0へ戻した記録です。入力した
+パスワードは値・長さとも履歴へ入りません。`startup-profile`はC6 NVSからの起動時接続、
+`profile-saved`／`profile-save-failed`はassociation後の保存結果、`profile-forgotten`は
+永続設定削除を表します。`enabled`／`disabled`は永続ON/OFF操作、状態`off`はsession、stack、
+自動接続timerがなくC6をpower downした状態です。メニューまたはCLIで接続先を入れ替える際の`replace-disconnect`は、古い
+associationの切断完了を待ってから新しい接続へ進んだ記録です。切断イベントが3秒以内に
+来なければ`disconnect-timeout`で停止します。例:
+
+```text
+1234ms g2 a1 associating->associating reason=4
+1234ms g2 a1 associating->retry-wait retry-ms=500
+1734ms g3 a2 retry-wait->associating retry-timer
+```
+
+接続後の自動再接続では`online->online reason=...`、`online->retry-wait retry-ms=...`、
+`retry-wait->associating retry-timer`、`associating->associated connected`、
+`associated->dhcp dhcp-start`の順が基本です。通常の起動時自動接続でも`connected`を独立した
+遷移として記録した後にDHCPへ進みます。
+C6リンク喪失では最初のreasonが`link-lost`になり、再構築成功時に`link-ready`が入ります。
+
+`wifisaved`はC6が現在読み込んでいるSTA設定を調べ、SSIDと資格情報の有無だけを表示します。
+RPC応答に含まれるpasswordは表示せず、長さも診断情報へ残しません。これはRAMの一回接続設定を
+表示する場合もあるため、C6 NVSだけを確認するにはC6 reset直後に実行します。OFF中はC6を
+起動せず、起動時に読んだ保存profile有無だけを表示します。`wififorget`成功後は現在のassociationが
+残る場合がありますが、管理器のRAM資格情報を消去し、次回起動時接続を止めます。OFF中のforgetは
+flash操作の間だけC6を起動し、空profileのOFF markerを書き直してから再びpower downします。
+同コマンド末尾の`profile writes this boot`、`failed`、`forgets`は起動後に管理器が要求した
+C6 NVS操作の回数で、C6内部NVSの生涯write回数ではありません。
 
 USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::rescan`を実行します。
 そのため、起動時にも列挙結果や`USB: initial scan complete`がUARTへ出ます。その後も、

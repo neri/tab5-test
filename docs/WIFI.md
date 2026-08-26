@@ -46,13 +46,13 @@ C6は**2.4 GHz専用**です（Wi-Fi 6 = 2.4 GHzの802.11ax）。5 GHzのAPは�
 | `src/wifi/hosted.rs` | ESP-Hostedのフレーム層。12 byteヘッダ、スレーブレジスタ、送受信、初期化ハンドシェイク |
 | `src/wifi/proto.rs` | RPCに必要な範囲だけのprotobuf |
 | `src/wifi/rpc.rs` | TLVエンベロープと`Rpc`メッセージ、分割と再結合、イベントの保持、`IF_STA`受信フレームのキュー |
-| `src/wifi/station.rs` | `esp_wifi_*`に対応する操作（初期化、スキャン、接続、状態、切断） |
+| `src/wifi/station.rs` | `esp_wifi_*`に対応する操作（初期化、スキャン、接続、設定取得、状態、切断） |
 
-C6のリンクは`src/app.rs`が`Option<wifi::Rpc>`として保持し、シェルコマンドを
-またいで生かします。リンクを張り直すとC6がリセットされ接続が失われるため、
-`wificonnect`の結果を`wifistatus`で見るには同じセッションが必要です。
-IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リンクが切れたときは
-一緒に捨てます。
+C6のリンクとIPスタックは`src/app/wifi_manager.rs`の接続管理器が、それぞれ
+`Option<wifi::Rpc>`と`Option<net::Stack>`としてまとめて保持します。リンクを張り直すと
+C6がリセットされ接続が失われるため、シェルコマンドをまたいで同じsessionを生かします。
+管理器は接続元（CLI／メニュー）、IP設定方針（未設定／DHCP／static）、接続状態も持ち、
+C6リンク喪失またはSTA切断時は古いIP stackを同時に捨てます。
 
 **受信フレームは読まないと溜まります。** アソシエート後のC6はホストが読むまで
 フレームを保持し、総量がステージングバッファを超えるとリンクは復帰できません。
@@ -63,14 +63,18 @@ IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リン�
 
 | コマンド | 内容 |
 | --- | --- |
-| `wifi` | キーボード操作の全画面メニュー。APをスキャンして選択し、必要ならマスク付きでパスワードを入力して接続する。メニュー経由では接続後にDHCPも自動開始する |
-| `wifiinfo` | C6をSDIOカードとして活性化し、RCA・I/O関数数・CIS識別子・バス幅・クロックを表示（SDIO層の診断） |
-| `wifiup` | ESP-Hostedのリンクを張り、スレーブが申告するチップID・ファームウェア版・capability・キューサイズを表示 |
+| `wifi` | 全画面メニュー。AP選択、password入力、保存方法の選択、DHCPまでを行う |
+| `wifi on\|off\|status\|forget` | Wi-Fi全体の永続ON/OFF、管理器状態の表示、保存profileの削除。引数なしの`wifi`はメニューを開く |
+| `wifiinfo` | C6をSDIOカードとして活性化し、RCA・I/O関数数・CIS識別子・バス幅・クロックを表示（SDIO層の診断）。終了後は元のON/OFF状態へ戻す |
+| `wifiup` | ESP-Hostedのリンクを張り、スレーブが申告するチップID・ファームウェア版・capability・キューサイズを表示。終了後は元のON/OFF状態へ戻す |
 | `wifimac` | RPCを1往復させてC6のSTA MACアドレスを取得（RPC層の診断） |
 | `wifiscan` | station modeで起動してスキャンし、AP一覧（RSSI・チャンネル・認証方式・SSID）を表示 |
 | `wificonnect <ssid> [password]` | 指定APへ接続。結果はイベントで待ち、成功ならSSID・BSSID・チャンネル・認証方式を表示 |
 | `wifistatus` | 接続先のSSID・BSSID・チャンネル・RSSI。未接続ならスレーブのステータスコード |
-| `wifidisconnect` | 切断 |
+| `wifisaved` | C6が現在読み込んでいるSTA設定のSSID、資格情報の有無、このboot中のprofile書き込み／失敗／forget回数を表示。passwordと長さは表示しない |
+| `wififorget` | `wifi forget`の互換名。C6 NVSの保存済みWi-Fi設定をdefaultへ戻す。OFF中でも実行でき、OFF状態は維持する |
+| `wifilog` | 接続管理器の直近16件の状態遷移、試行番号、接続世代、reason／RPC status／backoffを表示 |
+| `wifidisconnect` | 今回のbootだけ現在のAPから切断する。Wi-Fiと保存profileは有効なままで、次回bootでは自動接続する |
 
 `wifi`メニューは接続成功後にDHCPを自動開始し、最大15秒待って取得したIPv4アドレスを
 結果画面へ表示します。一方、コマンドラインの`wificonnect`は従来どおり
@@ -78,19 +82,67 @@ IPスタック（`Option<net::Stack>`）はその隣に並べて持ち、リン�
 IP関連コマンド（`ipconfig`・`ping`・`tftpget`・`httpget`・`netdump`）の詳細は
 [`NETWORK.md`](NETWORK.md)にあります。
 
-`wifiscan`以降は必要に応じてリンクを張り、`esp_wifi_init`→station mode→
+Wi-FiがONなら`wifiscan`以降は必要に応じてリンクを張り、`esp_wifi_init`→station mode→
 `esp_wifi_start`→省電力オフまでを済ませてから本題に入ります。
-`wifiinfo`と`wifiup`は下層の診断なので、実行するとセッションを捨てて
-張り直します。
+OFF中のscan、接続、IP関連コマンドはC6を暗黙に起動せず、`wifi on`を案内します。
+`wifiinfo`と`wifiup`は下層の診断なので一時的にセッションを捨てて張り直しますが、
+終了時にOFFならC6を再びpower downし、ONなら保存profileの通常接続を復元します。
 
-メニューのAP一覧はscan結果の順で15件ずつ表示し、上下キーとEnterで選択、`R`で再scan、
-Escapeで終了します。hidden SSIDは表示しますが選択できません。OPEN以外は最大64 byteの
-パスワードを入力し、画面には同じbyte数の`*`だけを表示します。パスワードはコマンド履歴や
-UARTログに出さず、入力bufferも接続またはcancel後に消去します。スキャン、接続イベント待ち、
-DHCP待ちは既存のblocking処理を使うため途中cancelできませんが、各処理にはtimeoutがあります。
+メニューのAP一覧は同じSSIDを1行へまとめ、最も強いRSSIのBSSIDと検出BSSID数を
+15件ずつ表示します。上下／Page Up／Page Downで選択し、Enterまたは行のtapで接続、
+`R`で再scan、Escapeで終了します。`O`はWi-Fi全体のON/OFF、`F`は確認画面を経たprofile削除です。
+hidden SSIDは表示しますが選択できません。OPEN以外は最大64 byteの
+パスワードを入力し、画面には同じbyte数の`*`だけを表示します。続けて保存方法を選び、
+`Save and auto-connect`は次回起動にも使うprofile、`Connect once`はC6 resetまでの一時設定に
+します。パスワードはコマンド履歴やUARTログに出しません。画面側の入力bufferはconnect要求の直後に消去し、接続管理器は初回接続の
+自動再試行と接続後の自動再接続に使うため、現在のメニュー接続が有効な間だけ固定長RAM bufferへ
+保持します。認証系エラーでの停止、別AP／CLI接続への置換、明示disconnect、低層sessionの
+明示破棄、HP core reboot時にvolatile writeで消去し、値や長さを`wifilog`にも出しません。
 
-この最小メニューはキーボード操作だけです。自動リトライ、自動再接続、接続先保存、起動時接続、
-Wi-Fi ON/OFF、タッチ操作は未実装です。
+永続profileはP4側Flashへ複製せず、C6のESP-IDF NVSだけに保存します。通常のメニュー試行は
+最初に`WIFI_STORAGE_RAM`を選び、association成功後にだけ同じ設定を
+`WIFI_STORAGE_FLASH`で書くため、誤passwordや到達不能APで以前のprofileを置換しません。
+`Connect once`、CLI接続、再接続は毎回RAM保存を明示し、保存profileを上書きしません。
+起動時はC6 NVSからmodeとprofileを読み、ONかつprofileが存在すれば画面を開かず
+associationとDHCPを開始します。OFFならsessionとstackを作らずC6をpower downします。
+Stage 6の実機確認ではC6 reset、HP core reboot、完全電源断のすべてでprofile保持を確認しました。
+
+起動時自動接続または以前のメニュー接続が有効な状態で、メニューまたはCLIから別の接続を
+開始する場合は、古いIP stackと再接続timerを無効化してからC6へdisconnectを要求し、切断イベントを
+最大3秒待ちます。切断完了後にだけ新しいRAM設定とconnect要求を送るため、既存associationと
+新しい要求を競合させません。保存済みprofileは新しいassociationが成功するまで変更しません。
+切断RPCの失敗またはtimeout時は新しい接続を開始せず、メニュー／CLI表示と`wifilog`へ理由を残します。
+CLIはこの前処理を共有しますが、接続後のDHCPは従来どおり`ipconfig dhcp`まで開始しません。
+
+`wifisaved`はC6の`esp_wifi_get_config(WIFI_IF_STA)`相当RPCを呼びます。応答には平文の
+passwordも含まれるため、固定長bufferへ必要な範囲だけcopyした直後にRPC応答bufferを消去し、
+表示はSSIDと資格情報の有無だけに限定します。このコマンドが示すのは「現在C6が読み込んでいる
+設定」であり、RAMの`Connect once`設定を表示する場合もあります。保存profileそのものを
+確認するには、接続設定を変更する操作を挟まずC6 reset後に再実行します。`wififorget`は
+`esp_wifi_restore`相当RPCでC6のWi-Fi永続設定をdefaultへ戻し、P4側の自動再接続資格情報も
+消去します。
+
+scanとconnect要求のRPC自体は同期処理ですが、associationイベント待ちとDHCP待ちは
+フレーム駆動です。待機中も入力とC6リンクを毎フレーム処理し、Escapeでシェルへ戻っても
+開始済みの接続とDHCPは管理器が続行します。associationは20秒、結果画面で待つDHCPは15秒で
+timeout表示になりますが、DHCP clientは動作を続け、後からleaseを取得できます。
+
+初回接続でreason 4を受けた場合は500 ms間隔で3回再試行し、その後は1、2、4、8、16、最大30秒の
+backoffへ移ります。AP不在、beacon timeout、association失敗、接続timeout、RPC無応答も一般
+backoffで再試行します。認証／handshake系reason 15、202、204、210、211とRPCが返したerror
+statusでは停止し、APを選び直してpasswordを再入力するよう表示します。
+
+メニュー接続の成功後にSTA切断を検出した場合も古いIP stackを直ちに破棄し、同じreason分類と
+backoffで自動再接続します。APが戻ってassociationできると新しいstackでDHCPを取り直します。
+C6／ESP-Hostedリンク喪失ではC6リンクから再構築します。10分安定すると失敗回数をresetします。
+DHCP leaseだけを失った場合はWi-Fiを切らず、動作中のDHCP clientが再取得を続けます。
+これらはメニュー接続だけが対象で、CLIの`wificonnect`には自動再接続も自動DHCPも適用しません。
+
+ON/OFFはC6 NVSのWi-Fi modeで保持します。保存profileがある場合はprofileを残したまま
+`WIFI_MODE_NULL`をOFFとして使います。profileがない初期状態との区別には、FAST scanでは
+接続動作へ使われないSTA設定の`failure_retry_cnt`へmarkerを置きます。ONへ戻すとmarkerを消し、
+station modeを開始します。P4側RAM内の資格情報はreboot／完全電源断をまたがず、永続profileの
+平文資格情報はC6側だけにあります。
 
 ## 再起動をまたぐC6
 

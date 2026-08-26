@@ -4,18 +4,18 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
 > コードを優先してください。
 
-## 状態: 最小メニュー（Stage 0〜2）完了
+## 状態: Stage 0〜7完了
 
 | Stage | 内容 | 状態 |
 | --- | --- | --- |
 | 0 | 最小メニューの境界固定と既存動作のbaseline | 完了（実機baselineはStage 2へ統合） |
 | 1 | キーボード操作の最小メニュー、接続、メニュー専用DHCP | 完了 |
 | 2 | 最小メニューの実機受入とCLI回帰確認 | 完了 |
-| 3 | Wi-FiセッションとIPスタックを接続管理器へ集約 | 未着手 |
-| 4 | 初回接続失敗とreason 4の自動リトライ | 未着手 |
-| 5 | 接続後の切断検出と自動再接続 | 未着手 |
-| 6 | 永続化経路の調査、接続先保存、起動時自動接続 | 未着手 |
-| 7 | Wi-Fi ON/OFF、保存情報の削除、タッチ操作、既存コマンド統合 | 未着手 |
+| 3 | Wi-FiセッションとIPスタックを接続管理器へ集約 | 完了 |
+| 4 | 初回接続失敗とreason 4の自動リトライ | 完了（reason 4の実機再現は未観測） |
+| 5 | 接続後の切断検出と自動再接続 | 完了 |
+| 6 | 永続化経路の調査、接続先保存、起動時自動接続 | 完了 |
+| 7 | Wi-Fi ON/OFF、保存情報の削除、タッチ操作、既存コマンド統合 | 完了 |
 | 8 | 長時間・異常系の実機受入と現状文書の更新 | 未着手 |
 
 ### Stage 1実装記録
@@ -38,6 +38,236 @@ stack 178,176 byteだった。workspace全体のstrict Clippyは既存コード�
 2026-08-26に利用者が実機で最小メニューとCLI回帰を確認し、Stage 2の受入を完了した。
 これにより今回の実装対象であるStage 0〜2を完了とする。自動リトライ、自動再接続、保存、
 起動時接続、ON/OFF、タッチ操作は今回の残作業ではなく、Stage 3以降の将来対応として残す。
+
+### Stage 3実装記録
+
+2026-08-26に`src/app/wifi_manager.rs`を追加し、`Rpc`、`net::Stack`、接続元、IP設定方針、
+接続状態を1つの所有者へ移した。接続元は`ShellManual`と`MenuManaged`、IP方針は
+`Unconfigured`、`Dhcp`、`Static`を区別する。C6リンク喪失とSTA切断では古いstackを
+同時に破棄し、通常フレームループとWi-Fiメニューは毎フレーム管理器をserviceする。
+
+メニューでは`esp_wifi_set_config`／connect要求までを同期実行し、STA接続／切断イベントと
+20秒timeout、DHCP取得と15秒timeoutをフレーム駆動へ変更した。待機中も入力を処理し、
+Escapeで画面を閉じても管理器が接続処理を引き継ぐ。passwordはconnect要求直後にzeroizeし、
+管理器へ保持しない。DHCP timeout後もclientを維持し、後のフレームでleaseを取得すれば
+`Online`へ遷移する。
+
+ブラウザは管理器から`Rpc`と`Stack`を1 stepずつ短時間借用し、描画途中を含むserviceでは
+管理器自身を呼ぶ。表示中に切断またはlease lossが起きた場合は古い通信を閉じ、無効なstackを
+使い続けない。CLIの`wificonnect`は従来の同期表示と手動DHCP契約を維持し、実際に
+`ipconfig dhcp`またはstatic設定を行った時点でだけ管理器のIP方針を更新する。
+
+静的確認ではホスト側test 188件（ほか1件ignored）、`cargo build --release`、
+`tools/check_elf_layout.py`が成功した。生成ELFはIRAM 10,100 byte、DRAM rodata 1,364 byte、
+DROM 130,776 byte、IROM 754,898 byte、stack 178,176 byteだった。Stage 3の完了条件にある
+メニュー、CLI、ping、browserの回帰を実機受入対象とした。
+
+2026-08-26に利用者が実機でStage 3の受入項目を確認した。接続／DHCP待ち中の入力応答、
+メニューを閉じた後の処理継続、CLIの手動DHCP、ping、browserと切断時の終了を含め、
+Stage 3を完了とする。
+
+### Stage 4実装記録
+
+2026-08-26に初回接続のreason分類を`src/app/wifi_retry.rs`へ純粋なpolicyとして分離した。
+reason 4は500 ms間隔で3回再試行してから一般backoffへ移り、reason 200、201、203、205、
+212、未知reason、association timeout、RPC無応答は1、2、4、8、16、最大30秒で再試行する。
+reason 15、202、204、210、211とRPCが返したエラーステータスは自動再試行を停止する。
+この処理はメニューから開始した初回接続だけに適用し、CLIの`wificonnect`は従来どおり
+1回だけの同期接続と手動`ipconfig dhcp`を維持する。
+
+再試行中だけSSIDとpasswordを固定長RAM bufferへ保持し、接続成功、認証系停止、別操作への
+置換時にvolatile writeで消去する。メニュー側の入力bufferとRPCへ渡す一時copyも直後に
+消去し、値や長さを画面、UART、履歴へ出さない。試行番号と接続世代番号を管理器へ追加し、
+再試行待ちに届いた古いイベントを拒否し、次のconnect前には保留イベントを捨て、期限切れの
+timerは世代番号で無効化する。
+
+管理器は直近16件の状態遷移をRAMへ記録し、`wifilog`で時刻、世代、試行、旧状態、新状態、
+reason／RPC status／backoffを表示する。メニューには現在の試行番号、再試行待ち、認証系停止後の
+password再入力要求を表示する。追加rodataが従来の128 KiB DROM枠を約1.1 KiB越えたため、
+XIP 2セグメントと64 KiB page offsetの契約を維持したままDROMを192 KiB枠へ、IROM開始を
+`0x40030000`へ移した。policy単体test 4件、ホスト側test 188件（ほか1件ignored）、
+`cargo build --release`、ELF配置検査、変換後ESP image検査が成功した。生成ELFは
+IRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、IROM 771,200 byte、
+stack 178,176 byteで、変換後imageは998,432 byte、XIP 2本＋RAM 2本を維持する。
+
+2026-08-26に利用者が実機で、新しいXIP配置からの起動、通常のメニュー接続とDHCP、
+誤passwordでの自動再試行停止、`wifilog`の診断内容と資格情報非表示、CLIの一回接続と
+手動DHCP契約を確認した。reason 4は発生頻度が低く、この受入では再現しなかった。
+reason 4専用分岐はpolicy単体testで500 ms間隔3回と一般backoffへの移行を固定しており、
+実機での強制再現のためにAPやC6の状態を意図的に不安定化させず、未観測であることを判断記録に
+残してStage 4を完了とする。自然発生時は`wifilog`を採取して回復結果を追記する。
+
+### Stage 5実装記録
+
+2026-08-26に、メニュー接続でOnlineになった後もSSIDとpasswordを接続管理器の固定長RAM
+bufferへ保持し、STA切断後の自動再associationへ利用するようにした。資格情報の寿命は現在の
+メニュー接続だけで、別APへの接続、CLI接続、明示disconnect、低層sessionの明示破棄、認証系
+停止、HP core rebootでvolatile writeにより消去する。Flashへは保存せず、値と長さを画面、
+UART、`wifilog`へ出さない。
+
+STA切断時は古い`net::Stack`を直ちに破棄し、Stage 4と同じreason分類と最大30秒のbackoffで
+再試行する。再association後はSTA MACから新しいstackを作り、メニュー接続のDHCP方針に従って
+leaseを取り直す。DHCP leaseだけを失った場合はassociationと既存DHCP clientを維持し、
+smoltcpの再取得を続ける。C6／ESP-Hostedリンク喪失では`Rpc`とstackを破棄するが資格情報と
+方針は残し、backoff後にC6リンク、station、association、DHCPの順で再構築する。接続が10分
+安定した時点で失敗回数を0へ戻し、`wifilog`へ`stable-reset`を残す。
+
+ブラウザは従来どおり毎フレーム管理器をserviceし、切断時に旧stackのsocketを閉じて操作可能な
+画面へ戻る。再接続後の新しい操作は新しいstackを借りる。CLIの`wificonnect`は資格情報を
+管理器へ保持せず、自動再接続と自動DHCPの対象にしない。policy単体test 6件、ホスト側test
+188件（ほか1件ignored）、`cargo build --release`、ELF配置検査、変換後ESP image検査が
+成功した。生成ELFはIRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、
+IROM 772,552 byte、stack 178,176 byteで、変換後imageは999,776 byte、XIP 2本＋RAM 2本を
+維持した。これらを実機受入対象とした。
+
+2026-08-26に利用者が実機で、メニュー接続後のAP停止、backoff中の操作と`wifilog`、AP復帰後の
+自動再association、パスワード再入力なしのDHCP／ping復旧、browserの操作継続を確認した。
+CLIの一回接続と手動DHCP契約も維持されている。これをStage 5の機能受入として完了とする。
+複数回の1時間放置と24時間soakは機能実装の合否から切り離し、Stage 8の長時間受入でまとめて
+実施する。
+
+### Stage 6調査記録
+
+2026-08-26にEspressifの
+[`esp_hosted_rpc.proto`](https://github.com/espressif/esp-hosted-mcu/blob/main/common/proto/esp_hosted_rpc.proto)
+を確認した。搭載C6へ使っているRPCには
+`WifiGetConfig`（request 285）、`WifiSetStorage`（request 313）、`WifiRestore`があり、
+STA設定のSSIDとpasswordを読み戻す経路、およびESP-IDFの`WIFI_STORAGE_FLASH`／
+`WIFI_STORAGE_RAM`を選ぶ経路が存在する。ESP-IDFのWi-Fi driverでは保存先の既定値が
+Flashで、Flash保存した設定は電源断をまたぐ仕様である（Espressif
+[`NVS FAQ`](https://docs.espressif.com/projects/esp-faq/en/latest/software-framework/storage/nvs.html)）。
+このため、まずC6側NVSを利用する第一候補を実機で検証し、不成立の場合だけP4側settings方式へ
+進む。
+
+搭載済みC6 firmwareが同じRPCを実装し、HP core reboot、C6 reset、完全電源断をまたいで
+設定を返すか調べるため、`wifisaved`を追加した。これは`esp_wifi_get_config(WIFI_IF_STA)`相当を
+呼び、SSIDと資格情報の有無だけを表示する。passwordを含むRPC応答bufferは固定長領域へcopy後
+直ちにzeroizeし、passwordの値も長さも画面、UART、履歴へ出さない。接続後、HP core reboot後、
+完全電源断後の各時点で、ほかの接続操作より前に同コマンドを実行することを実機判定条件とする。
+
+この確認段階では保存方式をまだ確定せず、P4側Flashのpartitionや書き込み処理も追加しない。
+C6側で保持できた場合は、メニュー接続をいったんRAM設定で成功させ、成功後だけ明示的にFlashへ
+保存することで「新しいAPはassociation成功後にだけ旧profileを置換する」契約を守る。
+`Connect once`とCLI接続はRAM設定に固定し、保存profileを上書きしない。起動時接続とforgetは
+保持試験の結果を記録してから実装する。
+
+診断段階の静的確認ではpolicy単体test 6件、ホスト側test 188件（ほか1件ignored）、
+`cargo build --release`、ELF配置検査、変換後ESP image検査が成功した。生成ELFは
+IRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、IROM 774,408 byte、
+stack 178,176 byteで、変換後applicationは1,001,632 byte、XIP 2本＋RAM 2本を維持する。
+
+最初の実機確認では、メニュー接続とDHCPは成功したが`wifisaved`が`station config RPC failed`
+と表示した。これは保存失敗ではなく、proto3で成功値`resp = 0`のfieldが省略されるのに、
+初版parserがfield 1の存在を必須としていたP4側の解析誤りだった。ほかのRPC response parserと
+同様にfield不在をsuccessの0として扱うよう修正し、保持試験をやり直す。
+
+修正後も同じ検査一式が成功した。生成ELFのIROMは774,374 byte、変換後applicationは
+1,001,600 byteで、ほかの領域とsegment構成は変わらない。
+
+2026-08-26に利用者が修正版を実機確認し、メニュー接続直後の`wifisaved`でSSIDが取得できる
+ことを確認した。これにより搭載C6が`WifiGetConfig` RPCを実装し、P4側parserが現在設定を
+読み出せることは確定した。C6 NVSの採用判断には、引き続きC6 reset、HP core reboot、完全電源断
+後の保持を、接続設定を上書きする操作より前に確認する。
+
+続く実機確認で、同じprofileがC6 reset、HP core reboot、完全電源断のすべてをまたいで
+保持されることを確認した。これによりStage 6の保存先はC6側ESP-IDF NVSに確定し、P4側の
+settings partition、journal、Flash書き込み処理は実装しない。パスワードの永続copyはC6だけに
+置き、P4は接続中の自動再接続に必要な固定長RAM copyだけを持つ。
+
+保存方式確定後、ESP-Hostedの`WifiSetStorage`を追加し、メニューへ
+`Save and auto-connect`／`Connect once`の選択を追加した。どちらも最初は
+`WIFI_STORAGE_RAM`でassociationし、保存選択時だけ成功イベント後に同じprofileを
+`WIFI_STORAGE_FLASH`で書く。従って誤passwordや到達不能APは以前のprofileを置換しない。
+CLIの`wificonnect`と再試行も毎回RAMを明示するため、従来の手動DHCP契約と保存しない契約を
+維持する。
+
+起動時は`WifiGetConfig`でC6 NVSから読み出したprofileを管理器のRAMへcopyし、画面を開かず
+associationとDHCPを開始する。C6 link／STA切断後はStage 5の同じ再接続経路へ入る。RPC response、
+manager、画面の各password bufferは寿命終了時にzeroizeする。`wififorget`はEspressifが
+永続的なmode／protocol／configをdefaultへ戻すために提供する`WifiRestore` RPCを明示操作で呼び、
+管理器のRAM資格情報も消去する。現在のassociationは直ちに切れない場合があるが、以後の
+自動再接続と次回起動時接続は行わない。`wifisaved`はこのboot中のprofile保存要求、失敗、forget
+回数も表示する。C6内部NVSの生涯write countはRPCから取得できないため、P4が発行した操作だけを
+診断対象とする。
+
+完成実装の静的確認ではpolicy単体test 6件、ホスト側test 188件（ほか1件ignored）、
+`cargo build --release`、ELF配置検査、変換後ESP image検査が成功した。生成ELFは
+IRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、IROM 784,578 byte、
+stack 178,176 byteで、変換後applicationは1,011,808 byte、XIP 2本＋RAM 2本を維持する。
+完成機能の実機受入結果はStage 6完了時に追記する。
+
+完成機能の最初の実機確認では、保存profileによる起動時自動接続が
+`startup-profile`→`connect`→`dhcp-start`→`dhcp-configured`まで進み、Onlineになることを
+確認した。一方、その状態からメニュー接続を開始するとassociation timeoutになった。
+原因は、管理器がローカルのstackと資格情報を置換するだけで、C6上の既存associationを切断せずに
+新しい`set_config`／connectを送っていたことである。また、接続イベント処理が直ちにDHCP状態へ
+遷移していたため、成功していても`wifilog`に`connected`が残らなかった。
+
+修正版では、メニュー接続による置換時に古い再接続世代とIP stackを無効化し、C6へdisconnectを
+要求して切断イベントを最大3秒待つ。成功後だけ新しいRAM設定とconnectを送り、待機中に届いた
+旧世代イベントは新しい接続結果へ流用しない。切断失敗はRPC失敗、status、timeoutを区別して
+メニューと履歴へ残す。接続イベントは一度`Associated`へ遷移して`connected`を記録してから
+profile保存とDHCPを開始する。保存profileを使った起動時接続と、接続済み状態からのメニュー置換を
+修正版の実機再確認対象とする。
+
+修正版の静的確認ではpolicy単体test 6件、ホスト側test 188件（ほか1件ignored）、
+`cargo build --release`、ELF配置検査、変換後ESP image検査が成功した。生成ELFは
+IRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、IROM 785,656 byte、
+stack 178,176 byteで、変換後applicationは1,012,880 byte、XIP 2本＋RAM 2本を維持する。
+
+同じ実機でCLIの`wificonnect`もtimeoutすることが判明した。CLI経路も管理器の既存associationを
+切断せず、直接RAM設定とconnectを送っていたため、起動時自動接続と同じ競合が起きていた。
+CLIでも引数検証後に同じ切断完了待ちを通し、成功後だけ従来の同期connectを実行するようにした。
+この前処理は保存profileを書き換えず、CLI接続後のDHCPも暗黙に開始しない。切断前処理に失敗した
+場合はconnectを送らず、管理器が記録済みの失敗へ架空のCLI接続試行を追加しない。
+
+CLI修正後も同じ静的検査一式が成功した。生成ELFのIROMは787,446 byte、変換後applicationは
+1,014,672 byteで、IRAM、DRAM rodata、DROM、stackおよびXIP 2本＋RAM 2本の構成は変わらない。
+
+2026-08-26に利用者が修正版を実機確認した。保存profileからの起動時自動接続とDHCP取得、
+接続済み状態からのメニュー接続への入れ替え、および同じ状態からのCLI `wificonnect`への
+入れ替えがtimeoutせず完了した。CLIでは引き続き`ipconfig dhcp`までDHCPを開始しない契約も
+維持している。C6 NVSのC6 reset／HP core reboot／完全電源断をまたぐ保持確認と合わせ、
+Stage 6の機能受入を完了とする。保存中電源断の反復試験や長時間耐久はStage 8で実施する。
+
+### Stage 7実装記録
+
+2026-08-26に接続管理器へ`Off`状態と永続ON/OFF操作を追加した。OFFは進行中の接続世代と
+資格情報を無効化し、IP stackを破棄し、C6へbest-effort disconnect、Wi-Fi driver stop、
+`WIFI_MODE_NULL`設定を行ってからESP-Hosted sessionを捨て、E2.P0でC6をpower downする。
+OFF中は管理器のserviceがscan、association、DHCP、retryを進めず、`wifiscan`、`wificonnect`、
+`wifistatus`とIP関連シェルコマンドも別sessionを暗黙に作らない。`wifiinfo`／`wifiup`だけは
+明示的な低層診断として一時起動を許し、終了後にOFFなら再power down、ONなら保存profileの
+通常接続へ戻す。
+
+ON/OFFはP4 Flashへ新しいsettings領域を作らず、C6 NVSに保存されるWi-Fi modeを使う。
+保存profileがあるOFFは`WIFI_MODE_NULL`だけで識別する。profileがないOFFはfactory defaultの
+mode NULL／空SSIDと区別するため、既定のFAST scanでは無視されるSTA `failure_retry_cnt`へ
+1 byteのmarkerを保存する。ONではstation modeへ戻し、空profile markerを消してからdriverを
+開始する。保存profileがあれば従来の`MenuManaged`／DHCP経路で自動接続する。OFF中のforgetは
+flash操作中だけC6を起動し、profile削除後に空profile markerとNULL modeを再設定してOFFを
+維持する。
+
+シェルの`wifi on|off|status|forget`を同じ管理器へ接続し、`wififorget`は互換名として残した。
+`wifidisconnect`は今回のbootだけの切断で、Wi-Fiと保存profileは残ることを表示する。
+CLI `wificonnect`は引き続きRAM設定、一回association、手動`ipconfig dhcp`であり、ON/OFF追加後も
+保存やDHCPを暗黙に開始しない。
+
+メニューはscan結果をSSID単位へ統合し、最も強いRSSIのBSSIDと検出BSSID数を表示する。
+Page Up／Down、一覧行のtap、`O`によるON/OFF、`F`と確認画面によるforgetを追加した。OFF画面の
+ON／forgetボタンと確認画面もtapできる。既存の上下キー、Enter、`R`、Escapeは維持した。
+Stage 7完了判定は、同一バイナリを使ったOFFの10分放置と再起動保持、ON後の保存profile接続、
+forget後の再起動、キーボード回帰、AP行tapを実機で確認した後に行う。
+
+静的確認ではpolicy単体test 6件、ホスト側test 188件（ほか1件ignored）、
+`cargo build --release`、ELF配置検査、変換後ESP image検査が成功した。生成ELFは
+IRAM 10,100 byte、DRAM rodata 1,364 byte、DROM 196,312 byte、IROM 806,896 byte、
+stack 178,176 byteで、変換後applicationは1,034,128 byte、XIP 2本＋RAM 2本を維持する。
+
+2026-08-26に利用者が同一バイナリを実機確認した。保存profileを残したOFF、10分放置中の
+接続処理停止、再起動後のOFF保持、ONへ戻した際の保存profileによるassociationとDHCP、
+forget後の自動接続停止、profileがない状態でのOFF保持、キーボード操作、Page Up／Down、
+AP一覧行のtapを確認した。これによりStage 7の機能受入を完了とする。
 
 ## 実装優先順位
 
@@ -387,7 +617,8 @@ Onlineへ戻ること。
 - ESP-Hostedに保存済みconfigを安全に再利用／削除するRPCがあるか確認する
 - 上記「採用判断」に従ってC6 NVSまたはP4 settings方式を選び、根拠をこの文書へ記録する
 - 選択した保存方式を実装する
-- format version、CRC、電源断時rollback、未知versionの安全な無視を実装する
+- P4 settings方式を選んだ場合はformat version、CRC、電源断時rollback、未知versionの安全な
+  無視を実装する
 - `Save and auto-connect`と`Connect once`を選べるようにする
 - 起動時は保存profileがありONなら、UIを開かず接続とDHCPを開始する
 - 新しいAPはassociation成功後にだけ旧profileと置き換える

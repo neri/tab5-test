@@ -52,11 +52,11 @@ use crate::browser::memory;
 use crate::browser::url::{self, Url};
 use crate::framebuffer::{BLACK, Framebuffer, HEIGHT, WHITE, WIDTH};
 use crate::input::{InputManager, Key, PrimaryTouch};
-use crate::net;
 use crate::usb::MOUSE_BUTTON_LEFT;
-use crate::{interrupts, tick, uart, wifi};
+use crate::{interrupts, tick, uart};
 
 use super::fetch::{self, Fetch, Network, Outcome as FetchOutcome};
+use super::wifi_manager::Manager as WifiManager;
 
 use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_union};
 
@@ -139,20 +139,16 @@ const FLUSH_BAND_WIDTH: usize = 128;
 
 /// Runs the viewer until Escape is pressed on a page.
 ///
-/// `rpc` and `stack` are borrowed for the whole screen but owned by
-/// `app::run`; the browser polls them and gives them back every frame
-/// rather than holding them across one. Both being `None`, or the stack
-/// having no address, is not an error -- the built-in pages still work, and
-/// a link that needs the network says so.
+/// The manager remains the owner for the whole screen. Individual fetch
+/// steps borrow its link and stack only for that step, allowing connection
+/// events and DHCP to advance between frames.
 pub fn run(
     framebuffer: &mut Framebuffer,
     input: &mut InputManager,
-    rpc: Option<&mut wifi::Rpc>,
-    stack: Option<&mut net::Stack>,
+    wifi: &mut WifiManager,
     base: Option<Url>,
     start: Option<Url>,
 ) {
-    let mut network = Network::new(rpc, stack);
     let mut viewer = match Viewer::new(base) {
         Ok(viewer) => viewer,
         Err(failure) => {
@@ -162,7 +158,7 @@ pub fn run(
             return;
         }
     };
-    if network.is_none() {
+    if addressed_network(wifi).is_none() {
         viewer.say("no network: leave and run wificonnect, then ipconfig dhcp");
     }
     if let Some(url) = start {
@@ -170,7 +166,7 @@ pub fn run(
     }
 
     framebuffer.fill(PAGE_BACKGROUND);
-    viewer.draw_all(framebuffer, &mut || service_link(&mut network));
+    viewer.draw_all(framebuffer, &mut || service_link(wifi));
     let mut cursor = Cursor::new(WIDTH / 2, HEIGHT / 2);
     input.reset_primary_touch();
     cursor.show(framebuffer);
@@ -202,15 +198,17 @@ pub fn run(
         // is gone for good at that point. The window that has to stay
         // small is "time between two reads", so the read comes first and
         // the expensive work below is broken up around more of them.
-        service_link(&mut network);
+        service_link(wifi);
 
         let mut leaving = false;
         while let Some(event) = input.poll_key() {
             match viewer.handle_key(event.key, pending.is_some()) {
                 Action::Continue => {}
                 Action::Cancel => {
-                    if let (Some(active), Some(link)) = (pending.take(), network.as_mut()) {
-                        active.fetch.close(link);
+                    if let Some(active) = pending.take() {
+                        if let Some(mut link) = raw_network(wifi) {
+                            active.fetch.close(&mut link);
+                        }
                         viewer.finish_loading();
                         viewer.say("stopped");
                     }
@@ -248,10 +246,16 @@ pub fn run(
         // A link that has died is otherwise only discovered by trying to
         // use it, which from the reader's side looks like every page
         // failing for its own reason.
-        if let Some(link) = network.as_ref()
-            && !link.rpc.is_alive()
-        {
+        if pending.is_some() && addressed_network(wifi).is_none() {
             viewer.report_lost_link();
+            // A lost association makes the manager discard the whole old
+            // stack, so any socket handles in this fetch are gone with it.
+            // If a stack still exists, close against it before dropping.
+            if let Some(active) = pending.take()
+                && let Some(mut link) = raw_network(wifi)
+            {
+                active.fetch.close(&mut link);
+            }
         }
 
         // A navigation the reader asked for. Whatever is in flight is
@@ -259,12 +263,16 @@ pub fn run(
         // this is also what makes "cancel, then fetch something else"
         // work without a state in between.
         if let Some(navigation) = viewer.take_request() {
-            if let (Some(active), Some(link)) = (pending.take(), network.as_mut()) {
-                active.fetch.close(link);
+            if let Some(active) = pending.take()
+                && let Some(mut link) = raw_network(wifi)
+            {
+                active.fetch.close(&mut link);
             }
+            let mut network = addressed_network(wifi);
             pending = begin(&mut viewer, navigation, network.as_mut());
         }
 
+        let mut network = addressed_network(wifi);
         let outcome = match (pending.as_mut(), network.as_mut()) {
             (Some(active), Some(link)) => {
                 let outcome = active.fetch.step(link);
@@ -284,8 +292,8 @@ pub fn run(
                     // links are both where the page actually came from.
                     let landed = active.fetch.url().clone();
                     let peak = active.fetch.peak_owned();
-                    if let Some(link) = network.as_mut() {
-                        active.fetch.close(link);
+                    if let Some(mut link) = raw_network(wifi) {
+                        active.fetch.close(&mut link);
                     }
                     viewer.show_document(document, &active.navigation, landed, elapsed, peak);
                 }
@@ -293,8 +301,8 @@ pub fn run(
             Some(FetchOutcome::Failed(failure)) => {
                 if let Some(active) = pending.take() {
                     let url = active.fetch.url().clone();
-                    if let Some(link) = network.as_mut() {
-                        active.fetch.close(link);
+                    if let Some(mut link) = raw_network(wifi) {
+                        active.fetch.close(&mut link);
                     }
                     viewer.show_failure(&url, failure);
                 }
@@ -309,7 +317,7 @@ pub fn run(
         // and goes back on last -- see `super::pointer`.
         let (previous_x, previous_y) = (cursor.x, cursor.y);
         cursor.hide(framebuffer);
-        viewer.draw_dirty(framebuffer, &mut || service_link(&mut network));
+        viewer.draw_dirty(framebuffer, &mut || service_link(wifi));
         cursor.move_to(target_x, target_y);
         cursor.show(framebuffer);
         flush_union(
@@ -324,8 +332,10 @@ pub fn run(
     // Leaving with a transfer still running would leak its socket out of
     // the set for the rest of the run. Every exit from the loop above is a
     // `break` so that this is the only way out.
-    if let (Some(active), Some(link)) = (pending.take(), network.as_mut()) {
-        active.fetch.close(link);
+    if let Some(active) = pending.take()
+        && let Some(mut link) = raw_network(wifi)
+    {
+        active.fetch.close(&mut link);
     }
 }
 
@@ -334,10 +344,20 @@ pub fn run(
 /// Called wherever this screen is about to spend longer than a frame not
 /// looking at the link -- which is most of a viewport repaint. Cheap when
 /// there is nothing waiting: a couple of SDIO register reads.
-fn service_link(network: &mut Option<Network<'_>>) {
-    if let Some(link) = network.as_mut() {
-        link.stack.poll(link.rpc);
+fn service_link(wifi: &mut WifiManager) {
+    wifi.service();
+}
+
+fn raw_network(wifi: &mut WifiManager) -> Option<Network<'_>> {
+    let (rpc, stack) = wifi.options_mut();
+    match (rpc.as_mut(), stack.as_mut()) {
+        (Some(rpc), Some(stack)) => Some(Network { rpc, stack }),
+        _ => None,
     }
+}
+
+fn addressed_network(wifi: &mut WifiManager) -> Option<Network<'_>> {
+    raw_network(wifi).filter(|network| network.stack.has_address())
 }
 
 /// Starts a navigation, or answers it without the network when it can.
@@ -784,7 +804,11 @@ impl Viewer {
             // leaves. One key, and which it means is exactly what the
             // toolbar is showing at the time.
             Key::Escape => {
-                return if loading { Action::Cancel } else { Action::Leave };
+                return if loading {
+                    Action::Cancel
+                } else {
+                    Action::Leave
+                };
             }
             Key::ArrowDown => self.scroll_by(1),
             Key::ArrowUp => self.scroll_by(-1),
@@ -1090,7 +1114,10 @@ impl Viewer {
             let elapsed = tick::now_ms().saturating_sub(started);
             if elapsed > self.slowest_repaint_ms {
                 self.slowest_repaint_ms = elapsed;
-                uart::log_hex(b"BROWSER: slowest viewport repaint so far, ms=", elapsed as u32);
+                uart::log_hex(
+                    b"BROWSER: slowest viewport repaint so far, ms=",
+                    elapsed as u32,
+                );
             }
         }
         if dirty.status {

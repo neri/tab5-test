@@ -31,9 +31,26 @@ HTTP GETができるところまでです。受け取ったファイルは`/tmp`
 
 `net::Stack`は**C6のリンクを所有しません**。`wifi::Rpc`がトランスポートを
 持ったままで、パケットを触る呼び出しはその都度`&mut Rpc`を借ります。
-`app.rs`は`Option<wifi::Rpc>`と`Option<net::Stack>`を並べて持ち、リンクが
-切れたときは両方捨てます（存在しないリンクで取得したアドレスを持ち続けない
-ため）。`wifiinfo`・`wifiup`もセッションを張り直すのでスタックを捨てます。
+`src/app/wifi_manager.rs`の接続管理器が両方の`Option`と接続元、IP設定方針、接続状態を
+1つの所有者として保持します。リンク喪失とSTA切断時はstackも同時に捨てるため、存在しない
+リンクで取得したアドレスが残りません。Wi-Fi OFFではstack、アドレス、route、resolverを
+まとめて破棄し、ネットワークコマンドから下層sessionを暗黙に作りません。`wifiinfo`・`wifiup`も
+セッションを張り直すので管理器を通してstackまで破棄し、診断後に元のON/OFF状態へ戻します。
+
+メニューから始めたassociationでは、接続管理器がreason／timeout／RPC結果を分類して最大30秒の
+backoffで再試行し、成功後にDHCPを自動開始します。接続後のSTA切断でも古いstackを破棄して
+同じRAM内資格情報で再associationし、新しいstackでDHCPを取り直します。C6リンク喪失では
+`Rpc`から再構築します。DHCP leaseだけを失った場合はassociationを維持し、既存DHCP clientの
+再取得を続けます。ブラウザの進行中socketは旧stackとともに無効になり、画面は操作可能なまま
+新しい接続を待ちます。
+
+C6 NVSに保存profileがある起動も同じ`MenuManaged`／`Dhcp`方針へ入り、画面操作なしで
+associationとDHCPを開始します。メニューの`Connect once`とCLIはC6 RAM設定を使うため、
+保存済みprofileを上書きしません。
+
+この処理はCLIの契約を変えません。`wificonnect`は1回のassociationだけで資格情報を管理器へ
+保持せず、IPv4設定は利用者が`ipconfig dhcp`またはstatic設定を実行するまで
+`Unconfigured`のままです。したがってCLI接続は自動再接続しません。
 
 ## 時刻源（`tick.rs`）
 
@@ -174,18 +191,18 @@ transmitコールバックで、Wi-Fiステーション用netifが渡すのは14
 | `httpget <host\|a.b.c.d>[:port] [path]` | HTTP/1.0 GET。ヘッダの先頭数行を表示し、本文をカレントディレクトリへ保存 |
 | `hs <url\|path> [r <n>\|p [n]\|c <n>]` | `Transaction`を直接回して結果を数値で報告（[`BROWSER.md`](BROWSER.md)） |
 
-いずれも必要に応じてC6のリンクとstation modeを用意します（`wifiscan`以降と
-同じ`wifi_session`を通ります）。APへのアソシエートは別で、`wificonnect`が
+Wi-FiがONなら、いずれも必要に応じてC6のリンクとstation modeを用意します（`wifiscan`以降と
+同じ`wifi_session`を通ります）。OFF中はC6を起動せず`wifi on`を案内します。APへのアソシエートは別で、`wificonnect`が
 済んでいないと`ipconfig dhcp`はリースを取れません。
 
-全画面の`wifi`メニューから接続した場合は、association成功後にSTA MACで
-`net::Stack`を新しく作り、DHCPを自動開始して最大15秒待ちます。時間内にleaseを
-取得できなかった場合もDHCP clientを動かしたstackを通常フレームループへ返すため、
-画面を閉じた後も毎フレームのpollで取得を継続します。メニューでキー入力を待っている間も、
-stackがあれば`Stack::poll`、なければ`Rpc::discard_station_frames`をフレームごとに呼びます。
+全画面の`wifi`メニュー、または起動時の保存profileから接続した場合は、管理器がassociationイベントをフレームごとに読み、
+成功後にSTA MACで`net::Stack`を新しく作ってDHCPを自動開始します。15秒でleaseを取得できない
+場合もDHCP clientを維持し、画面を閉じた後を含め毎フレームのpollで取得を継続します。
+stackがなければ`Rpc::discard_station_frames`を呼び、C6の受信queueを溜めません。
 
 CLIの`wificonnect`はこの自動DHCPを使いません。従来どおりassociationだけで戻り、利用者が
-`ipconfig dhcp`を実行した時点で初めてDHCPを開始します。
+`ipconfig dhcp`を実行した時点で初めてDHCPを開始します。管理器のIP方針もこの時点で
+`Dhcp`に変わり、static設定では`Static`、`ipconfig release`では`Unconfigured`になります。
 
 **こちら宛のICMP echoには、アドレスが設定されていればいつでも応答します。**
 smoltcpの`auto-icmp-echo-reply`によるもので、`ping`コマンドの実行中に
@@ -241,7 +258,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
 コードサイズはsmoltcp導入前後でIROMが260,142→334,900 byte（約+73 KiB）、
 DROMは変化なしです。DNSの追加ではIROMが344,222→354,526 byte（約+10.1 KiB、
 うちfeatureを有効にしただけで+3,758 byte）、DROMは130,776 byteのまま変化なし。
-FLASH XIP領域（`ROM_TEXT`は約3.9 MiB）に対して十分小さく、
+FLASH XIP領域（`ROM_TEXT`は約3.8 MiB）に対して十分小さく、
 ソケットバッファもPSRAMヒープ（約30 MiB）なのでどちらも制約になりません。
 
 ## DNS
@@ -494,5 +511,6 @@ status code、`Content-Type`と`charset`、`Content-Length`、
 - サーバ機能（TFTPサーバ、HTTPサーバ）なし
 - 受信したファイルの保存先は`/tmp`だけです。8 MiBで、リセットで消えます
   （[`FILESYSTEM.md`](FILESYSTEM.md)）
-- リンクが切れるとアドレスも失われます。`wificonnect`からやり直しです
+- リンクが切れると古いアドレスを破棄します。管理対象のメニュー／保存profile接続は
+  自動再接続とDHCPを行い、CLI接続は`wificonnect`と`ipconfig`の手動操作が必要です
 - シェルは単一スレッドなので、長いコマンドの実行中は他のことが止まります

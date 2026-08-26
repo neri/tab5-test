@@ -15,9 +15,9 @@ mod axis_test;
 mod battery;
 mod blockdev;
 mod browser;
-mod fetch;
 mod browsertest;
 mod coord_test;
+mod fetch;
 mod files;
 mod lsusb;
 mod mbr;
@@ -26,7 +26,9 @@ mod paint;
 mod pointer;
 mod shell;
 mod touch_test;
+mod wifi_manager;
 mod wifi_menu;
+mod wifi_retry;
 mod win;
 
 use crate::delay::delay_ms;
@@ -38,7 +40,7 @@ use crate::input::InputManager;
 use crate::lcd::Display;
 use crate::psram::Psram;
 use crate::startup::RebootTestBoot;
-use crate::{net, startup, tick, uart, wifi};
+use crate::{startup, tick, uart};
 
 /// Roughly half a second of cursor blink at the panel's fixed 57.3 Hz.
 const BLINK_INTERVAL_FRAMES: u32 = 30;
@@ -149,14 +151,16 @@ pub fn run(psram: Psram) {
         );
     }
 
+    // One owner keeps the C6 link, IP stack and the policy connecting them
+    // coherent across shell commands and full-screen modes.
+    let mut wifi_manager = wifi_manager::Manager::new();
+    match wifi_manager.begin_startup_auto_connect() {
+        Ok(true) => uart::log(b"WIFI: saved profile auto-connect started\r\n"),
+        Ok(false) if wifi_manager.is_enabled() => uart::log(b"WIFI: no saved profile\r\n"),
+        Ok(false) => uart::log(b"WIFI: persistent OFF; C6 powered down\r\n"),
+        Err(_) => uart::log(b"WIFI: saved profile probe failed; continuing boot\r\n"),
+    }
     console.write_prompt(display.framebuffer_mut());
-    // The C6 link outlives a single command: connecting and then asking for
-    // the connection's status are separate commands, and re-establishing the
-    // link resets the co-processor.
-    let mut wifi_session: Option<wifi::Rpc> = None;
-    // The IP stack lives beside the session rather than inside it: dropping
-    // the link has to drop the address with it.
-    let mut net_stack: Option<net::Stack> = None;
     let mut blink_frames = 0u32;
     loop {
         if display
@@ -184,15 +188,7 @@ pub fn run(psram: Psram) {
         // them, and a backlog larger than the transport's staging buffer
         // cannot be resynchronized -- so the link is serviced every frame,
         // not only while a network command is running.
-        match (wifi_session.as_mut(), net_stack.as_mut()) {
-            (Some(rpc), Some(stack)) => {
-                stack.poll(rpc);
-            }
-            // Associated with no IP stack yet: the frames have nowhere to
-            // go, but they still have to be read off the co-processor.
-            (Some(rpc), None) => rpc.discard_station_frames(),
-            _ => {}
-        }
+        wifi_manager.service();
 
         let Some(event) = input.poll_key() else {
             // No key this frame: advance the idle blink timer and, on phase
@@ -223,8 +219,7 @@ pub fn run(psram: Psram) {
             &mut vfs,
             &mut shell_state,
             &mut auto_mount,
-            &mut wifi_session,
-            &mut net_stack,
+            &mut wifi_manager,
         );
         match outcome {
             // Each of these blocks until a key is pressed and leaves its own
@@ -254,32 +249,25 @@ pub fn run(psram: Psram) {
                 console.clear(framebuffer);
             }
             shell::Outcome::WifiMenu => {
-                wifi_menu::run(framebuffer, &mut input, &mut wifi_session, &mut net_stack);
+                wifi_menu::run(framebuffer, &mut input, &mut wifi_manager);
                 console.clear(framebuffer);
-                shell::drop_dead_session(console, framebuffer, &mut wifi_session, &mut net_stack);
+                shell::drop_dead_session(console, framebuffer, &mut wifi_manager);
             }
             shell::Outcome::Browser(start) => {
-                // The viewer borrows the link and the stack for as long as
-                // it is up, and gives them back here. It polls them itself
-                // every frame, so the loop above is not servicing the C6
-                // while it runs -- which is why it has to.
+                // The viewer keeps borrowing the manager for one fetch step
+                // at a time and services it every frame, because the loop
+                // above is paused while the full-screen mode is running.
                 browser::run(
                     framebuffer,
                     &mut input,
-                    wifi_session.as_mut(),
-                    net_stack.as_mut(),
+                    &mut wifi_manager,
                     shell_state.base(),
                     start,
                 );
                 console.clear(framebuffer);
                 // A disconnection while the viewer was up is otherwise
                 // invisible: the same check every network command makes.
-                shell::drop_dead_session(
-                    console,
-                    framebuffer,
-                    &mut wifi_session,
-                    &mut net_stack,
-                );
+                shell::drop_dead_session(console, framebuffer, &mut wifi_manager);
             }
             shell::Outcome::VisualQa => {
                 run_visual_qa(console, framebuffer, &mut input);
@@ -289,7 +277,11 @@ pub fn run(psram: Psram) {
                 // The "rebooting..." line is already in PSRAM; give the panel
                 // one scan-out interval to actually show it before the reset.
                 delay_ms(300);
-                shell::reboot(wifi_session.as_mut());
+                // An HP-core reset does not physically clear all L2 RAM.
+                // Scrub the retained menu credential before the reboot path
+                // borrows the still-live session for its best-effort deauth.
+                wifi_manager.erase_credentials();
+                shell::reboot(wifi_manager.session_mut());
             }
             shell::Outcome::Shutdown => {
                 // As with reboot, let the acknowledgement reach the panel

@@ -258,12 +258,17 @@ fn fetch(
     let (Ok(target), Ok(host)) = (url.request_target(), url.host_header()) else {
         return failed(Error::OutOfMemory);
     };
-    let mut transaction =
-        match Transaction::start(stack, address, url.port(), host.as_bytes(), target.as_bytes(), MAX_BODY)
-        {
-            Ok(transaction) => transaction,
-            Err(error) => return failed(error),
-        };
+    let mut transaction = match Transaction::start(
+        stack,
+        address,
+        url.port(),
+        host.as_bytes(),
+        target.as_bytes(),
+        MAX_BODY,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => return failed(error),
+    };
 
     let mut parser = if build_document {
         // The page's own URL is the base every relative link resolves
@@ -443,12 +448,17 @@ fn cancel_immediately(
     let (Ok(target), Ok(host)) = (url.request_target(), url.host_header()) else {
         return failed(Error::OutOfMemory);
     };
-    let mut transaction =
-        match Transaction::start(stack, address, url.port(), host.as_bytes(), target.as_bytes(), MAX_BODY)
-        {
-            Ok(transaction) => transaction,
-            Err(error) => return failed(error),
-        };
+    let mut transaction = match Transaction::start(
+        stack,
+        address,
+        url.port(),
+        host.as_bytes(),
+        target.as_bytes(),
+        MAX_BODY,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => return failed(error),
+    };
     let mut discard = |_: &[u8]| true;
     let _ = transaction.poll(stack, rpc, http::DEFAULT_POLL_BUDGET, &mut discard);
     transaction.cancel();
@@ -723,7 +733,6 @@ fn split_word(text: &[u8]) -> (&[u8], &[u8]) {
         None => (text, b""),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // `bt` -- the fixture walk.
@@ -1189,7 +1198,11 @@ fn write_totals(console: &mut Console, framebuffer: &mut Framebuffer, totals: &T
 /// One line per endpoint on the UART, in a shape two runs can be diffed.
 fn log_visit(round: u32, path: &str, expectation: &str, result: &Visit) {
     let mut line = LogLine::new();
-    line.text(if result.matched { "BT  ok  " } else { "BT FAIL " });
+    line.text(if result.matched {
+        "BT  ok  "
+    } else {
+        "BT FAIL "
+    });
     line.text("round=");
     line.decimal(round);
     line.text(" path=");
