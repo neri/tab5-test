@@ -1139,7 +1139,7 @@ mod tests {
     fn an_https_link_is_kept_so_it_can_be_explained() {
         let document = parse(b"<p><a href=\"https://example.com/s\">secure</a></p>");
         assert_eq!(link_targets(&document), ["https://example.com/s"]);
-        assert!(!document.links()[0].url.scheme().is_fetchable());
+        assert!(!document.links()[0].url.scheme().is_cleartext());
     }
 
     #[test]

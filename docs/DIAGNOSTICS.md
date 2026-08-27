@@ -134,9 +134,22 @@ Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起
   スロットルを要求している間に送ろうとしたフレーム、`NET: DHCP lease lost`は
   保持していたリースが失効したことを示します
 
+- `TLS: ...` — TLS 1.3 transport。正常な接続では**何も出ません**。出るのは
+  次の3つで、いずれも接続が成立しなかったことを意味します
+
+| 行 | 意味 |
+| --- | --- |
+| `TLS: <理由>; not connecting` | 真性乱数の種を用意できず、**1 packetも送っていない**。`entropy`コマンドで切り分ける |
+| `TLS: unsupported CertificateVerify signature scheme` | serverがこのfirmwareの実装していない署名方式を選んだ。Ed25519とECDSA P-384はClientHelloに載るが検証できない（[`NETWORK.md`](NETWORK.md)） |
+| `TLS: a transaction was dropped without close()` | socketが`SocketSet`に取り残された。実装のバグで、そのsocketはリセットまで戻らない |
+
+  失敗の分類は画面とコマンド出力側に出ます（`tls-cert`、`tls-pin`、`tls-alert`など）。
+  ASN.1の解析位置のような詳細は意図的に出しません。証明書の中身を無制限に
+  画面へ出すのは、そこに攻撃者の書いた文字列が入り得るからです
+
 対応範囲は[`WIFI.md`](WIFI.md)と[`NETWORK.md`](NETWORK.md)、実機で踏んだ罠は
-[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)と[`TCPIP_PLAN.md`](TCPIP_PLAN.md)を
-参照してください。
+[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)と[`TCPIP_PLAN.md`](TCPIP_PLAN.md)、
+TLSは[`TLS_PLAN.md`](TLS_PLAN.md)を参照してください。
 
 IP層が答えない場合の切り分けはUARTログよりコマンドの出力を見ます。
 `netdump`が何も出さなければフレームがそもそも届いておらず（APへアソシエート

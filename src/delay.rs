@@ -7,6 +7,15 @@
 const CPU_CYCLES_PER_US: u32 = 360;
 const CPU_CYCLES_PER_MS: u32 = CPU_CYCLES_PER_US * 1000;
 
+/// How long a cycle-counter interval was, in microseconds.
+///
+/// For callers measuring their own work rather than waiting: the counter and
+/// the divisor belong together, and a caller dividing by 360 itself is a
+/// caller that will not be found when the clock changes.
+pub fn cycles_to_us(cycles: u32) -> u32 {
+    cycles / CPU_CYCLES_PER_US
+}
+
 pub fn delay_ms(milliseconds: u32) {
     let start = cycle_count();
     let cycles = milliseconds.saturating_mul(CPU_CYCLES_PER_MS);

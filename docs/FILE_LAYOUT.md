@@ -104,7 +104,15 @@
 - `src/power.rs`: E2 P4（`PWROFF_PULSE`）を用いたTab5全体の電源断要求
 - `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
 - `src/ina226.rs`: INA226の識別、連続測定設定、5 mΩシャント向け較正、電圧・電流の読出しと換算
-- `src/rtc.rs`: RX8130CE（`0x32`）のカレンダー読み書き、BCDと週ビットフィールドの検証、フラグ・制御レジスタの読出し（`rtc`コマンド）
+- `src/rtc.rs`: RX8130CE（`0x32`）のカレンダー読み書き、BCDと週ビットフィールドの検証、フラグ・制御レジスタの読出し（`rtc`コマンド）。レジスタが保持する値は**UTC**で、このファイルは入出力のどちらでも変換しない
+- `src/wall_clock.rs`: RTCのカウンタが何を意味するかの決めごと。表示とFATタイムスタンプ向けの`local_now`（既定JST）と、証明書の有効期間検証だけが使う`unix_time_utc`（`VLF`／`STOP`／不正BCDを拒否し、代替値を作らない）を、名前で分けて提供する
+- `time/src/lib.rs`: 暦・Unix秒・固定オフセットタイムゾーンの変換（パッケージ名`tab5-time`）。`browser/`・`font/`と同じくworkspace memberなので、境界の年・閏日・月末・日付をまたぐローカル変換を`cargo test`で検査できる。ハードウェアには一切触れない
+- `src/regi2c.rs`: アナログブロックの設定バス（`I2C_ANA_MST`）。MMIOに出ていないMSPI PLLやSAR ADCのレジスタを1バイトずつ読み書きする。ブロックアドレスと`ANA_CONF2`のルーティングビットは無関係な番号なので[`Block`]が両方を持ち、毎回ルーティングを設定してから転送する。`psram.rs`がPSRAM使用前に呼ぶため`.iram.text.critical.psram`に置く
+- `src/net/pins.rs`: SPKI pin表とhostnameからの検索。実体は`tools/pins/generate.py`の生成物（`src/net/pins/generated.rs`）で、実行時の追加もTOFUも無い。通常releaseの表は空で、試験用pinは`tls-fixture-pins` featureにだけ入る
+- `src/net/transport.rs`: HTTP交換が乗るバイトストリームの選択（`Plain`／`Tls`）。`net::http`がソケットに触らないための境界で、「使える状態か・書け・読め・終わったか」の4つだけを共通化する。認証状態は平坦化せず、平文は`None`、TLSは`Some`を返す
+- `src/net/tls.rs`: TLS 1.3クライアント。TCP socketを所有し、平文を出すtransport。embedded-tlsのasync APIを`Waker::noop()`で1 frameに1回pollし、socketとfutureのあいだをbyte queue（`Rc<RefCell<Shared>>`）で分けるので自己参照structにならない。`CertificateVerify`をleafの公開鍵で検証する自作verifierを持ち、ライブラリの`NoVerify`は使わない。SPKI pinが一致しない場合は`Unverified`へfallbackしない
+- `spki/src/lib.rs`: leaf証明書のDERから`SubjectPublicKeyInfo`と公開鍵バイト列を取り出す（パッケージ名`tab5-spki`）。TLS経路で唯一、攻撃者が選んだ入力を解析する場所なのでworkspace memberにしてhost testを置く。証明書の検証はしない（有効期限・SAN・chainのいずれも読まない）
+- `src/entropy.rs`: SAR ADCノイズ源によるハードウェア乱数と、そこから種を取るChaCha20 CSPRNG（`entropy`コマンド）。Wi-FiがC6側にあるためP4のRNGには撹拌源が無く、ESP-IDFの`bootloader_random_enable`相当でADCを立ち上げる必要がある。有効化はRAIIの`Source`が持ち、途中失敗でも`Drop`が必ず停止させる。真性乱数が用意できないときはサイクルカウンタやMACへfallbackせず失敗する
 - `src/lcd.rs`: I/O expander（`i2c.rs`のI2Cバスを使用）、D-PHY、パネル、DSI Bridge、DW-GDMA
 - `src/lcd/st7121.rs`: パネル初期化コマンド
 - `src/interrupts.rs`: 共通CLICトラップ入口、表示用DW-GDMA ISR、USB-A High-Speed DWC

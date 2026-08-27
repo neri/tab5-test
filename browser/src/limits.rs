@@ -20,10 +20,19 @@
 /// The response head, from the status line to the blank line that ends it.
 ///
 /// Shared with `net::http`, which had this bound before the browser
-/// existed. A server that has not finished its headers by 4 KiB is not one
+/// existed. A server that has not finished its headers by here is not one
 /// this can work with, and continuing to buffer means the body's start
 /// becomes a guess.
-pub const MAX_HEADER_BYTES: usize = 4096;
+///
+/// It was 4 KiB, which turned out to be a real limit rather than a
+/// theoretical one: measured on 2026-08-28, `en.wikipedia.org` answers with
+/// 6.4 KiB of headers and `github.com` with 5.2 KiB, and both were refused
+/// with `header-limit` before a byte of page arrived. Modern sites spend
+/// that much on security policy and cookies alone. 16 KiB clears everything
+/// measured with room over, and costs nothing that matters: the head buffer
+/// is a heap allocation that only exists while a head is arriving, on a
+/// heap of some twenty megabytes.
+pub const MAX_HEADER_BYTES: usize = 16384;
 
 /// One URL, as text.
 ///

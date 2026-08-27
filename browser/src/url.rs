@@ -29,13 +29,11 @@ use crate::memory::{self, OutOfMemory};
 
 /// The two schemes this recognises.
 ///
-/// `Https` is in here despite nothing being able to fetch it. Dropping it
-/// would make an `https://` link indistinguishable from `gopher://` --
-/// both "unsupported scheme" -- and the useful thing to tell someone who
-/// followed a link to a secure page is that it is secure and this cannot
-/// read it, not that the URL was gibberish. It also keeps the no-downgrade
-/// rule enforceable: a value that says `Https` cannot be handed to the TCP
-/// path by accident, whereas a rewritten `http://` one could be.
+/// Both are fetchable. What the distinction is for now is the no-downgrade
+/// rule and what the toolbar says: a value that says `Https` cannot be
+/// handed to the plaintext path by accident, whereas a rewritten `http://`
+/// one could be, and a redirect that changes this field from `Https` to
+/// `Http` is a redirect the viewer refuses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scheme {
     Http,
@@ -57,8 +55,14 @@ impl Scheme {
         }
     }
 
-    /// Whether this browser can actually fetch it.
-    pub fn is_fetchable(self) -> bool {
+    /// Whether the transport for this scheme authenticates nothing at all.
+    ///
+    /// True for `http`, and *also* true for `https` in this firmware:
+    /// unauthenticated TLS stops passive eavesdropping and stops nothing
+    /// else (`docs/TLS_PLAN.md`). Which of the two a page actually got is
+    /// not a property of the scheme, so nothing here can answer it -- the
+    /// connection's own authentication state has to.
+    pub fn is_cleartext(self) -> bool {
         matches!(self, Scheme::Http)
     }
 }
@@ -1001,8 +1005,8 @@ mod tests {
     fn https_parses_but_cannot_be_fetched() {
         let url = parsed("https://example.com/secure");
         assert_eq!(url.scheme(), Scheme::Https);
-        assert!(!url.scheme().is_fetchable());
-        assert!(parsed("http://example.com/").scheme().is_fetchable());
+        assert!(!url.scheme().is_cleartext());
+        assert!(parsed("http://example.com/").scheme().is_cleartext());
     }
 
     #[test]

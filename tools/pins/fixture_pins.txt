@@ -1,0 +1,26 @@
+# SPKI pins for the test fixtures, compiled in ONLY under the
+# `tls-fixture-pins` cargo feature.
+#
+# These belong to the throwaway keys in `tools/tls/`, whose private halves
+# are in the repository. That is safe precisely because these pins are never
+# in a normal image -- `generate.py --check-release` proves it by looking for
+# their bytes in the linked ELF -- and it would stop being safe the moment
+# one of them shipped.
+#
+# `tls-fixture.invalid` carries two pins, which is the key-rotation case: the
+# key the fixture server is using now, and the one it will move to. Both have
+# to be accepted. `fixture-other.crt` is deliberately absent, so a server
+# presenting it fails with `tls-pin` rather than falling back to unverified.
+tls-fixture.invalid  bfc168711cf44e44a5f1bb004e36fe33541d6a4d008585f883f3d46a91119eb4
+tls-fixture.invalid  aeb0f8fc52ad4ca97e4761a0cb777fdbe5650f18f8dd15ed4c56fcd1ec620ed3
+
+# The same two pins under the fixture server's LAN address, because the board
+# has no way to resolve `tls-fixture.invalid` -- pins are looked up by the
+# string in the URL, and for `https://192.168.0.159:8443/` that string is the
+# address. Pinning does not read the certificate's SAN or CN at all, so the
+# name in the certificate is beside the point.
+#
+# CHANGE THIS LINE to the address of the machine running
+# `tools/browser_fixture_server.py`, then re-run `tools/pins/generate.py`.
+192.168.0.159  bfc168711cf44e44a5f1bb004e36fe33541d6a4d008585f883f3d46a91119eb4
+192.168.0.159  aeb0f8fc52ad4ca97e4761a0cb777fdbe5650f18f8dd15ed4c56fcd1ec620ed3

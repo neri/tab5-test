@@ -16,7 +16,7 @@
 
 use core::mem::transmute;
 
-use crate::uart;
+use crate::{regi2c, uart};
 
 pub const WIDTH: usize = 720;
 pub const HEIGHT: usize = 1280;
@@ -50,8 +50,6 @@ const MSPI_IOMUX: usize = 0x500E_1200;
 const PMU: usize = 0x5011_5000;
 const LP_CLKRST: usize = 0x5011_1000;
 const LP_STORE15: usize = 0x5011_0068;
-const LPPERI: usize = 0x5012_0000;
-const I2C_ANA_MST: usize = 0x5012_4000;
 const FALLBACK_TEST_MAGIC: u32 = 0x5053_4642;
 
 const ROM_SPI_CMD_CONFIG: usize = 0x4FC0_0108;
@@ -671,7 +669,6 @@ fn enable_power_and_clock(timing: &PsramTiming) -> Result<(), InitStage> {
 #[inline(never)]
 #[unsafe(link_section = ".iram.text.critical.psram")]
 fn configure_mpll_400mhz() -> bool {
-    const MPLL_BLOCK: u8 = 0x63;
     const MPLL_CAL_RSTB_REG: u8 = 1;
     const MPLL_DIV_REG: u8 = 2;
     const MPLL_DHREF_REG: u8 = 3;
@@ -680,31 +677,27 @@ fn configure_mpll_400mhz() -> bool {
     const MPLL_CAL_END: u32 = 1 << 8;
     const MPLL_CAL_STOP: u32 = 1 << 9;
 
+    regi2c::enable_clock();
     unsafe {
-        // The bootloader normally leaves this clock enabled. Force it on so
-        // CPU-only reboot and future bootloader changes cannot break regi2c.
-        modify(LPPERI, 1 << 27, 1 << 27);
-        modify(I2C_ANA_MST + 0x34, 1, 1);
-
         // Clearing CAL_STOP starts MPLL self-calibration.
         modify(HP_SYS_CLKRST + 0xBC, MPLL_CAL_STOP, 0);
     }
 
-    let Some(dhref) = regi2c_read(MPLL_BLOCK, MPLL_DHREF_REG) else {
+    let Some(dhref) = regi2c::read_register(regi2c::MSPI_XTAL, MPLL_DHREF_REG) else {
         uart::log(&MPLL_READBACK_FAILED);
         return false;
     };
-    if !regi2c_write(MPLL_BLOCK, MPLL_DHREF_REG, dhref | (3 << 4)) {
+    if !regi2c::write_register(regi2c::MSPI_XTAL, MPLL_DHREF_REG, dhref | (3 << 4)) {
         uart::log(&MPLL_READBACK_FAILED);
         return false;
     }
-    let Some(cal_rstb) = regi2c_read(MPLL_BLOCK, MPLL_CAL_RSTB_REG) else {
+    let Some(cal_rstb) = regi2c::read_register(regi2c::MSPI_XTAL, MPLL_CAL_RSTB_REG) else {
         uart::log(&MPLL_READBACK_FAILED);
         return false;
     };
-    if !regi2c_write(MPLL_BLOCK, MPLL_CAL_RSTB_REG, cal_rstb & !MPLL_CAL_RSTB)
-        || !regi2c_write(MPLL_BLOCK, MPLL_CAL_RSTB_REG, cal_rstb | MPLL_CAL_RSTB)
-        || !regi2c_write(MPLL_BLOCK, MPLL_DIV_REG, MPLL_DIV_400MHZ)
+    if !regi2c::write_register(regi2c::MSPI_XTAL, MPLL_CAL_RSTB_REG, cal_rstb & !MPLL_CAL_RSTB)
+        || !regi2c::write_register(regi2c::MSPI_XTAL, MPLL_CAL_RSTB_REG, cal_rstb | MPLL_CAL_RSTB)
+        || !regi2c::write_register(regi2c::MSPI_XTAL, MPLL_DIV_REG, MPLL_DIV_400MHZ)
     {
         uart::log(&MPLL_READBACK_FAILED);
         return false;
@@ -722,67 +715,11 @@ fn configure_mpll_400mhz() -> bool {
     }
     unsafe { modify(HP_SYS_CLKRST + 0xBC, MPLL_CAL_STOP, MPLL_CAL_STOP) };
 
-    if regi2c_read(MPLL_BLOCK, MPLL_DIV_REG) != Some(MPLL_DIV_400MHZ) {
+    if regi2c::read_register(regi2c::MSPI_XTAL, MPLL_DIV_REG) != Some(MPLL_DIV_400MHZ) {
         uart::log(&MPLL_READBACK_FAILED);
         return false;
     }
     true
-}
-
-#[inline(never)]
-#[unsafe(link_section = ".iram.text.critical.psram")]
-fn regi2c_select_mpll() {
-    unsafe {
-        // ESP32-P4's analog master routes MPLL block 0x63 through bit 9.
-        modify(I2C_ANA_MST + 0x1C, 0x00FF_FFFF, 0);
-        modify(I2C_ANA_MST + 0x20, 0x00FF_FFFF, 1 << 9);
-    }
-}
-
-#[inline(never)]
-#[unsafe(link_section = ".iram.text.critical.psram")]
-fn regi2c_wait_idle() -> bool {
-    let mut timeout = 1_000_000u32;
-    while unsafe { read(I2C_ANA_MST) } & (1 << 25) != 0 {
-        if timeout == 0 {
-            return false;
-        }
-        timeout -= 1;
-        core::hint::spin_loop();
-    }
-    true
-}
-
-#[inline(never)]
-#[unsafe(link_section = ".iram.text.critical.psram")]
-fn regi2c_read(block: u8, register: u8) -> Option<u8> {
-    regi2c_select_mpll();
-    if !regi2c_wait_idle() {
-        return None;
-    }
-    unsafe {
-        write(I2C_ANA_MST, (block as u32) | ((register as u32) << 8));
-    }
-    if !regi2c_wait_idle() {
-        return None;
-    }
-    Some((unsafe { read(I2C_ANA_MST) } >> 16) as u8)
-}
-
-#[inline(never)]
-#[unsafe(link_section = ".iram.text.critical.psram")]
-fn regi2c_write(block: u8, register: u8, value: u8) -> bool {
-    regi2c_select_mpll();
-    if !regi2c_wait_idle() {
-        return false;
-    }
-    unsafe {
-        write(
-            I2C_ANA_MST,
-            (block as u32) | ((register as u32) << 8) | ((value as u32) << 16) | (1 << 24),
-        );
-    }
-    regi2c_wait_idle()
 }
 
 /// Resets the shared AXI and APB portions of the dual-MSPI controller.

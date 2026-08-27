@@ -1,0 +1,15 @@
+# SPKI pins compiled into normal release images.
+#
+# One line per pin: a hostname, whitespace, and the SHA-256 of the leaf
+# certificate's DER SubjectPublicKeyInfo as 64 hexadecimal digits. Blank
+# lines and lines starting with `#` are ignored. Up to two pins may be
+# listed for one hostname -- the key in use and the one it is about to be
+# rotated to -- and no more; see `README.md` beside this file.
+#
+# This file is EMPTY on purpose. Pinning a host is a promise that this
+# firmware will refuse to talk to it under any other key, and a promise that
+# only a firmware update can withdraw. Nothing this board does today needs
+# one, so nothing is pinned, and `TLS PINNED` never appears in a normal
+# build. Adding a line here is a deliberate act with a rollout that has to be
+# planned: publish the new pin alongside the old one, wait for boards to take
+# the update, then rotate the key.

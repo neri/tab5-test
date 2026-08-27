@@ -3,13 +3,21 @@
 # with `cargo test`. This package cannot: `main.rs` and everything under it
 # is RISC-V. See `browser/src/lib.rs`.
 [workspace]
-members = ["browser", "font"]
+members = ["browser", "font", "spki", "time"]
 
 [package]
 name = "tab5-hello-world"
 version = "0.2.0"
 edition = "2024"
 publish = false
+
+[features]
+# Compiles the SPKI pins for the test fixtures (`tools/pins/fixture_pins.txt`)
+# into the image, so that `tls-fixture.invalid` can be reached as a pinned
+# host. Never for a release: the matching private keys are in `tools/tls/`,
+# and `tools/pins/generate.py --check-release` fails on an image that has
+# these pins in it.
+tls-fixture-pins = []
 
 [dependencies]
 # FAT12/16/32 (and, later, exFAT) parsing. Like `smoltcp` below, this is a
@@ -70,6 +78,47 @@ tab5-font = { path = "font" }
 # a module because it is the one part of the firmware that can be tested off
 # the board; see the `[workspace]` note above.
 tab5-browser = { path = "browser" }
+# Calendar arithmetic, Unix time and fixed-offset time zones. The RX8130CE
+# holds UTC (`docs/RTC.md`); this is what turns that into the Unix second a
+# certificate check would use and the JST reading a person reads, and it is a
+# workspace member so that both directions have host tests.
+tab5-time = { path = "time" }
+# The CSPRNG `src/entropy.rs` seeds from the SAR ADC noise source. ChaCha20
+# is a fully specified construction with published test vectors, which is
+# where this repository's "implement it yourself" rule stops applying for the
+# same reason it does for smoltcp -- and a stream cipher written here would be
+# a stream cipher with no test vectors behind it. `rand_core` is the trait
+# the TLS library asks its randomness for.
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+# TLS 1.3 client. Like smoltcp, this is a fully specified wire protocol
+# rather than a hardware layer -- and unlike a hardware layer, a TLS stack
+# written here would be one whose mistakes nobody else has already found.
+# `docs/TLS_PLAN.md` records the comparison behind this choice and the gates
+# it had to pass. `default-features = false` drops `std`, `log` and tokio;
+# `rsa` (which needs `alloc`) is what makes RSA-PSS `CertificateVerify`
+# checkable. `rustpki` is deliberately off: `src/net/tls.rs` brings its own
+# verifier, because the library's would need a chain and a clock this does
+# not have.
+embedded-tls = { version = "0.19", default-features = false, features = [
+    "alloc",
+    "rsa",
+] }
+embedded-io-async = { version = "0.7", default-features = false }
+# The signature and digest work `src/net/tls.rs`'s verifier does itself.
+# `embedded-tls` does not re-export these, and a verifier that cannot name
+# its own primitives cannot be written outside the library.
+sha2 = { version = "0.10", default-features = false }
+digest = { version = "0.10", default-features = false }
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",
+    "sha256",
+] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+# The DER walk that finds a leaf certificate's public key. A workspace member
+# because it is the one part of the TLS path that parses input an attacker
+# chooses, and `cargo test` builds it for the host.
+tab5-spki = { path = "spki" }
 
 [profile.release]
 debug = 2

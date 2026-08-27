@@ -1,0 +1,12 @@
+[package]
+name = "tab5-time"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# No dependencies at all. Calendar arithmetic is arithmetic: it reads no
+# register and touches no bus, which is what lets `cargo test` build this
+# crate for the host while the firmware only ever builds for RISC-V -- the
+# same reason `tab5-browser` and `tab5-font` are workspace members rather
+# than modules of the binary.
+[dependencies]

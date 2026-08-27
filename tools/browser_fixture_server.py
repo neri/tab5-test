@@ -32,6 +32,7 @@ import argparse
 import re
 import socket
 import socketserver
+import ssl
 import sys
 import threading
 import time
@@ -43,7 +44,7 @@ from typing import Callable
 # Limits, mirrored from browser/src/limits.rs.
 # --------------------------------------------------------------------------
 
-MAX_HEADER_BYTES = 4096
+MAX_HEADER_BYTES = 16384
 MAX_URL_BYTES = 2048
 MAX_REDIRECTS = 5
 MAX_HISTORY = 8
@@ -789,9 +790,35 @@ def redirect_loop(self: "FixtureHandler", request: Request) -> None:
     self.send_all(redirect("/redirect/loop", 302))
 
 
-@route("/redirect/https", "error:https")
+@route("/redirect/https", "ok")
 def redirect_https(self: "FixtureHandler", request: Request) -> None:
-    self.send_all(redirect("https://example.invalid/secure", 302))
+    """Both halves of the no-downgrade rule, from whichever side is asking.
+
+    Over plaintext this redirects *up* to the TLS listener, which the viewer
+    is supposed to follow: the page it lands on is this same index, served
+    over TLS, so the expectation is `ok`.
+
+    Over TLS it redirects *down* to the plaintext listener, which the viewer
+    is supposed to refuse with `https-downgrade` -- and refusing it is the
+    whole rule. That direction cannot be produced from a plaintext-only
+    server, which is why the TLS listener exists.
+    """
+    self.send_all(redirect(self.other_scheme_origin(request) + "/", 302))
+
+
+@route("/redirect/unpinned", "error:dns")
+def redirect_unpinned(self: "FixtureHandler", request: Request) -> None:
+    """A redirect to an `https` host this firmware has no pin for.
+
+    From a *pinned* connection that is `tls-auth-downgrade`: the identity
+    that was established is being traded for one that cannot be. From an
+    unpinned one there was no identity to lose, so the viewer follows it and
+    fails at the name, which does not resolve.
+
+    Which of the two the manifest asks for therefore depends on the build as
+    well as the connection -- see `tls_manifest_entries`.
+    """
+    self.send_all(redirect("https://tls-unpinned.invalid/", 302))
 
 
 def redirect_chain(self: "FixtureHandler", request: Request) -> None:
@@ -1022,9 +1049,11 @@ def filler(size: int) -> bytes:
     """A deterministic byte pattern of `size` bytes.
 
     Derived from the index rather than random so the CRC-32 below is stable
-    across runs of this server: `httpget` saves the file and the board's
-    `fsverify` checksums it, and a target that moved every restart would
-    make that comparison meaningless.
+    across runs of this server: the board's `hs` command CRC-32s the body it
+    decoded, and a target that moved every restart would make that
+    comparison meaningless. (`httpget` saves the same endpoint, but nothing
+    on the board checksums a saved file -- `fsverify` re-checks mounts
+    against their media, which is a different question.)
     """
     return bytes((index * 31 + (index >> 8) * 17) & 0xFF for index in range(size))
 
@@ -1059,7 +1088,22 @@ for path, content in DOWNLOADS.items():
 
 @route("/manifest.txt", "text")
 def manifest(self: "FixtureHandler", request: Request) -> None:
-    lines = "".join(f"{path}\t{outcome}\n" for path, outcome in sorted(set(MANIFEST)))
+    """The walk's contract, written for the connection that asked for it.
+
+    Two endpoints mean different things depending on whether this request
+    arrived over TLS -- an upgrade is a success and a downgrade is a refusal,
+    and which one `/redirect/https` performs depends on which way round it
+    already is. Serving one static list would make one of the two wrong, so
+    the list is built per connection by the server that will also answer it.
+
+    The absolute-URL entries are the TLS failure fixtures, which live on
+    their own ports. They are absolute so that a plaintext walk reaches them
+    too: whether the board can be talked out of a TLS failure has nothing to
+    do with how it read the manifest.
+    """
+    entries = dict(MANIFEST)
+    entries.update(self.tls_manifest_entries(request))
+    lines = "".join(f"{path}\t{outcome}\n" for path, outcome in sorted(entries.items()))
     body = lines.encode("utf-8")
     self.send_all(
         head(
@@ -1095,6 +1139,92 @@ class FixtureServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+# Which extra listeners exist, and what each is for. The offsets are from
+# `--tls-port` so that one number moves them all.
+TLS_ALERT_OFFSET = 1
+TLS_ED25519_OFFSET = 2
+TLS_RSA_OFFSET = 3
+
+
+class AlertHandler(socketserver.BaseRequestHandler):
+    """Answers a ClientHello with a fatal TLS alert and nothing else.
+
+    Hand-written rather than produced by refusing something in OpenSSL,
+    because what is being tested is that the board reports `tls-alert` --
+    a peer that said no -- rather than folding it into a timeout or a
+    connection error. Seven bytes is the whole of it: a TLS record of type
+    alert (0x15), version TLS 1.2 as the record layer always claims,
+    length 2, then fatal (2) and handshake_failure (40).
+    """
+
+    RECORD = bytes([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 40])
+
+    def handle(self) -> None:
+        try:
+            # Wait until the ClientHello is actually on the wire, so the
+            # alert is an answer rather than a race with the connect.
+            self.request.recv(4096)
+            self.request.sendall(self.RECORD)
+        except OSError:
+            pass
+
+
+class AlertServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class TlsFixtureServer(FixtureServer):
+    """The same fixtures, over TLS 1.3.
+
+    A second listener rather than a mode, so that one run of this serves
+    both and a walk can compare them. What it is for is the pinning
+    fixtures: the board decides whether a connection is authenticated by
+    hashing the certificate's public key, so which key this presents is the
+    whole experiment -- `tools/tls/fixture-current` is the pinned one,
+    `fixture-next` is the rotation pin, and `fixture-other` is a key that is
+    not pinned and must be refused.
+
+    TLS 1.3 only, matching what the board speaks. Nothing here checks a
+    client certificate: the board does not send one.
+    """
+
+    def __init__(self, address, handler, certificate: Path, key: Path) -> None:
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.minimum_version = ssl.TLSVersion.TLSv1_3
+        self.context.load_cert_chain(certfile=str(certificate), keyfile=str(key))
+        super().__init__(address, handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        # Wrapping here rather than in the handler keeps the handler
+        # identical for both listeners -- the fixtures are the same
+        # fixtures, and a second copy of them written against a TLS socket
+        # would be a second set of answers to compare against.
+        return self.context.wrap_socket(connection, server_side=True), address
+
+    def handle_error(self, request, client_address) -> None:
+        # A client that hangs up mid-handshake is an ordinary outcome here:
+        # the pin-mismatch fixture is *supposed* to be refused by the board.
+        # A traceback for it would drown the log the walk is read from.
+        print(f"  (tls handshake failed from {client_address[0]})", flush=True)
+
+
+# Ports the running server is listening on, for the manifest to name. Filled
+# in by `main`; the handler cannot work them out from a connection because
+# the extra listeners are not the one it arrived on.
+PORTS: dict[str, int] = {}
+
+# Whether the board being walked has a pin for the address it is reaching
+# this server on -- that is, whether it was built with `tls-fixture-pins`
+# *and* `tools/pins/fixture_pins.txt` names this machine's address.
+#
+# It changes three expectations, and no server can work it out from a
+# connection: pinning is entirely the client's decision and leaves no trace
+# on the wire when it succeeds. So it is a flag rather than a guess.
+BOARD_HAS_FIXTURE_PINS = True
+
+
 class FixtureHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         try:
@@ -1128,6 +1258,86 @@ class FixtureHandler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
 
+    def is_tls(self) -> bool:
+        return isinstance(self.request, ssl.SSLSocket)
+
+    def origin(self, request: Request, port: int, secure: bool) -> str:
+        """`scheme://host:port` for one of this server's own listeners.
+
+        The host comes from the request's `Host` header, so it is the
+        address the board actually reached this machine on rather than
+        whatever this machine thinks it is called.
+        """
+        # Everything before the first colon. The browser has no IPv6
+        # literals, so a host is a name or a dotted quad and a colon can
+        # only be the port -- and taking the *first* one keeps this right
+        # even for a client that sent a doubled port.
+        host = request.headers.get("host", "").partition(":")[0]
+        scheme = "https" if secure else "http"
+        return f"{scheme}://{host}:{port}"
+
+    def other_scheme_origin(self, request: Request) -> str:
+        """The other listener: the TLS one from plaintext, and back."""
+        if self.is_tls():
+            return self.origin(request, PORTS["http"], secure=False)
+        return self.origin(request, PORTS["tls"], secure=True)
+
+    def tls_manifest_entries(self, request: Request) -> dict[str, str]:
+        """The manifest lines that depend on the connection or the build.
+
+        `/redirect/https` swaps direction with the scheme. `/redirect/unpinned`
+        is a downgrade only from a connection that had an identity to lose,
+        which is a property of the *board's* build as well as of the
+        connection -- see `BOARD_HAS_FIXTURE_PINS`.
+        """
+        entries: dict[str, str] = {}
+        if self.is_tls():
+            entries["/redirect/https"] = "error:https-downgrade"
+            entries["/redirect/unpinned"] = (
+                "error:tls-auth-downgrade" if BOARD_HAS_FIXTURE_PINS else "error:dns"
+            )
+        else:
+            entries["/redirect/https"] = "ok"
+            entries["/redirect/unpinned"] = "error:dns"
+        if "tls" not in PORTS:
+            return entries
+        alert = self.origin(request, PORTS["tls"] + TLS_ALERT_OFFSET, secure=True)
+        ed25519 = self.origin(request, PORTS["tls"] + TLS_ED25519_OFFSET, secure=True)
+        rsa = self.origin(request, PORTS["tls"] + TLS_RSA_OFFSET, secure=True)
+        # No certificate is ever offered here, so nothing about pinning
+        # applies: this one reads the same from either build.
+        entries[f"{alert}/"] = "error:tls-alert"
+
+        if BOARD_HAS_FIXTURE_PINS:
+            # A pin belongs to a *host*, not to a host and port. These
+            # listeners are on the same address as the pinned one, so a
+            # board carrying its pins checks them here too -- and neither of
+            # these keys is pinned, so both are refused before their
+            # signature algorithm is ever reached.
+            #
+            # That is worth asserting rather than working around: it is the
+            # property that makes a pin worth having. A key that got in by
+            # arriving on another port would be a pin that protects one port.
+            entries[f"{ed25519}/"] = "error:tls-pin"
+            entries[f"{rsa}/"] = "error:tls-pin"
+            return entries
+
+        # Without pins the connection gets as far as the signature, which is
+        # where these two earn their keep.
+        #
+        # Ed25519 is in the ClientHello because the library puts it there and
+        # will not be talked out of it, and the firmware's verifier does not
+        # implement it. What has to happen is an explicit refusal rather than
+        # an acceptance -- an unimplemented algorithm that passed would be
+        # the worst outcome available.
+        entries[f"{ed25519}/"] = "error:tls-cert"
+        # RSA-PSS against a server whose key is known, next to the ECDSA
+        # P-256 one the main listener uses: both signature schemes the
+        # firmware does implement, exercised from the walk rather than only
+        # against whatever the public internet happens to serve today.
+        entries[f"{rsa}/"] = "ok"
+        return entries
+
     def read_request(self) -> Request | None:
         buffer = b""
         while b"\r\n\r\n" not in buffer:
@@ -1135,6 +1345,13 @@ class FixtureHandler(socketserver.BaseRequestHandler):
             if not data:
                 return None
             buffer += data
+            # A TLS ClientHello starts with 0x16, and no HTTP method starts
+            # with anything but an uppercase letter. Hanging up on it is
+            # what a plaintext server does, and it is what makes
+            # `/redirect/https` fail quickly and identically every time
+            # instead of waiting for the board's handshake timeout.
+            if buffer[:1] and not (b"A" <= buffer[:1] <= b"Z"):
+                raise ValueError("not an HTTP request")
             if len(buffer) > 64 * 1024:
                 raise ValueError("request head too long")
         head_text = buffer.split(b"\r\n\r\n", 1)[0].decode("latin-1")
@@ -1172,6 +1389,28 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
+        "--tls-port",
+        type=int,
+        default=8443,
+        help="port for the TLS listener, or 0 to serve plaintext only",
+    )
+    parser.add_argument(
+        "--unpinned-board",
+        action="store_true",
+        help="the board being walked has no pin for this machine's address. "
+        "changes what /manifest.txt expects of /redirect/unpinned and of the "
+        "Ed25519 and RSA listeners, which a pinned board refuses on the pin "
+        "before it reaches their signatures",
+    )
+    parser.add_argument(
+        "--tls-key-name",
+        default="current",
+        choices=["current", "next", "other"],
+        help="which key in tools/tls/ the TLS listener presents. `current` "
+        "and `next` are both pinned by tools/pins/fixture_pins.txt; `other` "
+        "is not, and a board built with those pins must refuse it",
+    )
+    parser.add_argument(
         "--check-limits",
         action="store_true",
         help="compare this file's limits against browser/src/limits.rs and exit",
@@ -1196,6 +1435,11 @@ def main() -> int:
     if arguments.list:
         for path, outcome in sorted(set(MANIFEST)):
             print(f"{path}\t{outcome}")
+        print(
+            "\n(as served over plaintext. /redirect/https and /redirect/unpinned\n"
+            " change over TLS, and the TLS failure fixtures are added as absolute\n"
+            " URLs once the listeners have ports -- see tls_manifest_entries)"
+        )
         return 0
 
     if check_limits():
@@ -1204,12 +1448,66 @@ def main() -> int:
     server = FixtureServer((arguments.host, arguments.port), FixtureHandler)
     print(f"serving fixtures on http://{arguments.host}:{arguments.port}/", flush=True)
     print(f"{len(set(MANIFEST))} endpoints; /manifest.txt lists them", flush=True)
+
+    global BOARD_HAS_FIXTURE_PINS
+    BOARD_HAS_FIXTURE_PINS = not arguments.unpinned_board
+    PORTS["http"] = arguments.port
+    extra: list[socketserver.BaseServer] = []
+    if arguments.tls_port:
+        PORTS["tls"] = arguments.tls_port
+        keys = Path(__file__).resolve().parent / "tls"
+
+        def start(server: socketserver.BaseServer, description: str) -> None:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            extra.append(server)
+            print(f"  {description}", flush=True)
+
+        def tls_listener(port: int, name: str, description: str) -> bool:
+            certificate = keys / f"fixture-{name}.crt"
+            key = keys / f"fixture-{name}.key"
+            if not certificate.exists():
+                print(f"no such fixture key: {certificate}", file=sys.stderr)
+                return False
+            start(
+                TlsFixtureServer((arguments.host, port), FixtureHandler, certificate, key),
+                f"https://{arguments.host}:{port}/  {description}",
+            )
+            return True
+
+        print("TLS listeners:", flush=True)
+        if not tls_listener(
+            arguments.tls_port,
+            arguments.tls_key_name,
+            f"the fixtures, ECDSA P-256, `{arguments.tls_key_name}` key",
+        ):
+            return 1
+        start(
+            AlertServer(
+                (arguments.host, arguments.tls_port + TLS_ALERT_OFFSET), AlertHandler
+            ),
+            f"https://{arguments.host}:{arguments.tls_port + TLS_ALERT_OFFSET}/"
+            "  a fatal handshake_failure alert",
+        )
+        if not tls_listener(
+            arguments.tls_port + TLS_ED25519_OFFSET,
+            "ed25519",
+            "an Ed25519 certificate, which the firmware does not verify",
+        ):
+            return 1
+        if not tls_listener(
+            arguments.tls_port + TLS_RSA_OFFSET, "rsa", "an RSA-PSS certificate"
+        ):
+            return 1
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping", flush=True)
     finally:
         server.server_close()
+        for other in extra:
+            other.shutdown()
+            other.server_close()
     return 0
 
 

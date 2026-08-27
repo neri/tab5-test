@@ -17,6 +17,7 @@ mod cardkb;
 mod console;
 mod delay;
 mod dma2d;
+mod entropy;
 mod font;
 mod framebuffer;
 mod fs;
@@ -33,6 +34,7 @@ mod pmp;
 mod power;
 mod ppa;
 mod psram;
+mod regi2c;
 mod rtc;
 mod sdio;
 mod sdmmc;
@@ -42,6 +44,7 @@ mod tick;
 mod touch;
 mod uart;
 mod usb;
+mod wall_clock;
 mod wifi;
 
 // ESP-IDF 2nd-stage bootloaders and espflash require this descriptor. The

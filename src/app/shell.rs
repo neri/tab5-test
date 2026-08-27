@@ -24,8 +24,8 @@ use crate::fs::path::{self, Path};
 use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, Vfs};
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
 use crate::{
-    browser, delay, dma2d, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio, sdmmc,
-    startup, tick, uart, usb, wifi,
+    browser, delay, dma2d, entropy, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio,
+    sdmmc, startup, tick, uart, usb, wall_clock, wifi,
 };
 
 /// Roughly the panel's vsync rate; used only for the coarse `uptime` command.
@@ -298,8 +298,36 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "tls",
+        usage: "tls <host|a.b.c.d>[:port] [path]",
+        lines: &[
+            "open a TLS 1.3 connection, fetch one page over it and report",
+            "what the handshake proved. the default port is 443 and the",
+            "default path is /. the connection is UNAUTHENTICATED: the",
+            "server's CertificateVerify and Finished are checked against the",
+            "key it sent, but nothing checks that the key is this host's --",
+            "no chain, no root, no name, no expiry. it stops passive",
+            "eavesdropping and not an active attacker. reports the handshake",
+            "time and the longest single poll, which is what the browser's",
+            "frame loop would feel.",
+        ],
+    },
+    HelpEntry {
+        name: "entropy",
+        usage: "entropy | entropy test [count] | entropy fail on|off",
+        lines: &[
+            "the SAR ADC noise source behind the hardware RNG, which TLS",
+            "seeds its CSPRNG from. with no argument, take one seed and",
+            "print it. 'test' repeats the seeding, checks that every",
+            "enable was paired with a disable and that no two seeds came",
+            "out the same. 'fail' forces seeding to fail without touching",
+            "the hardware, so a caller can be checked for starting nothing",
+            "when there is no randomness to start it with.",
+        ],
+    },
+    HelpEntry {
         name: "rtc",
-        usage: "rtc | rtc set <YYYY-MM-DD> <HH:MM:SS> | rtc regs | rtc test",
+        usage: "rtc | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC) | rtc regs | rtc test",
         lines: &[
             "RX8130CE real-time clock (board I2C 0x32). with no argument,",
             "show the calendar and the flag/control registers. 'set' writes",
@@ -791,15 +819,19 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "httpget",
-        usage: "httpget <host|a.b.c.d>[:port] [path]",
+        usage: "httpget <host|a.b.c.d>[:port] [path] | httpget <url>",
         lines: &[
             "issue a minimal HTTP/1.0 GET, print the status and headers, and",
             "save the body into the current directory under the last part of",
             "the path. a path naming no file -- / or one ending in / -- is",
             "not saved, just reported. a status outside 2xx keeps its error",
             "page out of the tree. still a TCP smoke test rather than an HTTP",
-            "client: no redirects, no chunked decoding and no TLS. a name",
-            "given here is also what goes in the Host: header",
+            "client: no redirects and no chunked decoding. a name given here",
+            "is also what goes in the Host: header.",
+            "  a bare host is plaintext, as it has always been. TLS needs an",
+            "  explicit 'https://' url -- the command never decides on its",
+            "  own to encrypt or not to. an https fetch is UNAUTHENTICATED:",
+            "  it stops passive eavesdropping and nothing else (see 'tls')",
         ],
     },
     HelpEntry {
@@ -850,8 +882,8 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "  r <n>  fetch n times",
             "  c <n>  start and abandon n times",
             "each reports whether the socket set and the heap came back to",
-            "where they started. http only -- an https url is reported, not",
-            "fetched",
+            "where they started. an https url is fetched over unauthenticated",
+            "TLS -- encrypted, with nobody identified (see 'tls')",
         ],
     },
     HelpEntry {
@@ -1033,6 +1065,7 @@ pub fn execute(
         b"backlight" => cmd_backlight(console, framebuffer, argument),
         b"icm" => cmd_icm(console, framebuffer, argument),
         b"ppafill" => cmd_ppafill(console, framebuffer, argument),
+        b"entropy" => cmd_entropy(console, framebuffer, argument),
         b"rtc" => cmd_rtc(console, framebuffer, argument),
         b"sdinfo" => cmd_sdinfo(console, framebuffer),
         b"sdread" => cmd_sdread(console, framebuffer, argument),
@@ -1380,6 +1413,13 @@ pub fn execute(
                     wifi_session,
                     net_stack,
                 );
+                drop_dead_session(console, framebuffer, wifi_manager);
+            }
+        }
+        b"tls" => {
+            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+                let (wifi_session, net_stack) = wifi_manager.options_mut();
+                cmd_tls(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
@@ -3335,6 +3375,164 @@ fn cmd_uptime(console: &mut Console, framebuffer: &mut Framebuffer) {
 ///
 /// The clock is the one board device whose whole purpose is to keep counting
 /// while the firmware is not running, so "does it answer on I2C" says very
+/// The default number of seedings `entropy test` takes.
+///
+/// The plan's figure. Enough that a stuck source or an unpaired guard shows
+/// up, few enough that the whole run is under a second.
+const ENTROPY_TEST_ROUNDS: u32 = 100;
+
+fn cmd_entropy(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
+    let (subcommand, rest) = split_first_word(argument);
+    match subcommand {
+        b"" => cmd_entropy_show(console, framebuffer),
+        b"test" => {
+            let rounds = match trim(rest) {
+                b"" => ENTROPY_TEST_ROUNDS,
+                text => match parse_u32(text) {
+                    Some(rounds) if rounds > 0 => rounds,
+                    _ => {
+                        console.write_output_line(framebuffer, "usage: entropy test [count]");
+                        return;
+                    }
+                },
+            };
+            cmd_entropy_test(console, framebuffer, rounds);
+        }
+        b"fail" => match trim(rest) {
+            b"on" => {
+                entropy::force_failure(true);
+                console.write_output_line(framebuffer, "entropy: seeding will now fail");
+            }
+            b"off" => {
+                entropy::force_failure(false);
+                console.write_output_line(framebuffer, "entropy: seeding re-enabled");
+            }
+            _ => console.write_output_line(framebuffer, "usage: entropy fail on|off"),
+        },
+        _ => console.write_output_line(framebuffer, "usage: entropy [test [count] | fail on|off]"),
+    }
+}
+
+fn cmd_entropy_show(console: &mut Console, framebuffer: &mut Framebuffer) {
+    if entropy::failure_is_forced() {
+        console.write_output_line(framebuffer, "entropy: failure is forced ('entropy fail off')");
+    }
+    let mut bytes = [0u8; entropy::SEED_BYTES];
+    let taken = {
+        match entropy::Source::enable() {
+            Ok(_source) => entropy::read_hardware_bytes(&mut bytes),
+            Err(error) => Err(error),
+        }
+    };
+    match taken {
+        Ok(()) => {
+            for chunk in bytes.chunks(16) {
+                let mut line = Line::new();
+                for &byte in chunk {
+                    line.push_hex(byte as u32, 2);
+                    line.push_str(" ");
+                }
+                console.write_output_line(framebuffer, line.as_str());
+            }
+        }
+        Err(error) => {
+            let mut line = Line::new();
+            line.push_str(error.name());
+            line.push_str(": ");
+            line.push_str(error.message());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+    push_entropy_counts(console, framebuffer);
+}
+
+/// Repeats the whole path a TLS connection takes -- bring the source up,
+/// seed a CSPRNG, draw from it -- and reports the two things a single
+/// reading cannot show: that the guard always powered the ADC back down,
+/// and that no two connections would start from the same bytes.
+///
+/// Comparing whole draws rather than testing their statistics on purpose --
+/// a statistical test cannot prove randomness, but a repeat proves its
+/// absence.
+fn cmd_entropy_test(console: &mut Console, framebuffer: &mut Framebuffer, rounds: u32) {
+    use rand_core::RngCore;
+
+    let (enables_before, disables_before) = entropy::transition_counts();
+    let mut previous = [0u8; entropy::SEED_BYTES];
+    let mut repeats = 0u32;
+    let mut failures = 0u32;
+    let mut first_error = None;
+
+    for round in 0..rounds {
+        let mut bytes = [0u8; entropy::SEED_BYTES];
+        match entropy::Csprng::from_hardware() {
+            Ok(mut csprng) => {
+                // What a ClientHello would draw: the random and the key
+                // share come out of this stream, so two rounds matching
+                // here is two handshakes that would have matched.
+                csprng.fill_bytes(&mut bytes);
+                if round > 0 && bytes == previous {
+                    repeats += 1;
+                }
+                previous = bytes;
+            }
+            Err(error) => {
+                failures += 1;
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    let (enables_after, disables_after) = entropy::transition_counts();
+    let enables = enables_after.wrapping_sub(enables_before);
+    let disables = disables_after.wrapping_sub(disables_before);
+
+    let mut line = Line::new();
+    line.push_str("rounds ");
+    line.push_u32(rounds);
+    line.push_str(", enables ");
+    line.push_u32(enables);
+    line.push_str(", disables ");
+    line.push_u32(disables);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut passed = true;
+    if enables != disables {
+        console.write_output_line(framebuffer, "FAIL an enable was not paired with a disable");
+        passed = false;
+    }
+    if repeats > 0 {
+        let mut line = Line::new();
+        line.push_str("FAIL ");
+        line.push_u32(repeats);
+        line.push_str(" draws repeated the one before");
+        console.write_output_line(framebuffer, line.as_str());
+        passed = false;
+    }
+    if let Some(error) = first_error {
+        let mut line = Line::new();
+        line.push_str("FAIL ");
+        line.push_u32(failures);
+        line.push_str(" seedings failed: ");
+        line.push_str(error.message());
+        console.write_output_line(framebuffer, line.as_str());
+        passed = false;
+    }
+    if passed {
+        console.write_output_line(framebuffer, "entropy test: all checks passed");
+    }
+}
+
+fn push_entropy_counts(console: &mut Console, framebuffer: &mut Framebuffer) {
+    let (enables, disables) = entropy::transition_counts();
+    let mut line = Line::new();
+    line.push_str("source enabled ");
+    line.push_u32(enables);
+    line.push_str(" times, disabled ");
+    line.push_u32(disables);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
 /// little about it: `rtc test` also measures a carry of the second counter,
 /// which is the only check here that observes the 32.768 kHz oscillator
 /// rather than the register file.
@@ -3347,7 +3545,7 @@ fn cmd_rtc(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]
         b"test" => cmd_rtc_test(console, framebuffer),
         _ => console.write_output_line(
             framebuffer,
-            "usage: rtc [set <YYYY-MM-DD> <HH:MM:SS> | regs | test]",
+            "usage: rtc [set <YYYY-MM-DD> <HH:MM:SS> (UTC) | regs | test]",
         ),
     }
 }
@@ -3356,11 +3554,14 @@ fn cmd_rtc_show(console: &mut Console, framebuffer: &mut Framebuffer) {
     match rtc::read_datetime() {
         Ok(datetime) => {
             let mut line = Line::new();
+            line.push_str("UTC  ");
             push_datetime(&mut line, &datetime);
             console.write_output_line(framebuffer, line.as_str());
+            push_local_line(console, framebuffer, datetime.calendar());
         }
         Err(error) => console.write_output_line(framebuffer, error.message()),
     }
+    push_certificate_clock_line(console, framebuffer);
     match rtc::read_status() {
         Ok(status) => report_rtc_status(console, framebuffer, status),
         Err(error) => console.write_output_line(framebuffer, error.message()),
@@ -3393,7 +3594,10 @@ fn cmd_rtc_set(console: &mut Console, framebuffer: &mut Framebuffer, argument: &
     let mut date = [0u32; 3];
     let mut time = [0u32; 3];
     if !parse_fields(date_text, b'-', &mut date) || !parse_fields(time_text, b':', &mut time) {
-        console.write_output_line(framebuffer, "usage: rtc set <YYYY-MM-DD> <HH:MM:SS>");
+        console.write_output_line(
+            framebuffer,
+            "usage: rtc set <YYYY-MM-DD> <HH:MM:SS>; the time is UTC, not local",
+        );
         return;
     }
     // Narrowing through `try_from` so that a field too large for the calendar
@@ -3442,9 +3646,10 @@ fn cmd_rtc_set(console: &mut Console, framebuffer: &mut Framebuffer, argument: &
     match rtc::read_datetime() {
         Ok(readback) => {
             let mut line = Line::new();
-            line.push_str("set; reads back as ");
+            line.push_str("set; reads back as UTC  ");
             push_datetime(&mut line, &readback);
             console.write_output_line(framebuffer, line.as_str());
+            push_local_line(console, framebuffer, readback.calendar());
         }
         Err(error) => console.write_output_line(framebuffer, error.message()),
     }
@@ -3495,8 +3700,10 @@ fn cmd_rtc_test(console: &mut Console, framebuffer: &mut Framebuffer) {
             // The week register is an independent counter, not derived from
             // the date, so the two can legitimately be read and still
             // disagree -- which is worth naming rather than hiding.
-            let expected = rtc::weekday_from_date(datetime.year, datetime.month, datetime.day);
-            if datetime.weekday.is_some_and(|weekday| weekday != expected) {
+            let expected = datetime.calendar().weekday();
+            if let Some(expected) = expected
+                && datetime.weekday.is_some_and(|weekday| weekday != expected)
+            {
                 let mut line = Line::new();
                 line.push_str("WARN week register disagrees with the date (expected ");
                 line.push_str(rtc::weekday_name(expected));
@@ -3697,6 +3904,62 @@ fn report_rtc_status(console: &mut Console, framebuffer: &mut Framebuffer, statu
 
 /// Formats a calendar as `YYYY-MM-DD (Day) HH:MM:SS`, naming an
 /// uninterpretable week register instead of inventing a day for it.
+/// Reports whether the stricter reading -- the one certificate validity
+/// checking would use -- can be believed right now.
+///
+/// This is the only place the two clocks visibly disagree: a Tab5 whose
+/// `VLF` is set still prints a UTC and a JST line above, because those are
+/// what the counters hold, and still fails here, because what the counters
+/// hold is not a time anyone set. Unauthenticated TLS and SPKI pinning do
+/// not consult this line at all (`docs/TLS_PLAN.md`).
+fn push_certificate_clock_line(console: &mut Console, framebuffer: &mut Framebuffer) {
+    let mut line = Line::new();
+    line.push_str("cert clock  ");
+    match wall_clock::unix_time_utc() {
+        Ok(seconds) => {
+            line.push_str("unix ");
+            line.push_u64(seconds as u64);
+        }
+        Err(error) => {
+            line.push_str(error.name());
+            line.push_str(": ");
+            line.push_str(error.message());
+        }
+    }
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Writes the local reading of a UTC one, on its own line and labelled with
+/// the zone it was converted into.
+///
+/// Two labelled lines rather than one unlabelled time: the device holds UTC
+/// and a person reads JST, and the only way a reader can tell which they are
+/// looking at is for both to be named.
+fn push_local_line(console: &mut Console, framebuffer: &mut Framebuffer, utc: tab5_time::Calendar) {
+    let zone = wall_clock::timezone();
+    let Some(local) = tab5_time::local_datetime(utc, zone) else {
+        return;
+    };
+    let mut line = Line::new();
+    line.push_str(zone.name);
+    line.push_str("  ");
+    line.push_u32(local.year as u32);
+    line.push_str("-");
+    push_two_digits(&mut line, local.month);
+    line.push_str("-");
+    push_two_digits(&mut line, local.day);
+    line.push_str(" ");
+    push_two_digits(&mut line, local.hour);
+    line.push_str(":");
+    push_two_digits(&mut line, local.minute);
+    line.push_str(":");
+    push_two_digits(&mut line, local.second);
+    line.push_str(" ");
+    // `offset_text` is five ASCII digits and a sign by construction.
+    line.push_str(core::str::from_utf8(&zone.offset_text()).unwrap_or("?????"));
+    console.write_output_line(framebuffer, line.as_str());
+}
+
 fn push_datetime(line: &mut Line, datetime: &rtc::DateTime) {
     line.push_u32(datetime.year as u32);
     line.push_str("-");
@@ -5368,6 +5631,209 @@ fn report_tftp_error(
     }
 }
 
+/// `tls` -- one unauthenticated TLS 1.3 fetch, reported in detail.
+///
+/// A diagnostic rather than a way to browse. It runs the *same*
+/// `net::http::Transaction` the plaintext path runs, over a TLS transport,
+/// which is the point: if the status line, the header block and the body
+/// framing needed their own code for HTTPS there would be two answers to
+/// "where does this body end" and no way to know which was right.
+///
+/// What it prints beyond the head is the state of the handshake and the
+/// shape of the polling, because those are the two things
+/// `docs/TLS_PLAN.md` says have to be measured on real hardware before the
+/// browser is allowed near HTTPS. The body is counted and dropped;
+/// `httpget` is where saving one belongs.
+fn cmd_tls(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    session: &mut Option<wifi::Rpc>,
+    stack: &mut Option<net::Stack>,
+) {
+    let (target, rest) = split_first_word(trim(argument));
+    let path = match trim(rest) {
+        b"" => b"/".as_slice(),
+        path => path,
+    };
+    let Some((host, port)) = split_host_port_with_default(target, 443) else {
+        console.write_output_line(framebuffer, "usage: tls <host|a.b.c.d>[:port] [path]");
+        return;
+    };
+
+    let Some((rpc, stack)) = net_session(console, framebuffer, session, stack) else {
+        return;
+    };
+    if !stack.has_address() {
+        console.write_output_line(framebuffer, "no address; run ipconfig dhcp first");
+        return;
+    }
+    let Some(address) = resolve_target(console, framebuffer, rpc, stack, host) else {
+        return;
+    };
+    let Ok(server_name) = core::str::from_utf8(host) else {
+        console.write_output_line(framebuffer, "the host is not valid UTF-8");
+        return;
+    };
+
+    // The `Host:` header carries the port when it is not 443, the same rule
+    // the browser's `Url::host_header` applies -- and the same rule
+    // `net::http::get` applies for the plaintext default.
+    let mut host_header = alloc::vec::Vec::new();
+    host_header.extend_from_slice(host);
+    if port != 443 {
+        host_header.push(b':');
+        push_decimal_bytes(&mut host_header, port as u32);
+    }
+
+    console.write_output_line(framebuffer, "handshaking...");
+    let mut transaction = match net::http::Transaction::start(
+        stack,
+        address,
+        port,
+        &host_header,
+        path,
+        u64::MAX,
+        net::transport::Security::Tls {
+            server_name,
+            policy: net::pins::policy_for(server_name),
+        },
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            write_http_failure(console, framebuffer, error);
+            return;
+        }
+    };
+
+    let mut announced = false;
+    let mut body = 0u64;
+    while !transaction.is_finished() {
+        let mut sink = |bytes: &[u8]| {
+            body += bytes.len() as u64;
+            true
+        };
+        let progress = transaction.poll(stack, rpc, net::http::DEFAULT_POLL_BUDGET, &mut sink);
+        if !announced && let Some(authentication) = transaction.authentication() {
+            announced = true;
+            let mut line = Line::new();
+            line.push_str("handshake: ");
+            line.push_str(authentication.label());
+            console.write_output_line(framebuffer, line.as_str());
+        }
+        if progress == net::http::Progress::HeadReady
+            && let Some(head) = transaction.head()
+        {
+            let mut line = Line::new();
+            line.push_str("status ");
+            match head.status {
+                Some(status) => line.push_u32(status as u32),
+                None => line.push_str("(not an HTTP status line)"),
+            }
+            if head.chunked {
+                line.push_str(", chunked");
+            }
+            if let Some(length) = head.content_length {
+                line.push_str(", length ");
+                line.push_u64(length);
+            }
+            console.write_output_line(framebuffer, line.as_str());
+        }
+    }
+
+    let failure = transaction.error();
+    let without_notify = transaction.closed_without_notify();
+    let tls_stats = transaction.tls_stats();
+    let stats = transaction.close(stack, rpc);
+
+    let mut line = Line::new();
+    line.push_str("body ");
+    line.push_u64(body);
+    line.push_str(" B, plaintext received ");
+    line.push_u32(stats.received as u32);
+    console.write_output_line(framebuffer, line.as_str());
+
+    if let Some(tls_stats) = tls_stats {
+        let mut line = Line::new();
+        line.push_str("ciphertext in ");
+        line.push_u32(tls_stats.received as u32);
+        line.push_str(" out ");
+        line.push_u32(tls_stats.sent as u32);
+        line.push_str(", handshake ");
+        line.push_u64(tls_stats.handshake_ms);
+        line.push_str(" ms");
+        console.write_output_line(framebuffer, line.as_str());
+
+        let mut line = Line::new();
+        line.push_str("total ");
+        line.push_u64(stats.elapsed_ms);
+        line.push_str(" ms, polls ");
+        line.push_u32(stats.polls);
+        line.push_str(", longest TLS poll ");
+        line.push_u32(tls_stats.longest_poll_us);
+        line.push_str(" us");
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    if without_notify {
+        // Worth saying rather than hiding: the stream ended with a TCP
+        // close instead of a close_notify, so TLS cannot vouch that nothing
+        // was cut off the end. Whether the body was whole is the HTTP
+        // framing's answer, which is the line above this one.
+        console.write_output_line(
+            framebuffer,
+            "note: the server closed without close_notify (normal for HTTP/1.0)",
+        );
+    }
+    if let Some(error) = failure {
+        write_http_failure(console, framebuffer, error);
+    }
+}
+
+fn write_http_failure(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    error: net::http::Error,
+) {
+    let mut line = Line::new();
+    line.push_str(net::http::error_name(error));
+    line.push_str(": ");
+    line.push_str(net::http::error_text(error));
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+fn push_decimal_bytes(out: &mut alloc::vec::Vec<u8>, value: u32) {
+    if value >= 10 {
+        push_decimal_bytes(out, value / 10);
+    }
+    out.push(b'0' + (value % 10) as u8);
+}
+
+/// The transport `httpget` was asked for.
+///
+/// `secure` came from the scheme the user typed and from nothing else. The
+/// host is passed straight through as the SNI name, so what is asked for
+/// and what is connected to are the same string.
+fn httpget_security(host: &[u8], secure: bool) -> net::transport::Security<'_> {
+    if !secure {
+        return net::transport::Security::Plain;
+    }
+    match core::str::from_utf8(host) {
+        Ok(server_name) => net::transport::Security::Tls {
+            server_name,
+            policy: net::pins::policy_for(server_name),
+        },
+        // Unreachable in practice: the URL parser has already accepted the
+        // host as text. Falling back to plaintext would be a downgrade, so
+        // this fails the connection instead by asking for a name no server
+        // will match -- there is no "plaintext, but they asked for TLS".
+        Err(_) => net::transport::Security::Tls {
+            server_name: "",
+            policy: net::tls::PinPolicy::UNAUTHENTICATED,
+        },
+    }
+}
+
 fn cmd_httpget(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -5380,16 +5846,71 @@ fn cmd_httpget(
     stack: &mut Option<net::Stack>,
 ) {
     let (target, rest) = split_first_word(trim(argument));
-    let path = match trim(rest) {
-        b"" => b"/".as_slice(),
-        path => path,
+
+    // Two shapes, and which one was typed decides the transport. A bare
+    // host is plaintext, exactly as this command has always been; TLS needs
+    // the scheme spelled out. The command never chooses encryption on its
+    // own in either direction -- a `httpget` that quietly used TLS would be
+    // as wrong as an `https://` one that quietly did not.
+    let parsed;
+    let (host, port, path, secure) = if browser::url::has_scheme(
+        core::str::from_utf8(target).unwrap_or(""),
+    ) {
+        if !trim(rest).is_empty() {
+            console.write_output_line(
+                framebuffer,
+                "a url carries its own path; do not give a second one",
+            );
+            return;
+        }
+        let Ok(text) = core::str::from_utf8(target) else {
+            console.write_output_line(framebuffer, "the address has to be ASCII");
+            return;
+        };
+        parsed = match browser::url::Url::parse(text) {
+            Ok(url) => url,
+            Err(error) => {
+                let mut line = Line::new();
+                line.push_str("bad address: ");
+                line.push_str(browser::url::error_text(error));
+                console.write_output_line(framebuffer, line.as_str());
+                return;
+            }
+        };
+        let Ok(request_target) = parsed.request_target() else {
+            console.write_output_line(framebuffer, "out of memory");
+            return;
+        };
+        // Leaked into a local so the borrows below outlive this block; the
+        // `Url` owns its strings and is dropped with the command.
+        let path = match request_target.as_str() {
+            "" => "/",
+            path => path,
+        };
+        let path: alloc::vec::Vec<u8> = path.as_bytes().to_vec();
+        (
+            parsed.host().as_bytes(),
+            parsed.port(),
+            path,
+            parsed.scheme() == browser::url::Scheme::Https,
+        )
+    } else {
+        let path = match trim(rest) {
+            b"" => b"/".as_slice(),
+            path => path,
+        };
+        // The port has to come off before anything else: whatever is left
+        // is the host, and it is a name as often as an address.
+        let Some((host, port)) = split_host_port(target) else {
+            console.write_output_line(
+                framebuffer,
+                "usage: httpget <host|a.b.c.d>[:port] [path] | httpget <url>",
+            );
+            return;
+        };
+        (host, port, path.to_vec(), false)
     };
-    // The port has to come off before anything else: whatever is left is
-    // the host, and it is a name as often as an address.
-    let Some((host, port)) = split_host_port(target) else {
-        console.write_output_line(framebuffer, "usage: httpget <host|a.b.c.d>[:port] [path]");
-        return;
-    };
+    let path = path.as_slice();
 
     // A path with no last component -- `/`, or one ending in `/` -- names no
     // file, so there is nothing to save it as. That is the shape of the
@@ -5427,7 +5948,16 @@ fn cmd_httpget(
     // resolved address would ask for whichever one is the default.
     let Some(download) = download.as_ref() else {
         let mut discard = |_: &[u8]| true;
-        let outcome = net::http::get(stack, rpc, address, port, host, path, &mut discard);
+        let outcome = net::http::get(
+            stack,
+            rpc,
+            address,
+            port,
+            host,
+            path,
+            httpget_security(host, secure),
+            &mut discard,
+        );
         report_http(console, framebuffer, outcome, None);
         return;
     };
@@ -5438,9 +5968,16 @@ fn cmd_httpget(
             download.part.as_str(),
             fs::vfs::OpenMode::Truncate,
             |write| {
-                net::http::get(stack, rpc, address, port, host, path, &mut |body| {
-                    write(body)
-                })
+                net::http::get(
+                    stack,
+                    rpc,
+                    address,
+                    port,
+                    host,
+                    path,
+                    httpget_security(host, secure),
+                    &mut |body| write(body),
+                )
             },
         )
     });
@@ -5607,10 +6144,6 @@ fn resolve_address(
         return None;
     };
     match Url::parse_typed(text) {
-        Ok(url) if !url.scheme().is_fetchable() => {
-            console.write_output_line(framebuffer, "HTTPS is not supported");
-            None
-        }
         Ok(url) => Some(url),
         Err(error) => {
             let mut line = Line::new();
@@ -6024,8 +6557,13 @@ fn parse_ipv4_cidr(bytes: &[u8]) -> Option<(Ipv4Address, u8)> {
 /// because it is not this function's business whether it is an address --
 /// and because the text is what the `Host:` header wants either way.
 fn split_host_port(bytes: &[u8]) -> Option<(&[u8], u16)> {
+    split_host_port_with_default(bytes, 80)
+}
+
+/// The same split, for a scheme whose default port is not 80.
+fn split_host_port_with_default(bytes: &[u8], default: u16) -> Option<(&[u8], u16)> {
     let (host, port) = match bytes.iter().position(|&byte| byte == b':') {
-        None => (bytes, 80),
+        None => (bytes, default),
         Some(colon) => {
             let port = parse_u32(&bytes[colon + 1..])?;
             if port == 0 || port > 65535 {

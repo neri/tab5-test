@@ -21,8 +21,11 @@
 use crate::browser::document::{Document, Parser};
 use crate::browser::error::{self, Error};
 use crate::browser::limits::{MAX_DECODED_HTML_BYTES, MAX_REDIRECTS};
-use crate::browser::url::Url;
+use crate::browser::url::{Scheme, Url};
 use crate::net::http::{self, Progress, Transaction};
+use crate::net::pins;
+use crate::net::tls::Authentication;
+use crate::net::transport::Security;
 use crate::net::{self, dns};
 use crate::{tick, wifi};
 
@@ -82,11 +85,47 @@ pub enum Outcome {
     Failed(Failure),
 }
 
+/// What a page's connection proved, for the toolbar to show.
+///
+/// Not a boolean and not a scheme. `https://` says what was *asked* for;
+/// this says what was *got*, and the two come apart exactly where it
+/// matters -- an unauthenticated TLS connection is an `https://` URL whose
+/// peer nobody identified.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum PageSecurity {
+    /// Plaintext. Everything on the wire is readable by anyone carrying it.
+    Cleartext,
+    /// TLS, with the peer's identity unestablished.
+    Tls(Authentication),
+}
+
+impl PageSecurity {
+    /// The badge text. `SECURE` appears nowhere: nothing this firmware can
+    /// do earns it yet.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Cleartext => "INSECURE HTTP",
+            Self::Tls(authentication) => authentication.label(),
+        }
+    }
+
+    /// Whether the badge is a warning rather than a statement.
+    ///
+    /// True for plaintext *and* for unauthenticated TLS. The second one is
+    /// the whole reason this is not `self == Cleartext`: encryption without
+    /// identity is not a safe state to display calmly.
+    pub fn is_warning(self) -> bool {
+        !matches!(self, Self::Tls(Authentication::Pinned))
+    }
+}
+
 /// One page being fetched, from a name to a document.
 #[must_use = "a Fetch owns a socket and has to be closed"]
 pub struct Fetch {
     /// The address currently being fetched, which moves with each redirect.
     url: Url,
+    /// What the hop currently open proved, once its handshake finished.
+    security: Option<PageSecurity>,
     redirects: usize,
     query: Option<dns::Query>,
     transaction: Option<Transaction>,
@@ -105,14 +144,9 @@ pub struct Fetch {
 impl Fetch {
     /// Begins a fetch. The first byte does not leave until [`Fetch::step`].
     pub fn start(url: Url, network: &mut Network<'_>) -> Result<Fetch, Failure> {
-        if !url.scheme().is_fetchable() {
-            // Refused here rather than at connect time, and never rewritten
-            // to `http`. A secure address that quietly becomes an insecure
-            // one is worse than an address that does not load.
-            return Err(HTTPS);
-        }
         let mut fetch = Fetch {
             url,
+            security: None,
             redirects: 0,
             query: None,
             transaction: None,
@@ -130,6 +164,17 @@ impl Fetch {
     /// chain rather than the one the caller asked for.
     pub fn url(&self) -> &Url {
         &self.url
+    }
+
+    /// What the connection currently open proved, or `None` before a TLS
+    /// handshake has finished.
+    ///
+    /// Plaintext answers immediately -- there is nothing to wait for and
+    /// nothing to establish. TLS answers only once the handshake is over,
+    /// which is what stops a toolbar showing a security state for a session
+    /// that may still fail.
+    pub fn security(&self) -> Option<PageSecurity> {
+        self.security
     }
 
     pub fn received(&self) -> usize {
@@ -188,6 +233,21 @@ impl Fetch {
         let (Ok(target), Ok(host)) = (self.url.request_target(), self.url.host_header()) else {
             return Err(OUT_OF_MEMORY);
         };
+        // Every string the connection is made of comes from the same `Url`:
+        // the address was resolved from `host()`, the SNI name is `host()`,
+        // the `Host:` header is `host_header()` and the request target is
+        // `request_target()`. Building any of them separately is how a
+        // request ends up asking one host for another host's page.
+        let security = match self.url.scheme() {
+            Scheme::Http => Security::Plain,
+            Scheme::Https => Security::Tls {
+                server_name: self.url.host(),
+                // The pin table is keyed by the same string that goes in
+                // SNI, so a host cannot be looked up under one name and
+                // connected to under another.
+                policy: pins::policy_for(self.url.host()),
+            },
+        };
         Transaction::start(
             network.stack,
             address,
@@ -195,6 +255,7 @@ impl Fetch {
             host.as_bytes(),
             target.as_bytes(),
             MAX_DECODED_HTML_BYTES as u64,
+            security,
         )
         .map_err(|error| Failure {
             name: http::error_name(error),
@@ -206,21 +267,76 @@ impl Fetch {
 
     /// Moves to the next address in a redirect chain, giving back the
     /// socket the previous hop was using.
+    ///
+    /// A redirect is the one place a page's security can change without
+    /// anyone choosing it, so it is the one place the rules have to be
+    /// applied. Both refusals are about going *down*:
+    ///
+    /// - `https` to `http` is a server asking to be read in the clear
+    ///   instead. Refused, always. It is not a rule against the user typing
+    ///   an `http://` address or following a link to one -- those are
+    ///   choices, made with the address visible -- it is a rule against the
+    ///   choice being made for them by the server they were talking to.
+    /// - a pinned connection to a host with no pin is the same move one
+    ///   level up: the identity that was established is being traded for
+    ///   one that is not. Refused for the same reason.
+    ///
+    /// Going *up* -- `http` to `https` -- is allowed and unremarkable.
     fn redirect_to(&mut self, target: Url, network: &mut Network<'_>) -> Outcome {
+        let from_scheme = self.url.scheme();
+        let from_security = self.security;
         if let Some(transaction) = self.transaction.take() {
             self.received += transaction.close(network.stack, network.rpc).received;
         }
         self.parser = None;
         self.document_error = None;
+        self.security = None;
+
+        if from_scheme == Scheme::Https && target.scheme() == Scheme::Http {
+            return Outcome::Failed(HTTPS_DOWNGRADE);
+        }
+        if from_security == Some(PageSecurity::Tls(Authentication::Pinned))
+            && !self.host_is_pinned(&target)
+        {
+            return Outcome::Failed(TLS_AUTH_DOWNGRADE);
+        }
+
         self.url = target;
         self.redirects += 1;
-        if !self.url.scheme().is_fetchable() {
-            return Outcome::Failed(HTTPS);
-        }
         match self.open(network) {
             Ok(()) => Outcome::Working,
             Err(failure) => Outcome::Failed(failure),
         }
+    }
+
+    /// Picks up what the open connection proved, once and not before.
+    ///
+    /// Plaintext is known the moment there is a connection: there is
+    /// nothing to establish. TLS is not known until its handshake has
+    /// finished, and asking earlier gets `None` -- which is the answer the
+    /// toolbar needs, because a badge drawn from a handshake that has not
+    /// happened is a badge that can turn out to have been wrong.
+    fn note_security(&mut self) {
+        if self.security.is_some() {
+            return;
+        }
+        let Some(transaction) = self.transaction.as_ref() else {
+            return;
+        };
+        self.security = match self.url.scheme() {
+            Scheme::Http => Some(PageSecurity::Cleartext),
+            Scheme::Https => transaction.authentication().map(PageSecurity::Tls),
+        };
+    }
+
+    /// Whether a redirect target is a host this firmware could authenticate.
+    ///
+    /// Being pinned is a property of the host, not of the connection that
+    /// has not been made yet: a redirect to a pinned host is allowed to
+    /// proceed and then has to satisfy that host's pins, and one to a host
+    /// with no pins is the downgrade this refuses.
+    fn host_is_pinned(&self, target: &Url) -> bool {
+        target.scheme() == Scheme::Https && pins::is_pinned(target.host())
     }
 
     pub fn step(&mut self, network: &mut Network<'_>) -> Outcome {
@@ -316,6 +432,7 @@ impl Fetch {
         if let Some(parser) = self.parser.as_ref() {
             self.peak_owned = self.peak_owned.max(parser.owned_bytes());
         }
+        self.note_security();
 
         match progress {
             Progress::HeadReady => self.head_ready(network),
@@ -428,11 +545,18 @@ impl Fetch {
 /// Named as constants so the one-word `name` -- which the fixture manifest
 /// is written against -- is in one place rather than spelled out at each
 /// site that produces it.
-pub const HTTPS: Failure = Failure::new(
-    "https",
-    "HTTPS is not supported",
-    "This build has no TLS, and a secure address is never quietly turned \
-     into an insecure one.",
+pub const HTTPS_DOWNGRADE: Failure = Failure::new(
+    "https-downgrade",
+    "Refused to leave HTTPS",
+    "The server redirected a secure address to a plaintext one. Following \
+     that would put the rest of this page on the wire in the clear without \
+     anyone having chosen it.",
+);
+pub const TLS_AUTH_DOWNGRADE: Failure = Failure::new(
+    "tls-auth-downgrade",
+    "Refused to lose the pinned identity",
+    "The server redirected an authenticated connection to a host this \
+     firmware cannot authenticate.",
 );
 pub const REDIRECT_LIMIT: Failure = Failure::new(
     "redirect-limit",

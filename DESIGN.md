@@ -34,9 +34,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、共通ブロックデバイス層、MBR判定、シェルコマンド |
 | [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
-| [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP |
-| [BROWSER.md](docs/BROWSER.md) | `browser`のハイパーテキストビューア。対応するHTML、操作、上限、エラー、平文HTTPだけであること、診断コマンド |
-| [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書きと`rtc test`の検査内容 |
+| [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP、TLS 1.3とSPKI pin |
+| [BROWSER.md](docs/BROWSER.md) | `browser`のハイパーテキストビューア。対応するHTML、操作、上限、エラー、未認証TLSとセキュリティ表示、診断コマンド |
+| [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書き、UTCという決めごとと既定JST表示、`rtc test`の検査内容 |
 | [FILE_LAYOUT.md](docs/FILE_LAYOUT.md) | モジュールごとの責務一覧、コーディング方針（コメントの言語、`unsafe`の粒度） |
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
 | [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかったDW-GDMA／SDHOSTの制約 |
@@ -63,6 +63,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [WIFI_REFACTOR_PLAN.md](docs/WIFI_REFACTOR_PLAN.md)、
 [TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
 [DNS_PLAN.md](docs/DNS_PLAN.md)、
+[TLS_PLAN.md](docs/TLS_PLAN.md)、
 [WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)。
 
 ## 制約
@@ -89,15 +90,22 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
   （[WIFI.md](docs/WIFI.md)）。
 - TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、名前解決、ping、
-  TFTP読み出し、HTTP GETまでで、**IPv6、サーバ機能、TLSはありません**。
+  TFTP読み出し、HTTP GET、TLS 1.3クライアントまでで、**IPv6とサーバ機能は
+  ありません**。`https://`はブラウザ・`hs`・`httpget`（明示スキーム時）・`tls`
+  から取得できますが、接続先のidentityを保証しない**未認証TLS**です。受動的な
+  盗聴は防ぎますが能動的な攻撃者は防ぎません。表示は必ず`TLS UNVERIFIED`とし、
+  `SECURE`とは表示しません。SPKI pinの仕組みはありますが登録先は空です
+  （[NETWORK.md](docs/NETWORK.md)、[TLS_PLAN.md](docs/TLS_PLAN.md)）。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
   受信したファイルは`/tmp`（8 MiB、リセットで消える）へ保存できます
   （[NETWORK.md](docs/NETWORK.md)、[FILESYSTEM.md](docs/FILESYSTEM.md)）。
   HTTPは同期の`httpget`と、1回のpollごとに戻る`net::http::Transaction`の
   2つの顔がありますが、実装は1つです。
 - `browser`はHTMLから文章とリンクを取り出して読む全画面ビューアです。
-  **Webブラウザではありません**。CSS、JavaScript、画像デコード、TLSは
-  いずれもありません。`https://`は認識して未対応と表示し、httpへ落としません。
+  **Webブラウザではありません**。CSS、JavaScript、画像デコードはいずれも
+  ありません。`https://`は取得できますが未認証TLSなので、toolbarは
+  `TLS UNVERIFIED`を平文と同じ赤で出します。`https`→`http`のredirectは
+  `https-downgrade`で拒否します。
   日本語フォントが無いので非ASCII文字は1文字1マスの四角で表示します
   （[BROWSER.md](docs/BROWSER.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの

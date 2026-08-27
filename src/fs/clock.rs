@@ -15,6 +15,15 @@
 //! truthful than several readings that differ by however long the write
 //! took.
 //!
+//! ## Which clock is written
+//!
+//! The RX8130CE holds UTC (`crate::wall_clock`), and FAT has nowhere to
+//! record a time zone, so what goes into a directory entry is the local
+//! reading -- JST, until something in the firmware can change it. That
+//! matches what a PC writes to the same card, which is the point: a file
+//! this firmware wrote and a file Windows wrote should not appear nine hours
+//! apart in the same listing.
+//!
 //! ## When the clock is not set
 //!
 //! An unset or unreadable RTC writes zero into the date and time fields.
@@ -27,7 +36,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 
 use hadris_fat::time::{FatDateTime, TimeProvider};
 
-use crate::{rtc, uart};
+use crate::{uart, wall_clock};
 
 /// The FAT-encoded date and time the next entry write will use. Zero means
 /// no timestamp; see this module's header.
@@ -41,18 +50,14 @@ static FAT_TIME: AtomicU16 = AtomicU16::new(0);
 /// place: a stale timestamp on a new file is worse than none, because it
 /// looks like a real answer.
 pub fn sample() {
-    let sampled = match rtc::read_datetime() {
-        Ok(now) if now.is_valid() => Some(FatDateTime::new(
+    let sampled = match wall_clock::local_now() {
+        Ok(now) => Some(FatDateTime::new(
             now.year, now.month, now.day, now.hour, now.minute, now.second,
         )),
-        Ok(_) => {
-            uart::log(b"FS: RTC reading out of range; writing no timestamp\r\n");
-            None
-        }
         Err(error) => {
-            uart::log(b"FS: RTC unreadable (");
+            uart::log(b"FS: ");
             uart::log(error.message().as_bytes());
-            uart::log(b"); writing no timestamp\r\n");
+            uart::log(b"; writing no timestamp\r\n");
             None
         }
     };
@@ -74,10 +79,10 @@ pub fn clear() {
 
 /// The provider handed to the filesystem library.
 ///
-/// Local time, with no timezone conversion. FAT has nowhere to record an
-/// offset, so every timestamp on these volumes is already implicitly the
-/// clock of whatever wrote it; converting to UTC on the way out would make
-/// this firmware's files disagree with the ones a PC wrote to the same card.
+/// What it hands over is already local time: [`sample`] did the conversion
+/// from the device's UTC once, for the whole operation. Nothing here
+/// converts, because a provider that reached for a time zone would be
+/// reaching for it several times inside one file commit.
 #[derive(Debug)]
 pub struct RtcTimeProvider;
 

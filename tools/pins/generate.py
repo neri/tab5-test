@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Turn the pin lists into the Rust table the firmware links into DROM.
+
+The firmware parses nothing: this runs on the host and the checked-in
+`src/net/pins/generated.rs` is what the build picks up. Pins can only change
+by a firmware update, which is the whole point -- there is no runtime
+registration and no trust on first use, so there has to be a step where a
+person decides, and this is it.
+
+Three things this prints on every run, because a generated artifact nobody
+can reproduce is a generated artifact nobody can audit: the SHA-256 of each
+input, how many hosts and pins came out of it, and how many bytes the output
+is. The same inputs always produce the same file, byte for byte.
+
+    tools/pins/generate.py                     # regenerate the table
+    tools/pins/generate.py --check             # fail if it is out of date
+    tools/pins/generate.py --from-cert FILE    # print the line to add
+    tools/pins/generate.py --check-release ELF # fixture pins must be absent
+
+See `README.md` beside this file for the format and for how to get a pin off
+a server you intend to pin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parent.parent
+
+PRODUCTION = HERE / "pins.txt"
+FIXTURES = HERE / "fixture_pins.txt"
+OUTPUT = REPOSITORY / "src" / "net" / "pins" / "generated.rs"
+
+# One host may carry the key it uses and the one it is rotating to, and
+# nothing else. A longer list is a host that has stopped being pinned in any
+# useful sense: every extra key is another key an attacker could be holding.
+MAX_PINS_PER_HOST = 2
+
+HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+
+
+class Problem(Exception):
+    """Something in an input file, reported with the line it came from."""
+
+
+def read_pins(path: Path) -> tuple[dict[str, list[str]], str]:
+    """Parses one pin list, returning the pins by host and the file's hash.
+
+    The hash covers the file as it is on disk, comments included. Comments
+    are where the reason for a pin is written down, and a pin whose reason
+    changed is worth showing up as a changed input.
+    """
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    hosts: dict[str, list[str]] = {}
+    for number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        fields = text.split()
+        if len(fields) != 2:
+            raise Problem(f"{path.name}:{number}: expected `<hostname> <64 hex digits>`")
+        host, pin = fields[0].lower(), fields[1].lower()
+        if not HOSTNAME.match(host):
+            raise Problem(f"{path.name}:{number}: `{host}` is not a hostname")
+        if len(pin) != 64 or any(digit not in "0123456789abcdef" for digit in pin):
+            raise Problem(f"{path.name}:{number}: a pin is 64 hexadecimal digits")
+        pins = hosts.setdefault(host, [])
+        if pin in pins:
+            raise Problem(f"{path.name}:{number}: `{host}` already has that pin")
+        if len(pins) >= MAX_PINS_PER_HOST:
+            raise Problem(
+                f"{path.name}:{number}: `{host}` already has {MAX_PINS_PER_HOST} pins"
+            )
+        pins.append(pin)
+    return hosts, digest
+
+
+def pin_of_certificate(path: Path) -> str:
+    """The SHA-256 of a certificate's DER SubjectPublicKeyInfo.
+
+    Via OpenSSL rather than a Python X.509 parser: the pin has to be the same
+    number the firmware computes, and agreeing with a widely used
+    implementation is a better check of that than agreeing with a second
+    parser written here.
+    """
+    form = "DER" if path.suffix.lower() in {".der", ".cer"} else "PEM"
+    public_key = subprocess.run(
+        ["openssl", "x509", "-in", str(path), "-inform", form, "-noout", "-pubkey"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    spki = subprocess.run(
+        ["openssl", "pkey", "-pubin", "-outform", "DER"],
+        input=public_key,
+        capture_output=True,
+        check=True,
+    ).stdout
+    return hashlib.sha256(spki).hexdigest()
+
+
+def rust_table(name: str, hosts: dict[str, list[str]]) -> str:
+    """One `&[Host]`, sorted so the lookup can binary-search it."""
+    lines = [f"pub(super) static {name}: &[Host] = &["]
+    for host in sorted(hosts):
+        lines.append("    Host {")
+        lines.append(f'        name: "{host}",')
+        lines.append("        pins: &[")
+        for pin in hosts[host]:
+            octets = ", ".join(f"0x{pin[index:index + 2]}" for index in range(0, 64, 2))
+            lines.append(f"            [{octets}],")
+        lines.append("        ],")
+        lines.append("    },")
+    lines.append("];")
+    return "\n".join(lines)
+
+
+def render(production: dict[str, list[str]], fixtures: dict[str, list[str]]) -> str:
+    return f"""// Generated by `tools/pins/generate.py`. Do not edit.
+//
+// The inputs are `tools/pins/pins.txt` and `tools/pins/fixture_pins.txt`;
+// `tools/pins/README.md` says what they mean and how a pin is obtained.
+// Regenerate with `tools/pins/generate.py`, and check the checked-in copy is
+// current with `--check`.
+
+use super::Host;
+
+{rust_table("PRODUCTION", production)}
+
+/// Pins for the test fixtures, behind a feature so that a normal release
+/// cannot trust the throwaway keys in `tools/tls/`.
+///
+/// `tools/pins/generate.py --check-release <elf>` looks for these bytes in a
+/// linked image and fails if it finds them.
+#[cfg(feature = "tls-fixture-pins")]
+{rust_table("FIXTURES", fixtures)}
+"""
+
+
+def check_release(elf: Path, fixtures: dict[str, list[str]]) -> int:
+    """Fails if any fixture pin's bytes appear anywhere in a linked image.
+
+    Cruder than reading the symbol table, and on purpose: what has to be true
+    is that the bytes are not in the image at all, whatever section a future
+    change might put them in.
+    """
+    image = elf.read_bytes()
+    found = [
+        (host, pin)
+        for host, pins in fixtures.items()
+        for pin in pins
+        if bytes.fromhex(pin) in image
+    ]
+    if found:
+        for host, pin in found:
+            print(f"FAIL fixture pin for {host} is in {elf.name}: {pin}", file=sys.stderr)
+        print(
+            "the `tls-fixture-pins` feature must not be enabled for a release image",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{elf.name}: no fixture pin bytes present ({len(fixtures)} hosts checked)")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="fail if the checked-in table is not what the inputs produce",
+    )
+    parser.add_argument(
+        "--from-cert",
+        type=Path,
+        metavar="FILE",
+        help="print the pin for a PEM or DER certificate and exit",
+    )
+    parser.add_argument(
+        "--check-release",
+        type=Path,
+        metavar="ELF",
+        help="fail if the image contains any fixture pin",
+    )
+    arguments = parser.parse_args()
+
+    if arguments.from_cert is not None:
+        print(f"<hostname>  {pin_of_certificate(arguments.from_cert)}")
+        return 0
+
+    try:
+        production, production_hash = read_pins(PRODUCTION)
+        fixtures, fixtures_hash = read_pins(FIXTURES)
+    except Problem as problem:
+        print(problem, file=sys.stderr)
+        return 1
+
+    if arguments.check_release is not None:
+        return check_release(arguments.check_release, fixtures)
+
+    rendered = render(production, fixtures)
+    print(f"{PRODUCTION.name}  sha256 {production_hash}")
+    print(f"{FIXTURES.name}  sha256 {fixtures_hash}")
+    print(
+        f"production: {len(production)} hosts, "
+        f"{sum(len(pins) for pins in production.values())} pins"
+    )
+    print(
+        f"fixtures:   {len(fixtures)} hosts, "
+        f"{sum(len(pins) for pins in fixtures.values())} pins"
+    )
+    print(f"output:     {len(rendered.encode('utf-8'))} bytes -> {OUTPUT.relative_to(REPOSITORY)}")
+
+    if arguments.check:
+        current = OUTPUT.read_text() if OUTPUT.exists() else ""
+        if current != rendered:
+            print("the checked-in table is not what these inputs produce", file=sys.stderr)
+            return 1
+        print("up to date")
+        return 0
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

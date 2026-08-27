@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!  y=0    ┌───────────────────────────────────────────────┐
-//!         │ INSECURE HTTP  http://host/page      12 links │  toolbar
+//!         │ TLS UNVERIFIED https://host/page     12 links │  toolbar
 //!  y=40   ├───────────────────────────────────────────────┤
 //!         │ A heading                                     │
 //!         │                                               │  viewport
@@ -24,6 +24,15 @@
 //! against the panel and nothing else. Line heights vary (headings are
 //! larger), so "scroll by one line" moves by different amounts in different
 //! parts of a page, which reads perfectly naturally.
+//!
+//! The badge at the left says what the connection this page came off
+//! actually proved, which is not the same question as what its address
+//! asked for. `INSECURE HTTP` and `TLS UNVERIFIED` are both red, because
+//! both mean the reader cannot be sure the page is from where the address
+//! says: the second one is encrypted, and encryption without an identity
+//! stops someone reading the page in transit but not someone writing it.
+//! `TLS PINNED` -- the only case where the peer was identified -- is the
+//! one that is not red, and even it does not say "secure".
 //!
 //! **A page is only ever shown complete.** While one is arriving the
 //! previous one stays on screen and only the toolbar's byte count moves; the
@@ -90,9 +99,17 @@ const CHROME_CELL: usize = CELL_WIDTH * CHROME_SCALE;
 const CHROME_TEXT_Y: usize = (TOOLBAR_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
 const STATUS_TEXT_Y: usize = VIEWPORT_BOTTOM + (STATUS_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
 
-/// The cleartext warning, and where the address field starts after it.
-const BADGE: &str = "INSECURE HTTP";
-const ADDRESS_LEFT: usize = MARGIN + (BADGE.len() + 2) * CHROME_CELL;
+/// The security badge's slot, and where the address field starts after it.
+///
+/// Wide enough for the longest text that can go in it (`TLS UNVERIFIED`), so
+/// that the address does not shift sideways when a page's security differs
+/// from the last one's. A toolbar that reflows is a toolbar whose badge is
+/// easy to miss.
+const BADGE_CELLS: usize = 14;
+/// What is shown while a connection is being made and has proved nothing.
+/// Not a security state: the absence of one.
+const CONNECTING_BADGE: &str = "CONNECTING";
+const ADDRESS_LEFT: usize = MARGIN + (BADGE_CELLS + 2) * CHROME_CELL;
 /// Room kept at the right for the link and line counts.
 const SUMMARY_CELLS: usize = 26;
 const ADDRESS_RIGHT: usize = WIDTH - MARGIN - SUMMARY_CELLS * CHROME_CELL;
@@ -114,9 +131,14 @@ const CHROME_TEXT: u16 = BLACK;
 /// Status-line messages, in the same red as the cleartext badge: almost
 /// every one of them is the viewer refusing to do something.
 const MESSAGE_COLOR: u16 = 0x9000;
-/// The cleartext warning. Red, permanently, and never conditional: there is
-/// no TLS here, so there is no state in which it should be absent.
+/// The badge when the connection proves nothing about who answered: plain
+/// HTTP, and unauthenticated TLS. Red, because both mean the same thing to
+/// a reader -- what is on screen may not be what the address says.
 const INSECURE_COLOR: u16 = 0xF800;
+/// The badge when a pin matched. Dark green: the one case where the peer
+/// was actually identified. Still not the word "secure", which would claim
+/// more than a pin does.
+const AUTHENTICATED_COLOR: u16 = 0x0400;
 /// The address field while it is being edited.
 const EDIT_BACKGROUND: u16 = WHITE;
 const EDIT_CARET: u16 = 0x001F;
@@ -276,7 +298,7 @@ pub fn run(
         let outcome = match (pending.as_mut(), network.as_mut()) {
             (Some(active), Some(link)) => {
                 let outcome = active.fetch.step(link);
-                viewer.update_loading(active.fetch.received());
+                viewer.update_loading(active.fetch.received(), active.fetch.security());
                 Some(outcome)
             }
             _ => None,
@@ -292,10 +314,18 @@ pub fn run(
                     // links are both where the page actually came from.
                     let landed = active.fetch.url().clone();
                     let peak = active.fetch.peak_owned();
+                    let security = active.fetch.security();
                     if let Some(mut link) = raw_network(wifi) {
                         active.fetch.close(&mut link);
                     }
-                    viewer.show_document(document, &active.navigation, landed, elapsed, peak);
+                    viewer.show_document(
+                        document,
+                        &active.navigation,
+                        landed,
+                        elapsed,
+                        peak,
+                        security,
+                    );
                 }
             }
             Some(FetchOutcome::Failed(failure)) => {
@@ -373,10 +403,6 @@ fn begin(
         }
         return None;
     }
-    if !navigation.url.scheme().is_fetchable() {
-        viewer.show_failure(&navigation.url, fetch::HTTPS);
-        return None;
-    }
     let Some(network) = network else {
         viewer.show_failure(&navigation.url, fetch::NO_NETWORK);
         return None;
@@ -449,6 +475,11 @@ struct Dirty {
 /// what drops the previous document, its layout and its links together.
 struct Page {
     document: Document,
+    /// What the connection this page came off proved, or `None` for a page
+    /// that never crossed a network -- a built-in page, or this viewer's
+    /// own error page. `None` is displayed from the scheme instead, which
+    /// for those is always `http://built-in/...`.
+    security: Option<fetch::PageSecurity>,
     layout: Layout,
     /// Index of the topmost drawn line.
     first_line: usize,
@@ -518,6 +549,11 @@ impl Editing {
 /// What the toolbar shows while a page is arriving.
 struct Loading {
     url: String,
+    /// What the connection being made has proved so far. `None` until a TLS
+    /// handshake finishes -- which is the point: a badge drawn from a
+    /// handshake that has not happened is a badge that can turn out to have
+    /// been a lie.
+    security: Option<fetch::PageSecurity>,
     received: usize,
     /// Kilobytes last drawn, so the toolbar is repainted when the number
     /// changes rather than on every frame.
@@ -621,6 +657,7 @@ impl Viewer {
         let text = url.to_text().unwrap_or_default();
         self.loading = Some(Loading {
             url: text,
+            security: None,
             received: 0,
             shown_kib: usize::MAX,
         });
@@ -629,10 +666,14 @@ impl Viewer {
         self.dirty.status = true;
     }
 
-    fn update_loading(&mut self, received: usize) {
+    fn update_loading(&mut self, received: usize, security: Option<fetch::PageSecurity>) {
         let Some(loading) = self.loading.as_mut() else {
             return;
         };
+        if loading.security != security {
+            loading.security = security;
+            self.dirty.toolbar = true;
+        }
         loading.received = received;
         let kib = received / 1024;
         if kib != loading.shown_kib {
@@ -659,10 +700,12 @@ impl Viewer {
         landed: Url,
         elapsed_ms: u64,
         peak_owned: usize,
+        security: Option<fetch::PageSecurity>,
     ) {
         let statistics = document.stats();
         match build_page(document) {
-            Ok(page) => {
+            Ok(mut page) => {
+                page.security = security;
                 if navigation.push_history {
                     self.push_current();
                 }
@@ -1149,18 +1192,20 @@ impl Viewer {
 
     fn draw_toolbar(&self, framebuffer: &mut Framebuffer) {
         framebuffer.fill_rect(0, 0, WIDTH, TOOLBAR_HEIGHT, CHROME_BACKGROUND);
-        // The cleartext warning is first and is red, on every page, with no
-        // condition attached. HTTP is the only thing this can fetch, so
-        // there is no state in which the badge should be absent or a
-        // different colour -- and a warning that only sometimes appears is
-        // one nobody reads.
+        // The badge comes first and is never absent. What it says is what
+        // the connection actually proved, not what the address asked for:
+        // an `https://` URL whose peer nobody identified reads
+        // `TLS UNVERIFIED` in the same red as plaintext, because to a
+        // reader the two mean the same thing -- what is on screen may not
+        // be from where the address says.
+        let (badge, badge_color) = self.badge();
         draw_ascii(
             framebuffer,
             MARGIN,
             CHROME_TEXT_Y,
-            BADGE,
+            badge,
             CHROME_SCALE,
-            INSECURE_COLOR,
+            badge_color,
         );
 
         match (&self.editing, &self.loading) {
@@ -1210,6 +1255,37 @@ impl Viewer {
             CHROME_SCALE,
             CHROME_TEXT,
         );
+    }
+
+    /// What the badge says, and in what colour.
+    ///
+    /// While a page is loading this describes the connection being made,
+    /// not the page still on screen: the address field has already moved to
+    /// the new URL, and a badge left describing the old page beside the new
+    /// address would be the one combination that actively misleads.
+    ///
+    /// A connection that has not proved anything yet says so. It does not
+    /// borrow the previous page's answer and it does not guess from the
+    /// scheme.
+    fn badge(&self) -> (&'static str, u16) {
+        let security = match &self.loading {
+            Some(loading) => match loading.security {
+                Some(security) => security,
+                None => return (CONNECTING_BADGE, CHROME_TEXT),
+            },
+            None => match self.page.security {
+                Some(security) => security,
+                // A built-in page or this viewer's error page: never
+                // fetched, and always at an `http://built-in/` address.
+                None => fetch::PageSecurity::Cleartext,
+            },
+        };
+        let color = if security.is_warning() {
+            INSECURE_COLOR
+        } else {
+            AUTHENTICATED_COLOR
+        };
+        (security.badge(), color)
     }
 
     /// The address field, scrolled so the caret is always on screen.
@@ -1571,6 +1647,7 @@ fn build_page(document: Document) -> Result<Page, Error> {
     let order = layout.link_order()?;
     Ok(Page {
         document,
+        security: None,
         layout,
         first_line: 0,
         // Nothing is focused until the reader asks: an automatically

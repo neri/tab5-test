@@ -18,6 +18,14 @@
 //! - [`device`] is smoltcp's `phy::Device` over that queue
 //! - [`stack`] owns the interface, the socket set and the DHCP client, and
 //!   is what a shell command drives
+//! - [`tls`] is a transport rather than a client: it owns a TCP socket like
+//!   the clients do, but what comes out of it is plaintext for one of them
+//!   to read
+//! - [`pins`] is the SPKI pin table, generated from text a person edits and
+//!   compiled in: what makes a TLS connection to a known host authenticated
+//! - [`transport`] is the choice between a plain TCP stream and a TLS one,
+//!   made once by whoever knows the URL's scheme. [`http`] reads bytes from
+//!   it and never sees a socket
 //! - [`dns`], [`ping`], [`tftp`] and [`http`] are the clients that run on
 //!   that stack's sockets, one file each in the same way `usb/` splits its
 //!   class drivers. [`dns`] is the odd one: its socket belongs to
@@ -26,8 +34,11 @@
 pub mod device;
 pub mod dns;
 pub mod http;
+pub mod pins;
 pub mod ping;
 pub mod stack;
 pub mod tftp;
+pub mod tls;
+pub mod transport;
 
 pub use stack::{AddressSource, Stack};

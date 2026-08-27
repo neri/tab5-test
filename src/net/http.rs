@@ -16,28 +16,30 @@
 //! What this understands of HTTP is deliberately small and listed in
 //! [`Head`]: a status, a length or a chunked encoding, a content type, a
 //! `Location`, and a refusal to pretend it can decode a `Content-Encoding`
-//! it cannot. No cookies, no authentication, no keep-alive, no TLS.
+//! it cannot. No cookies, no authentication, no keep-alive.
+//!
+//! Nothing here touches a socket. The bytes come from a
+//! [`Transport`](crate::net::transport::Transport), which is either a TCP
+//! stream or a TLS session over one, and everything below -- the status
+//! line, the header block, the chunk decoder, where a body ends -- is the
+//! same code either way. That is the point: two copies of "where does the
+//! body end", one for `http` and one for `https`, is two chances to get it
+//! wrong and one page shown as complete when it is half of one.
 //!
 //! Names are resolved before they get here: the caller passes both the
 //! address to connect to and the text to put in `Host:`.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp;
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::Ipv4Address;
 
 use crate::browser::memory::{self, OutOfMemory};
 use crate::net::Stack;
+use crate::net::tls;
+use crate::net::transport::{self, Security, Transport};
 use crate::wifi::Rpc;
-use crate::{delay, tick, uart};
+use crate::tick;
 
-/// Socket buffers. 8 KiB each is more than the link can fill between two
-/// polls and still nothing next to the PSRAM heap.
-const BUFFER_BYTES: usize = 8192;
-
-const CONNECT_TIMEOUT_MS: u64 = 5000;
 /// How long the transfer may stall before it is called dead.
 const IDLE_TIMEOUT_MS: u64 = 5000;
 
@@ -65,9 +67,15 @@ const READ_CHUNK: usize = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
-    LinkLost,
-    /// The connection was refused or never completed.
-    NotConnected,
+    /// The byte stream underneath failed: the link, the connection, or --
+    /// for `https` -- the handshake, the certificate or a pin.
+    ///
+    /// Carried rather than flattened so that a TLS failure keeps its own
+    /// name all the way to the screen: "the certificate's signature is
+    /// wrong" and "the connection timed out" are not the same thing to
+    /// report, and a browser fixture matching on one must not pass on the
+    /// other.
+    Transport(transport::Error),
     /// Connected, but the peer stopped talking mid-response.
     TimedOut,
     /// No blank line ended the headers within [`MAX_HEADER_BYTES`], so where
@@ -104,11 +112,23 @@ impl From<OutOfMemory> for Error {
     }
 }
 
+impl From<transport::Error> for Error {
+    fn from(error: transport::Error) -> Self {
+        match error {
+            // The ones the HTTP layer already had names for keep them, so
+            // that splitting the transport out renamed no failure.
+            transport::Error::Cancelled => Error::Cancelled,
+            transport::Error::OutOfMemory => Error::OutOfMemory,
+            transport::Error::Local => Error::Local,
+            error => Error::Transport(error),
+        }
+    }
+}
+
 /// A short ASCII sentence, for the console and the browser's status line.
 pub fn error_text(error: Error) -> &'static str {
     match error {
-        Error::LinkLost => "the C6 link was lost during the transfer",
-        Error::NotConnected => "the connection was refused or timed out",
+        Error::Transport(error) => error.message(),
         Error::TimedOut => "the server stopped responding",
         Error::HeadersTooLong => "the response headers never ended",
         Error::Truncated => "the connection closed before the page finished",
@@ -125,8 +145,7 @@ pub fn error_text(error: Error) -> &'static str {
 /// A short name, for one-line UART statistics.
 pub fn error_name(error: Error) -> &'static str {
     match error {
-        Error::LinkLost => "link-lost",
-        Error::NotConnected => "not-connected",
+        Error::Transport(error) => error.name(),
         Error::TimedOut => "timed-out",
         Error::HeadersTooLong => "header-limit",
         Error::Truncated => "truncated",
@@ -281,11 +300,11 @@ pub struct Stats {
 
 /// One HTTP GET in flight.
 ///
-/// Owns a socket handle in the caller's `SocketSet` and nothing else --
-/// specifically not the [`Stack`] or the [`Rpc`], which are borrowed for
-/// the length of a single [`Transaction::poll`] and given back. That is
-/// what lets the browser's frame loop keep the stack for its own polling
-/// while a fetch is running.
+/// Owns a [`Transport`] -- which owns a socket handle in the caller's
+/// `SocketSet` -- and nothing else. Specifically not the [`Stack`] or the
+/// [`Rpc`], which are borrowed for the length of a single
+/// [`Transaction::poll`] and given back. That is what lets the browser's
+/// frame loop keep the stack for its own polling while a fetch is running.
 ///
 /// It must be handed to [`Transaction::close`]. Dropping it instead leaks
 /// the socket out of the set, and since the set is `'static` that socket
@@ -293,11 +312,11 @@ pub struct Stats {
 /// letting it be silent.
 #[must_use = "a Transaction owns a socket and has to be closed"]
 pub struct Transaction {
-    handle: SocketHandle,
+    transport: Option<Transport>,
     state: State,
-    /// The request, and how much of it has been handed to the socket.
-    /// Sending can be partial: the send buffer is 8 KiB but a request with
-    /// a long target is still a request that might not fit in one call.
+    /// The request, and how much of it has been handed to the transport.
+    /// Sending can be partial: the plaintext send buffer is 8 KiB but a
+    /// request with a long target might not fit in one call.
     request: Vec<u8>,
     sent: usize,
     /// The head block as it accumulates, replaced by [`Head`] once the
@@ -315,14 +334,28 @@ pub struct Transaction {
 impl Transaction {
     /// Opens a connection and queues `GET target`.
     ///
-    /// `host` is what goes in the `Host:` header, and is not always
-    /// `address` written out: when the destination was given as a name,
-    /// the name is what the server needs to pick a virtual host, and the
-    /// address it resolved to tells it nothing.
+    /// `host` is the finished `Host:` header value -- the port included when
+    /// it is not the scheme's default, which is what
+    /// [`Url::host_header`](crate::browser::url::Url::host_header) produces.
+    /// Nothing is appended to it here. It is not always `address` written
+    /// out: when the destination was given as a name, the name is what the
+    /// server needs to pick a virtual host, and the address it resolved to
+    /// tells it nothing.
+    ///
+    /// [`get`] takes the *bare* host instead and builds this from it. The
+    /// two are different on purpose and were once the same word, which is
+    /// how a caller came to hand a header value to the one that appends a
+    /// port to it.
     ///
     /// `max_body` bounds the decoded body. A transfer that reaches it fails
     /// with [`Error::BodyTooLong`] rather than delivering a prefix -- and a
     /// `Content-Length` past it fails before the body is read at all.
+    ///
+    /// `security` decides whether this is `http` or `https`, and is the
+    /// only place the difference is made. A failure to open a TLS
+    /// connection at all -- no hardware randomness, for instance -- is
+    /// reported here rather than as state, because there is no socket to
+    /// clean up when it happens.
     pub fn start(
         stack: &mut Stack,
         address: Ipv4Address,
@@ -330,15 +363,13 @@ impl Transaction {
         host: &[u8],
         target: &[u8],
         max_body: u64,
+        security: Security<'_>,
     ) -> Result<Transaction, Error> {
         let request = build_request(host, target)?;
-        let handle = stack.sockets_mut().add(tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; BUFFER_BYTES]),
-            tcp::SocketBuffer::new(vec![0u8; BUFFER_BYTES]),
-        ));
+        let transport = Transport::connect(stack, address, port, security)?;
         let now = tick::now_ms();
-        let mut transaction = Transaction {
-            handle,
+        Ok(Transaction {
+            transport: Some(transport),
             state: State::Connecting,
             request,
             sent: 0,
@@ -349,16 +380,26 @@ impl Transaction {
             started_ms: now,
             last_progress_ms: now,
             closed: false,
-        };
-        let local_port = 49152 + (delay::cycle_count() % 16384) as u16;
-        let remote = IpEndpoint::new(IpAddress::Ipv4(address), port);
-        if stack.connect_tcp(handle, remote, local_port).is_err() {
-            // The socket is in the set and has to come out of it, which is
-            // the caller's job through `close` -- so report the failure as
-            // state rather than as an early return that drops the handle.
-            transaction.state = State::Failed(Error::Local);
-        }
-        Ok(transaction)
+        })
+    }
+
+    /// What the connection proved about who is on the other end, or `None`
+    /// for plaintext HTTP.
+    pub fn authentication(&self) -> Option<tls::Authentication> {
+        self.transport.as_ref().and_then(Transport::authentication)
+    }
+
+    /// Whether a TLS stream ended with a TCP close rather than a
+    /// `close_notify`. Always false for plaintext.
+    pub fn closed_without_notify(&self) -> bool {
+        self.transport
+            .as_ref()
+            .is_some_and(Transport::closed_without_notify)
+    }
+
+    /// The TLS counters, for a caller reporting them. `None` for plaintext.
+    pub fn tls_stats(&self) -> Option<tls::Stats> {
+        self.transport.as_ref().and_then(Transport::tls_stats)
     }
 
     /// Makes up to `budget` bytes of progress, then returns.
@@ -379,49 +420,61 @@ impl Transaction {
             State::Failed(error) => return Progress::Failed(error),
             _ => {}
         }
-        if !stack.poll(rpc) {
-            return self.fail(Error::LinkLost);
+
+        // The transport is stepped first and unconditionally: for TLS this
+        // is what runs the handshake and turns records into plaintext, and
+        // there is nothing for the parser to read until it has.
+        let Some(transport) = self.transport.as_mut() else {
+            return self.fail(Error::Local);
+        };
+        match transport.poll(stack, rpc, budget) {
+            transport::Progress::Failed(error) => return self.fail(error.into()),
+            transport::Progress::Connecting => {
+                if matches!(self.state, State::Connecting) {
+                    return Progress::Connecting;
+                }
+                // Past the point where the request went out, a transport
+                // that says it is not ready has gone backwards, which only
+                // a broken one does.
+                return self.fail(Error::Transport(transport::Error::NotConnected));
+            }
+            transport::Progress::Ready => {
+                if matches!(self.state, State::Connecting) {
+                    self.state = State::Sending;
+                    self.last_progress_ms = tick::now_ms();
+                }
+            }
         }
 
         match self.state {
-            State::Connecting => self.poll_connecting(stack),
             State::Sending => self.poll_sending(stack),
             State::Head | State::Body(_) => self.poll_receiving(stack, budget, sink),
             State::Complete => Progress::Complete,
             State::Failed(error) => Progress::Failed(error),
+            State::Connecting => Progress::Connecting,
         }
-    }
-
-    fn poll_connecting(&mut self, stack: &mut Stack) -> Progress {
-        if stack
-            .sockets_mut()
-            .get_mut::<tcp::Socket>(self.handle)
-            .may_send()
-        {
-            self.state = State::Sending;
-            self.last_progress_ms = tick::now_ms();
-            return Progress::Connecting;
-        }
-        if tick::now_ms().saturating_sub(self.started_ms) > CONNECT_TIMEOUT_MS {
-            return self.fail(Error::NotConnected);
-        }
-        Progress::Connecting
     }
 
     fn poll_sending(&mut self, stack: &mut Stack) -> Progress {
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
-        match socket.send_slice(&self.request[self.sent..]) {
+        let Some(transport) = self.transport.as_mut() else {
+            return self.fail(Error::Local);
+        };
+        match transport.write(stack, &self.request[self.sent..]) {
             Ok(count) => {
                 self.sent += count;
                 if count > 0 {
                     self.last_progress_ms = tick::now_ms();
                 }
             }
-            Err(_) => return self.fail(Error::Local),
+            Err(error) => return self.fail(error.into()),
         }
         if self.sent >= self.request.len() {
+            // No body follows a GET, so the request is finished the moment
+            // its last byte is handed over. The TLS engine needs telling;
+            // the plaintext one does not care.
+            transport.finish_request();
             self.state = State::Head;
-        } else if tick::now_ms().saturating_sub(self.last_progress_ms) > IDLE_TIMEOUT_MS {
+        } else if tick::now_ms().saturating_sub(self.last_progress_ms) > transport::WRITE_STALL_MS {
             return self.fail(Error::TimedOut);
         }
         Progress::Connecting
@@ -462,11 +515,13 @@ impl Transaction {
         while spent < budget {
             let mut chunk = [0u8; READ_CHUNK];
             let want = READ_CHUNK.min(budget - spent);
-            let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
-            let count = match socket.recv_slice(&mut chunk[..want]) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => count,
+            let Some(transport) = self.transport.as_mut() else {
+                return self.fail(Error::Local);
             };
+            let count = transport.read(stack, &mut chunk[..want]);
+            if count == 0 {
+                break;
+            }
             spent += count;
             self.stats.received += count;
             self.last_progress_ms = tick::now_ms();
@@ -497,11 +552,12 @@ impl Transaction {
             return Progress::Body;
         }
 
-        // Nothing arrived. Either the peer has closed, or it is quiet.
-        let socket = stack.sockets_mut().get_mut::<tcp::Socket>(self.handle);
-        // `may_recv` goes false once the peer has sent its FIN and the
-        // receive buffer is drained.
-        if !socket.may_recv() {
+        // Nothing arrived. Either the peer has finished, or it is quiet.
+        let at_end = self
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.at_end(stack));
+        if at_end {
             return self.finish_at_close();
         }
         if tick::now_ms().saturating_sub(self.last_progress_ms) > IDLE_TIMEOUT_MS {
@@ -528,7 +584,7 @@ impl Transaction {
             State::Body(Framing::Length { remaining }) if *remaining == 0 => self.complete(),
             State::Body(_) => self.fail(Error::Truncated),
             State::Complete => Progress::Complete,
-            _ => self.fail(Error::NotConnected),
+            _ => self.fail(Error::Transport(transport::Error::NotConnected)),
         }
     }
 
@@ -717,26 +773,19 @@ impl Transaction {
     /// Stops the transfer. The socket still has to be [`Transaction::close`]d.
     pub fn cancel(&mut self) {
         if !self.is_finished() {
+            if let Some(transport) = self.transport.as_mut() {
+                transport.cancel();
+            }
             self.state = State::Failed(Error::Cancelled);
             self.stats.elapsed_ms = tick::now_ms().saturating_sub(self.started_ms);
         }
     }
 
-    /// Aborts the connection and takes the socket out of the set.
-    ///
-    /// `abort` rather than `close`: the socket is going away with the
-    /// handle, so there is nobody left to finish a graceful shutdown. The
-    /// short pump afterwards is what actually puts the RST on the wire --
-    /// without it the peer is left holding a connection that no longer
-    /// exists at this end, which after a hundred cancellations is a hundred
-    /// sockets on the other machine.
+    /// Ends the connection and takes the socket out of the set.
     pub fn close(mut self, stack: &mut Stack, rpc: &mut Rpc) -> Stats {
-        stack
-            .sockets_mut()
-            .get_mut::<tcp::Socket>(self.handle)
-            .abort();
-        stack.pump_until(rpc, ABORT_PUMP_MS, |_| false);
-        stack.sockets_mut().remove(self.handle);
+        if let Some(transport) = self.transport.take() {
+            transport.close(stack, rpc);
+        }
         self.closed = true;
         if self.stats.elapsed_ms == 0 {
             self.stats.elapsed_ms = tick::now_ms().saturating_sub(self.started_ms);
@@ -745,17 +794,10 @@ impl Transaction {
     }
 }
 
-/// How long the abort is pumped for so the RST actually leaves.
-const ABORT_PUMP_MS: u64 = 20;
-
 impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.closed {
-            // Nothing can be done about it from here: removing the socket
-            // needs the stack, and the stack is not reachable from a
-            // `Drop`. Saying so is the whole of the remedy, and it turns a
-            // silent leak into a line in the log.
-            uart::log(b"HTTP: a transaction was dropped without close()\r\n");
+            transport::report_unclosed(b"HTTP");
         }
     }
 }
@@ -1091,25 +1133,38 @@ pub struct Response {
 /// wrong for anything with a frame loop. [`Transaction`] is the same
 /// exchange for callers that cannot block.
 ///
-/// `host` is what goes in the `Host:` header, and is not always `address`
-/// written out: when the destination was given as a name, the name is what
-/// the server needs to pick a virtual host, and the address it resolved to
-/// tells it nothing.
+/// `bare_host` is the host *without* a port: this builds the `Host:` header
+/// from it and `port`. That is the opposite of [`Transaction::start`], which
+/// takes the finished header value -- so a caller with a
+/// [`Url`](crate::browser::url::Url) passes `host()` here and `host_header()`
+/// there. Passing the wrong one produces `Host: name:8080:8080`, which most
+/// servers ignore and which is therefore invisible until something reads it.
+///
+/// It is not always `address` written out: when the destination was given as
+/// a name, the name is what the server needs to pick a virtual host, and the
+/// address it resolved to tells it nothing.
 pub fn get(
     stack: &mut Stack,
     rpc: &mut Rpc,
     address: Ipv4Address,
     port: u16,
-    host: &[u8],
+    bare_host: &[u8],
     path: &[u8],
+    security: Security<'_>,
     sink: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<Response, Error> {
     // The `Host:` header carries the port when it is not the default, the
-    // same rule the browser's `Url::host_header` applies.
+    // same rule the browser's `Url::host_header` applies. Which port counts
+    // as default depends on the scheme, so it comes from the transport
+    // choice rather than from a constant.
+    let default_port = match security {
+        Security::Plain => 80,
+        Security::Tls { .. } => 443,
+    };
     let host_header = match port {
-        80 => owned(host)?,
+        port if port == default_port => owned(bare_host)?,
         port => {
-            let mut value = owned(host)?;
+            let mut value = owned(bare_host)?;
             value.push(b':');
             push_decimal(&mut value, port as u32);
             value
@@ -1118,7 +1173,7 @@ pub fn get(
     // No body limit: `httpget` saves what it is given, and its 512 KiB
     // regression download is larger than the browser's page bound.
     let mut transaction =
-        Transaction::start(stack, address, port, &host_header, path, u64::MAX)?;
+        Transaction::start(stack, address, port, &host_header, path, u64::MAX, security)?;
     loop {
         match transaction.poll(stack, rpc, DEFAULT_POLL_BUDGET, sink) {
             Progress::Complete => break,

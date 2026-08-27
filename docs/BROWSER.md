@@ -4,8 +4,9 @@
 > [`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md)
 
 `browser`コマンドで開く全画面のビューアです。**Webブラウザではありません。**
-平文HTTPで取得したHTMLから文章とリンクを取り出し、画面幅へ折り返して読む
-ものだけを実装してあります。CSS・JavaScript・画像・TLSはいずれもありません。
+HTTPまたはHTTPSで取得したHTMLから文章とリンクを取り出し、画面幅へ折り返して読む
+ものだけを実装してあります。CSS・JavaScript・画像はいずれもありません。TLSは
+ありますが、接続先の身元は確認しません（下記「未認証TLS」）。
 
 対象を狭く固定してあるのは能力不足の言い訳ではなく設計です。対象外の内容を
 推測して実行したり、上限なく保持したりしないことが、1つのページで基板ごと
@@ -15,7 +16,7 @@
 
 | できる | できない |
 | --- | --- |
-| `http://`の取得 | `https://`（認識して「未対応」と表示。**httpへ落としません**） |
+| `http://`と`https://`の取得 | 接続先の**身元の確認**（未認証TLS。下記） |
 | HTMLの文章・見出し・リスト・リンク | CSS（`style`属性・`<style>`・外部stylesheet） |
 | 相対リンクの解決、履歴8ページ、戻る | JavaScript、DOM API |
 | リダイレクト5回まで | 画像のデコード（`img`は`alt`だけ） |
@@ -23,9 +24,38 @@
 | キーボード・タッチ・USBマウス | 日本語フォント、日本語入力 |
 | 読み込み中のキャンセル | IPv6、HTTP/2、HTTP/3、WebSocket |
 
-平文HTTPしか話せないので、**認証情報を送る機能を持ちません**。アドレス欄の
-左には常に赤で`INSECURE HTTP`と出ます。条件付きではありません——TLSが無い
-以上、この表示が消えてよい状態が存在しないからです。
+**認証情報を送る機能を持ちません。** cookie、form送信、Basic／Bearer認証の
+いずれも無く、それはTLSが入っても変わりません。理由はTLSの中身にあります。
+
+### 未認証TLS
+
+`https://`で接続すると、serverの`CertificateVerify`とFinished、全recordの
+AEAD tagを検証します。しかしそれで分かるのは「相手が、提示した証明書の
+秘密鍵を持っている」ことだけで、その証明書がアドレス欄のhostのものかは
+**確認していません**。chainを辿らず、rootを見ず、名前を照合せず、有効期限も
+読みません（[NETWORK.md](NETWORK.md)、[TLS_PLAN.md](TLS_PLAN.md)）。
+
+したがって受動的な盗聴は防ぎますが、能動的な攻撃者は自前の証明書で接続を
+終端でき、上の検証はすべて通ります。**これは通常のHTTPSと同じものではありません。**
+
+toolbarの左端のバッジはこの区別をそのまま出します。
+
+| バッジ | 色 | 意味 |
+| --- | --- | --- |
+| `INSECURE HTTP` | 赤 | 平文。経路上の誰でも読める |
+| `TLS UNVERIFIED` | 赤 | 暗号化されているが、相手が誰かは未確認 |
+| `TLS PINNED` | 緑 | leafのSPKIがfirmware組み込みのpinと一致（pin表は空なので通常buildでは出ません） |
+| `CONNECTING` | 地色 | 接続中。まだ何も証明されていない |
+
+前2つが同じ赤なのは、読み手にとって意味が同じだからです——画面に出ている
+ものがアドレスどおりの出所とは限らない。`SECURE`という語はどのバッジにも
+出しません。バッジ幅は最長の文字列に固定してあり、ページが変わっても
+アドレス欄が横にずれません。
+
+読み込み中のバッジは**読み込み中の接続**の状態です。画面に残っている前の
+ページのものではありません。アドレス欄は既に新しいURLへ移っているので、
+そこに前のページのバッジを併記するのが、唯一積極的に誤解を招く組み合わせに
+なるためです。handshakeが終わるまでは`CONNECTING`で、schemeから推測しません。
 
 ## 画面
 
@@ -33,7 +63,7 @@
 
 ```text
  y=0    ┌───────────────────────────────────────────────┐
-        │ INSECURE HTTP  http://host/page      12 links │  toolbar
+        │ TLS UNVERIFIED https://host/page     12 links │  toolbar
  y=40   ├───────────────────────────────────────────────┤
         │ 見出し                                        │
         │                                               │  viewport
@@ -43,7 +73,7 @@
  y=720  └───────────────────────────────────────────────┘
 ```
 
-- **toolbar**: `INSECURE HTTP`、現在のアドレス（編集中はアドレス欄）、
+- **toolbar**: セキュリティバッジ（上表）、現在のアドレス（編集中はアドレス欄）、
   リンク数と行数。読み込み中は受信KiBに変わります
 - **viewport**: scroll位置と交差する行だけを描きます。文書全体のbitmapは
   作りません
@@ -207,7 +237,7 @@ HTMLは壊れているのが通常だという前提です。未終了タグ・�
 
 | 項目 | 上限 |
 | --- | ---: |
-| HTTP応答ヘッダ | 4 KiB |
+| HTTP応答ヘッダ | 16 KiB |
 | URL 1件 | 2,048 byte |
 | redirect | 5回 |
 | 履歴 | 8ページ |
@@ -243,13 +273,15 @@ manifestはこの名前で期待値を書きます。
 
 | name | 意味 |
 | --- | --- |
-| `https` | HTTPSは未対応。httpへ落とさない |
+| `https-downgrade` | `https`から`http`へのredirect。**自動では落ちません** |
+| `tls-auth-downgrade` | pin済みの接続から、pinの無いhostへのredirect |
+| `tls-connect`／`tls-cert`／`tls-alert`ほか | TLS層の失敗（[NETWORK.md](NETWORK.md)） |
 | `redirect-limit` | 5回を超えた、または循環している |
 | `redirect-broken` | `Location`が無い／読めない |
 | `not-http` | 1行目がステータス行ではない |
 | `status` | 2xx以外（表示は`status-404`のように数字が付く） |
 | `not-html` | HTMLではない |
-| `header-limit` | ヘッダが4 KiBまでに終わらない |
+| `header-limit` | ヘッダが16 KiBまでに終わらない |
 | `truncated` | 本文が終わる前に接続が切れた |
 | `chunk` | chunked転送の書式が壊れている |
 | `body-limit` | 本文が2 MiBを超えた |
@@ -264,7 +296,13 @@ manifestはこの名前で期待値を書きます。
 **表示するアドレスと実際に接続するhost／portは同じ`Url`から生成します。**
 別々の文字列を正にすると、アドレス欄が嘘をつける実装になります。
 
-- 接続できるschemeは`http`だけ。`https`は認識して拒否、それ以外は拒否
+- 接続できるschemeは`http`と`https`。それ以外は拒否
+- **redirectでの降格は拒否します。** `https`→`http`は`https-downgrade`、
+  pin済み接続からpinの無いhostへは`tls-auth-downgrade`。`http`→`https`は
+  許可します。これは「利用者が`http://`のアドレスを打つ」「ページ上の
+  `http`リンクを選ぶ」ことを禁じる規則ではありません——それらはアドレスが
+  見えた上での選択です。禁じているのは、その選択を相手のserverが代わりに
+  行うことです
 - hostはASCII DNS名またはIPv4。IDNA変換は行わない（punycode表記は入力可）
 - userinfo（`user@host`）とIPv6 literalは拒否
 - 数字とドットだけのhostは厳格なdotted quad（先頭ゼロ禁止）でなければ拒否し、
@@ -296,6 +334,7 @@ schemeを必須にします——文書の中のscheme無しは壊れた文書�
 | `example.com/page.html` | `http://example.com/page.html` |
 | `//example.com/x` | `http://example.com/x`（schemeだけ補う） |
 | `https://example.com/` | そのまま。**httpへは落としません** |
+| （`https`ページ上の`http`リンク） | 隠さず平文で読み込み、完了後は`INSECURE HTTP`になる |
 | `ftp://example.com/` | そのまま拒否。`http://ftp://…`にはしません |
 | `http:example.com` | `http:`はschemeなので補完せず、「hostが無い」のまま |
 
@@ -328,7 +367,7 @@ mise run test    # cargo test -p tab5-browser --target x86_64-unknown-linux-gnu
 | `browser/src/layout.rs` | 折返しレイアウト、当たり判定、リンク順序 |
 | `browser/src/limits.rs` | 上限の一覧 |
 | `browser/src/memory.rs` | 失敗を返す確保 |
-| `src/app/fetch.rs` | 取得の状態機械。DNS→接続→head判定→本文→文書 |
+| `src/app/fetch.rs` | 取得の状態機械。DNS→接続→head判定→本文→文書。schemeからtransportを選び、redirectでの降格を拒否し、接続が何を証明したか（`PageSecurity`）を持つ |
 | `src/app/browser.rs` | 画面、入力、履歴、アドレス編集、組み込みページ |
 | `src/app/pointer.rs` | `win`と共有するカーソル |
 | `src/app/browsertest.rs` | `hs`／`bt`診断 |
@@ -361,6 +400,40 @@ python3 tools/browser_fixture_server.py            # 0.0.0.0:8080
 python3 tools/browser_fixture_server.py --list     # 端点と期待値
 python3 tools/browser_fixture_server.py --dump browser/tests/fixtures
 ```
+
+fixture serverは同じ端点をTLSでも出します（`--tls-port`、既定8443）。
+`bt https://<addr>:8443` とすると全manifestがTLS上で巡回されるので、
+平文とHTTPSで結果が一致することを突き合わせられます。
+
+`/manifest.txt`は**接続ごとに内容が変わります**。`/redirect/https`は平文から
+なら上へ（TLS listenerへ）redirectして`ok`、TLSからなら下へ（平文listenerへ）
+redirectして`https-downgrade`になります。降格の拒否は「TLSを話すserverから
+平文へ誘導される」状況でしか作れないので、この向きはTLS listenerが要ります。
+
+`/redirect/unpinned`はpin済み接続からpinの無いhostへのredirectで、
+`tls-auth-downgrade`になります。ただしこれは**基板側のbuild**にも依存します
+（pinを持たないbuildでは失うidentityが無いので、単に名前が引けず`dns`）。
+既定ではpin入りbuildを想定するので、通常buildで巡回するときは
+`--unpinned-board`を付けてください。
+
+TLS固有の失敗は専用のlistenerで、manifestには絶対URLとして載ります
+（平文の巡回からも届きます）。
+
+| port | 提示するもの | pin無しbuild | pin入りbuild |
+| --- | --- | --- | --- |
+| `--tls-port` | ECDSA P-256、`--tls-key-name`の鍵 | `ok` | `ok`／`other`鍵なら`tls-pin` |
+| +1 | fatalな`handshake_failure` alertだけ | `tls-alert` | `tls-alert` |
+| +2 | Ed25519証明書 | `tls-cert` | `tls-pin` |
+| +3 | RSA-PSS証明書 | `ok` | `tls-pin` |
+
+**pinはhostname単位で、port単位ではありません。** これらのlistenerはpin済みの
+listenerと同じアドレスにいるので、pinを持つ基板はここでもpinを照合し、どちらの
+鍵もpinされていないため署名方式に到達する前に拒否します。回避せず期待値として
+書いているのは、これがpinを持つ意味そのものだからです——別のportから来た鍵が
+通ってしまうpinは、1つのportしか守らないpinです。
+
+したがってEd25519の明示拒否（`tls-cert`）とRSA-PSSの成功（`ok`）を確認するのは
+pin無しbuildの巡回です。2つのbuildで1回ずつ巡回すると全部が埋まります。
 
 `--dump`で書き出したHTMLは`browser/tests/fixtures.rs`が解析します。実機が
 返すのと同じbyte列をホストでも解析するので、期待値の写しが2つある状態を

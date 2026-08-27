@@ -242,6 +242,23 @@ struct DocumentOutcome {
     error: Option<error::Error>,
 }
 
+/// The transport a URL's scheme calls for.
+///
+/// Taken from the `Url` rather than from a flag, at every site that opens a
+/// connection: an `https://` address handed to the plaintext path would
+/// connect in the clear to port 443, which is the downgrade this whole
+/// layering exists to make unwriteable. There is deliberately no way to ask
+/// for one with the other's scheme.
+fn security_for(url: &Url) -> net::transport::Security<'_> {
+    match url.scheme() {
+        crate::browser::url::Scheme::Http => net::transport::Security::Plain,
+        crate::browser::url::Scheme::Https => net::transport::Security::Tls {
+            server_name: url.host(),
+            policy: net::pins::policy_for(url.host()),
+        },
+    }
+}
+
 /// One fetch, polled to the end with a bounded budget each time.
 ///
 /// The loop here stands in for the browser's frame loop: it is what proves
@@ -265,6 +282,7 @@ fn fetch(
         host.as_bytes(),
         target.as_bytes(),
         MAX_BODY,
+        security_for(url),
     ) {
         Ok(transaction) => transaction,
         Err(error) => return failed(error),
@@ -455,6 +473,7 @@ fn cancel_immediately(
         host.as_bytes(),
         target.as_bytes(),
         MAX_BODY,
+        security_for(url),
     ) {
         Ok(transaction) => transaction,
         Err(error) => return failed(error),
@@ -1094,9 +1113,15 @@ fn load_manifest(
     rpc: &mut wifi::Rpc,
     stack: &mut net::Stack,
 ) -> Result<String, &'static str> {
-    let (Ok(target), Ok(host)) = (url.request_target(), url.host_header()) else {
+    // `host()` and not `host_header()`: `net::http::get` builds the header
+    // from a bare host and the port, where `Transaction::start` takes the
+    // finished value. Handing it the finished one asked the server for
+    // `Host: 192.168.0.159:8080:8080`, which no fixture had ever looked at
+    // until the manifest started building URLs out of it.
+    let Ok(target) = url.request_target() else {
         return Err("out of memory");
     };
+    let host = url.host();
     let mut body = String::new();
     let mut overflowed = false;
     let outcome = {
@@ -1120,6 +1145,7 @@ fn load_manifest(
             url.port(),
             host.as_bytes(),
             target.as_bytes(),
+            security_for(url),
             &mut sink,
         )
     };

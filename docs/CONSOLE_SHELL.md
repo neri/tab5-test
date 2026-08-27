@@ -282,6 +282,33 @@ PMAが「そのアドレスがどう振る舞うか」を決めるのに対し�
 このため使えません）とこのマシンモードの規則を出します。TORの上限が前エントリの下限以下で
 何にも一致しないエントリには`empty`を付けます。`pma`と同様にCSRは読むだけです。
 
+`httpget`はhostだけを渡すと従来どおり平文です。TLSにするには`https://`から
+始まるURLを明示します。コマンド名だけで暗号化の有無を変えることはありません。
+`hs`もURLのschemeでtransportを選びます。どちらのhttps取得も**未認証**です
+（[BROWSER.md](BROWSER.md)）。
+
+`tls <host>[:port] [path]`はTLS 1.3接続を1回張り、その上で1ページ取得して、
+handshakeが何を証明したかを報告します。既定portは443、既定pathは`/`です。
+接続は**未認証**で、serverの`CertificateVerify`とFinishedは提示された鍵に対して
+検証しますが、その鍵がこのhostのものかは確認しません（[NETWORK.md](NETWORK.md)）。
+表示は`TLS UNVERIFIED`で、`SECURE`にはなりません。本文は数えて捨てます。
+
+報告するのはhandshake時間、総時間、poll回数、そして**1回のpollの最長時間**です。
+最後の値がブラウザのframe loopが実際に感じる停止時間で、署名検証はpollの内側の
+分割できない処理なので、ここが100 msを超えるかどうかが
+[TLS_PLAN.md](TLS_PLAN.md)の中止条件になります。
+
+`entropy`はTLSがCSPRNGの種に使うSAR ADCノイズ源を検査します。引数なしで1回種を取り、
+32 byteと有効化／停止の累計回数を表示します。`entropy test [count]`は既定100回、
+「ノイズ源を立ち上げる→CSPRNGへ種を入れる→32 byte引く」というTLS接続と同じ経路を
+繰り返し、(1)有効化と停止の回数が必ず一致すること、(2)連続する2回が同じ32 byteを
+出さないことを確認します。統計的なランダム性検定は行いません。真性であることを
+証明できない一方、同じ値の再出現は真性でないことを証明するからです。
+
+`entropy fail on`はハードウェアに触れずに種の取得を失敗させるテストフックです。
+真性乱数が用意できないとき呼び出し側が1 packetも送らないことを確認するために使い、
+`entropy fail off`で戻します（[TLS_PLAN.md](TLS_PLAN.md) Stage 2）。
+
 ## 再起動
 
 `reboot`は`src/startup.rs`の`reboot()`が実装しており、HPCPU 0自身の

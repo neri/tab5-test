@@ -15,6 +15,14 @@
 //! this driver reads them for display and never touches them -- with the one
 //! exception of `CTRL0`'s `STOP` bit, which has to be set for the duration of
 //! a calendar write and is restored immediately afterwards.
+//!
+//! The calendar this driver reads and writes is **UTC**. The device has
+//! nowhere to record a time zone, so which one its counters mean is this
+//! firmware's decision rather than the device's, and [`crate::wall_clock`] is
+//! where that decision is written down. Nothing in this file converts: what
+//! goes in is what comes out.
+
+use tab5_time::Calendar;
 
 use crate::i2c::{self, I2cError, SoftI2c};
 
@@ -86,16 +94,30 @@ pub struct DateTime {
 impl DateTime {
     /// Whether every field is in range for the calendar it describes,
     /// including the length of the given month in the given year.
+    ///
+    /// The calendar rules are `tab5_time`'s, so that the firmware has one
+    /// notion of which days exist; what is added here is the device's own
+    /// limit, a two-digit year with no century bit.
     pub fn is_valid(&self) -> bool {
         self.year >= YEAR_BASE
             && self.year < YEAR_BASE + 100
-            && (1..=12).contains(&self.month)
-            && self.day >= 1
-            && self.day <= days_in_month(self.year, self.month)
-            && self.hour <= 23
-            && self.minute <= 59
-            && self.second <= 59
+            && self.calendar().is_valid()
             && self.weekday.is_none_or(|weekday| weekday <= 6)
+    }
+
+    /// The same reading without the week register, which is the device's
+    /// redundant copy of the date rather than part of it.
+    ///
+    /// What this holds is UTC: see [`crate::wall_clock`].
+    pub fn calendar(&self) -> Calendar {
+        Calendar {
+            year: self.year,
+            month: self.month,
+            day: self.day,
+            hour: self.hour,
+            minute: self.minute,
+            second: self.second,
+        }
     }
 }
 
@@ -223,7 +245,9 @@ pub fn write_datetime(datetime: &DateTime) -> Result<(), Error> {
     let control0 = read_register(bus, REGISTER_CONTROL0)?;
 
     write_register(bus, REGISTER_CONTROL0, control0 | CONTROL0_STOP)?;
-    let weekday = weekday_from_date(datetime.year, datetime.month, datetime.day);
+    // `is_valid` above has already accepted the date, so this cannot fail.
+    let weekday = tab5_time::weekday_from_date(datetime.year, datetime.month, datetime.day)
+        .unwrap_or_default();
     let counters: [u8; CALENDAR_BYTES] = [
         to_bcd(datetime.second),
         to_bcd(datetime.minute),
@@ -254,30 +278,6 @@ pub fn clear_flag(flag: u8) -> Result<(), Error> {
     write_register(i2c::board_bus(), REGISTER_FLAG, !flag)
 }
 
-/// Day of the week for a date, 0 = Sunday, matching the bit position the
-/// RX8130CE's week register uses (bit 0 = Sunday .. bit 6 = Saturday).
-pub fn weekday_from_date(year: u16, month: u8, day: u8) -> u8 {
-    // Zeller's congruence, whose January and February belong to the previous
-    // year.
-    let (year, month) = if month <= 2 {
-        (year - 1, month + 12)
-    } else {
-        (year, month)
-    };
-    let (year, month, day) = (year as u32, month as u32, day as u32);
-    let century = year / 100;
-    let within_century = year % 100;
-    let saturday_based = (day
-        + 13 * (month + 1) / 5
-        + within_century
-        + within_century / 4
-        + century / 4
-        + 5 * century)
-        % 7;
-    // Zeller counts from Saturday; shift to Sunday.
-    ((saturday_based + 6) % 7) as u8
-}
-
 pub fn weekday_name(weekday: u8) -> &'static str {
     match weekday {
         0 => "Sun",
@@ -288,18 +288,6 @@ pub fn weekday_name(weekday: u8) -> &'static str {
         5 => "Fri",
         6 => "Sat",
         _ => "???",
-    }
-}
-
-pub fn days_in_month(year: u16, month: u8) -> u8 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
-            29
-        }
-        2 => 28,
-        _ => 0,
     }
 }
 

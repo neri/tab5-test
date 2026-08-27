@@ -28,6 +28,9 @@ HTTP GETができるところまでです。受け取ったファイルは`/tmp`
 | `src/net/ping.rs` | ICMP echoの送信と往復時間の測定 |
 | `src/net/tftp.rs` | TFTP読み出しクライアント（RFC 1350） |
 | `src/net/http.rs` | HTTP/1.0 GET。中断可能な`Transaction`と、その上の同期`get` |
+| `src/net/tls.rs` | TLS 1.3クライアント。TCP socketを所有し、平文を出すtransport |
+| `spki/src/lib.rs` | leaf証明書のDERから`SubjectPublicKeyInfo`を取り出す（`tab5-spki`、host test付き） |
+| `src/entropy.rs` | SAR ADCノイズ源から種を取るCSPRNG。TLSの秘密値はここからだけ来る |
 
 `net::Stack`は**C6のリンクを所有しません**。`wifi::Rpc`がトランスポートを
 持ったままで、パケットを触る呼び出しはその都度`&mut Rpc`を借ります。
@@ -422,10 +425,36 @@ CRCを取る・数える・書く・捨てるのどれを選んでも転送の�
 
 ## HTTP
 
-TLSはありません。HTTP/1.1ではなく**1.0**を使うのは、本文の終わりでサーバに
-接続を閉じさせ、`may_recv`が落ちることを終端の判定に使うためです。要求には
-`Accept-Encoding: identity`を明記します。ヘッダを省略したときの既定は
-「何でも」で、gzipで返されると展開する手段がないためです。
+HTTP/1.1ではなく**1.0**を使うのは、本文の終わりでサーバに接続を閉じさせ、
+それを終端の判定に使うためです。要求には`Accept-Encoding: identity`を
+明記します。ヘッダを省略したときの既定は「何でも」で、gzipで返されると
+展開する手段がないためです。
+
+### ソケットには触らない
+
+`net::http`はソケットを持ちません。バイトは`net::transport::Transport`から
+来て、それが平文TCPかTLSセッションかは上の層が`Security`で1回だけ決めます。
+status行、ヘッダブロック、chunkデコーダ、本文の終端判定は**どちらでも同じ
+コード**です。
+
+```text
+                   +-- Transport::Plain -- TCP socket
+HTTP Transaction --+
+                   +-- Transport::Tls ---- net::tls::Transaction -- TCP socket
+```
+
+分けなかった理由は単純で、「本文はどこで終わるか」の答えが2つあると、
+どちらが正しいか誰にも分からなくなるからです。半分のページを1ページとして
+表示してしまう失敗は、この層全体がそれを避けるために組んであります。
+
+`Transport`が答える質問は4つだけです——使える状態か（`poll`）、このバイト列を
+受け取れ（`write`）、バイトをよこせ（`read`）、終わったか（`at_end`）。
+平文側は`recv_slice`と`may_recv`がそのまま答え、TLS側は自前のfutureと
+record bufferとhandshakeの裏でそれを作ります。
+
+ただし**認証状態だけは平坦化しません**。`Transport::authentication`は平文で
+`None`、TLSで`Some`を返します。`None`は「安全でない」ではなく「この質問は
+当てはまらない」なので、表示側はschemeから推測せずこの値を見る必要があります。
 
 ### 2つの顔、実装は1つ
 
@@ -437,7 +466,7 @@ TLSはありません。HTTP/1.1ではなく**1.0**を使うのは、本文の�
 - **`get`**は`Transaction`を回すループです。`httpget`が使います。コンソールを
   占有するコマンドは待ってよいので、こちらは取得完了まで戻りません
 
-ヘッダ解析・本文の終端判定・ソケットの後始末は1箇所にしかありません。
+ヘッダ解析・本文の終端判定・接続の後始末は1箇所にしかありません。
 `Transaction`は`close`を呼ばないとソケットが`SocketSet`から抜けないので、
 `Drop`で「closeせずに捨てられた」ことをUARTへ出します。ここから`Stack`へは
 手が届かないので、言うことが治療のすべてです。
@@ -475,7 +504,7 @@ status code、`Content-Type`と`charset`、`Content-Length`、
 ### ヘッダと本文を分ける
 
 **ヘッダの終わりの空行で切り分け**、ヘッダは保持し（上限
-`MAX_HEADER_BYTES` = 4 KiB）、**本文だけをsinkへ渡します**。以前は先頭4 KiBを
+`MAX_HEADER_BYTES` = 16 KiB）、**本文だけをsinkへ渡します**。以前は先頭4 KiBを
 ヘッダごと保持し、残りは受信して捨てていました。ステータス行を見る手段では
 あっても、何かを取ってくる手段ではありませんでした。
 
@@ -503,12 +532,176 @@ status code、`Content-Type`と`charset`、`Content-Length`、
 **約827 KiB/s**です。**リンクの実力を示すのはTFTPの111 KiB/sではなくこちら**で、
 差は複数セグメントを同時に飛ばして往復の待ちを隠せるかどうかによります。
 
+## TLS
+
+`src/net/tls.rs`はTLS 1.3クライアントである。`net::http`と同じく、TCP socketを
+`SocketSet`に持ち、`poll`のあいだだけ`&mut Stack`と`&mut Rpc`を借りる。違うのは
+出てくるものが平文であることで、HTTP層はこの上に載る（統合は未着手、下記「現状の範囲」）。
+
+### 1 frameで戻るための構造
+
+TLSエンジンは[embedded-tls](https://docs.rs/embedded-tls/) 0.19である。採用理由と
+検討したほかの候補は[TLS_PLAN.md](TLS_PLAN.md)にある。
+
+このライブラリのblocking APIは`open()`がhandshake全体を回してから返るため、
+「1回のpollで決まった量だけ進んで返る」という契約と両立しない。そこでasync APIを
+`Waker::noop()`で1 frameに1回だけpollする。futureがsocketを所有すると
+`SocketSet`の借用をfutureへ持ち込むことになるので、両者のあいだにbyte queueを置く。
+
+```text
+smoltcp socket ──(cipher_rx/cipher_tx)── TLS future ──(plain_rx/plain_tx)── 呼び出し側
+```
+
+4本のqueueは`Rc<RefCell<Shared>>`で双方が所有する。自己参照structにならないので
+unsafeも生ポインタも要らない。1回の`poll`は「socket→cipher_rx」「futureを1回poll」
+「cipher_tx→socket」の順で、queueが枯れた時点でfuture内のawaitが`Poll::Pending`を
+返してframe loopへ戻る。1 pollで復号するciphertextには予算（既定8 KiB）があり、
+まとめて届いたbufferの消化に1 frameを使い切らない。
+
+`cancel`はqueueへcancelledを立ててfutureを捨て、`close`がsocketをabortして
+setから外す。closeを忘れるとsocketがsetに残るので、`Drop`はUARTへその旨を出す。
+
+### 検証するものとしないもの
+
+すべての接続で、serverの`CertificateVerify`をleaf証明書の公開鍵に対して検証し、
+Finishedとすべてのrecordのaead tagを検証する。ライブラリの`NoVerify`は使わず、
+これらを飛ばす経路をこのファイルは持たない。
+
+それで分かるのは「相手が、提示した証明書の秘密鍵を持っている」ことだけである。
+その証明書がURLのhostのものかは**確認していない**。chainを辿らず、rootを見ず、
+名前を照合せず、有効期限も読まない。したがって能動的な攻撃者は自前の証明書で
+接続を終端でき、上の検証はすべて通る。これが`Authentication::Unverified`で、
+`TLS UNVERIFIED`と表示する。`SECURE`や鍵アイコンにはしない。
+
+認証状態を外へ出すのは**handshakeが終わってから**である。`verify_certificate`は
+証明書が主張する内容を控えるだけで、`verify_signature`が通って初めてそれを
+`Outcome::Authenticated`にし、さらに`open()`が返って（server Finishedが検証されて）
+初めて`Transaction::authentication`が答える。証明書を受け取っただけ、暗号化された
+だけの段階で認証済み表示に変わることはない。
+
+hostnameの照合をしないのは手抜きではない。信頼されたrootまでのchainが無い状態で
+証明書中の名前を照合しても何も証明できない（誰でも自分で署名した証明書に任意の名前を
+書ける）ので、照合するふりをするのは照合しないより悪い。
+
+`Authentication::Pinned`はもう一段強い。leafのDER `SubjectPublicKeyInfo`のSHA-256が
+firmwareに埋め込んだそのhost用のpinと一致した場合である。pinが登録されているhostで
+鍵が一致しない場合は`tls-pin`で失敗し、`Unverified`へは落ちない。
+
+### SPKI pin
+
+pin tableは`src/net/pins.rs`で、実体は`tools/pins/generate.py`が
+`tools/pins/pins.txt`から作る生成物（`src/net/pins/generated.rs`）である。
+**実行時にpinを追加する方法は無く、TOFU（初回接続した鍵を覚える）もしない。**
+初回に応答した鍵を覚えても、その瞬間に攻撃者がいれば攻撃者の鍵を覚えるだけで、
+基板は誰も選んでいない鍵を抱えることになる。pinはコードと同じ経路、つまり
+firmware更新でしか変わらない。
+
+pinの対象は証明書全体ではなくDER `SubjectPublicKeyInfo`なので、**同じ鍵のまま
+証明書を更新してもpinは変わらない**。1 hostにつき最大2 pin（現用と更新予定）で、
+rotationは「新旧2 pinを載せたfirmwareを先に配る→serverの鍵を切り替える」の順に
+行う。逆順にすると更新前の基板が繋がらなくなる（警告ではなく接続失敗になる）。
+
+pin検索のkeyはURLの中の文字列そのもの、つまりSNIに送る名前と同じである。
+IPv4リテラルにも登録できる。**証明書のSANやCNはpinningの判断材料にしない。**
+
+`tools/pins/pins.txt`は**空である**。通常のbuildで`TLS PINNED`になる接続先は
+無く、`https://`は常に未認証である。hostをpinすることは「firmware更新まで
+他の鍵では絶対に話さない」という約束で、この基板が今している用途にその約束を
+する理由が無いため。書式とrotation手順は[`../tools/pins/README.md`](../tools/pins/README.md)。
+
+試験用のpinは`tls-fixture-pins` featureを付けたbuildにだけ入る。対応する
+秘密鍵は`tools/tls/`にあり、それが安全なのは通常releaseに入らないからである。
+`tools/pins/generate.py --check-release <elf>`がELF全体からpinの32 byteを
+探して、入っていないことを確かめる。
+
+証明書からの鍵の取り出しは`tab5-spki`にある。TLS経路で唯一「攻撃者が選んだ入力」を
+解析する部分なので、workspace memberにしてhost testを置いてある。切り詰めた証明書の
+全prefix、長さフィールドの改変、tagの取り違え、unused-bitが0でないBIT STRINGは
+すべて拒否する。OpenSSLの出力と一致することも確認している（`spki/data/`）。
+
+### 暗号方式
+
+| 項目 | 値 |
+| --- | --- |
+| cipher suite | AES-128-GCM / SHA-256 |
+| 鍵交換 | secp256r1 |
+| `CertificateVerify` | ECDSA P-256 SHA-256、RSA-PSS SHA-256/384/512 |
+| pin | leafのDER `SubjectPublicKeyInfo`のSHA-256、32 byte |
+| 乱数 | ChaCha20 CSPRNG、種はSAR ADCノイズ源から32 byte（`src/entropy.rs`） |
+
+真性乱数が得られない場合は`entropy`で失敗し、**1 packetも送らない**。
+サイクルカウンタやMACアドレスへfallbackしない。`net::Stack`がTCPの初期シーケンス番号に
+使っているそれらは、TLSの秘密値には使えない。
+
+ライブラリはClientHelloでEd25519とECDSA P-384も広告する（署名方式リストが
+ライブラリ内部でprivateなため、こちらから減らせない）。それらの証明書しか持たない
+serverは`tls-cert`で失敗する。互換性の制限であって、検証を緩めているのではない。
+
+### 上限
+
+| 項目 | 値 |
+| --- | ---: |
+| record buffer（送受信各1本） | 16,640 byte |
+| 復号待ち平文の滞留（背圧） | 64 KiB |
+| 送信待ちciphertextの滞留（背圧） | 32 KiB |
+| TCP socket buffer（送受信各1本） | 8 KiB |
+
+入力に依存する確保は`try_reserve`を通し、失敗は`tls-limit`または`out-of-memory`として
+接続を閉じる。record bufferはPSRAMヒープに置く。大きなローカル配列にすると
+内部RAMのstack（128 KiB保証）を食うためである。
+
+### ストリームの終わり方
+
+TLSの正しい終わり方は`close_notify`だが、HTTP/1.0のserverは応答を書き終えたら
+そのままTCPを閉じることが多い（Google、2026-08-28実測）。embedded-tlsから見ると
+どちらもtransportの0バイト読みで、`IoError`として同じ形で返ってくる。そこで
+`Io::read`が終端に達した事実をqueueへ記録し、handshake完了後の受信中に限って
+「serverが終わった」と「接続が壊れた」を区別する。handshake中の0バイト読みは
+従来どおり失敗である。
+
+`close_notify`なしで終わった場合は`Stats::closed_without_notify`が立つ。
+これ自体はエラーではないが、TLSとしては「末尾が切られていないこと」を保証できない
+という意味なので、本文が完結しているかはHTTP側のframing（`Content-Length`・
+chunked・close終端）が判断する。
+
+### 失敗の名前
+
+`entropy`、`link-lost`、`tls-connect`、`tls-timeout`、`tls-version`、`tls-alert`、
+`tls-cert`、`tls-pin`、`tls-pin-missing`、`tls-limit`、`cancelled`、`out-of-memory`、
+`tls-local`。ライブラリ固有のenumはこの境界で正規化する。証明書エラーをTCP timeoutに
+潰さず、逆にASN.1 parserの詳細を画面へ出さない。
+
+### 実測（2026-08-28、実機）
+
+| 接続先 | 署名方式 | handshake | 総時間 | 1 pollの最長 | 平文 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `www.google.com` | ECDSA P-256 | 122 ms | 427 ms | 70.6 ms | 89,824 B |
+| `www.rfc-editor.org` | RSA-PSS | 127 ms | 550 ms | 69.4 ms | 179,477 B |
+
+**1回のpollの最長は約70 ms**である。これはhandshake中の1 pollで、鍵交換と署名検証が
+ライブラリ内部の分割できない処理としてまとまっているためで、こちらから分割できない。
+[TLS_PLAN.md](TLS_PLAN.md)の中止条件（1 stepが100 msを超える）には当たらないが、
+57.3 Hzのframe loopでは約4 frame分の停止に相当する。ブラウザへ統合する際は、
+handshake中は「読み込み中」の表示のまま止まって見える時間がこの長さになる。
+
+### 現状の範囲
+
+HTTP層とは`net::transport`経由で繋がっており、`tls`コマンド
+（[CONSOLE_SHELL.md](CONSOLE_SHELL.md)）が`net::http::Transaction`を
+TLS transportの上で回す。まだ無いのは`https://` URLのfetch、ブラウザ表示、
+redirect規則、pin tableの生成で、段階分けは[TLS_PLAN.md](TLS_PLAN.md)にある。
+`httpget`とブラウザは引き続き平文専用である。
+
 ## 制約
 
 - IPv6なし。名前解決もAレコードだけで、AAAAは引けません
 - DNSにキャッシュ・サーチドメイン・逆引き（PTR）・mDNS（`.local`）はありません。
   同じ名前を2回使えば2回問い合わせます
-- サーバ機能（TFTPサーバ、HTTPサーバ）なし
+- サーバ機能（TFTPサーバ、HTTPサーバ、TLSサーバ）なし
+- TLSはクライアントの1.3のみ。TLS 1.2以前、client certificate、PSK、session
+  resumption、0-RTT、ALPN、DTLS、QUICはありません
+- TLSは接続先のidentityを保証しません（未認証TLS）。`TLS PINNED`になる
+  経路はpin tableが未実装のためまだありません
 - 受信したファイルの保存先は`/tmp`だけです。8 MiBで、リセットで消えます
   （[`FILESYSTEM.md`](FILESYSTEM.md)）
 - リンクが切れると古いアドレスを破棄します。管理対象のメニュー／保存profile接続は
