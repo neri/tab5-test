@@ -50,6 +50,7 @@ pub const RED: u16 = 0xF800;
 pub const GREEN: u16 = 0x07E0;
 pub const BLUE: u16 = 0x001F;
 pub const CYAN: u16 = 0x07FF;
+#[allow(dead_code)]
 pub const MAGENTA: u16 = 0xF81F;
 pub const YELLOW: u16 = 0xFFE0;
 
@@ -711,7 +712,14 @@ impl Framebuffer {
             let bytes = coordinate_label(b'Y', y);
             // coordinate_label emits ASCII only.
             let label = unsafe { core::str::from_utf8_unchecked(&bytes) };
-            self.draw_text(8, y.saturating_sub(font::HEIGHT / 2), label, 1, WHITE, Some(BLACK));
+            self.draw_text(
+                8,
+                y.saturating_sub(font::HEIGHT / 2),
+                label,
+                1,
+                WHITE,
+                Some(BLACK),
+            );
         }
 
         // Centred and corner-aligned from the text's own width rather than

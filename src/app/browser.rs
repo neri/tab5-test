@@ -48,7 +48,11 @@
 //! this is where the answer matters and where the shell is not running: a
 //! reader whose page will not load cannot type `wifistatus` while a
 //! full-screen mode is up, and without this has no way to tell a dead link
-//! from a dead server. Like the lock, they say their sentence when tapped.
+//! from a dead server. Unlike the lock, they are also a way out of the
+//! problem they report: tapping them opens the Wi-Fi menu, and the state
+//! it leaves behind is the sentence that lands on the status line on the
+//! way back. Reporting alone would have been an indicator that says what is
+//! wrong on the one screen from which nothing can be done about it.
 //!
 //! **A page is only ever shown complete.** While one is arriving the
 //! previous one stays on screen and only the toolbar's byte count moves; the
@@ -83,6 +87,7 @@ use crate::{interrupts, tick, uart};
 use super::fetch::{self, Fetch, Network, Outcome as FetchOutcome};
 use super::localfile::{LocalRead, Started};
 use super::wifi_manager::Manager as WifiManager;
+use super::wifi_menu;
 
 use crate::fs::vfs::Vfs;
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
@@ -298,7 +303,7 @@ pub fn run(
         }
     };
     if addressed_network(wifi).is_none() {
-        viewer.say("no network: leave and run wificonnect, then ipconfig dhcp");
+        viewer.say("no network: tap the Wi-Fi bars to choose one");
     }
     if let Some(url) = start {
         viewer.request(Navigation::fresh(url));
@@ -343,12 +348,13 @@ pub fn run(
         viewer.update_wifi(wifi_level(wifi));
 
         let mut leaving = false;
+        let mut wifi_menu_wanted = false;
         while let Some(event) = input.poll_key() {
             match viewer.handle_key(event.key, pending.is_some()) {
                 Action::Continue => {}
                 Action::Cancel => stop_pending(&mut viewer, &mut pending, wifi, vfs),
                 Action::Report => report_state(&mut viewer, &pending, wifi),
-                Action::Wifi => report_wifi(&mut viewer, wifi),
+                Action::Wifi => wifi_menu_wanted = true,
                 Action::Leave => leaving = true,
             }
         }
@@ -369,16 +375,32 @@ pub fn run(
 
         if let PrimaryTouch::Pressed(point) = touch {
             let action = viewer.click(point.x, point.y);
-            answer_click(action, &mut viewer, &mut pending, wifi, vfs);
+            wifi_menu_wanted |= answer_click(action, &mut viewer, &mut pending, wifi, vfs);
         }
         if let Some(update) = motion {
             if update.pressed & MOUSE_BUTTON_LEFT != 0 {
                 let action = viewer.click(target_x, target_y);
-                answer_click(action, &mut viewer, &mut pending, wifi, vfs);
+                wifi_menu_wanted |= answer_click(action, &mut viewer, &mut pending, wifi, vfs);
             }
             if update.wheel != 0 {
                 viewer.scroll_by(-update.wheel * WHEEL_LINES);
             }
+        }
+
+        // The whole screen goes to the menu and comes back repainted, so
+        // this frame ends here: the pointer bookkeeping at the bottom
+        // describes a screen that no longer exists.
+        if wifi_menu_wanted {
+            open_wifi_menu(
+                framebuffer,
+                input,
+                wifi,
+                vfs,
+                &mut viewer,
+                &mut cursor,
+                &mut pending,
+            );
+            continue;
         }
 
         // A managed connection can disappear between two page-fetch steps.
@@ -582,24 +604,86 @@ fn suspend_or_fail(
     }
 }
 
-/// Acts on what a tap or a click came to.
+/// Acts on what a tap or a click came to, and answers whether the Wi-Fi
+/// menu was asked for.
 ///
 /// The two pointer paths -- touch and mouse -- go through here rather than
 /// each handling the actions themselves, so a new action is added in one
-/// place and cannot be answered on one input and ignored on the other.
+/// place and cannot be answered on one input and ignored on the other. The
+/// menu is the one action this cannot perform itself: it needs the screen
+/// and the pointer, and both belong to the frame loop.
 fn answer_click(
     action: Action,
     viewer: &mut Viewer,
     pending: &mut Option<Pending>,
     wifi: &mut WifiManager,
     vfs: &mut Vfs,
-) {
+) -> bool {
     match action {
         Action::Cancel => stop_pending(viewer, pending, wifi, vfs),
-        Action::Wifi => report_wifi(viewer, wifi),
+        Action::Wifi => return true,
         Action::Report => report_state(viewer, pending, wifi),
         // Nothing on the toolbar leaves the browser.
         Action::Continue | Action::Leave => {}
+    }
+    false
+}
+
+/// Hands the whole screen to the Wi-Fi menu and takes it back.
+///
+/// The bars are the way in because this is where the answer matters and
+/// where the shell is not running: a reader whose page will not load cannot
+/// type `wifi` while a full-screen mode is up, and leaving the viewer to do
+/// it loses the address they were on. Coming back, the state the menu left
+/// behind goes on the status line -- which is the sentence the bars used to
+/// say when they were only tappable for a sentence.
+///
+/// A transfer in flight cannot survive the menu: connecting builds a new IP
+/// stack and the socket belongs to the old one. Its socket goes back before
+/// the menu opens, but the navigation is kept as a network wait, so a
+/// connection made in there resumes the page instead of losing it. A local
+/// read owns no socket and nothing in the menu can disturb it, so it stays
+/// exactly as it was.
+fn open_wifi_menu(
+    framebuffer: &mut Framebuffer,
+    input: &mut InputManager,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+    viewer: &mut Viewer,
+    cursor: &mut Cursor,
+    pending: &mut Option<Pending>,
+) {
+    if pending.as_ref().is_some_and(Pending::is_network_transfer) {
+        let active = pending.take().expect("network transfer is pending");
+        let url = active.navigation.url.clone();
+        let navigation = Navigation {
+            url: url.clone(),
+            restore: active.navigation.restore,
+            how: active.navigation.how,
+        };
+        close_pending(active, wifi, vfs);
+        viewer.wait_for_network(&url);
+        *pending = Some(Pending {
+            source: Source::WaitingForNetwork,
+            navigation,
+        });
+    }
+
+    // Lifted before the menu paints over it: the sprite's saved pixels
+    // describe the viewer's screen, and putting them back afterwards would
+    // stamp a square of the old toolbar onto the new one.
+    cursor.hide(framebuffer);
+    let _ = wifi_menu::run(framebuffer, input, wifi, wifi_menu::Entry::Browser);
+    // The tap that leaves the menu must not also arrive here.
+    input.reset_primary_touch();
+
+    viewer.update_wifi(wifi_level(wifi));
+    report_wifi(viewer, wifi);
+    framebuffer.fill(PAGE_BACKGROUND);
+    viewer.draw_all(framebuffer, &mut || service_link(wifi));
+    cursor.show(framebuffer);
+    if !framebuffer.flush() {
+        uart::log(b"Browser: flush after the Wi-Fi menu failed\r\n");
     }
 }
 
@@ -623,9 +707,9 @@ fn report_wifi(viewer: &mut Viewer, wifi: &mut WifiManager) {
     line.push(match state {
         State::Off => "Wi-Fi is off",
         State::LinkDown => "the link to the C6 is down",
-        State::Idle => "not connected: leave and run wificonnect",
-        State::Failed(_) => "the last attempt failed: leave and run wificonnect",
-        State::NeedsPassword(_) => "a password is needed: leave and run wificonnect",
+        State::Idle => "not connected: tap the Wi-Fi bars to choose a network",
+        State::Failed(_) => "the last attempt failed: tap the Wi-Fi bars to try again",
+        State::NeedsPassword(_) => "a password is needed: tap the Wi-Fi bars",
         State::Associating { .. } => "connecting",
         State::RetryWaiting { .. } => "waiting to try again",
         State::Online(_) if addressed => "online",
@@ -961,8 +1045,9 @@ enum Action {
     /// numbers -- the sockets in use and whether a transfer is running --
     /// belong to things the viewer does not hold.
     Report,
-    /// Say what the Wi-Fi indicator means, in words. Answered by the loop
-    /// for the same reason: the manager is not the viewer's to hold.
+    /// Open the Wi-Fi menu. Answered by the loop for the same reason, and
+    /// because handing the whole screen to another mode is not something
+    /// the viewer can do while it is drawing itself.
     Wifi,
     Leave,
 }
@@ -2885,10 +2970,10 @@ mod builtin {
              </ul>\
              <hr>\
              <p>These five are in flash and need no network. Fetching anything \
-             else needs <code>wificonnect</code> and <code>ipconfig dhcp</code> \
-             first. <code>browser &lt;url&gt;</code> opens one directly, and an \
-             address typed without a scheme -- here or in the address field -- \
-             is read as <code>http://</code>.</p>",
+             else needs a connection: tap the Wi-Fi bars at the right of the \
+             toolbar to choose a network. <code>browser &lt;url&gt;</code> opens \
+             one directly, and an address typed without a scheme -- here or in \
+             the address field -- is read as <code>http://</code>.</p>",
         ),
     };
 

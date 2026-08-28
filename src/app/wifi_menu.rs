@@ -3,6 +3,21 @@
 //! Scanning and the short RPC request remain synchronous. Association events
 //! and DHCP are advanced once per frame by the connection manager, so input
 //! and link servicing continue while the AP or DHCP server is slow.
+//!
+//! The list is laid out in fixed columns rather than one packed string per
+//! row, and the name comes first: it is the only column the reader is
+//! looking for, and a column at a fixed x can be read down the list instead
+//! of only across one row. The signal follows the name because it is what
+//! decides between two rows that carry the same one; the channel, the
+//! security and the BSSID count are read rarely and never scanned, so they
+//! go to the right of both. The row the board is already on is ticked and
+//! its name drawn bold: which network this is on is the first thing anyone
+//! opening the screen wants to know, and finding it by reading every row
+//! is what a list of thirty networks makes hard.
+//!
+//! The screen is reached from the shell's `wifi`, from the startup screen,
+//! and from the browser's Wi-Fi indicator (`Entry`); only the startup entry
+//! behaves differently, returning as soon as the connection is up.
 
 use alloc::vec::Vec;
 
@@ -11,7 +26,7 @@ use crate::input::{InputManager, Key, PrimaryTouch};
 use crate::{interrupts, uart, wifi};
 
 use super::shell::Line;
-use super::wifi_manager::{Failure, Manager, ProfileChoice, ProfileSaveState, State};
+use super::wifi_manager::{Association, Failure, Manager, ProfileChoice, ProfileSaveState, State};
 
 const BACKGROUND: u16 = WHITE;
 const HEADER: u16 = 0xE71C;
@@ -22,6 +37,11 @@ const MUTED: u16 = 0x632C;
 const PRIMARY: u16 = 0x0015;
 const SUCCESS: u16 = 0x0400;
 const WARNING: u16 = 0xA500;
+/// The unlit part of a signal bar: mid grey, so the bar's full height stays
+/// visible against both the panel and the lighter selected row. A bar drawn
+/// only where it is lit would make "one bar" and "four bars" the same shape
+/// at different heights instead of the same shape differently filled.
+const BAR_EMPTY: u16 = 0x8C51;
 
 const HEADER_HEIGHT: usize = 78;
 const LIST_TOP: usize = 94;
@@ -30,9 +50,101 @@ const ROW_HEIGHT: usize = 32;
 const VISIBLE_ROWS: usize = (LIST_BOTTOM - LIST_TOP) / ROW_HEIGHT;
 const FOOTER_TOP: usize = 620;
 
+/// The list's columns, left to right, as x positions inside a row.
+///
+/// The name comes first because it is the only column the reader is
+/// looking for: everything else on the row answers a question they only
+/// ask once they have found the network. The signal follows it because it
+/// is what decides between two rows with the same name, and the channel,
+/// the security and the BSSID count -- the three that are read rarely, and
+/// never scanned down the list -- go to the right of both.
+///
+/// A row spans `ROW_LEFT..ROW_RIGHT`, so every column is a fixed x rather
+/// than a position in one packed string. That is what makes a column
+/// readable down the list instead of only across one row.
+const ROW_LEFT: usize = 24;
+const ROW_RIGHT: usize = WIDTH - 24;
+/// The tick on the network the board is already on. Half-width, like the
+/// ASCII around it: the subset draws U+2713 in an 8 pixel cell.
+const MARK_LEFT: usize = 36;
+/// The name. It runs to `SIGNAL_LEFT` and cannot overrun it: an SSID is 32
+/// bytes, and a glyph is 16 pixels wide only for the code points that take
+/// three of them, so the widest one drawable is 32 half-width characters --
+/// 256 pixels, less than what is reserved here.
+const SSID_LEFT: usize = 60;
+/// The signal: the bars, then the number, both inside this column.
+const SIGNAL_LEFT: usize = 380;
+const SIGNAL_TEXT_LEFT: usize = SIGNAL_LEFT + 40;
+const CHANNEL_LEFT: usize = 620;
+const AUTH_LEFT: usize = 720;
+const COUNT_LEFT: usize = 1000;
+/// Where the text in a row sits inside its `ROW_HEIGHT` band.
+const ROW_TEXT_OFFSET: usize = 6;
+/// The column headings, in the 16 pixels between the header band and the
+/// first row.
+const COLUMN_LABEL_TOP: usize = HEADER_HEIGHT;
+
+const _: () = assert!(
+    ROW_LEFT < MARK_LEFT
+        && MARK_LEFT < SSID_LEFT
+        && SSID_LEFT < SIGNAL_LEFT
+        && SIGNAL_LEFT < SIGNAL_TEXT_LEFT
+        && SIGNAL_TEXT_LEFT < CHANNEL_LEFT
+        && CHANNEL_LEFT < AUTH_LEFT
+        && AUTH_LEFT < COUNT_LEFT
+        && COUNT_LEFT < ROW_RIGHT,
+    "the list columns are not in left-to-right order inside a row"
+);
+const _: () = assert!(
+    COLUMN_LABEL_TOP + crate::font::HEIGHT <= LIST_TOP,
+    "the column headings overlap the first row"
+);
+
 struct Network {
     access_point: wifi::station::AccessPoint,
     bssid_count: u32,
+}
+
+/// What the list needs to know about the board's own connection, read once
+/// per repaint.
+///
+/// Read from the manager rather than remembered by the screen: the state
+/// machine advances every frame while this menu is up, so a connection made
+/// here -- or lost here -- has to show without the list being rebuilt.
+#[derive(Clone, Copy)]
+struct Status {
+    enabled: bool,
+    /// The SSID the manager is associated to, and whether that association
+    /// has reached `Online`. `None` when there is no association at all.
+    active: Option<(Association, bool)>,
+}
+
+impl Status {
+    fn read(manager: &Manager) -> Self {
+        let state = manager.state();
+        let association = match state {
+            State::Associated(association)
+            | State::RequestingDhcp { association, .. }
+            | State::AssociatedNoLease(association)
+            | State::Online(association) => Some(association),
+            _ => None,
+        };
+        Self {
+            enabled: manager.is_enabled(),
+            active: association.map(|association| (association, matches!(state, State::Online(_)))),
+        }
+    }
+
+    /// `Some(online)` when `ssid` is the network the board is on.
+    ///
+    /// Matched on the SSID and not the BSSID because that is what the list
+    /// shows: `consolidate_access_points` has already folded every BSSID of
+    /// one name into a single row, so the row a roaming client is on is the
+    /// name's row whichever radio answered.
+    fn marks(&self, ssid: &[u8]) -> Option<bool> {
+        let (association, online) = self.active?;
+        (!ssid.is_empty() && association.ssid() == ssid).then_some(online)
+    }
 }
 
 enum ListAction {
@@ -47,10 +159,27 @@ enum ListAction {
     Activate(usize),
 }
 
+/// Where the menu was opened from.
+///
+/// Only `Startup` behaves differently -- it is the one entry that returns
+/// as soon as the connection is up, because the startup screen has a screen
+/// to go to next. The other two are told apart in the log, which is where
+/// the question "how did the reader get here" is actually asked.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Entry {
     Shell,
+    Browser,
     Startup,
+}
+
+impl Entry {
+    fn name(self) -> &'static [u8] {
+        match self {
+            Entry::Shell => b"shell",
+            Entry::Browser => b"browser",
+            Entry::Startup => b"startup",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -69,7 +198,9 @@ pub fn run(
     manager: &mut Manager,
     entry: Entry,
 ) -> Outcome {
-    uart::log(b"WIFI MENU: opened\r\n");
+    uart::log(b"WIFI MENU: opened from ");
+    uart::log(entry.name());
+    uart::log(b"\r\n");
     input.reset_primary_touch();
     let mut selected = 0usize;
     let mut first = 0usize;
@@ -181,7 +312,7 @@ pub fn run(
                 selected,
                 first,
                 None,
-                manager.is_enabled(),
+                Status::read(manager),
             );
             let Some(action) =
                 wait_list_action(input, manager, selected, first, access_points.len())
@@ -221,7 +352,7 @@ pub fn run(
                                 .as_ref()
                                 .map(Line::as_str)
                                 .or(Some("SAVED PROFILE DELETED")),
-                            manager.is_enabled(),
+                            Status::read(manager),
                         );
                         let _ = wait_key(input, manager);
                     }
@@ -253,7 +384,7 @@ pub fn run(
                             selected,
                             first,
                             Some("HIDDEN SSIDS CANNOT BE SELECTED IN THIS VERSION"),
-                            manager.is_enabled(),
+                            Status::read(manager),
                         );
                         let _ = wait_key(input, manager);
                         continue;
@@ -758,18 +889,20 @@ fn draw_access_points(
     selected: usize,
     first: usize,
     message: Option<&str>,
-    enabled: bool,
+    status: Status,
 ) {
     draw_chrome(framebuffer, "WI-FI NETWORKS");
     let mut count = Line::new();
     count.push_u32(access_points.len() as u32);
     count.push_str(" NETWORKS  ");
-    count.push_str(if enabled { "ON" } else { "OFF" });
+    count.push_str(if status.enabled { "ON" } else { "OFF" });
     framebuffer.draw_text(930, 30, count.as_str(), 1, MUTED, None);
 
     if access_points.is_empty() {
         centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, WARNING);
         centred(framebuffer, 335, "PRESS R TO RESCAN", 1, BLACK);
+    } else {
+        draw_column_labels(framebuffer);
     }
 
     for (visible, network) in access_points
@@ -782,9 +915,14 @@ fn draw_access_points(
         let y = LIST_TOP + visible * ROW_HEIGHT;
         let selected_row = index == selected;
         let background = if selected_row { SELECTED } else { PANEL };
-        framebuffer.fill_rect(24, y, WIDTH - 48, ROW_HEIGHT - 3, background);
-        let line = access_point_line(network);
-        framebuffer.draw_text(36, y + 6, line.as_str(), 1, BLACK, None);
+        framebuffer.fill_rect(
+            ROW_LEFT,
+            y,
+            ROW_RIGHT - ROW_LEFT,
+            ROW_HEIGHT - 3,
+            background,
+        );
+        draw_access_point_row(framebuffer, network, y, status);
     }
 
     framebuffer.draw_text(
@@ -810,37 +948,201 @@ fn draw_access_points(
     flush(framebuffer, b"WIFI MENU: list flush failed\r\n");
 }
 
-fn access_point_line(network: &Network) -> Line {
+/// Names the columns once, above the first row.
+///
+/// Without these the second column is a row of bars and a negative number,
+/// which reads as a measurement of something but does not say of what.
+fn draw_column_labels(framebuffer: &mut Framebuffer) {
+    for (x, label) in [
+        (SSID_LEFT, "NETWORK"),
+        (SIGNAL_LEFT, "SIGNAL"),
+        (CHANNEL_LEFT, "CH"),
+        (AUTH_LEFT, "SECURITY"),
+        (COUNT_LEFT, "APS"),
+    ] {
+        framebuffer.draw_text(x, COLUMN_LABEL_TOP, label, 1, MUTED, None);
+    }
+}
+
+/// One row: the tick, the name, the signal, and the three columns that are
+/// only read once the name has been found.
+fn draw_access_point_row(
+    framebuffer: &mut Framebuffer,
+    network: &Network,
+    y: usize,
+    status: Status,
+) {
     let access_point = &network.access_point;
-    let mut line = Line::new();
-    if access_point.rssi > -100 {
-        line.push_str(" ");
+    let text_y = y + ROW_TEXT_OFFSET;
+    let active = status.marks(access_point.ssid());
+
+    // The connection the board already has. A tick rather than a colour
+    // alone, and green only once there is an address: associated without a
+    // lease is the state where the row is the right one and the network
+    // still does not work, and the browser's bars make the same
+    // distinction.
+    if let Some(online) = active {
+        let colour = if online { SUCCESS } else { WARNING };
+        framebuffer.draw_text(MARK_LEFT, text_y, "\u{2713}", 1, colour, None);
     }
-    if access_point.rssi < 0 {
-        line.push_str("-");
+
+    // Bold on the row that is connected. The name is what the reader
+    // scans, so the weight goes on the name and not on the whole row.
+    let bold = active.is_some();
+    if access_point.ssid().is_empty() {
+        draw_label(
+            framebuffer,
+            SSID_LEFT,
+            text_y,
+            "(HIDDEN - UNAVAILABLE)",
+            MUTED,
+            false,
+        );
+    } else {
+        draw_ssid(framebuffer, SSID_LEFT, text_y, access_point.ssid(), bold);
     }
-    line.push_u32(access_point.rssi.unsigned_abs());
-    line.push_str(" DBM  CH ");
-    line.push_u32(access_point.channel);
-    line.push_str("  ");
+
+    draw_signal(framebuffer, text_y, access_point.rssi);
+
+    let mut channel = Line::new();
+    channel.push_u32(access_point.channel);
+    draw_label(
+        framebuffer,
+        CHANNEL_LEFT,
+        text_y,
+        channel.as_str(),
+        BLACK,
+        false,
+    );
+
+    let mut auth = Line::new();
     match wifi::station::auth_mode_name(access_point.auth_mode) {
-        Some(name) => line.push_str(name),
+        Some(name) => auth.push_str(name),
         None => {
-            line.push_str("AUTH ");
-            line.push_u32(access_point.auth_mode as u32);
+            auth.push_str("AUTH ");
+            auth.push_u32(access_point.auth_mode as u32);
         }
     }
-    line.push_str("  ");
+    draw_label(framebuffer, AUTH_LEFT, text_y, auth.as_str(), BLACK, false);
+
+    // Only when there is more than one: a column of `1 AP` down the whole
+    // list says nothing and is what the eye has to skip over to find the
+    // rows where the number matters.
     if network.bssid_count > 1 {
-        line.push_u32(network.bssid_count);
-        line.push_str(" APS  ");
+        let mut count = Line::new();
+        count.push_u32(network.bssid_count);
+        draw_label(
+            framebuffer,
+            COUNT_LEFT,
+            text_y,
+            count.as_str(),
+            MUTED,
+            false,
+        );
     }
-    if access_point.ssid().is_empty() {
-        line.push_str("(HIDDEN - UNAVAILABLE)");
+}
+
+/// Draws the name, as text when the bytes are UTF-8 and byte by byte when
+/// they are not.
+///
+/// An SSID is 32 bytes with no declared encoding. Most are UTF-8 and the
+/// font covers Japanese, so the common case is drawn as what it says; the
+/// rest fall back to `Line::push_ascii`, which substitutes `.` rather than
+/// leaving a hole where a byte was.
+fn draw_ssid(framebuffer: &mut Framebuffer, x: usize, y: usize, ssid: &[u8], bold: bool) {
+    match core::str::from_utf8(ssid) {
+        Ok(name) => draw_label(framebuffer, x, y, name, BLACK, bold),
+        Err(_) => {
+            let mut line = Line::new();
+            line.push_ascii(ssid);
+            draw_label(framebuffer, x, y, line.as_str(), BLACK, bold);
+        }
+    }
+}
+
+/// The signal column: four ascending bars, then the RSSI itself.
+///
+/// Both, because they answer different questions. The bars are what makes
+/// two rows comparable at a glance; the number is what makes one row
+/// comparable with the same network yesterday, and is the only form the
+/// UART log and the `wifiscan` output share.
+fn draw_signal(framebuffer: &mut Framebuffer, y: usize, rssi: i32) {
+    const BAR_WIDTH: usize = 5;
+    const BAR_GAP: usize = 2;
+    const BARS: usize = 4;
+    const TALLEST: usize = 16;
+
+    let lit = signal_bars(rssi);
+    // The glyph box is 16 pixels tall and the bars are drawn inside it, so
+    // the tallest bar and a capital letter end on the same row.
+    let baseline = y + TALLEST;
+    for index in 0..BARS {
+        let height = 4 + index * 4;
+        let colour = if index < lit { PRIMARY } else { BAR_EMPTY };
+        framebuffer.fill_rect(
+            SIGNAL_LEFT + index * (BAR_WIDTH + BAR_GAP),
+            baseline - height,
+            BAR_WIDTH,
+            height,
+            colour,
+        );
+    }
+
+    let mut line = Line::new();
+    if rssi < 0 {
+        line.push_str("-");
+    }
+    line.push_u32(rssi.unsigned_abs());
+    line.push_str(" DBM");
+    draw_label(
+        framebuffer,
+        SIGNAL_TEXT_LEFT,
+        y,
+        line.as_str(),
+        MUTED,
+        false,
+    );
+}
+
+/// How many of the four bars an RSSI lights.
+///
+/// The thresholds are the ones the usual client-side tables use: -55 dBm
+/// and better is as good as it gets in a room, -67 is what voice and video
+/// want, -75 still carries a page, and below -85 an association is a
+/// coin toss. Nothing here reads them back, so they only have to be
+/// monotonic and to put the strong and the hopeless at opposite ends.
+fn signal_bars(rssi: i32) -> usize {
+    if rssi >= -55 {
+        4
+    } else if rssi >= -67 {
+        3
+    } else if rssi >= -75 {
+        2
+    } else if rssi >= -85 {
+        1
     } else {
-        line.push_ascii(access_point.ssid());
+        0
     }
-    line
+}
+
+/// Draws `text`, struck twice one pixel apart when `bold`.
+///
+/// The 16 pixel font has one weight, so weight is synthesised rather than
+/// selected -- the same thing the browser does for `<b>`. One physical
+/// pixel thickens every vertical stem, which at this size is most of what
+/// a bold face is.
+fn draw_label(
+    framebuffer: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    text: &str,
+    colour: u16,
+    bold: bool,
+) {
+    framebuffer.draw_text(x, y, text, 1, colour, None);
+    if bold {
+        framebuffer.draw_text(x + 1, y, text, 1, colour, None);
+    }
 }
 
 fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usize) {

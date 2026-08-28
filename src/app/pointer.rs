@@ -42,7 +42,7 @@ const CURSOR_HEIGHT: usize = 18;
 
 /// Stored flat, one row after another, rather than as an array of row
 /// literals: an array of 18 row references is a shape the optimizer
-/// unrolls, and 216 unrolled `fill_rect` calls cost more instruction
+/// unrolls, and 216 unrolled `draw_pixel` calls cost more instruction
 /// memory than this whole sprite is worth on a part with 256 KiB of RAM
 /// for everything. Flat, it stays a loop.
 const CURSOR_PIXELS: &[u8; CURSOR_WIDTH * CURSOR_HEIGHT] = b"\
@@ -74,12 +74,12 @@ X....XOOX...\
 const POINTER_SPEED_NUMERATOR: i32 = 5;
 const POINTER_SPEED_DENOMINATOR: i32 = 2;
 
-/// The panel is 1280x720 on a 5-inch module, so a 12x18 sprite at 1:1 is
-/// about 1.5 mm tall. Doubling it puts the pointer at roughly the apparent
-/// size it has on a desktop monitor.
-const CURSOR_SCALE: usize = 2;
-pub const CURSOR_DRAWN_WIDTH: usize = CURSOR_WIDTH * CURSOR_SCALE;
-pub const CURSOR_DRAWN_HEIGHT: usize = CURSOR_HEIGHT * CURSOR_SCALE;
+/// The sprite is drawn at 1:1, so the drawn size is the bitmap's own size.
+/// Kept as separate names because callers -- `flush_union`'s rectangles,
+/// `win`'s hit tests -- ask for the size on screen, not the size of the
+/// bitmap, and those were two different numbers when the sprite was scaled.
+pub const CURSOR_DRAWN_WIDTH: usize = CURSOR_WIDTH;
+pub const CURSOR_DRAWN_HEIGHT: usize = CURSOR_HEIGHT;
 const CURSOR_SAVED_PIXELS: usize = CURSOR_DRAWN_WIDTH * CURSOR_DRAWN_HEIGHT;
 
 pub struct Cursor {
@@ -90,7 +90,7 @@ pub struct Cursor {
     /// -- including when the sprite hangs off the right or bottom edge,
     /// which both clip identically.
     ///
-    /// 864 pixels, 1.7 KiB, on the caller's stack rather than the heap:
+    /// 216 pixels, 432 bytes, on the caller's stack rather than the heap:
     /// full-screen modes are entered from a shell command with the whole
     /// 128 KiB stack free, and a pointer that could fail to allocate would
     /// be a pointer with a failure path nobody would ever exercise.
@@ -177,13 +177,7 @@ impl Cursor {
                 _ => continue,
             };
             let (column, row) = (index % CURSOR_WIDTH, index / CURSOR_WIDTH);
-            framebuffer.fill_rect(
-                self.x + column * CURSOR_SCALE,
-                self.y + row * CURSOR_SCALE,
-                CURSOR_SCALE,
-                CURSOR_SCALE,
-                color,
-            );
+            framebuffer.draw_pixel(self.x + column, self.y + row, color);
         }
         self.visible = true;
     }

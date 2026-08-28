@@ -56,12 +56,13 @@
     - `assets/startup/`: 起動画面用USB／Wi-Fiアイコン。確認用の64×64 PNGと、firmwareが`include_bytes!`で直接読む同寸法の8-bit alpha maskを置く
     - `src/app/wifi_manager.rs`: ESP-Hostedの`Rpc`、IPの`Stack`、接続元、IP設定方針、接続状態、永続ON/OFFをまとめる単一所有者。毎フレームC6とsmoltcpをpollし、起動時／メニュー接続のassociation、切断後の再接続、C6リンク再構築、DHCPを状態遷移で進める。資格情報は現在の管理対象接続が有効な間だけ固定長RAMへ保持し、association成功後のC6 NVS保存、OFF時の切断・driver停止・power down、ON、forget、直近16遷移の診断も担当する
     - `src/app/wifi_retry.rs`: association失敗のreason、timeout、RPC結果を、停止または待ち時間へ変換する副作用のないpolicy。reason 4の短い再試行、一般の指数backoff、10分安定後の失敗回数resetをホスト単体testで検査する
-    - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する
+    - `src/app/wifi_menu.rs`: `wifi`コマンド、起動画面、ブラウザのWi-Fi indicatorから開くキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、SSID／信号／CH／SECURITY／BSSID数の固定列表示と接続中SSIDの`✓`＋太字、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する
     - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
       toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件の
       戻る・進む・再読込、toolbarのボタンとセキュリティの南京錠、アドレス欄の編集、
-      通信を必要としない組み込みページ（`http://built-in/`）を持つ。文書の取得
-      そのものは持たない（[`BROWSER.md`](BROWSER.md)）
+      通信を必要としない組み込みページ（`http://built-in/`）を持つ。Wi-Fi indicator
+      のtapで`wifi_menu.rs`を開き、取得中のページは再接続待ちへ移して戻り際に再開
+      する。文書の取得そのものは持たない（[`BROWSER.md`](BROWSER.md)）
     - `src/app/fetch.rs`: 1ページ分の取得の状態機械。名前解決→接続→応答headの判定
       （redirect追跡・statusの判定・HTMLかどうか・`charset`）→本文→文書。2xx以外でも
       HTMLなら本文を組み立て、statusを添えて返す。`step`は決まった量だけ

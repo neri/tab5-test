@@ -117,13 +117,14 @@ USB-Cの接続有無、充電中／満充電／異常の確定状態、絶対的
 
 ## 起動画面
 
-LCDを初期化すると、`src/app/startup_screen.rs`が白背景へ2倍角の`Tab5`とUSB／Wi-Fiの
-状態アイコンを表示する。アイコンは提供された240×240 PNGを64×64へ縮小したalpha maskを
-RGB565で描き、状態色のmarkerを重ねる。USB初回探索は未接続または列挙失敗でも最低2秒間
-再試行し、その判定後も通常の接続eventとfallback scanを止めない。USB自動マウント、
-保存済みWi-Fi profileのassociation／
-DHCPをフレーム駆動で並行して進め、両方が終端になるまで表示を維持する。USBの失敗は警告として
-起動を続け、Wi-Fiが`Online`なら組み込みhomeのBrowser、それ以外ならWi-Fi設定メニューへ進む。
+LCDを初期化すると、`src/app/startup_screen.rs`が白背景へ2倍角のタイトルとUSB／Wi-Fiの
+状態アイコンを表示する。アイコン行は画面高の3/4を中心に置き、タイトルはその上、状態文字列は
+アイコンの直下に置く（アイコン自体が種別を示すので、名前のラベルは持たない）。アイコンは
+提供された240×240 PNGを64×64へ縮小したalpha maskをRGB565で描き、状態色のmarkerを
+重ねる。USB初回探索は未接続または列挙失敗でも最低2秒間再試行し、その判定後も通常の
+接続eventとfallback scanを止めない。USB自動マウント、保存済みWi-Fi profileの
+association／DHCPをフレーム駆動で並行して進め、両方が終端になるまで表示を維持する。
+USBの失敗は警告として起動を続け、Wi-Fiが`Online`なら組み込みhomeのBrowser、それ以外ならWi-Fi設定メニューへ進む。
 
 初回表示から5秒経っても処理中なら、最下行より1行上へ
 `ESC  CANCEL STARTUP AND OPEN CONSOLE`を表示する。案内の表示後だけEscapeを受け付け、
@@ -134,11 +135,15 @@ Browserへ進む。
 
 ## Wi-Fi設定メニュー
 
-`wifi`コマンドまたは起動分岐は`src/app/wifi_menu.rs`の白ベースの全画面メニューを開く。
+`wifi`コマンド、起動分岐、ブラウザのWi-Fiインジケーターのtapが`src/app/wifi_menu.rs`の
+白ベースの全画面メニューを開く（`Entry::Shell`／`Startup`／`Browser`。挙動が違うのは
+`Startup`だけで、接続が成立した時点で戻る）。
 Wi-FiがONなら既存のblocking
 scanを実行し、同じSSIDの結果を最も強いRSSIの1行へ統合して検出BSSID数とともに15件ずつ
-表示する。上下／Page Up／Page Downで選択を移動し、Enterまたは一覧行のtapで接続、`R`で
-再scan、Escapeでシェルへ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
+表示する。1行は固定x位置の列で、左からSSID／信号（4本の棒とRSSI）／CH／SECURITY／
+BSSID数の順。現在接続中のSSIDの行は`✓`付きでSSIDを太字にする。
+上下／Page Up／Page Downで選択を移動し、Enterまたは一覧行のtapで接続、`R`で
+再scan、Escapeで呼び出し元へ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
 
 OPEN APはそのまま、それ以外は最大64 byteのパスワード入力画面を開き、その後に
 `SAVE AND AUTO-CONNECT`または`CONNECT ONCE`を選ぶ。入力は`*`だけで
@@ -245,7 +250,7 @@ USBマウスのポインタ移動量は生カウントに`5/2`倍の利得をか
 なので実装場所として正しかったが、2つ目の利用者が現れた以上、200行とビットマップを
 コピーするのは実装場所の選び方ではない。
 
-ポインタは12×18のスプライトを2倍で描く。下地の画素を`Framebuffer::read_rect`で退避
+ポインタは12×18のスプライトを等倍で描く。下地の画素を`Framebuffer::read_rect`で退避
 してから重ね、移動時に`blit_rgb565`で書き戻す。デスクトップを手続き的に描き直す方式を
 採らないのは、そうすると画面上の全要素が任意の矩形へクリップして再描画できる必要が
 生じるからで、得られるものがない。時計とステータス行の再描画は必ずポインタを退避した
@@ -313,6 +318,13 @@ barの上のものはすべて`TOOLBAR_HEIGHT`から導いてあり（`BUTTON_WI
 中止ボタンは`Escape`と同じ`Action::Cancel`を返し、走っている取得のソケットを
 返すのは`stop_pending`1箇所です。ボタンのために2つ目の経路を書くと、返し忘れが
 そちらにだけ残ります。`click`が`handle_key`と同じ`Action`を返すのはこのためです。
+
+Wi-Fiのtapが返す`Action::Wifi`だけはフレームループが答えます。画面全体とポインタ
+を明け渡す動作で、どちらもビューアの持ち物ではないためです。ループはWi-Fiメニュー
+を開き、戻ったら接続状態の文言をstatus行へ入れて全面を描き直し、そのフレームは
+そこで終わります（下のポインタ処理は既に無い画面の話になるため）。取得中のページ
+はメニューへ入る前にsocketを返して`Source::WaitingForNetwork`へ移すので、メニュー
+で接続すればそのまま再開します。
 
 viewportは描き直しますが、**前回描いた範囲と今回描く範囲の広い方**だけです。
 その下は既に背景なので、塗り直すのは1.66 MBのPSRAM往来を何も変えないために

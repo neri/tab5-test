@@ -17,15 +17,16 @@ const USB_PROBE_CONNECT_WAIT_MS: u32 = 1;
 const WIFI_BEGIN_RETRY_MS: u64 = 500;
 const WIFI_BEGIN_MAX_ATTEMPTS: u32 = 3;
 
-const TITLE_Y: usize = 216;
-const ICON_TOP: usize = 320;
 const ICON_SIZE: usize = 64;
 const ICON_PIXELS: usize = ICON_SIZE * ICON_SIZE;
+// The icon row is centred three quarters of the way down the screen; the
+// title keeps the distance it always had above it.
+const ICON_TOP: usize = HEIGHT * 3 / 4 - ICON_SIZE / 2;
+const TITLE_Y: usize = HEIGHT / 2 - font::HEIGHT * 2;
 const ICON_CELL_WIDTH: usize = 176;
 const USB_CELL_LEFT: usize = WIDTH / 2 - ICON_CELL_WIDTH;
 const WIFI_CELL_LEFT: usize = WIDTH / 2;
-const LABEL_Y: usize = ICON_TOP + ICON_SIZE + 12;
-const DETAIL_Y: usize = LABEL_Y + font::HEIGHT + 6;
+const DETAIL_Y: usize = ICON_TOP + ICON_SIZE + 12;
 const CANCEL_Y: usize = HEIGHT - font::HEIGHT * 2;
 const CANCEL_TEXT: &str = "ESC  CANCEL STARTUP AND OPEN CONSOLE";
 
@@ -72,15 +73,9 @@ pub enum InitialRoute {
 
 pub fn draw_initial(framebuffer: &mut Framebuffer) -> bool {
     framebuffer.fill(WHITE);
-    centred(framebuffer, TITLE_Y, "Tab5", 2, BLACK);
-    draw_cell(framebuffer, USB_CELL_LEFT, "USB", Visual::pending(), true);
-    draw_cell(
-        framebuffer,
-        WIFI_CELL_LEFT,
-        "WI-FI",
-        Visual::pending(),
-        false,
-    );
+    centred(framebuffer, TITLE_Y, "パソコンへようこそ", 2, BLACK);
+    draw_cell(framebuffer, USB_CELL_LEFT, Visual::pending(), true);
+    draw_cell(framebuffer, WIFI_CELL_LEFT, Visual::pending(), false);
     framebuffer.flush()
 }
 
@@ -180,7 +175,7 @@ impl Screen {
             return;
         }
         self.usb = visual;
-        draw_cell(framebuffer, USB_CELL_LEFT, "USB", visual, true);
+        draw_cell(framebuffer, USB_CELL_LEFT, visual, true);
         flush_cell(
             framebuffer,
             USB_CELL_LEFT,
@@ -193,7 +188,7 @@ impl Screen {
             return;
         }
         self.wifi = visual;
-        draw_cell(framebuffer, WIFI_CELL_LEFT, "WI-FI", visual, false);
+        draw_cell(framebuffer, WIFI_CELL_LEFT, visual, false);
         flush_cell(
             framebuffer,
             WIFI_CELL_LEFT,
@@ -509,13 +504,7 @@ const fn begin_failure_retryable(failure: Failure) -> bool {
     )
 }
 
-fn draw_cell(
-    framebuffer: &mut Framebuffer,
-    cell_left: usize,
-    label: &str,
-    visual: Visual,
-    usb_icon: bool,
-) {
+fn draw_cell(framebuffer: &mut Framebuffer, cell_left: usize, visual: Visual, usb_icon: bool) {
     framebuffer.fill_rect(
         cell_left,
         ICON_TOP - 8,
@@ -530,15 +519,6 @@ fn draw_cell(
         WIFI_ICON_ALPHA
     };
     draw_bitmap_icon(framebuffer, icon_left, ICON_TOP, visual.phase, alpha);
-    centred_in(
-        framebuffer,
-        cell_left,
-        ICON_CELL_WIDTH,
-        LABEL_Y,
-        label,
-        1,
-        BLACK,
-    );
     centred_in(
         framebuffer,
         cell_left,

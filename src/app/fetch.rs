@@ -683,7 +683,7 @@ pub const OUT_OF_MEMORY: Failure = Failure::new(
 pub const NO_NETWORK: Failure = Failure::new(
     "no-network",
     "No network",
-    "Leave the browser and run wificonnect, then ipconfig dhcp.",
+    "Tap the Wi-Fi bars at the right of the toolbar to choose a network.",
 );
 pub const NOT_NETWORK: Failure = Failure::new(
     "not-network",
