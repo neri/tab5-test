@@ -20,6 +20,7 @@ mod coord_test;
 mod fetch;
 mod font_test;
 mod files;
+mod localfile;
 mod lsusb;
 mod mbr;
 mod membench;
@@ -262,7 +263,14 @@ pub fn run(psram: Psram) {
                 // The viewer keeps borrowing the manager for one fetch step
                 // at a time and services it every frame, because the loop
                 // above is paused while the full-screen mode is running.
-                browser::run(framebuffer, &mut input, &mut wifi_manager, start);
+                browser::run(
+                    framebuffer,
+                    &mut input,
+                    &mut wifi_manager,
+                    &mut vfs,
+                    ram_disk.as_mut(),
+                    start,
+                );
                 console.clear(framebuffer);
                 // A disconnection while the viewer was up is otherwise
                 // invisible: the same check every network command makes.

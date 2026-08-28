@@ -27,17 +27,21 @@ use alloc::vec::Vec;
 use crate::limits::MAX_URL_BYTES;
 use crate::memory::{self, OutOfMemory};
 
-/// The two schemes this recognises.
+/// The schemes this recognises.
 ///
-/// Both are fetchable. What the distinction is for now is the no-downgrade
-/// rule and what the toolbar says: a value that says `Https` cannot be
-/// handed to the plaintext path by accident, whereas a rewritten `http://`
-/// one could be, and a redirect that changes this field from `Https` to
-/// `Http` is a redirect the viewer refuses.
+/// All three are fetchable, and the distinction is what decides how. A
+/// value that says `Https` cannot be handed to the plaintext path by
+/// accident, whereas a rewritten `http://` one could be, and a redirect
+/// that changes this field from `Https` to `Http` is a redirect the viewer
+/// refuses. `File` is not a network scheme at all: nothing about it goes
+/// near a socket, and a redirect *to* it is refused outright -- a server
+/// must never be able to steer the board into its own filesystem.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scheme {
     Http,
     Https,
+    /// A file on a mounted volume. No host, no port, no network.
+    File,
 }
 
 impl Scheme {
@@ -45,14 +49,34 @@ impl Scheme {
         match self {
             Scheme::Http => "http",
             Scheme::Https => "https",
+            Scheme::File => "file",
         }
     }
 
+    /// The port a URL of this scheme gets when it does not name one.
+    ///
+    /// Zero for `file`, which has no port at all. It is not a port that
+    /// happens to be zero -- nothing ever connects to it -- and
+    /// `has_default_port` is what keeps it out of the displayed address.
     pub fn default_port(self) -> u16 {
         match self {
             Scheme::Http => 80,
             Scheme::Https => 443,
+            Scheme::File => 0,
         }
+    }
+
+    /// Whether a URL of this scheme has an authority at all.
+    ///
+    /// `file:` does not. RFC 8089 allows an empty one or `localhost`, and
+    /// both mean the same thing: the machine this is running on.
+    pub fn has_authority(self) -> bool {
+        !matches!(self, Scheme::File)
+    }
+
+    /// Whether fetching this reaches the network.
+    pub fn is_network(self) -> bool {
+        !matches!(self, Scheme::File)
     }
 
     /// Whether the transport for this scheme authenticates nothing at all.
@@ -79,10 +103,15 @@ pub enum Error {
     Empty,
     /// Past [`MAX_URL_BYTES`], as written or once percent-encoded.
     TooLong,
-    /// A scheme that is neither `http` nor `https`.
+    /// A scheme that is none of `http`, `https` and `file`.
     UnsupportedScheme,
-    /// `http://` with nothing after it.
+    /// `http://` with nothing after it, or `file:` with a path that is not
+    /// absolute.
     MissingHost,
+    /// `file://somewhere/x`. A `file:` URL names a file on this machine,
+    /// and there is no other machine it could name instead: reading the
+    /// local file anyway would answer a question nobody asked.
+    RemoteFileHost,
     /// Not an ASCII DNS name and not a dotted-quad IPv4 address.
     InvalidHost,
     /// `user:password@host`. Credentials over cleartext HTTP are not
@@ -112,8 +141,9 @@ pub fn error_text(error: Error) -> &'static str {
     match error {
         Error::Empty => "the address is empty",
         Error::TooLong => "the address is too long",
-        Error::UnsupportedScheme => "only http:// and https:// addresses are understood",
+        Error::UnsupportedScheme => "only http://, https:// and file:/// addresses are understood",
         Error::MissingHost => "the address has no host",
+        Error::RemoteFileHost => "a file:// address can only name this machine",
         Error::InvalidHost => "the host is not an ASCII name or an IPv4 address",
         Error::HasUserinfo => "addresses carrying a user name are not supported",
         Error::Ipv6Literal => "IPv6 addresses are not supported",
@@ -209,15 +239,27 @@ impl Url {
             return Err(Error::UnsupportedScheme);
         };
         let scheme = match_scheme(scheme)?;
-        let Some(rest) = rest.strip_prefix("//") else {
-            // `http:example.com` is legal generic-URI syntax and means
-            // something quite different from `http://example.com`. Rather
-            // than guess which was meant, refuse it: an address bar entry
-            // that reached here is a typo, and a link that did is broken.
-            return Err(Error::MissingHost);
+        let (host, port, remainder) = if scheme.has_authority() {
+            let Some(rest) = rest.strip_prefix("//") else {
+                // `http:example.com` is legal generic-URI syntax and means
+                // something quite different from `http://example.com`.
+                // Rather than guess which was meant, refuse it: an address
+                // bar entry that reached here is a typo, and a link that
+                // did is broken.
+                return Err(Error::MissingHost);
+            };
+            let (authority, remainder) = split_authority(rest);
+            let (host, port) = parse_authority(authority, scheme)?;
+            (host, port, remainder)
+        } else {
+            // `file:` has no authority. RFC 8089 writes it `file:///path`
+            // with an empty one; `file://localhost/path` means the same
+            // machine and is accepted as the same thing; and `file:/path`
+            // -- no slashes at all -- is what a person types, so it is
+            // taken rather than refused. All three end up identical, which
+            // is what stops the same file having three addresses.
+            (String::new(), 0, strip_file_authority(rest)?)
         };
-        let (authority, remainder) = split_authority(rest);
-        let (host, port) = parse_authority(authority, scheme)?;
         let (path, query, fragment) = split_path_query_fragment(remainder);
         let url = Url {
             scheme,
@@ -282,6 +324,13 @@ impl Url {
         let resolved = match classify(reference) {
             Reference::Absolute => return Url::parse(reference),
             Reference::SchemeRelative => {
+                // `//host/path` on a `file:` page would mean a file URL
+                // with an authority, which is not a thing this has: there
+                // is no host to inherit and nothing sensible to resolve
+                // against.
+                if !self.scheme.has_authority() {
+                    return Err(Error::MissingHost);
+                }
                 // Inherit only the scheme. Everything after `//` is a fresh
                 // authority, so a `//other.example/` link genuinely leaves
                 // this host -- which is why it cannot be treated as a path.
@@ -415,8 +464,7 @@ impl Url {
     /// hosting several sites on one address picks the site from this
     /// header, so sending the address asks for whichever one is default.
     pub fn host_header(&self) -> Result<String, Error> {
-        let mut value =
-            memory::string_with_capacity(self.host.len() + self.port_suffix_length())?;
+        let mut value = memory::string_with_capacity(self.host.len() + self.port_suffix_length())?;
         memory::push_str(&mut value, &self.host)?;
         if !self.has_default_port() {
             memory::push_str(&mut value, ":")?;
@@ -425,11 +473,45 @@ impl Url {
         Ok(value)
     }
 
+    /// The same URL with its path ending in `/`.
+    ///
+    /// This is not cosmetic. A relative reference resolves against
+    /// everything up to the base's **last** `/`, so `notes.txt` beside
+    /// `file:///tmp` is `file:///notes.txt` and beside `file:///tmp/` it is
+    /// `file:///tmp/notes.txt`. A directory's page is a page of relative
+    /// links, so its own address has to be the second spelling or every
+    /// link on it points one level too high.
+    ///
+    /// The query and the fragment are dropped: they belong to the reference
+    /// that was typed, not to the directory, and leaving them on the base
+    /// would put them on the address the reader is shown as well.
+    pub fn as_directory(&self) -> Result<Url, Error> {
+        if self.path.ends_with('/') {
+            return Ok(self.clone());
+        }
+        let mut path = memory::string_with_capacity(self.path.len() + 1)?;
+        memory::push_str(&mut path, &self.path)?;
+        memory::push_str(&mut path, "/")?;
+        let url = Url {
+            scheme: self.scheme,
+            host: memory::string_from(&self.host)?,
+            port: self.port,
+            path,
+            query: None,
+            fragment: None,
+        };
+        url.check_length()?;
+        Ok(url)
+    }
+
     /// The whole URL as text, for the address bar and for link targets in
     /// the status line. Includes the fragment; hides a default port.
     pub fn to_text(&self) -> Result<String, Error> {
         let mut text = memory::string_with_capacity(self.text_length())?;
         memory::push_str(&mut text, self.scheme.as_str())?;
+        // `file:///path`: the empty authority is written out, because
+        // `file:/path` and `file://host/path` are different productions in
+        // the grammar and only the three-slash form is unambiguous.
         memory::push_str(&mut text, "://")?;
         memory::push_str(&mut text, &self.host)?;
         if !self.has_default_port() {
@@ -597,8 +679,42 @@ fn match_scheme(scheme: &str) -> Result<Scheme, Error> {
         Ok(Scheme::Http)
     } else if scheme.eq_ignore_ascii_case("https") {
         Ok(Scheme::Https)
+    } else if scheme.eq_ignore_ascii_case("file") {
+        Ok(Scheme::File)
     } else {
         Err(Error::UnsupportedScheme)
+    }
+}
+
+/// Takes the empty (or `localhost`) authority off a `file:` URL and
+/// returns the path.
+///
+/// The three spellings RFC 8089 and everyday use produce:
+///
+/// ```text
+/// file:///tmp/notes.txt          the canonical form
+/// file://localhost/tmp/notes.txt the same machine, named
+/// file:/tmp/notes.txt            what a person types
+/// ```
+///
+/// Anything else after `file://` is a host, and there is no host here to
+/// reach: a `file://other-machine/x` that silently read the local file
+/// would be answering a question nobody asked.
+fn strip_file_authority(rest: &str) -> Result<&str, Error> {
+    let Some(rest) = rest.strip_prefix("//") else {
+        // `file:/path`, or `file:path`. The second is a relative reference
+        // with a scheme on it, which is not something to guess at.
+        return if rest.starts_with('/') {
+            Ok(rest)
+        } else {
+            Err(Error::MissingHost)
+        };
+    };
+    let (authority, remainder) = split_authority(rest);
+    if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+        Ok(remainder)
+    } else {
+        Err(Error::RemoteFileHost)
     }
 }
 
@@ -686,7 +802,9 @@ fn validate_host(host: &str) -> Result<String, Error> {
     // it is not a valid one it is refused rather than looked up as a name:
     // `999.1.1.1` is a typo, and asking DNS about it is not what the user
     // wanted.
-    let numeric = host.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.');
+    let numeric = host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.');
     if numeric {
         return match parse_ipv4(host) {
             Some(_) => memory::string_from(host).map_err(Error::from),
@@ -974,7 +1092,10 @@ mod tests {
 
     #[test]
     fn an_explicit_default_port_is_not_shown_again() {
-        assert_eq!(text_of(&parsed("http://example.com:80/x")), "http://example.com/x");
+        assert_eq!(
+            text_of(&parsed("http://example.com:80/x")),
+            "http://example.com/x"
+        );
         assert_eq!(
             text_of(&parsed("http://example.com:8080/x")),
             "http://example.com:8080/x"
@@ -1013,7 +1134,6 @@ mod tests {
     fn other_schemes_are_refused() {
         for text in [
             "ftp://example.com/f",
-            "file:///etc/passwd",
             "mailto:someone@example.com",
             "javascript:alert(1)",
             "data:text/html,hi",
@@ -1021,6 +1141,140 @@ mod tests {
         ] {
             assert_eq!(Url::parse(text), Err(Error::UnsupportedScheme), "{text}");
         }
+    }
+
+    #[test]
+    fn the_three_spellings_of_a_file_url_are_one_url() {
+        // Every form RFC 8089 and everyday typing produce, ending as the
+        // same value -- which is what stops one file having three
+        // addresses, and what makes the toolbar's text comparable.
+        let canonical = parsed("file:///tmp/notes.txt");
+        assert_eq!(canonical.scheme(), Scheme::File);
+        assert_eq!(canonical.host(), "");
+        assert_eq!(canonical.path(), "/tmp/notes.txt");
+        assert_eq!(canonical.to_text().unwrap(), "file:///tmp/notes.txt");
+        for text in ["file://localhost/tmp/notes.txt", "file:/tmp/notes.txt"] {
+            assert_eq!(parsed(text), canonical, "{text}");
+        }
+        assert_eq!(parsed("file://LOCALHOST/tmp/notes.txt"), canonical);
+    }
+
+    #[test]
+    fn a_file_url_naming_another_machine_is_refused() {
+        // Not read as the local file, which would be answering a question
+        // nobody asked.
+        assert_eq!(
+            Url::parse("file://other-machine/tmp/x"),
+            Err(Error::RemoteFileHost)
+        );
+        assert_eq!(
+            Url::parse("file://192.168.0.2/tmp/x"),
+            Err(Error::RemoteFileHost)
+        );
+    }
+
+    #[test]
+    fn a_file_url_needs_an_absolute_path() {
+        assert_eq!(Url::parse("file:tmp/x"), Err(Error::MissingHost));
+        assert_eq!(Url::parse("file:"), Err(Error::MissingHost));
+    }
+
+    #[test]
+    fn a_file_url_has_no_port_in_its_text() {
+        let url = parsed("file:///tmp/x");
+        assert_eq!(url.port(), 0);
+        // Zero is this scheme's default, so `has_default_port` keeps it
+        // out of the address the reader sees.
+        assert_eq!(url.to_text().unwrap(), "file:///tmp/x");
+    }
+
+    #[test]
+    fn relative_links_resolve_inside_a_file_url() {
+        let base = parsed("file:///vol/usb0p1/docs/index.html");
+        assert_eq!(
+            base.resolve("notes.txt").unwrap().to_text().unwrap(),
+            "file:///vol/usb0p1/docs/notes.txt"
+        );
+        assert_eq!(
+            base.resolve("../readme.txt").unwrap().to_text().unwrap(),
+            "file:///vol/usb0p1/readme.txt"
+        );
+        assert_eq!(
+            base.resolve("/tmp/x").unwrap().to_text().unwrap(),
+            "file:///tmp/x"
+        );
+        // `..` cannot climb out of the root, exactly as for http.
+        assert_eq!(
+            base.resolve("/../../etc").unwrap().to_text().unwrap(),
+            "file:///etc"
+        );
+        // A scheme-relative reference has no authority to land in.
+        assert_eq!(base.resolve("//host/x"), Err(Error::MissingHost));
+        // An absolute link off the local machine still works.
+        assert_eq!(
+            base.resolve("http://example.com/x").unwrap().scheme(),
+            Scheme::Http
+        );
+    }
+
+    #[test]
+    fn a_directory_url_ends_in_a_slash_so_its_links_land_inside_it() {
+        // The bug this exists for: without the trailing slash the last
+        // segment is a *sibling*, so every name on a listing page resolves
+        // one level too high.
+        let bare = parsed("file:///tmp");
+        assert_eq!(
+            bare.resolve("notes.txt").unwrap().to_text().unwrap(),
+            "file:///notes.txt"
+        );
+        let directory = bare.as_directory().unwrap();
+        assert_eq!(directory.to_text().unwrap(), "file:///tmp/");
+        assert_eq!(
+            directory.resolve("notes.txt").unwrap().to_text().unwrap(),
+            "file:///tmp/notes.txt"
+        );
+        // `..` from a directory page goes exactly one level up, which is
+        // what the `..` link on a listing needs.
+        assert_eq!(
+            parsed("file:///vol/usb0p1/docs/")
+                .resolve("..")
+                .unwrap()
+                .to_text()
+                .unwrap(),
+            "file:///vol/usb0p1/"
+        );
+        // Already a directory: unchanged, and not given a second slash.
+        let already = parsed("file:///tmp/");
+        assert_eq!(already.as_directory().unwrap(), already);
+        // The root is already one.
+        assert_eq!(parsed("file:///").as_directory().unwrap().path(), "/");
+        // Works for http too, where the same rule has always applied.
+        assert_eq!(
+            parsed("http://example.com/a/b")
+                .as_directory()
+                .unwrap()
+                .to_text()
+                .unwrap(),
+            "http://example.com/a/b/"
+        );
+    }
+
+    #[test]
+    fn a_directory_url_drops_the_query_and_the_fragment() {
+        let url = parsed("file:///tmp?x=1#part").as_directory().unwrap();
+        assert_eq!(url.to_text().unwrap(), "file:///tmp/");
+    }
+
+    #[test]
+    fn a_typed_file_address_is_not_completed_to_http() {
+        assert_eq!(
+            Url::parse_typed("file:///tmp/x").unwrap().scheme(),
+            Scheme::File
+        );
+        assert_eq!(
+            Url::parse_typed("file:/tmp/x").unwrap().scheme(),
+            Scheme::File
+        );
     }
 
     #[test]
@@ -1040,21 +1294,36 @@ mod tests {
             Url::parse("http://user:secret@example.com/"),
             Err(Error::HasUserinfo)
         );
-        assert_eq!(Url::parse("http://user@example.com/"), Err(Error::HasUserinfo));
+        assert_eq!(
+            Url::parse("http://user@example.com/"),
+            Err(Error::HasUserinfo)
+        );
     }
 
     #[test]
     fn ipv6_literals_are_refused() {
         assert_eq!(Url::parse("http://[::1]/"), Err(Error::Ipv6Literal));
-        assert_eq!(Url::parse("http://[2001:db8::1]:8080/"), Err(Error::Ipv6Literal));
+        assert_eq!(
+            Url::parse("http://[2001:db8::1]:8080/"),
+            Err(Error::Ipv6Literal)
+        );
     }
 
     #[test]
     fn ports_must_be_numbers_below_65536() {
         assert_eq!(parsed("http://example.com:65535/").port(), 65535);
-        assert_eq!(Url::parse("http://example.com:65536/"), Err(Error::InvalidPort));
-        assert_eq!(Url::parse("http://example.com:80x/"), Err(Error::InvalidPort));
-        assert_eq!(Url::parse("http://example.com:-1/"), Err(Error::InvalidPort));
+        assert_eq!(
+            Url::parse("http://example.com:65536/"),
+            Err(Error::InvalidPort)
+        );
+        assert_eq!(
+            Url::parse("http://example.com:80x/"),
+            Err(Error::InvalidPort)
+        );
+        assert_eq!(
+            Url::parse("http://example.com:-1/"),
+            Err(Error::InvalidPort)
+        );
     }
 
     #[test]
@@ -1114,7 +1383,12 @@ mod tests {
 
     #[test]
     fn malformed_names_are_refused() {
-        for host in ["exa mple.com", "example..com", ".example.com", "ex%41mple.com"] {
+        for host in [
+            "exa mple.com",
+            "example..com",
+            ".example.com",
+            "ex%41mple.com",
+        ] {
             let text = format!("http://{host}/");
             assert!(Url::parse(&text).is_err(), "{host}");
         }
@@ -1182,7 +1456,10 @@ mod tests {
 
     #[test]
     fn the_host_header_carries_a_non_default_port() {
-        assert_eq!(parsed("http://example.com/").host_header().unwrap(), "example.com");
+        assert_eq!(
+            parsed("http://example.com/").host_header().unwrap(),
+            "example.com"
+        );
         assert_eq!(
             parsed("http://example.com:8080/").host_header().unwrap(),
             "example.com:8080"
@@ -1255,7 +1532,10 @@ mod tests {
     /// confining the request to.
     #[test]
     fn percent_encoded_dots_are_not_dot_segments() {
-        assert_eq!(parsed("http://example.com/a/%2e%2e/b").path(), "/a/%2e%2e/b");
+        assert_eq!(
+            parsed("http://example.com/a/%2e%2e/b").path(),
+            "/a/%2e%2e/b"
+        );
         assert_eq!(parsed("http://example.com/a/%2E./b").path(), "/a/%2E./b");
         assert_eq!(resolved("%2e%2e/x"), "http://example.com/a/b/%2e%2e/x");
         // And the unencoded form still is one.
@@ -1342,8 +1622,14 @@ mod tests {
 
     #[test]
     fn an_absolute_reference_ignores_the_base_entirely() {
-        assert_eq!(resolved("http://other.example:8080/g"), "http://other.example:8080/g");
-        assert_eq!(resolved("https://other.example/g"), "https://other.example/g");
+        assert_eq!(
+            resolved("http://other.example:8080/g"),
+            "http://other.example:8080/g"
+        );
+        assert_eq!(
+            resolved("https://other.example/g"),
+            "https://other.example/g"
+        );
     }
 
     #[test]
@@ -1355,7 +1641,10 @@ mod tests {
 
     #[test]
     fn a_reference_carries_its_own_query_and_fragment() {
-        assert_eq!(resolved("g.html?y=2#z"), "http://example.com/a/b/g.html?y=2#z");
+        assert_eq!(
+            resolved("g.html?y=2#z"),
+            "http://example.com/a/b/g.html?y=2#z"
+        );
     }
 
     #[test]
@@ -1386,8 +1675,14 @@ mod tests {
 
     #[test]
     fn unsupported_schemes_in_a_link_are_refused_at_resolution() {
-        assert_eq!(base().resolve("ftp://example.com/f"), Err(Error::UnsupportedScheme));
-        assert_eq!(base().resolve("javascript:void(0)"), Err(Error::UnsupportedScheme));
+        assert_eq!(
+            base().resolve("ftp://example.com/f"),
+            Err(Error::UnsupportedScheme)
+        );
+        assert_eq!(
+            base().resolve("javascript:void(0)"),
+            Err(Error::UnsupportedScheme)
+        );
     }
 
     #[test]
@@ -1467,7 +1762,10 @@ mod tests {
             Err(Error::UnsupportedScheme)
         );
         // `http:` without the slashes is a typo, and it keeps saying so.
-        assert_eq!(Url::parse_typed("http:example.com"), Err(Error::MissingHost));
+        assert_eq!(
+            Url::parse_typed("http:example.com"),
+            Err(Error::MissingHost)
+        );
     }
 
     #[test]

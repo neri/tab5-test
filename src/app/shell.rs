@@ -615,7 +615,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         name: "shutdown",
         usage: "shutdown",
         lines: &[
-            "turn off the whole Tab5 through the board power controller",
+            "turn off the whole Tab5 through its power controller",
             "(save data first; press the physical power key to start again)",
         ],
     },
@@ -770,7 +770,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "address is configured, nothing is addressed to us: with no IP,",
             "nothing on the network has a reason to talk to this station.",
             "'netdump tx' instead shows the last frames handed to the C6,",
-            "which is the only way to see what this board actually sent",
+            "which is the only way to see what this device actually sent",
         ],
     },
     HelpEntry {
@@ -798,7 +798,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "ping <host|a.b.c.d> [count]",
         lines: &[
             "send ICMP echo requests and time the replies; default 4. echo",
-            "requests aimed at this board are answered whenever an address",
+            "requests aimed at this device are answered whenever an address",
             "is configured, whether or not this command is running",
         ],
     },
@@ -889,7 +889,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         name: "reboot",
         usage: "reboot",
-        lines: &["restart the board"],
+        lines: &["restart the device"],
     },
 ];
 

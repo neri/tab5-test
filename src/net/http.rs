@@ -198,6 +198,21 @@ impl Head {
         }
     }
 
+    /// Whether the body is text of some kind that is not HTML.
+    ///
+    /// Every `text/*` subtype except `text/html`, which [`Self::is_html`]
+    /// has already claimed. The browser shows these as themselves: a
+    /// `.txt`, a `.md`, a `.csv`, a server's `manifest.txt`. A response
+    /// with no `Content-Type` is not one of these -- it is treated as HTML,
+    /// see above -- so this only ever answers for a server that said what
+    /// it was sending.
+    pub fn is_text(&self) -> bool {
+        match &self.media_type {
+            Some(media) => media.starts_with(b"text/") && !self.is_html(),
+            None => false,
+        }
+    }
+
     pub fn is_redirect(&self) -> bool {
         matches!(self.status, Some(301 | 302 | 303 | 307 | 308))
     }
@@ -1090,20 +1105,40 @@ fn parse_status(headers: &[u8]) -> Option<u16> {
 /// for an absent header is "anything", and a server that took that up on a
 /// gzip would be sending a body this has no decompressor for.
 ///
+/// `User-Agent` is sent because a request without one is refused outright by
+/// a good deal of the web -- measured on 2026-08-28, `en.wikipedia.org` and
+/// `stackoverflow.com` both answer 403 to this request with the header
+/// removed and 200 with it present, and adding `Accept` instead changes
+/// nothing.
+///
+/// What it says is what this is. Claiming to be Firefox was tried and is
+/// both dishonest and *worse*: `reddit.com` answers 403 to a bare
+/// `Mozilla/5.0` and 200 to [`USER_AGENT`]. An operator who wants to know
+/// what is fetching their pages can find out, and that turns out to be the
+/// combination the web actually rewards.
+///
 /// The target and the host come from a `browser::url::Url`, which has
 /// already refused CR, LF, space and every control character -- so nothing
 /// here can add a line to the request.
 fn build_request(host: &[u8], target: &[u8]) -> Result<Vec<u8>, Error> {
     let mut request = Vec::new();
-    let length = target.len() + host.len() + 96;
+    let length = target.len() + host.len() + USER_AGENT.len() + 96;
     request.try_reserve_exact(length).map_err(|_| Error::OutOfMemory)?;
     request.extend_from_slice(b"GET ");
     request.extend_from_slice(target);
     request.extend_from_slice(b" HTTP/1.0\r\nHost: ");
     request.extend_from_slice(host);
+    request.extend_from_slice(b"\r\nUser-Agent: ");
+    request.extend_from_slice(USER_AGENT.as_bytes());
     request.extend_from_slice(b"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
     Ok(request)
 }
+
+/// What this firmware calls itself to a server.
+///
+/// The version comes from `Cargo.toml` so the two cannot drift apart. No URL
+/// and no imitation of a browser: see [`build_request`].
+pub const USER_AGENT: &str = concat!("tab5-browser/", env!("CARGO_PKG_VERSION"));
 
 // ---------------------------------------------------------------------------
 // The blocking call.

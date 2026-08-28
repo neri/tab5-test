@@ -430,6 +430,16 @@ HTTP/1.1ではなく**1.0**を使うのは、本文の終わりでサーバに�
 明記します。ヘッダを省略したときの既定は「何でも」で、gzipで返されると
 展開する手段がないためです。
 
+`User-Agent`も送ります（`tab5-browser/<version>`）。**無いと相当数のサイトが
+403で断ります** — 2026-08-28の実測で、`en.wikipedia.org`と`stackoverflow.com`は
+このヘッダを外した要求に403を返し、付けると200になりました（`Accept`を足しても
+変わりません）。
+
+名乗る内容は実物どおりにします。ブラウザを騙るのは不誠実なうえに**成績も悪い**
+のが実測で分かりました——`reddit.com`は素の`Mozilla/5.0`に403を返し、
+`tab5-browser/0.2.0`には200を返します。fixture serverの`/require-user-agent`が
+このヘッダを送り続けることを固定しています。
+
 ### ソケットには触らない
 
 `net::http`はソケットを持ちません。バイトは`net::transport::Transport`から
@@ -481,6 +491,15 @@ redirectや表示しないstatusを、本文を1 byteも読まずに判断でき
 
 status code、`Content-Type`と`charset`、`Content-Length`、
 `Transfer-Encoding: chunked`、`Location`、`Content-Encoding`。
+
+`charset`はここでは小文字化して持つだけです。使うのはブラウザ側で、
+本文の1 byte目より前に`Parser::declare_charset`へ渡します
+（[BROWSER.md](BROWSER.md)の「文字符号化」）。
+
+`Head::is_html`は`text/html`と`application/xhtml+xml`、および
+`Content-Type`が無い応答に真を返します。`Head::is_text`はそれ以外の
+`text/*`で、ブラウザはこちらをplain textとして表示します
+（[BROWSER.md](BROWSER.md)の「HTML以外のもの」）。
 
 本文の終端は3種類あり、どれかによって「接続が閉じた」の意味が変わります。
 
@@ -667,9 +686,24 @@ chunked・close終端）が判断する。
 ### 失敗の名前
 
 `entropy`、`link-lost`、`tls-connect`、`tls-timeout`、`tls-version`、`tls-alert`、
-`tls-cert`、`tls-pin`、`tls-pin-missing`、`tls-limit`、`cancelled`、`out-of-memory`、
-`tls-local`。ライブラリ固有のenumはこの境界で正規化する。証明書エラーをTCP timeoutに
-潰さず、逆にASN.1 parserの詳細を画面へ出さない。
+`tls-handshake`、`tls-cert`、`tls-pin`、`tls-pin-missing`、`tls-limit`、`cancelled`、
+`out-of-memory`、`tls-local`。ライブラリ固有のenumはこの境界で正規化する。
+証明書エラーをTCP timeoutに潰さず、逆にASN.1 parserの詳細を画面へ出さない。
+
+`tls-alert`と`tls-handshake`は**どちらが断ったか**が違う。前者はserverがfatal
+alertを送ってきた場合、後者はserverのhandshakeをこちらが解釈できずalertを送って
+中断した場合である。後者を「serverが拒否した」と表示すると、こちら側の制約を
+探しにserverの設定を見に行かせることになる。
+
+serverのalertのうち`protocol_version`、`handshake_failure`、
+`insufficient_security`の3つは`tls-alert`ではなく**`tls-version`**として上げる。
+どれも「話せるものが1つも無い」という意味で、こちらがTLS 1.3・
+AES-128-GCM-SHA256・secp256r1しか出さないことが原因だからである。TLS 1.2までの
+serverはこの経路で`tls-version`になる（実測: 2026-08-28）。
+
+alertの中身（`handshake_failure`、`protocol_version`、`unrecognized_name`など）は
+**UARTにだけ**出す（[DIAGNOSTICS.md](DIAGNOSTICS.md)）。画面に出しても読み手には
+できることが無い一方、シリアルを繋いでいる人には3つがまったく別の対処になる。
 
 ### 実測（2026-08-28、実機）
 

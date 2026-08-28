@@ -83,6 +83,13 @@ pub fn run(
             return;
         }
     };
+    // This command drives a `Transaction`, and a `file:` address has none:
+    // there is no host to resolve, no socket to count and no head to
+    // report. The viewer opens one; this does not.
+    if !url.scheme().is_network() {
+        console.write_output_line(framebuffer, "hs needs an http:// or https:// address");
+        return;
+    }
 
     // The address the URL says, resolved once: repeating the fetch is
     // meant to exercise sockets, not the resolver.
@@ -256,6 +263,10 @@ fn security_for(url: &Url) -> net::transport::Security<'_> {
             server_name: url.host(),
             policy: net::pins::policy_for(url.host()),
         },
+        // `hs` and `bt` refuse a `file:` address before they get here --
+        // there is no transport to pick for one. Plaintext is the answer
+        // that cannot be a downgrade of anything.
+        crate::browser::url::Scheme::File => net::transport::Security::Plain,
     }
 }
 
@@ -288,28 +299,14 @@ fn fetch(
         Err(error) => return failed(error),
     };
 
-    let mut parser = if build_document {
-        // The page's own URL is the base every relative link resolves
-        // against, so the parser is given the same `Url` the request was
-        // built from rather than a second one parsed from the same text.
-        Parser::new(url.clone()).ok()
-    } else {
-        None
-    };
+    // Built at `HeadReady` rather than here, because which kind it is
+    // depends on the `Content-Type`: markup gets the tokenizer, `text/*`
+    // that is not HTML gets the plain reader. Same decision as
+    // `app::fetch::head_ready`, so `hs <url> p` parses what the viewer
+    // would.
+    let mut parser: Option<Parser> = None;
     let mut crc = Crc32::new();
     let mut document_error = None;
-    let mut sink = |bytes: &[u8]| {
-        crc.update(bytes);
-        if let Some(parser) = parser.as_mut()
-            && let Err(failure) = parser.feed(bytes)
-        {
-            // Refusing the body here is what stops the transfer: a page
-            // past a limit is not read to the end and then discarded.
-            document_error = Some(failure);
-            return false;
-        }
-        true
-    };
     let mut status = None;
     let mut framing = "?";
     let mut location = None;
@@ -319,10 +316,54 @@ fn fetch(
     let mut disposition = "-";
     let deadline = tick::now_ms() + FETCH_DEADLINE_MS;
     loop {
-        match transaction.poll(stack, rpc, http::DEFAULT_POLL_BUDGET, &mut sink) {
+        // The sink is built fresh for each poll rather than once outside
+        // the loop. It borrows the parser, and the `HeadReady` arm below
+        // has to reach the same parser to hand it the response's
+        // `charset` -- which is what keeps `hs <url> p` decoding a page
+        // exactly the way the viewer will.
+        let progress = {
+            let mut sink = |bytes: &[u8]| {
+                crc.update(bytes);
+                if let Some(parser) = parser.as_mut()
+                    && let Err(failure) = parser.feed(bytes)
+                {
+                    // Refusing the body here is what stops the transfer: a
+                    // page past a limit is not read to the end and then
+                    // discarded.
+                    document_error = Some(failure);
+                    return false;
+                }
+                true
+            };
+            transaction.poll(stack, rpc, http::DEFAULT_POLL_BUDGET, &mut sink)
+        };
+        match progress {
             Progress::HeadReady => {
                 if let Some(head) = transaction.head() {
                     status = head.status;
+                    if build_document && head.is_success() {
+                        // The page's own URL is the base every relative
+                        // link resolves against, so the parser is given the
+                        // same `Url` the request was built from rather than
+                        // a second one parsed from the same text.
+                        // `None` for a response that is neither, which is
+                        // the diagnostic's way of saying the viewer would
+                        // have refused it rather than inventing an error
+                        // for it.
+                        let built = if head.is_html() {
+                            Some(Parser::new(url.clone()))
+                        } else if head.is_text() {
+                            Some(Parser::plain(url.clone()))
+                        } else {
+                            None
+                        };
+                        parser = built.and_then(Result::ok);
+                        if let Some(parser) = parser.as_mut()
+                            && let Some(charset) = head.charset.as_deref()
+                        {
+                            parser.declare_charset(charset);
+                        }
+                    }
                     framing = if head.chunked {
                         "chunked"
                     } else if head.content_length.is_some() {
@@ -781,6 +822,10 @@ pub fn walk(
     rpc: &mut wifi::Rpc,
     stack: &mut net::Stack,
 ) {
+    if !base.scheme().is_network() {
+        console.write_output_line(framebuffer, "bt needs an http:// or https:// address");
+        return;
+    }
     let Ok(manifest_url) = base.resolve("/manifest.txt") else {
         console.write_output_line(framebuffer, "bt: cannot build the manifest address");
         return;
@@ -1014,11 +1059,19 @@ fn visit(
                 let received = fetch.received();
                 let peak = fetch.peak_owned();
                 let redirects = fetch.redirects();
+                // A page that arrived with a status outside 2xx is still a
+                // refusal as far as the manifest is concerned: the viewer
+                // now shows the server's own page for it, but `/status/404`
+                // is expected to be `status-404` and has to stay so. The
+                // name comes from the status, which `judge` turns into
+                // `status-404`, exactly as it does for a `Failed`.
+                let status = fetch.status();
+                let name = if status.is_some() { "status" } else { "ok" };
                 fetch.close(&mut network);
                 return judge(
                     expected,
-                    ManifestName::new("ok"),
-                    None,
+                    ManifestName::new(name),
+                    status,
                     Some(document),
                     peak,
                     received,

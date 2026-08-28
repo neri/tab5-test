@@ -438,6 +438,12 @@ command名だけから暗黙にTLSへ変えません。`hs`、browser address欄
 | `tls-connect` | TCP接続またはClientHello送信前後の失敗 |
 | `tls-version` | 共通のTLS version／cipher suiteがない |
 | `tls-alert` | peerがTLS alertで終了した |
+| `tls-handshake` | serverのhandshakeをこちらが解釈できず中断した（計画表に無かったが実機診断のため追加） |
+
+serverのalertのうち`protocol_version`／`handshake_failure`／`insufficient_security`は
+`tls-alert`ではなく`tls-version`へ寄せた。実機でTLS 1.2 serverに当たったとき
+「the server rejected the connection」と出て、原因がこちらのversion制約だと
+分からなかったため。alertの名前はUARTへ出す。
 | `tls-cert` | certificate形式または`CertificateVerify`署名が不正 |
 | `tls-pin-missing` | 認証必須の接続先にpinが登録されていない |
 | `tls-pin` | leaf SPKIが登録pinと一致しない |

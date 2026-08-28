@@ -26,6 +26,7 @@
 extern crate alloc;
 
 pub mod document;
+pub mod encoding;
 pub mod error;
 pub mod html;
 pub mod layout;

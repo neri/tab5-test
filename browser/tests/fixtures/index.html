@@ -20,6 +20,20 @@ is itself part of what is being tested.</p>
   <li><a href="empty.html">empty.html</a> - a document with no text</li>
   <li><a href="links/">links/</a> - relative reference resolution</li>
 </ul>
+<h2>Character encodings</h2>
+<ul>
+  <li><a href="encoding/shift-jis">encoding/shift-jis</a> - declared by the header</li>
+  <li><a href="encoding/shift-jis-meta">encoding/shift-jis-meta</a> - declared by meta</li>
+  <li><a href="encoding/shift-jis-lying-meta">encoding/shift-jis-lying-meta</a> - header over meta</li>
+  <li><a href="encoding/shift-jis-broken">encoding/shift-jis-broken</a> - one dangling lead byte</li>
+  <li><a href="encoding/utf8-bom.html">encoding/utf8-bom.html</a> - a byte order mark</li>
+</ul>
+<h2>Media types</h2>
+<ul>
+  <li><a href="plain.txt">plain.txt</a> - text/plain, shown as itself</li>
+  <li><a href="plain-sjis.txt">plain-sjis.txt</a> - text/plain in Shift_JIS</li>
+  <li><a href="notatype.bin">notatype.bin</a> - neither HTML nor text, refused</li>
+</ul>
 <h2>Malformed markup that should still render</h2>
 <ul>
   <li><a href="broken/unclosed.html">broken/unclosed.html</a></li>
@@ -62,6 +76,7 @@ is itself part of what is being tested.</p>
 <ul>
   <li><a href="limit/input">limit/input</a> - past MAX_DECODED_HTML_BYTES</li>
   <li><a href="limit/input-nolength">limit/input-nolength</a> - the same without a length</li>
+  <li><a href="limit/text">limit/text</a> - past MAX_TEXT_BYTES</li>
   <li><a href="limit/items">limit/items</a> - past MAX_ITEMS</li>
   <li><a href="limit/links">limit/links</a> - past MAX_LINKS</li>
   <li><a href="limit/url">limit/url</a> - a link past MAX_URL_BYTES</li>

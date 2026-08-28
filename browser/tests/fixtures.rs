@@ -21,51 +21,121 @@
 use tab5_browser::document::{BlockKind, Document, Marker, Parser, STYLE_BOLD, STYLE_CODE};
 use tab5_browser::url::Url;
 
-/// Every dumped fixture, by the name the server writes it under.
+/// Every dumped fixture.
 ///
 /// Listed rather than globbed: a test that discovers its own inputs passes
 /// when they all disappear.
-const FIXTURES: &[(&str, &[u8])] = &[
-    ("index.html", include_bytes!("fixtures/index.html")),
-    ("simple.html", include_bytes!("fixtures/simple.html")),
-    ("long.html", include_bytes!("fixtures/long.html")),
-    ("headings.html", include_bytes!("fixtures/headings.html")),
-    ("list.html", include_bytes!("fixtures/list.html")),
-    ("pre.html", include_bytes!("fixtures/pre.html")),
-    ("entity.html", include_bytes!("fixtures/entity.html")),
-    ("utf8.html", include_bytes!("fixtures/utf8.html")),
-    ("inline.html", include_bytes!("fixtures/inline.html")),
-    ("image.html", include_bytes!("fixtures/image.html")),
-    ("rule.html", include_bytes!("fixtures/rule.html")),
-    ("script.html", include_bytes!("fixtures/script.html")),
-    ("empty.html", include_bytes!("fixtures/empty.html")),
-    ("links-index.html", include_bytes!("fixtures/links-index.html")),
-    ("links-target.html", include_bytes!("fixtures/links-target.html")),
-    ("links-deep.html", include_bytes!("fixtures/links-deep.html")),
-    (
+const FIXTURES: &[Fixture] = &[
+    Fixture("index.html", None, include_bytes!("fixtures/index.html")),
+    Fixture("simple.html", None, include_bytes!("fixtures/simple.html")),
+    Fixture("long.html", None, include_bytes!("fixtures/long.html")),
+    Fixture(
+        "headings.html",
+        None,
+        include_bytes!("fixtures/headings.html"),
+    ),
+    Fixture("list.html", None, include_bytes!("fixtures/list.html")),
+    Fixture("pre.html", None, include_bytes!("fixtures/pre.html")),
+    Fixture("entity.html", None, include_bytes!("fixtures/entity.html")),
+    Fixture("utf8.html", None, include_bytes!("fixtures/utf8.html")),
+    Fixture("inline.html", None, include_bytes!("fixtures/inline.html")),
+    Fixture("image.html", None, include_bytes!("fixtures/image.html")),
+    Fixture("rule.html", None, include_bytes!("fixtures/rule.html")),
+    Fixture("script.html", None, include_bytes!("fixtures/script.html")),
+    Fixture("empty.html", None, include_bytes!("fixtures/empty.html")),
+    Fixture(
+        "links-index.html",
+        None,
+        include_bytes!("fixtures/links-index.html"),
+    ),
+    Fixture(
+        "links-target.html",
+        None,
+        include_bytes!("fixtures/links-target.html"),
+    ),
+    Fixture(
+        "links-deep.html",
+        None,
+        include_bytes!("fixtures/links-deep.html"),
+    ),
+    Fixture(
         "broken-unclosed.html",
+        None,
         include_bytes!("fixtures/broken-unclosed.html"),
     ),
-    (
+    Fixture(
         "broken-deep-nest.html",
+        None,
         include_bytes!("fixtures/broken-deep-nest.html"),
     ),
-    (
+    Fixture(
         "broken-huge-attribute.html",
+        None,
         include_bytes!("fixtures/broken-huge-attribute.html"),
     ),
-    (
+    Fixture(
         "broken-bad-utf8.html",
+        None,
         include_bytes!("fixtures/broken-bad-utf8.html"),
     ),
-    ("slow.html", include_bytes!("fixtures/slow.html")),
-    ("chunked.html", include_bytes!("fixtures/chunked.html")),
-    ("limit-url.html", include_bytes!("fixtures/limit-url.html")),
-    (
+    Fixture("slow.html", None, include_bytes!("fixtures/slow.html")),
+    Fixture(
+        "chunked.html",
+        None,
+        include_bytes!("fixtures/chunked.html"),
+    ),
+    Fixture(
+        "limit-url.html",
+        None,
+        include_bytes!("fixtures/limit-url.html"),
+    ),
+    Fixture(
         "limit-longline.html",
+        None,
         include_bytes!("fixtures/limit-longline.html"),
     ),
+    // Not UTF-8. The first is declared by the response header only, the
+    // second by its own `<meta>` only, and the third is the first with
+    // one lead byte left dangling -- the three ways a Shift_JIS page
+    // arrives, decoded here by the same `Parser` the board runs.
+    Fixture(
+        "shift-jis.sjis.html",
+        Some(b"Shift_JIS"),
+        include_bytes!("fixtures/shift-jis.sjis.html"),
+    ),
+    Fixture(
+        "shift-jis-meta.sjis.html",
+        None,
+        include_bytes!("fixtures/shift-jis-meta.sjis.html"),
+    ),
+    Fixture(
+        "shift-jis-broken.sjis.html",
+        Some(b"shift_jis"),
+        include_bytes!("fixtures/shift-jis-broken.sjis.html"),
+    ),
+    Fixture(
+        "utf8-bom.html",
+        None,
+        include_bytes!("fixtures/utf8-bom.html"),
+    ),
+    // Not markup at all. Parsed through `Parser::plain`, which is what the
+    // viewer uses for `text/plain` off the network and for a file whose
+    // name does not end in `.html`.
+    Fixture(
+        "plain.txt",
+        Some(b"utf-8"),
+        include_bytes!("fixtures/plain.txt"),
+    ),
 ];
+
+/// One fixture: the name the server writes it under, the `charset` the
+/// server sends with it, and its bytes.
+///
+/// The charset is `None` wherever the server sends no `charset`
+/// parameter, which is not the same as sending `utf-8`: it is what
+/// leaves the document's own `<meta>` to decide, and two of these exist
+/// to exercise exactly that.
+struct Fixture(&'static str, Option<&'static [u8]>, &'static [u8]);
 
 /// The base every fixture is parsed against, standing in for the address
 /// the board would have fetched it from.
@@ -73,8 +143,31 @@ fn base() -> Url {
     Url::parse("http://fixture.local:8080/links/page.html").unwrap()
 }
 
-fn parse_in_chunks(input: &[u8], size: usize) -> Document {
-    let mut parser = Parser::new(base()).unwrap();
+/// Whether a fixture's name says it is not markup.
+///
+/// The suffix and nothing else, which is the same rule `app::localfile`
+/// applies to a file it opens: the dump writes the server's bytes under the
+/// server's own name, and `.txt` is what it serves as `text/plain`.
+fn is_plain(name: &str) -> bool {
+    name.ends_with(".txt")
+}
+
+fn parse_in_chunks(input: &[u8], charset: Option<&[u8]>, size: usize) -> Document {
+    parse_as(input, charset, size, false)
+}
+
+fn parse_as(input: &[u8], charset: Option<&[u8]>, size: usize, plain: bool) -> Document {
+    let mut parser = if plain {
+        Parser::plain(base()).unwrap()
+    } else {
+        Parser::new(base()).unwrap()
+    };
+    // Where the server sends one, before the first byte -- the same order
+    // `app::fetch` does it in, which is the order that lets the header
+    // outrank the document.
+    if let Some(charset) = charset {
+        parser.declare_charset(charset);
+    }
     for chunk in input.chunks(size) {
         parser.feed(chunk).unwrap();
     }
@@ -82,7 +175,16 @@ fn parse_in_chunks(input: &[u8], size: usize) -> Document {
 }
 
 fn parse(input: &[u8]) -> Document {
-    parse_in_chunks(input, input.len().max(1))
+    parse_in_chunks(input, None, input.len().max(1))
+}
+
+/// One fixture, parsed the way the server serves it.
+fn parse_fixture(fixture: &Fixture) -> Document {
+    parse_fixture_in_chunks(fixture, fixture.2.len().max(1))
+}
+
+fn parse_fixture_in_chunks(fixture: &Fixture, size: usize) -> Document {
+    parse_as(fixture.2, fixture.1, size, is_plain(fixture.0))
 }
 
 /// A whole document as one comparable string: one line per block, with its
@@ -127,10 +229,18 @@ fn text_of(document: &Document) -> String {
 
 #[test]
 fn every_fixture_parses() {
-    for (name, content) in FIXTURES {
-        let mut parser = Parser::new(base()).unwrap();
+    for fixture in FIXTURES {
+        let name = fixture.0;
+        let mut parser = if is_plain(name) {
+            Parser::plain(base()).unwrap()
+        } else {
+            Parser::new(base()).unwrap()
+        };
+        if let Some(charset) = fixture.1 {
+            parser.declare_charset(charset);
+        }
         parser
-            .feed(content)
+            .feed(fixture.2)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         parser
             .finish()
@@ -140,9 +250,10 @@ fn every_fixture_parses() {
 
 #[test]
 fn one_byte_at_a_time_gives_the_same_document() {
-    for (name, content) in FIXTURES {
-        let whole = describe(&parse(content));
-        let split = describe(&parse_in_chunks(content, 1));
+    for fixture in FIXTURES {
+        let name = fixture.0;
+        let whole = describe(&parse_fixture(fixture));
+        let split = describe(&parse_fixture_in_chunks(fixture, 1));
         assert_eq!(split, whole, "{name} differs when fed one byte at a time");
     }
 }
@@ -151,10 +262,11 @@ fn one_byte_at_a_time_gives_the_same_document() {
 /// the documents so the boundaries walk through them.
 #[test]
 fn no_chunk_size_changes_the_document() {
-    for (name, content) in FIXTURES {
-        let whole = describe(&parse(content));
+    for fixture in FIXTURES {
+        let name = fixture.0;
+        let whole = describe(&parse_fixture(fixture));
         for size in [1, 2, 3, 5, 7, 13, 31, 64, 127, 512, 4096] {
-            let split = describe(&parse_in_chunks(content, size));
+            let split = describe(&parse_fixture_in_chunks(fixture, size));
             assert_eq!(split, whole, "{name} differs in chunks of {size}");
         }
     }
@@ -183,7 +295,7 @@ fn fixtures_are_current() {
 
 #[test]
 fn simple_has_a_title_a_heading_and_a_link() {
-    let document = parse(FIXTURES[1].1);
+    let document = parse_fixture(&FIXTURES[1]);
     assert_eq!(document.title(), "simple");
     assert_eq!(document.blocks().len(), 3);
     assert_eq!(document.blocks()[0].kind, BlockKind::Heading(1));
@@ -280,6 +392,105 @@ fn non_ascii_text_survives_intact() {
     }
 }
 
+/// The three Shift_JIS fixtures come out as the text they were written as.
+///
+/// The bytes are the ones the fixture server sends, so what is checked here
+/// is the whole path the board takes -- header or `<meta>`, table lookup,
+/// halfwidth katakana, the extension rows -- against the sentence the
+/// server encoded.
+#[test]
+fn shift_jis_decodes_to_the_text_it_was_written_as() {
+    let expected = [
+        // Kanji from the main JIS rows, and the heading.
+        "日本語の表示",
+        // Halfwidth katakana, which is one byte each and has to stay
+        // halfwidth rather than becoming its fullwidth twin.
+        "ｶﾞｷﾞｸﾞﾀﾞ",
+        // The Windows extension rows: a name variant and circled numbers,
+        // none of which plain JIS X 0208 has.
+        "髙 﨑",
+        "①②③",
+    ];
+    for name in ["shift-jis.sjis.html", "shift-jis-meta.sjis.html"] {
+        let fixture = FIXTURES
+            .iter()
+            .find(|fixture| fixture.0 == name)
+            .expect("fixture is listed");
+        let text = text_of(&parse_fixture(fixture));
+        for wanted in expected {
+            assert!(
+                text.contains(wanted),
+                "{name}: {wanted} missing from {text}"
+            );
+        }
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "{name} has replacement characters"
+        );
+    }
+}
+
+/// One dangling lead byte costs one character and nothing else.
+///
+/// The failure this guards against is the one that matters in practice: a
+/// decoder that loses synchronisation on a damaged byte turns the rest of
+/// the page into rubble, and the reader cannot tell that from a server
+/// that sent rubble.
+#[test]
+fn a_damaged_shift_jis_byte_costs_one_character() {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.0 == "shift-jis-broken.sjis.html")
+        .expect("fixture is listed");
+    let text = text_of(&parse_fixture(fixture));
+    assert_eq!(text.matches('\u{FFFD}').count(), 1, "{text}");
+    // Everything after the damage is still there.
+    assert!(text.contains("ｶﾞｷﾞｸﾞﾀﾞ"), "{text}");
+    assert!(text.contains("①②③"), "{text}");
+}
+
+/// Plain text keeps its own spacing and means nothing by its punctuation.
+///
+/// The three things that separate `text/plain` from markup shown badly: the
+/// line breaks and the run of spaces survive, `<` and `>` are characters,
+/// and `&amp;` is four of them rather than one.
+#[test]
+fn plain_text_is_text_and_not_markup() {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.0 == "plain.txt")
+        .expect("fixture is listed");
+    let document = parse_fixture(fixture);
+    let text = text_of(&document);
+    assert!(text.contains("a < b && c > d"), "{text}");
+    assert!(text.contains("&amp; is four characters"), "{text}");
+    assert!(
+        text.contains("  indented, and the   run of spaces"),
+        "{text}"
+    );
+    assert!(text.contains('\n'), "line breaks are kept: {text}");
+    // Non-ASCII goes through the same decoder as a page does.
+    assert!(text.contains("日本語もそのまま出ます。"), "{text}");
+    // One block, and it is the preformatted kind: nothing in the file was
+    // read as a heading, a paragraph or a list.
+    assert_eq!(document.blocks().len(), 1);
+    assert_eq!(document.blocks()[0].kind, BlockKind::Preformatted);
+    assert_eq!(document.links().len(), 0);
+    assert_eq!(document.title(), "");
+}
+
+/// A byte order mark is consumed rather than shown.
+#[test]
+fn a_byte_order_mark_is_not_text() {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.0 == "utf8-bom.html")
+        .expect("fixture is listed");
+    let document = parse_fixture(fixture);
+    assert_eq!(document.title(), "bom");
+    assert!(!text_of(&document).contains('\u{FEFF}'));
+}
+
 #[test]
 fn inline_elements_become_styles_rather_than_text() {
     let document = parse(include_bytes!("fixtures/inline.html"));
@@ -289,10 +500,16 @@ fn inline_elements_become_styles_rather_than_text() {
         .filter(|run| run.style != 0)
         .map(|run| (run.style, document.run_text(run)))
         .collect();
-    assert!(styled.iter().any(|(style, text)| *style & STYLE_BOLD != 0
-        && *text == "strong"));
-    assert!(styled.iter().any(|(style, text)| *style & STYLE_CODE != 0
-        && text.contains("code()")));
+    assert!(
+        styled
+            .iter()
+            .any(|(style, text)| *style & STYLE_BOLD != 0 && *text == "strong")
+    );
+    assert!(
+        styled
+            .iter()
+            .any(|(style, text)| *style & STYLE_CODE != 0 && text.contains("code()"))
+    );
     // The markup inside `<code>` came through as text, not as tags.
     assert!(document.text().contains("<tag attribute=\"value\">"));
     assert!(!document.text().contains("<strong>"));
@@ -438,8 +655,9 @@ fn one_unbreakable_line_is_still_one_block() {
 
 #[test]
 fn no_fixture_holds_more_than_its_own_text() {
-    for (name, content) in FIXTURES {
-        let document = parse(content);
+    for fixture in FIXTURES {
+        let name = fixture.0;
+        let document = parse_fixture(fixture);
         let stats = document.stats();
         // Everything the document owns, against the text it holds. Twice
         // the text plus a fixed allowance: the buffer grows geometrically
@@ -476,7 +694,6 @@ fn the_parser_never_holds_the_whole_input() {
         document.stats().owned_bytes
     );
 }
-
 
 // --- the reference table the device's `bt` walk is diffed against ---------
 
@@ -529,8 +746,9 @@ fn reference_metrics() {
         "{:<28} {:>10} {:>7} {:>6} {:>6} {:>8}",
         "fixture", "crc32", "blocks", "runs", "links", "text"
     );
-    for (name, content) in FIXTURES {
-        let document = parse(content);
+    for fixture in FIXTURES {
+        let name = fixture.0;
+        let document = parse_fixture(fixture);
         let stats = document.stats();
         println!(
             "{:<28} {:>10} {:>7} {:>6} {:>6} {:>8}",

@@ -64,7 +64,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
 [DNS_PLAN.md](docs/DNS_PLAN.md)、
 [TLS_PLAN.md](docs/TLS_PLAN.md)、
-[WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)。
+[WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)、
+[BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)。
 
 ## 制約
 
@@ -74,7 +75,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   ヒープの3つへ分けます。ヒープは`linked_list_allocator`によるグローバル
   アロケータです（[PSRAM.md](docs/PSRAM.md)）。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
-- 日本語フォント、省電力制御は未実装です。`browser`の非ASCII表示もこれが理由です。
+- 省電力制御は未実装です。日本語フォントは16ピクセルのbitmap subsetがあり
+  （[FONT.md](docs/FONT.md)）、収録外の文字は中空の枠で表示します。日本語入力は
+  ありません。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
 - ストレージはブロック単位の読み書きとMBR表示に加えて、FAT12/16/32とexFATを

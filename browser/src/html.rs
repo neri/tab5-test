@@ -115,14 +115,18 @@ enum State {
     AfterAttributeName,
     BeforeAttributeValue,
     /// `quote` is `"` or `'`, or 0 for an unquoted value.
-    AttributeValue { quote: u8 },
+    AttributeValue {
+        quote: u8,
+    },
     AfterAttributeValue,
     SelfClosing,
     /// `<!` or `<?` followed by something that is not a comment: consumed
     /// to the next `>` and discarded.
     BogusComment,
     /// After `<!`, deciding between a comment and a doctype.
-    MarkupDeclaration { dashes: u8 },
+    MarkupDeclaration {
+        dashes: u8,
+    },
     Comment,
     /// One `-` seen inside a comment.
     CommentDash,
@@ -134,12 +138,17 @@ enum State {
     /// A `<` inside raw text, which may or may not begin the end tag.
     RawTextLessThan,
     /// Matching the end tag's name, `matched` bytes in.
-    RawTextEndTagName { matched: usize },
+    RawTextEndTagName {
+        matched: usize,
+    },
     /// After a matched raw-text end tag name, looking for `>`.
     RawTextEndTagRest,
     /// A character reference, in text or in an attribute value. `attribute`
     /// says which buffer the result goes to and which state to return to.
-    Entity { attribute: bool, quote: u8 },
+    Entity {
+        attribute: bool,
+        quote: u8,
+    },
 }
 
 /// The raw-text elements. Their content is not markup and is not displayed.
@@ -206,6 +215,9 @@ impl TagBuffer {
 
 pub struct Tokenizer {
     state: State,
+    /// Whether this is reading a document that is not markup, in which case
+    /// `state` never moves off `State::Text`. See [`Tokenizer::plain`].
+    plain: bool,
     /// The state to return to once a character reference resolves.
     raw: Option<RawKind>,
     tag: TagBuffer,
@@ -236,6 +248,7 @@ impl Tokenizer {
     pub fn new() -> Self {
         Self {
             state: State::Text,
+            plain: false,
             raw: None,
             tag: TagBuffer::new(),
             text: Vec::new(),
@@ -246,6 +259,23 @@ impl Tokenizer {
             scratch_name: String::new(),
             consumed: 0,
             longest_token: 0,
+        }
+    }
+
+    /// A tokenizer for a document that is not markup: every byte is text.
+    ///
+    /// `<` opens nothing and `&` starts nothing, so a `text/plain` file
+    /// that happens to contain either shows them as itself. This is a flag
+    /// on the tokenizer rather than a second path into the builder because
+    /// of what the tokenizer does *besides* recognising tags: it holds an
+    /// incomplete UTF-8 sequence across a chunk boundary, replaces invalid
+    /// bytes with U+FFFD, counts the input against the size limit and
+    /// flushes text to the sink in bounded pieces. All four are exactly as
+    /// necessary for plain text, and none of them is about markup.
+    pub fn plain() -> Self {
+        Self {
+            plain: true,
+            ..Self::new()
         }
     }
 
@@ -315,6 +345,12 @@ impl Tokenizer {
 
     /// One byte. Returns the byte to reconsider in the new state, if any.
     fn step(&mut self, byte: u8, sink: &mut dyn Sink) -> Result<Option<u8>, Error> {
+        if self.plain {
+            // No state machine at all: there is nothing in a plain text
+            // document that means anything other than itself.
+            memory::push(&mut self.text, byte)?;
+            return Ok(None);
+        }
         match self.state {
             State::Text => match byte {
                 b'<' => {
@@ -396,10 +432,7 @@ impl Tokenizer {
                 byte if byte.is_ascii_whitespace() => self.state = State::AfterAttributeName,
                 byte => {
                     if self.tag.attribute_name.len() < MAX_ATTRIBUTE_NAME {
-                        memory::push(
-                            &mut self.tag.attribute_name,
-                            byte.to_ascii_lowercase(),
-                        )?;
+                        memory::push(&mut self.tag.attribute_name, byte.to_ascii_lowercase())?;
                     }
                 }
             },
@@ -587,12 +620,7 @@ impl Tokenizer {
     /// difference on `&amp` written without a semicolon -- which is shown
     /// as typed rather than as `&` -- and buys a rule with no exceptions
     /// in it, which is worth more here than bug-compatibility with 1997.
-    fn step_entity(
-        &mut self,
-        byte: u8,
-        attribute: bool,
-        quote: u8,
-    ) -> Result<Option<u8>, Error> {
+    fn step_entity(&mut self, byte: u8, attribute: bool, quote: u8) -> Result<Option<u8>, Error> {
         let return_state = if attribute {
             State::AttributeValue { quote }
         } else {
@@ -990,13 +1018,20 @@ mod tests {
     fn tags_and_text_alternate() {
         assert_eq!(
             parse(b"<p>hello</p>"),
-            ["<p>".to_string(), "text:hello".to_string(), "</p>".to_string()]
+            [
+                "<p>".to_string(),
+                "text:hello".to_string(),
+                "</p>".to_string()
+            ]
         );
     }
 
     #[test]
     fn tag_names_are_lowercased() {
-        assert_eq!(parse(b"<DIV></DIV>"), ["<div>".to_string(), "</div>".to_string()]);
+        assert_eq!(
+            parse(b"<DIV></DIV>"),
+            ["<div>".to_string(), "</div>".to_string()]
+        );
     }
 
     #[test]
@@ -1009,7 +1044,10 @@ mod tests {
                 "</a>".to_string()
             ]
         );
-        assert_eq!(parse(b"<img src=\"a.png\" alt=\"a cat\">"), ["<img alt=a cat>"]);
+        assert_eq!(
+            parse(b"<img src=\"a.png\" alt=\"a cat\">"),
+            ["<img alt=a cat>"]
+        );
     }
 
     #[test]
@@ -1205,7 +1243,10 @@ mod tests {
         let href = "/".to_string() + &"p".repeat(MAX_URL_BYTES * 2);
         let markup = format!("<a href=\"{href}\">t</a>");
         let events = parse(markup.as_bytes());
-        let kept = events[0].strip_prefix("<a href=").unwrap().trim_end_matches('>');
+        let kept = events[0]
+            .strip_prefix("<a href=")
+            .unwrap()
+            .trim_end_matches('>');
         assert_eq!(kept.len(), MAX_HREF_BYTES);
     }
 

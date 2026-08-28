@@ -35,6 +35,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::encoding::Decoder;
 use crate::error::Error;
 use crate::html::{self, Tag, Tokenizer};
 use crate::limits::{MAX_ITEMS, MAX_LINKS, MAX_NESTING_DEPTH, MAX_TEXT_BYTES};
@@ -212,6 +213,14 @@ impl Document {
 /// document -- [`Parser::finish`] is the only way to get one, and a limit
 /// reached on the way there is an error rather than a shorter page.
 pub struct Parser {
+    /// What the page's bytes are turned into UTF-8 by, before the tokenizer
+    /// ever sees them.
+    ///
+    /// In here and not in front of the parser so that every caller gets it:
+    /// the firmware's fetch, the `hs` and `bt` diagnostics and this crate's
+    /// fixture tests all feed a `Parser`, and a transcoder attached to one
+    /// of them would be missing from the other three.
+    decoder: Decoder,
     tokenizer: Tokenizer,
     builder: Builder,
 }
@@ -221,25 +230,73 @@ impl Parser {
     /// and what the document reports as its own.
     pub fn new(url: Url) -> Result<Parser, Error> {
         Ok(Parser {
+            decoder: Decoder::new(),
             tokenizer: Tokenizer::new(),
             builder: Builder::new(url)?,
         })
     }
 
+    /// A parser for a document that is text rather than markup.
+    ///
+    /// `text/plain` and everything else under `text/` that is not HTML.
+    /// The whole file becomes one preformatted block, so its own spacing
+    /// and line breaks survive and nothing in it is read as a tag or a
+    /// character reference. Wrapping still happens at the screen's width,
+    /// because a line longer than the screen has to go somewhere.
+    ///
+    /// The encoding is settled exactly as it is for markup -- the header's
+    /// `charset` through [`Parser::declare_charset`], then a BOM -- except
+    /// that there is no `<meta>` to look for, and none is looked for: a
+    /// plain file that contains the characters `<meta charset=...>` is a
+    /// file that says so, not a file that means it.
+    pub fn plain(url: Url) -> Result<Parser, Error> {
+        let mut parser = Parser {
+            decoder: Decoder::plain(),
+            tokenizer: Tokenizer::plain(),
+            builder: Builder::new(url)?,
+        };
+        parser.builder.begin_preformatted()?;
+        Ok(parser)
+    }
+
+    /// Names the encoding from a `Content-Type` header's `charset`.
+    ///
+    /// Before the first [`Parser::feed`]: a header applies to the whole
+    /// body, and this is what stops the decoder holding the first kilobyte
+    /// back to look for a `<meta>` that cannot overrule it anyway. An
+    /// unrecognised label is ignored, which leaves the document to say.
+    pub fn declare_charset(&mut self, label: &[u8]) {
+        self.decoder.declare(label);
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.tokenizer.feed(bytes, &mut self.builder)
+        let tokenizer = &mut self.tokenizer;
+        let builder = &mut self.builder;
+        self.decoder
+            .feed(bytes, |decoded| tokenizer.feed(decoded, builder))
     }
 
     pub fn finish(mut self) -> Result<Document, Error> {
+        {
+            // Whatever the decoder was still holding -- a document shorter
+            // than the sniff window has never released a byte until now.
+            let tokenizer = &mut self.tokenizer;
+            let builder = &mut self.builder;
+            self.decoder
+                .finish(|decoded| tokenizer.feed(decoded, builder))?;
+        }
         self.tokenizer.finish(&mut self.builder)?;
         let longest = self.tokenizer.longest_token();
         let input = self.tokenizer.consumed();
         Ok(self.builder.finish(input, longest))
     }
 
-    /// What the parse owns right now, tokenizer and document together.
+    /// What the parse owns right now: the decoder's held bytes, the
+    /// tokenizer and the document together.
     pub fn owned_bytes(&self) -> usize {
-        self.tokenizer.owned_bytes() + self.builder.document.owned_bytes()
+        self.decoder.owned_bytes()
+            + self.tokenizer.owned_bytes()
+            + self.builder.document.owned_bytes()
     }
 
     /// Blocks and runs so far, for a progress line during a long parse.
@@ -349,6 +406,19 @@ impl Builder {
     /// whether a space is owed has to survive the split. That is the whole
     /// reason [`crate::html::Sink::text`] promises nothing about where runs
     /// are cut.
+    /// Opens a preformatted block and leaves it open.
+    ///
+    /// For a document that is text rather than markup: `pre` is exactly
+    /// what `text/plain` means -- spaces and line breaks are the author's
+    /// and are kept -- so a plain file is one `pre` block with the whole
+    /// file in it, rather than a block kind of its own that the layout and
+    /// the renderer would each need a case for.
+    fn begin_preformatted(&mut self) -> Result<(), Error> {
+        self.start_block(BlockKind::Preformatted)?;
+        self.preformatted = true;
+        Ok(())
+    }
+
     fn push_text(&mut self, text: &str) -> Result<(), Error> {
         for character in text.chars() {
             if self.preformatted {
@@ -913,9 +983,7 @@ mod tests {
 
     #[test]
     fn paragraphs_and_headings_become_blocks() {
-        let document = parse(
-            b"<h1>Simple</h1><p>First paragraph.</p><p>Second paragraph.</p>",
-        );
+        let document = parse(b"<h1>Simple</h1><p>First paragraph.</p><p>Second paragraph.</p>");
         assert_eq!(
             outline(&document),
             ["h1|Simple", "p|First paragraph.", "p|Second paragraph."]
@@ -1211,10 +1279,7 @@ mod tests {
     #[test]
     fn invalid_utf8_does_not_lose_the_text_around_it() {
         let document = parse(b"<p>before \xff after</p><p>\xe6\x97\xa5\xe6\x9c\xac</p>");
-        assert_eq!(
-            outline(&document),
-            ["p|before \u{FFFD} after", "p|日本"]
-        );
+        assert_eq!(outline(&document), ["p|before \u{FFFD} after", "p|日本"]);
     }
 
     // --- chunking ---------------------------------------------------------
@@ -1351,7 +1416,11 @@ mod tests {
         markup.push_str("<p>the only text</p>");
         let document = parse(markup.as_bytes());
         assert_eq!(outline(&document), ["p|the only text"]);
-        assert!(document.stats().owned_bytes < 8192, "{:?}", document.stats());
+        assert!(
+            document.stats().owned_bytes < 8192,
+            "{:?}",
+            document.stats()
+        );
         assert!(document.stats().input_bytes > 512 * 1024);
     }
 

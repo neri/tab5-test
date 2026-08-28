@@ -4,8 +4,9 @@
 //!
 //! ```text
 //!  y=0    ┌───────────────────────────────────────────────┐
-//!         │ TLS UNVERIFIED https://host/page     12 links │  toolbar
-//!  y=40   ├───────────────────────────────────────────────┤
+//!         │ ← → ↻  🔓 https://host/page              ▂▄▆ │  toolbar
+//!  y=48   ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤  8 px gap
+//!  y=56   ├───────────────────────────────────────────────┤
 //!         │ A heading                                     │
 //!         │                                               │  viewport
 //!         │ Body text, wrapped to the width of the screen  │
@@ -25,14 +26,29 @@
 //! larger), so "scroll by one line" moves by different amounts in different
 //! parts of a page, which reads perfectly naturally.
 //!
-//! The badge at the left says what the connection this page came off
-//! actually proved, which is not the same question as what its address
-//! asked for. `INSECURE HTTP` and `TLS UNVERIFIED` are both red, because
+//! The padlock says what the connection this page came off actually
+//! proved, which is not the same question as what its address asked for.
+//! Plaintext and unauthenticated TLS get the same red open lock, because
 //! both mean the reader cannot be sure the page is from where the address
 //! says: the second one is encrypted, and encryption without an identity
 //! stops someone reading the page in transit but not someone writing it.
-//! `TLS PINNED` -- the only case where the peer was identified -- is the
-//! one that is not red, and even it does not say "secure".
+//! A closed lock -- a pin matched, the only case where the peer was
+//! identified -- is the one that is not red, and even then nothing on
+//! screen says "secure". Tapping the lock puts the whole sentence in the
+//! status line; it used to be spelled out permanently, in fourteen cells
+//! of the space the address needed.
+//!
+//! The three buttons are back, forward, and reload -- which is stop while
+//! something is arriving, because the two are never both wanted. All of
+//! them have keys as well (`[`, `]`, `r`, Escape), and the keys are what
+//! CardKB has: the buttons are for the finger, not instead of them.
+//!
+//! At the right end are the Wi-Fi bars, the one thing on this screen that
+//! is about the board rather than about the page. They are here because
+//! this is where the answer matters and where the shell is not running: a
+//! reader whose page will not load cannot type `wifistatus` while a
+//! full-screen mode is up, and without this has no way to tell a dead link
+//! from a dead server. Like the lock, they say their sentence when tapped.
 //!
 //! **A page is only ever shown complete.** While one is arriving the
 //! previous one stays on screen and only the toolbar's byte count moves; the
@@ -65,7 +81,11 @@ use crate::usb::MOUSE_BUTTON_LEFT;
 use crate::{interrupts, tick, uart};
 
 use super::fetch::{self, Fetch, Network, Outcome as FetchOutcome};
+use super::localfile::{LocalRead, Started};
 use super::wifi_manager::Manager as WifiManager;
+
+use crate::fs::vfs::Vfs;
+use crate::fs::{Devices, RamBlockDevice, SdSlot};
 
 use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_union};
 
@@ -83,9 +103,30 @@ use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_unio
 const CELL_WIDTH: usize = crate::browser::layout::CELL_WIDTH as usize;
 const CELL_HEIGHT: usize = crate::font::HEIGHT;
 
-const TOOLBAR_HEIGHT: usize = 40;
+/// The toolbar's height, which is also every button's hit height.
+///
+/// 48 pixels is about 4.1 mm on this panel (1280 across roughly 111 mm, so
+/// 11.6 pixels per millimetre). Interface guidelines ask for something
+/// nearer 7 mm, which here would be 81 pixels -- an eighth of the screen's
+/// height for one bar, which is not a trade this screen can make. So the
+/// number was a judgement, and it was made by building both and pressing
+/// the buttons: 40 was reachable and 48 is comfortable, and the eight
+/// pixels come out of a viewport that has 640 left.
+///
+/// Everything on the bar is derived from this constant -- `BUTTON_WIDTH`
+/// included -- so changing it is one edit, and the assertions below are
+/// what say whether the derivation still holds.
+const TOOLBAR_HEIGHT: usize = 48;
 const STATUS_HEIGHT: usize = 32;
-const VIEWPORT_TOP: usize = TOOLBAR_HEIGHT;
+/// Blank space between the toolbar and the first line of the page.
+///
+/// The page's own top margin, in the page's own colour. Without it the
+/// first line of text sits against the bottom edge of the address field,
+/// which reads as though the chrome and the document are one surface --
+/// and on a heading, whose glyph box starts at the very top of its line,
+/// the two actually touch.
+const CONTENT_GAP: usize = 8;
+const VIEWPORT_TOP: usize = TOOLBAR_HEIGHT + CONTENT_GAP;
 const VIEWPORT_BOTTOM: usize = HEIGHT - STATUS_HEIGHT;
 const VIEWPORT_HEIGHT: usize = VIEWPORT_BOTTOM - VIEWPORT_TOP;
 /// Left and right margin inside the viewport.
@@ -99,21 +140,95 @@ const CHROME_CELL: usize = CELL_WIDTH * CHROME_SCALE;
 const CHROME_TEXT_Y: usize = (TOOLBAR_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
 const STATUS_TEXT_Y: usize = VIEWPORT_BOTTOM + (STATUS_HEIGHT - CELL_HEIGHT * CHROME_SCALE) / 2;
 
-/// The security badge's slot, and where the address field starts after it.
+/// The toolbar, left to right: three buttons, the security icon, and the
+/// address field running to the right margin.
 ///
-/// Wide enough for the longest text that can go in it (`TLS UNVERIFIED`), so
-/// that the address does not shift sideways when a page's security differs
-/// from the last one's. A toolbar that reflows is a toolbar whose badge is
-/// easy to miss.
-const BADGE_CELLS: usize = 14;
-/// What is shown while a connection is being made and has proved nothing.
-/// Not a security state: the absence of one.
-const CONNECTING_BADGE: &str = "CONNECTING";
-const ADDRESS_LEFT: usize = MARGIN + (BADGE_CELLS + 2) * CHROME_CELL;
-/// Room kept at the right for the link and line counts.
-const SUMMARY_CELLS: usize = 26;
-const ADDRESS_RIGHT: usize = WIDTH - MARGIN - SUMMARY_CELLS * CHROME_CELL;
-const ADDRESS_CELLS: usize = (ADDRESS_RIGHT - ADDRESS_LEFT) / CHROME_CELL;
+/// The order the space was found in matters. The link and line counts used
+/// to hold 208 pixels at the right and the security badge 112 at the left,
+/// spelled out in words; between them they paid for the buttons, the icon
+/// and a wider address field with room left over. Adding the buttons first
+/// would have meant taking the space out of the address, which is the one
+/// part of this bar that is never wide enough.
+/// Slightly wider than the bar is tall, which keeps three of them and the
+/// lock inside the space the link and line counts used to hold.
+const BUTTON_WIDTH: usize = TOOLBAR_HEIGHT + 4;
+const BUTTON_COUNT: usize = 3;
+const BUTTONS_LEFT: usize = MARGIN;
+/// What the three buttons are drawn with.
+///
+/// Characters and not bitmaps of their own: the font covers the arrows and
+/// the open circle arrow (`FONT.md`'s subset takes U+2190..U+21FF whole),
+/// and a glyph that is already there is one that cannot drift from the
+/// renderer. Nearby characters that look right are *not* all there --
+/// U+2715 MULTIPLICATION X and U+26A0 WARNING SIGN are outside the subset
+/// and would draw as the missing-character box -- so these four are the
+/// ones checked against `font/data/tab5font16.txt`.
+const BACK_GLYPH: &str = "\u{2190}";
+const FORWARD_GLYPH: &str = "\u{2192}";
+const RELOAD_GLYPH: &str = "\u{21BB}";
+const STOP_GLYPH: &str = "\u{00D7}";
+/// The security icon's slot: a padlock, drawn rather than typed. There is
+/// no padlock in the font -- U+1F512 is outside the BMP, which the source
+/// font does not cover -- and it is the one icon here worth a few
+/// rectangles of its own.
+const ICON_WIDTH: usize = 24;
+/// What the lock says when it is asked while a connection is being made and
+/// has proved nothing. Not a security state: the absence of one.
+const CONNECTING_TEXT: &str = "CONNECTING: nothing has been proved yet";
+const ICON_LEFT: usize = BUTTONS_LEFT + BUTTON_COUNT * BUTTON_WIDTH + 12;
+const ADDRESS_LEFT: usize = ICON_LEFT + ICON_WIDTH + 8;
+/// The Wi-Fi indicator's slot, at the far right of the bar.
+///
+/// The one thing on this screen that is about the board rather than about
+/// the page. It is here because the browser is where the answer matters
+/// and where the shell -- the only other place that could say -- is not
+/// running: `wifistatus` cannot be typed while a full-screen mode is up,
+/// so a reader whose page will not load otherwise has no way to tell a
+/// dead link from a dead server.
+const WIFI_WIDTH: usize = 24;
+const WIFI_LEFT: usize = WIDTH - MARGIN - WIFI_WIDTH;
+const ADDRESS_RIGHT: usize = WIFI_LEFT - 8;
+/// The clear button, inside the field's own right edge and present only
+/// while the field is open. `ADDRESS_CELLS` is what the text gets, which is
+/// the field less that button.
+const CLEAR_WIDTH: usize = 32;
+const CLEAR_LEFT: usize = ADDRESS_RIGHT - CLEAR_WIDTH;
+/// The open field's own box: two scaled glyphs tall, which is what the
+/// clear cross needs and what centres the text at `CHROME_TEXT_Y`.
+const FIELD_HEIGHT: usize = CELL_HEIGHT * 2;
+const FIELD_TOP: usize = (TOOLBAR_HEIGHT - FIELD_HEIGHT) / 2;
+const ADDRESS_CELLS: usize = (CLEAR_LEFT - 8 - ADDRESS_LEFT) / CHROME_CELL;
+
+// The bar has one free parameter (`TOOLBAR_HEIGHT`) and everything else is
+// derived from it, so these are what "derived correctly" means. Without
+// them a taller bar is a build that compiles and draws a lock through the
+// address field.
+const _: () = {
+    assert!(
+        FIELD_HEIGHT <= TOOLBAR_HEIGHT,
+        "the address field is taller than the bar"
+    );
+    assert!(
+        CELL_HEIGHT * 2 <= TOOLBAR_HEIGHT,
+        "a button glyph is taller than the bar"
+    );
+    assert!(
+        LOCK_HEIGHT <= TOOLBAR_HEIGHT,
+        "the lock is taller than the bar"
+    );
+    assert!(
+        ADDRESS_LEFT < CLEAR_LEFT,
+        "the buttons have eaten the address field"
+    );
+    assert!(
+        ADDRESS_RIGHT < WIFI_LEFT,
+        "the address field runs into the Wi-Fi icon"
+    );
+    assert!(
+        ADDRESS_CELLS >= 64,
+        "the address field is too narrow to edit in"
+    );
+};
 
 const PAGE_BACKGROUND: u16 = WHITE;
 const TEXT_COLOR: u16 = BLACK;
@@ -131,20 +246,20 @@ const CHROME_TEXT: u16 = BLACK;
 /// Status-line messages, in the same red as the cleartext badge: almost
 /// every one of them is the viewer refusing to do something.
 const MESSAGE_COLOR: u16 = 0x9000;
-/// The badge when the connection proves nothing about who answered: plain
+/// The lock when the connection proves nothing about who answered: plain
 /// HTTP, and unauthenticated TLS. Red, because both mean the same thing to
 /// a reader -- what is on screen may not be what the address says.
 const INSECURE_COLOR: u16 = 0xF800;
-/// The badge when a pin matched. Dark green: the one case where the peer
+/// The lock when a pin matched. Dark green: the one case where the peer
 /// was actually identified. Still not the word "secure", which would claim
 /// more than a pin does.
 const AUTHENTICATED_COLOR: u16 = 0x0400;
+/// A button whose action is not available: no history to go back to, no
+/// forward entry to return to.
+const DISABLED_COLOR: u16 = 0x8410;
 /// The address field while it is being edited.
 const EDIT_BACKGROUND: u16 = WHITE;
 const EDIT_CARET: u16 = 0x001F;
-
-/// The path the viewer's own error page lives at, under the built-in host.
-const ERROR_PATH: &str = "/error";
 
 /// Lines one wheel detent scrolls.
 const WHEEL_LINES: i32 = 3;
@@ -169,6 +284,8 @@ pub fn run(
     framebuffer: &mut Framebuffer,
     input: &mut InputManager,
     wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+    mut ram_disk: Option<&mut RamBlockDevice>,
     start: Option<Url>,
 ) {
     let mut viewer = match Viewer::new() {
@@ -221,20 +338,17 @@ pub fn run(
         // small is "time between two reads", so the read comes first and
         // the expensive work below is broken up around more of them.
         service_link(wifi);
+        // Read once per frame and compared inside, so the bar repaints on
+        // the frame the state changes and on no other.
+        viewer.update_wifi(wifi_level(wifi));
 
         let mut leaving = false;
         while let Some(event) = input.poll_key() {
             match viewer.handle_key(event.key, pending.is_some()) {
                 Action::Continue => {}
-                Action::Cancel => {
-                    if let Some(active) = pending.take() {
-                        if let Some(mut link) = raw_network(wifi) {
-                            active.fetch.close(&mut link);
-                        }
-                        viewer.finish_loading();
-                        viewer.say("stopped");
-                    }
-                }
+                Action::Cancel => stop_pending(&mut viewer, &mut pending, wifi, vfs),
+                Action::Report => report_state(&mut viewer, &pending, wifi),
+                Action::Wifi => report_wifi(&mut viewer, wifi),
                 Action::Leave => leaving = true,
             }
         }
@@ -254,11 +368,13 @@ pub fn run(
         let pointer_moved = (target_x, target_y) != (cursor.x, cursor.y);
 
         if let PrimaryTouch::Pressed(point) = touch {
-            viewer.click(point.x, point.y);
+            let action = viewer.click(point.x, point.y);
+            answer_click(action, &mut viewer, &mut pending, wifi, vfs);
         }
         if let Some(update) = motion {
             if update.pressed & MOUSE_BUTTON_LEFT != 0 {
-                viewer.click(target_x, target_y);
+                let action = viewer.click(target_x, target_y);
+                answer_click(action, &mut viewer, &mut pending, wifi, vfs);
             }
             if update.wheel != 0 {
                 viewer.scroll_by(-update.wheel * WHEEL_LINES);
@@ -268,15 +384,13 @@ pub fn run(
         // A link that has died is otherwise only discovered by trying to
         // use it, which from the reader's side looks like every page
         // failing for its own reason.
-        if pending.is_some() && addressed_network(wifi).is_none() {
+        if pending.as_ref().is_some_and(Pending::is_network) && addressed_network(wifi).is_none() {
             viewer.report_lost_link();
             // A lost association makes the manager discard the whole old
             // stack, so any socket handles in this fetch are gone with it.
             // If a stack still exists, close against it before dropping.
-            if let Some(active) = pending.take()
-                && let Some(mut link) = raw_network(wifi)
-            {
-                active.fetch.close(&mut link);
+            if let Some(active) = pending.take() {
+                close_pending(active, wifi, vfs);
             }
         }
 
@@ -285,56 +399,69 @@ pub fn run(
         // this is also what makes "cancel, then fetch something else"
         // work without a state in between.
         if let Some(navigation) = viewer.take_request() {
-            if let Some(active) = pending.take()
-                && let Some(mut link) = raw_network(wifi)
-            {
-                active.fetch.close(&mut link);
+            if let Some(active) = pending.take() {
+                close_pending(active, wifi, vfs);
             }
-            let mut network = addressed_network(wifi);
-            pending = begin(&mut viewer, navigation, network.as_mut());
+            pending = begin(
+                &mut viewer,
+                navigation,
+                wifi,
+                vfs,
+                ram_disk.as_deref_mut(),
+                input,
+            );
         }
 
-        let mut network = addressed_network(wifi);
-        let outcome = match (pending.as_mut(), network.as_mut()) {
-            (Some(active), Some(link)) => {
-                let outcome = active.fetch.step(link);
-                viewer.update_loading(active.fetch.received(), active.fetch.security());
-                Some(outcome)
+        let outcome = match pending.as_mut() {
+            Some(active) => {
+                let outcome = match &mut active.source {
+                    Source::Network(fetch) => addressed_network(wifi)
+                        .as_mut()
+                        .map(|link| fetch.step(link)),
+                    Source::Local(read) => {
+                        let mut sd = SdSlot::new();
+                        let mut devices = Devices {
+                            ram: ram_disk.as_deref_mut(),
+                            sd: &mut sd,
+                            usb: input.usb_host_mut(),
+                        };
+                        Some(read.step(vfs, &mut devices))
+                    }
+                };
+                if outcome.is_some() {
+                    viewer.update_loading(active.received(), active.security());
+                }
+                outcome
             }
-            _ => None,
+            None => None,
         };
         match outcome {
             None | Some(FetchOutcome::Working) => {}
             Some(FetchOutcome::Page(document)) => {
                 if let Some(active) = pending.take() {
-                    let elapsed = active.fetch.elapsed_ms();
                     // The final address, which is the last hop of a
                     // redirect chain rather than the one that was asked
                     // for -- so the toolbar and the base for this page's
                     // links are both where the page actually came from.
-                    let landed = active.fetch.url().clone();
-                    let peak = active.fetch.peak_owned();
-                    let security = active.fetch.security();
-                    if let Some(mut link) = raw_network(wifi) {
-                        active.fetch.close(&mut link);
-                    }
-                    viewer.show_document(
-                        document,
-                        &active.navigation,
-                        landed,
-                        elapsed,
-                        peak,
-                        security,
-                    );
+                    let landed = active.landed();
+                    let security = active.security();
+                    let status = active.status();
+                    let peak = active.peak_owned();
+                    let navigation = Navigation {
+                        url: landed.clone(),
+                        restore: active.navigation.restore,
+                        how: active.navigation.how,
+                    };
+                    close_pending(active, wifi, vfs);
+                    viewer.show_document(document, &navigation, landed, security, status, peak);
                 }
             }
             Some(FetchOutcome::Failed(failure)) => {
                 if let Some(active) = pending.take() {
-                    let url = active.fetch.url().clone();
-                    if let Some(mut link) = raw_network(wifi) {
-                        active.fetch.close(&mut link);
-                    }
-                    viewer.show_failure(&url, failure);
+                    let url = active.landed();
+                    let how = active.navigation.how;
+                    close_pending(active, wifi, vfs);
+                    viewer.show_failure(&url, failure, how);
                 }
             }
         }
@@ -362,11 +489,149 @@ pub fn run(
     // Leaving with a transfer still running would leak its socket out of
     // the set for the rest of the run. Every exit from the loop above is a
     // `break` so that this is the only way out.
-    if let Some(active) = pending.take()
-        && let Some(mut link) = raw_network(wifi)
-    {
-        active.fetch.close(&mut link);
+    if let Some(active) = pending.take() {
+        close_pending(active, wifi, vfs);
     }
+}
+
+/// Gives back whatever the pending read owns: a socket, or a file handle.
+///
+/// One function for both so that every site that abandons a read returns
+/// the right thing without having to know which kind it had.
+fn close_pending(pending: Pending, wifi: &mut WifiManager, vfs: &mut Vfs) {
+    match pending.source {
+        Source::Network(fetch) => {
+            if let Some(mut link) = raw_network(wifi) {
+                fetch.close(&mut link);
+            }
+        }
+        Source::Local(read) => read.close(vfs),
+    }
+}
+
+/// Acts on what a tap or a click came to.
+///
+/// The two pointer paths -- touch and mouse -- go through here rather than
+/// each handling the actions themselves, so a new action is added in one
+/// place and cannot be answered on one input and ignored on the other.
+fn answer_click(
+    action: Action,
+    viewer: &mut Viewer,
+    pending: &mut Option<Pending>,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+) {
+    match action {
+        Action::Cancel => stop_pending(viewer, pending, wifi, vfs),
+        Action::Wifi => report_wifi(viewer, wifi),
+        Action::Report => report_state(viewer, pending, wifi),
+        // Nothing on the toolbar leaves the browser.
+        Action::Continue | Action::Leave => {}
+    }
+}
+
+/// Says what the Wi-Fi indicator means, in words.
+///
+/// The same bargain the padlock makes: the bar shows a shape, and the shape
+/// says its sentence when it is asked. Where the state is one a reader can
+/// do something about, the sentence says what.
+fn report_wifi(viewer: &mut Viewer, wifi: &mut WifiManager) {
+    use super::wifi_manager::State;
+    let state = wifi.state();
+    let addressed = wifi.stack().is_some_and(crate::net::Stack::has_address);
+    let association = match state {
+        State::Associated(association)
+        | State::RequestingDhcp { association, .. }
+        | State::AssociatedNoLease(association)
+        | State::Online(association) => Some(association),
+        _ => None,
+    };
+    let mut line = Summary::new();
+    line.push(match state {
+        State::Off => "Wi-Fi is off",
+        State::LinkDown => "the link to the C6 is down",
+        State::Idle => "not connected: leave and run wificonnect",
+        State::Failed(_) => "the last attempt failed: leave and run wificonnect",
+        State::NeedsPassword(_) => "a password is needed: leave and run wificonnect",
+        State::Associating { .. } => "connecting",
+        State::RetryWaiting { .. } => "waiting to try again",
+        State::Online(_) if addressed => "online",
+        // Associated, and online-without-an-address, which is the same
+        // thing from here: a fetch would fail either way, and the
+        // indicator shows two bars for both.
+        _ => "associated but with no address: leave and run ipconfig dhcp",
+    });
+    // The name, but only when it is text. An SSID is bytes, and one that is
+    // not UTF-8 is left out rather than shown as replacement characters --
+    // the sentence around it already said what happened.
+    if let Some(association) = association
+        && let Ok(name) = core::str::from_utf8(association.ssid())
+    {
+        line.push(" on ");
+        line.push(name);
+    }
+    viewer.say(line.as_str());
+}
+
+/// Puts the numbers a leak would show up in on the status line, and the
+/// same line on the UART.
+///
+/// Every one of them is a thing that should come back to where it started.
+/// A browser leaks in two ways that matter on a board with no process to
+/// restart: heap that is never given back, and sockets that never return to
+/// the set -- and the second is invisible until the set runs dry several
+/// minutes later, somewhere else entirely. Both are differences between two
+/// moments rather than values, so this is a key rather than a log line:
+/// read it, do the thing twenty times, read it again.
+///
+/// `sockets` is the whole set, not this screen's share of it: DHCP and DNS
+/// hold their own. What matters is that it is the same number before and
+/// after, not what the number is.
+fn report_state(viewer: &mut Viewer, pending: &Option<Pending>, wifi: &mut WifiManager) {
+    let sockets = raw_network(wifi).map(|network| network.stack.sockets_mut().iter().count());
+    let mut line = Summary::new();
+    line.push("heap ");
+    line.push_usize(crate::heap_used() / 1024);
+    line.push("K sockets ");
+    match sockets {
+        Some(count) => line.push_usize(count),
+        // No stack at all is a different state from a stack with no
+        // sockets, and reading `0` for both would hide a lost link.
+        None => line.push("-"),
+    }
+    line.push(pending.as_ref().map_or("", |_| "+1 loading"));
+    line.push(" back ");
+    line.push_usize(viewer.history.len());
+    line.push(" fwd ");
+    line.push_usize(viewer.forward.len());
+    line.push(" page ");
+    line.push_usize(viewer.page_owned_bytes() / 1024);
+    line.push("K peak ");
+    line.push_usize(viewer.last_peak / 1024);
+    line.push("K");
+    uart::log(b"BROWSER: ");
+    uart::log(line.as_str().as_bytes());
+    uart::log(b"\r\n");
+    viewer.say(line.as_str());
+}
+
+/// Abandons the transfer in flight, if there is one, and says so.
+///
+/// The one place a running fetch is dropped by the reader's own choice, so
+/// that Escape and the stop button cannot end up returning the socket in
+/// two slightly different ways.
+fn stop_pending(
+    viewer: &mut Viewer,
+    pending: &mut Option<Pending>,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+) {
+    let Some(active) = pending.take() else {
+        return;
+    };
+    close_pending(active, wifi, vfs);
+    viewer.finish_loading();
+    viewer.say("stopped");
 }
 
 /// Reads whatever the C6 has waiting.
@@ -390,30 +655,83 @@ fn addressed_network(wifi: &mut WifiManager) -> Option<Network<'_>> {
     raw_network(wifi).filter(|network| network.stack.has_address())
 }
 
-/// Starts a navigation, or answers it without the network when it can.
+/// Starts a navigation, or answers it without leaving the board when it
+/// can.
+///
+/// Three answers in order, and the order is the point. A built-in page is
+/// decided before any resolver is asked; a `file:` URL is decided before
+/// any socket is opened; only what is left goes to the network.
 fn begin(
     viewer: &mut Viewer,
     navigation: Navigation,
-    network: Option<&mut Network<'_>>,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+    ram_disk: Option<&mut RamBlockDevice>,
+    input: &mut InputManager,
 ) -> Option<Pending> {
-    if navigation.url.host() == builtin::HOST {
+    if navigation.url.host() == builtin::HOST && navigation.url.scheme().is_network() {
         match builtin::by_path(navigation.url.path()) {
             Some(page) => viewer.show_builtin(page, &navigation),
-            None => viewer.show_failure(&navigation.url, fetch::NO_SUCH_BUILTIN),
+            None => viewer.show_failure(&navigation.url, fetch::NO_SUCH_BUILTIN, navigation.how),
         }
         return None;
     }
-    let Some(network) = network else {
-        viewer.show_failure(&navigation.url, fetch::NO_NETWORK);
+    if !navigation.url.scheme().is_network() {
+        return begin_local(viewer, navigation, vfs, ram_disk, input);
+    }
+    let mut network = addressed_network(wifi);
+    let Some(network) = network.as_mut() else {
+        viewer.show_failure(&navigation.url, fetch::NO_NETWORK, navigation.how);
         return None;
     };
     match Fetch::start(navigation.url.clone(), network) {
         Ok(fetch) => {
             viewer.begin_loading(&navigation.url);
-            Some(Pending { fetch, navigation })
+            Some(Pending {
+                source: Source::Network(fetch),
+                navigation,
+            })
         }
         Err(failure) => {
-            viewer.show_failure(&navigation.url, failure);
+            viewer.show_failure(&navigation.url, failure, navigation.how);
+            None
+        }
+    }
+}
+
+/// Opens a `file:` URL, or shows the directory it names.
+///
+/// A directory is finished here rather than stepped: the whole listing is
+/// one read of one directory, bounded by what is in it, where a file is
+/// bounded by nothing the reader can see before opening it.
+fn begin_local(
+    viewer: &mut Viewer,
+    navigation: Navigation,
+    vfs: &mut Vfs,
+    ram_disk: Option<&mut RamBlockDevice>,
+    input: &mut InputManager,
+) -> Option<Pending> {
+    let mut sd = SdSlot::new();
+    let mut devices = Devices {
+        ram: ram_disk,
+        sd: &mut sd,
+        usb: input.usb_host_mut(),
+    };
+    match LocalRead::start(&navigation.url, vfs, &mut devices) {
+        Ok(Started::Reading(read)) => {
+            viewer.begin_loading(&navigation.url);
+            Some(Pending {
+                source: Source::Local(read),
+                navigation,
+            })
+        }
+        Ok(Started::Page(document)) => {
+            let landed = navigation.url.clone();
+            viewer.show_document(document, &navigation, landed, None, None, 0);
+            None
+        }
+        Err(failure) => {
+            viewer.show_failure(&navigation.url, failure, navigation.how);
             None
         }
     }
@@ -426,13 +744,27 @@ fn begin(
 /// positions, which is why they live here and not there.
 struct Navigation {
     url: Url,
-    /// The line to put at the top once the page is up. Non-zero only when
-    /// going back, which is a re-fetch: history keeps a scroll position but
-    /// never a document.
+    /// The line to put at the top once the page is up. Non-zero when going
+    /// back or forward, which are re-fetches -- history keeps a scroll
+    /// position but never a document -- and when reloading, which is the
+    /// same page and should not jump to the top of it.
     restore: usize,
-    /// Whether the page being left should be pushed onto history. False for
-    /// `back` itself, which is what stops the two from fighting.
-    push_history: bool,
+    how: Direction,
+}
+
+/// Which of the four ways a navigation started, which is the only thing
+/// that decides what happens to the two stacks when it lands.
+///
+/// A single flag ("push history?") was not enough once there was a forward
+/// stack: `back` and `forward` both decline to push history and do
+/// opposite things with the other stack, and `reload` touches neither.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// A link, a typed address, a command-line argument.
+    Fresh,
+    Back,
+    Forward,
+    Reload,
 }
 
 impl Navigation {
@@ -440,21 +772,88 @@ impl Navigation {
         Navigation {
             url,
             restore: 0,
-            push_history: true,
+            how: Direction::Fresh,
         }
     }
 }
 
-/// A fetch together with what the viewer wants done when it lands.
+/// Something being read, together with what the viewer wants done when it
+/// lands.
+///
+/// Two sources, one loop. A `file:` URL has no name to resolve, no socket,
+/// no redirect chain and no status code, so it does not go through
+/// [`Fetch`] -- but it is stepped, cancelled, drawn and finished by exactly
+/// the same code here, because from the reader's side it is the same act.
 struct Pending {
-    fetch: Fetch,
+    source: Source,
     navigation: Navigation,
+}
+
+enum Source {
+    Network(Fetch),
+    Local(LocalRead),
+}
+
+impl Pending {
+    /// Where the page actually came from.
+    ///
+    /// For a fetch that is the last hop of a redirect chain rather than the
+    /// address that was asked for. A local read cannot be redirected, so
+    /// the two are the same thing there.
+    fn landed(&self) -> Url {
+        match &self.source {
+            Source::Network(fetch) => fetch.url().clone(),
+            Source::Local(_) => self.navigation.url.clone(),
+        }
+    }
+
+    /// What the connection proved. Nothing, for a file: nobody was asked.
+    fn security(&self) -> Option<fetch::PageSecurity> {
+        match &self.source {
+            Source::Network(fetch) => fetch.security(),
+            Source::Local(_) => None,
+        }
+    }
+
+    fn status(&self) -> Option<u16> {
+        match &self.source {
+            Source::Network(fetch) => fetch.status(),
+            Source::Local(_) => None,
+        }
+    }
+
+    fn received(&self) -> usize {
+        match &self.source {
+            Source::Network(fetch) => fetch.received(),
+            Source::Local(read) => read.received(),
+        }
+    }
+
+    fn peak_owned(&self) -> usize {
+        match &self.source {
+            Source::Network(fetch) => fetch.peak_owned(),
+            Source::Local(read) => read.peak_owned(),
+        }
+    }
+
+    fn is_network(&self) -> bool {
+        matches!(self.source, Source::Network(_))
+    }
 }
 
 enum Action {
     Continue,
     /// Escape while a page is arriving.
     Cancel,
+    /// Put the numbers a leak would show up in on the status line.
+    ///
+    /// Answered by the loop and not by the viewer, because two of the four
+    /// numbers -- the sockets in use and whether a transfer is running --
+    /// belong to things the viewer does not hold.
+    Report,
+    /// Say what the Wi-Fi indicator means, in words. Answered by the loop
+    /// for the same reason: the manager is not the viewer's to hold.
+    Wifi,
     Leave,
 }
 
@@ -480,6 +879,14 @@ struct Page {
     /// own error page. `None` is displayed from the scheme instead, which
     /// for those is always `http://built-in/...`.
     security: Option<fetch::PageSecurity>,
+    /// Whether this is the viewer's own explanation of a failure rather
+    /// than something that was fetched.
+    ///
+    /// A flag and not a look at the address, because the address is now the
+    /// one that failed: an error page carries the URL the reader asked for,
+    /// so that the toolbar does not name a page that does not exist and so
+    /// that reloading retries what actually went wrong.
+    error: bool,
     layout: Layout,
     /// Index of the topmost drawn line.
     first_line: usize,
@@ -488,6 +895,35 @@ struct Page {
     /// Links in the order they are laid out, which is the order `Tab`
     /// visits them.
     order: Vec<u16>,
+}
+
+/// The toolbar's buttons, left to right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Button {
+    Back,
+    Forward,
+    /// Reload, or stop while something is arriving. One button because the
+    /// two are never both wanted, and because a stop button that is dead
+    /// most of the time teaches nobody where it is.
+    Reload,
+}
+
+/// The button under a toolbar x, if any.
+fn button_at(x: usize) -> Option<Button> {
+    let offset = x.checked_sub(BUTTONS_LEFT)?;
+    match offset / BUTTON_WIDTH {
+        0 => Some(Button::Back),
+        1 => Some(Button::Forward),
+        2 => Some(Button::Reload),
+        _ => None,
+    }
+}
+
+/// Which of the viewer's two stacks a page is being put on.
+#[derive(Clone, Copy)]
+enum Stack {
+    History,
+    Forward,
 }
 
 /// A page that can be gone back to.
@@ -563,6 +999,12 @@ struct Loading {
 struct Viewer {
     page: Page,
     history: Vec<HistoryEntry>,
+    /// Pages gone back from, to be gone forward to.
+    ///
+    /// Emptied by any navigation that is not a `back` or a `forward`,
+    /// which is what stops "back, then somewhere else, then forward" from
+    /// returning to a page the reader has already left behind.
+    forward: Vec<HistoryEntry>,
     editing: Option<Editing>,
     loading: Option<Loading>,
     /// A sentence for the status line. Takes priority over the focused
@@ -587,6 +1029,19 @@ struct Viewer {
     /// frame is one that has to be broken up further, and the way to know
     /// is to have measured it on the panel rather than estimated it.
     slowest_repaint_ms: u64,
+    /// The most the last fetch's parser held at once.
+    ///
+    /// Kept only so `i` can report it. It is the number the memory budget
+    /// is written against (`MAX_BROWSER_OWNED_BYTES`), and it is not
+    /// recoverable after the fetch is closed, so it is caught on the way
+    /// past rather than asked for later.
+    last_peak: usize,
+    /// What the Wi-Fi indicator is currently drawn as.
+    ///
+    /// Sampled every frame and compared, rather than drawn every frame: the
+    /// toolbar only repaints when something on it changed, and the Wi-Fi
+    /// state changes a handful of times in a session.
+    wifi: WifiLevel,
     /// Whether the link was already reported as lost, so it is said once.
     link_reported: bool,
     dirty: Dirty,
@@ -598,12 +1053,15 @@ impl Viewer {
         Ok(Viewer {
             page,
             history: Vec::new(),
+            forward: Vec::new(),
             editing: None,
             loading: None,
             message: None,
             request: None,
             painted_bottom: VIEWPORT_BOTTOM,
             slowest_repaint_ms: 0,
+            last_peak: 0,
+            wifi: WifiLevel::Off,
             link_reported: false,
             dirty: Dirty {
                 toolbar: true,
@@ -615,6 +1073,15 @@ impl Viewer {
 
     fn dirty(&self) -> bool {
         self.dirty.toolbar || self.dirty.viewport || self.dirty.status
+    }
+
+    /// What the page on screen costs: its document and its layout.
+    ///
+    /// The two together, because they are freed together -- a page is
+    /// replaced whole -- and because a layout that grew while a document
+    /// did not is exactly the shape a wrapping bug takes.
+    fn page_owned_bytes(&self) -> usize {
+        self.page.document.stats().owned_bytes + self.page.layout.owned_bytes()
     }
 
     fn take_request(&mut self) -> Option<Navigation> {
@@ -642,6 +1109,14 @@ impl Viewer {
         }
         self.link_reported = true;
         self.say("the Wi-Fi link is gone; leave and run wificonnect again");
+    }
+
+    /// Takes the current Wi-Fi state, repainting the bar only on a change.
+    fn update_wifi(&mut self, level: WifiLevel) {
+        if self.wifi != level {
+            self.wifi = level;
+            self.dirty.toolbar = true;
+        }
     }
 
     fn clear_message(&mut self) {
@@ -678,7 +1153,10 @@ impl Viewer {
         let kib = received / 1024;
         if kib != loading.shown_kib {
             loading.shown_kib = kib;
-            self.dirty.toolbar = true;
+            // The status line and not the toolbar: the count moved down
+            // there when the address field grew to the right margin, and
+            // the band that repaints for it is the cheaper of the two.
+            self.dirty.status = true;
         }
     }
 
@@ -693,22 +1171,22 @@ impl Viewer {
     ///
     /// `landed` is where the page actually came from, which is the last hop
     /// of a redirect chain rather than the address that was asked for.
+    /// `status` is set when the server answered with something outside 2xx
+    /// and sent a page anyway, which is shown as itself with the number in
+    /// the status line -- see `fetch::Fetch::status`.
     fn show_document(
         &mut self,
         document: Document,
         navigation: &Navigation,
         landed: Url,
-        elapsed_ms: u64,
-        peak_owned: usize,
         security: Option<fetch::PageSecurity>,
+        status: Option<u16>,
+        peak_owned: usize,
     ) {
-        let statistics = document.stats();
         match build_page(document) {
             Ok(mut page) => {
                 page.security = security;
-                if navigation.push_history {
-                    self.push_current();
-                }
+                self.settle_history(navigation.how);
                 self.page = page;
                 // Through `scroll_to` rather than assigned, so a remembered
                 // position past the end of a page that has since got
@@ -722,7 +1200,10 @@ impl Viewer {
                     status: true,
                 };
                 let _ = landed;
-                log_page(&self.page, statistics, elapsed_ms, peak_owned);
+                self.last_peak = peak_owned;
+                if let Some(status) = status {
+                    self.say_status(status);
+                }
             }
             Err(failure) => {
                 let url = navigation.url.clone();
@@ -734,6 +1215,7 @@ impl Viewer {
                         detail: error::error_text(failure),
                         status: None,
                     },
+                    navigation.how,
                 );
             }
         }
@@ -742,9 +1224,7 @@ impl Viewer {
     fn show_builtin(&mut self, page: &'static builtin::Page, navigation: &Navigation) {
         match load_builtin(page) {
             Ok(loaded) => {
-                if navigation.push_history {
-                    self.push_current();
-                }
+                self.settle_history(navigation.how);
                 self.page = loaded;
                 self.scroll_to(navigation.restore);
                 self.loading = None;
@@ -764,18 +1244,32 @@ impl Viewer {
     /// A page rather than a status line, because a failed navigation has to
     /// leave somewhere to go: this one carries the address that failed, the
     /// reason, and a link home. Backspace still goes back.
-    fn show_failure(&mut self, url: &Url, failure: fetch::Failure) {
-        self.show_error(url, failure.headline, failure.detail, failure.status);
+    fn show_failure(&mut self, url: &Url, failure: fetch::Failure, how: Direction) {
+        self.show_error(url, failure.headline, failure.detail, failure.status, how);
     }
 
-    fn show_error(&mut self, url: &Url, headline: &str, detail: &str, status: Option<u16>) {
+    fn show_error(
+        &mut self,
+        url: &Url,
+        headline: &str,
+        detail: &str,
+        status: Option<u16>,
+        how: Direction,
+    ) {
         self.loading = None;
         // The page the reader was on when they followed the failing link is
         // pushed, so Backspace from the error page returns to it. Not when
         // this error replaces another one: that would stack duplicates and
         // put a wall of error pages between them and where they were.
-        if !self.showing_error() {
-            self.push_current();
+        if self.showing_error() {
+            // The forward stack still goes, though. A navigation the reader
+            // asked for happened, whether or not it arrived, and the pages
+            // that were ahead of them are not ahead of them any more.
+            if how == Direction::Fresh {
+                self.forward.clear();
+            }
+        } else {
+            self.settle_history(how);
         }
         match error_page(url, headline, detail, status) {
             Ok(page) => {
@@ -794,22 +1288,52 @@ impl Viewer {
     }
 
     fn showing_error(&self) -> bool {
-        let url = self.page.document.url();
-        url.host() == builtin::HOST && url.path() == ERROR_PATH
+        self.page.error
     }
 
-    /// Records the page now on screen so it can be gone back to.
-    fn push_current(&mut self) {
+    /// Says which status a page that is not the one asked for came with.
+    fn say_status(&mut self, status: u16) {
+        let mut text = Summary::new();
+        text.push("the server answered ");
+        text.push_usize(status as usize);
+        self.say(text.as_str());
+    }
+
+    /// Moves the page now on screen onto one of the two stacks.
+    fn push_current(&mut self, stack: Stack) {
         let entry = HistoryEntry {
             url: self.page.document.url().clone(),
             line: self.page.first_line,
         };
-        if self.history.len() >= MAX_HISTORY {
+        let stack = match stack {
+            Stack::History => &mut self.history,
+            Stack::Forward => &mut self.forward,
+        };
+        if stack.len() >= MAX_HISTORY {
             // The oldest goes, which is what makes this a bounded cost
             // rather than a growing one.
-            self.history.remove(0);
+            stack.remove(0);
         }
-        let _ = memory::push(&mut self.history, entry);
+        let _ = memory::push(stack, entry);
+    }
+
+    /// What a landed navigation does to the two stacks.
+    ///
+    /// In one place rather than at each call site, because the four cases
+    /// are only correct as a set: every one of them either moves the page
+    /// being left onto a stack or deliberately does not, and a fifth
+    /// behaviour appearing somewhere else is how a forward button starts
+    /// returning to pages nobody visited.
+    fn settle_history(&mut self, how: Direction) {
+        match how {
+            Direction::Fresh => {
+                self.push_current(Stack::History);
+                self.forward.clear();
+            }
+            Direction::Back => self.push_current(Stack::Forward),
+            Direction::Forward => self.push_current(Stack::History),
+            Direction::Reload => {}
+        }
     }
 
     fn go_back(&mut self) {
@@ -820,9 +1344,34 @@ impl Viewer {
         self.request(Navigation {
             url: entry.url,
             restore: entry.line,
-            // Going back must not push the page being left, or every back
-            // would add an entry and the history would never shrink.
-            push_history: false,
+            how: Direction::Back,
+        });
+    }
+
+    fn go_forward(&mut self) {
+        let Some(entry) = self.forward.pop() else {
+            self.say("nothing to go forward to");
+            return;
+        };
+        self.request(Navigation {
+            url: entry.url,
+            restore: entry.line,
+            how: Direction::Forward,
+        });
+    }
+
+    /// Fetches the address showing again, keeping the reader's place.
+    ///
+    /// The scroll position is restored because the usual reason to reload
+    /// is that the page may have changed under a reader who is partway
+    /// down it. On an error page this retries what failed, which works
+    /// because an error page's address is the address that failed.
+    fn reload(&mut self) {
+        let url = self.page.document.url().clone();
+        self.request(Navigation {
+            url,
+            restore: self.page.first_line,
+            how: Direction::Reload,
         });
     }
 
@@ -883,7 +1432,24 @@ impl Viewer {
                     self.start_editing();
                 }
             }
-            Key::Ascii(0x08) | Key::Ascii(0x7F) => self.go_back(),
+            // `[` and `]` beside Backspace because a pager's reader knows
+            // them and because Backspace has no opposite: there is no
+            // forward key on any of the keyboards here.
+            Key::Ascii(0x08) | Key::Ascii(0x7F) | Key::Ascii(b'[') => self.go_back(),
+            Key::Ascii(b']') => self.go_forward(),
+            // Reload, on a bare letter for the same reason `q` is one:
+            // CardKB v1.1 has no Ctrl key, and outside the address field
+            // nothing here takes typed text. The other two are what a
+            // desktop keyboard's reader will try first.
+            Key::Ascii(b'r') | Key::Ascii(b'R') | Key::Control(b'r') | Key::Function(5) => {
+                self.reload()
+            }
+            // The numbers behind "does this leak". Asked for rather than
+            // logged: the per-page UART line this replaces printed on every
+            // navigation, which made the log unreadable and still did not
+            // answer the question, because the question is about the
+            // difference between two moments the reader chooses.
+            Key::Ascii(b'i') | Key::Ascii(b'I') | Key::Function(1) => return Action::Report,
             // Three ways into the address field: Ctrl+L as on a desktop
             // browser, F2 for CardKB (which has no Ctrl key), and Enter
             // with nothing selected. The last is not redundant with the
@@ -990,15 +1556,17 @@ impl Viewer {
     }
 
     /// A tap or a click at a screen position.
-    fn click(&mut self, x: usize, y: usize) {
+    ///
+    /// Answers with an [`Action`] for the same reason `handle_key` does:
+    /// the stop button and Escape have to reach the one piece of code that
+    /// gives a running transfer's socket back, and a second copy of it
+    /// behind the button is a second place to forget.
+    fn click(&mut self, x: usize, y: usize) -> Action {
         if y < TOOLBAR_HEIGHT {
-            if (ADDRESS_LEFT..ADDRESS_RIGHT).contains(&x) {
-                self.start_editing();
-            }
-            return;
+            return self.click_toolbar(x);
         }
         if y >= VIEWPORT_BOTTOM {
-            return;
+            return Action::Continue;
         }
         if self.editing.is_some() {
             self.editing = None;
@@ -1006,11 +1574,11 @@ impl Viewer {
             self.dirty.toolbar = true;
         }
         let Some(top) = self.top_offset() else {
-            return;
+            return Action::Continue;
         };
         let document_y = top + (y - VIEWPORT_TOP) as u32;
         let Some(document_x) = x.checked_sub(MARGIN) else {
-            return;
+            return Action::Continue;
         };
         match self.page.layout.hit(document_x as u16, document_y) {
             Some(link) => {
@@ -1029,6 +1597,73 @@ impl Viewer {
                 }
             }
         }
+        Action::Continue
+    }
+
+    /// A tap on the toolbar: a button, the lock, the clear cross, or the
+    /// address field.
+    ///
+    /// Every hit area is the full height of the bar. There is nothing else
+    /// up here to hit, and a target as tall as the band is the difference
+    /// between a button that can be pressed with a finger and one that
+    /// needs the mouse.
+    fn click_toolbar(&mut self, x: usize) -> Action {
+        if let Some(button) = button_at(x) {
+            return self.press(button);
+        }
+        if (ICON_LEFT..ICON_LEFT + ICON_WIDTH).contains(&x) {
+            self.explain_security();
+            return Action::Continue;
+        }
+        // To the right edge rather than to the icon's own edge: there is
+        // nothing beyond it, and a target that stops short of the corner
+        // is one a thumb misses.
+        if x >= WIFI_LEFT {
+            return Action::Wifi;
+        }
+        // Only while the field is open, which is the whole of what makes
+        // this position mean two things safely: closed, it is part of the
+        // address and opens the field like the rest of it.
+        if self.editing.is_some() && (CLEAR_LEFT..ADDRESS_RIGHT).contains(&x) {
+            self.clear_address();
+            return Action::Continue;
+        }
+        if (ADDRESS_LEFT..ADDRESS_RIGHT).contains(&x) {
+            self.start_editing();
+        }
+        Action::Continue
+    }
+
+    fn press(&mut self, button: Button) -> Action {
+        // A button is not the address field, so an open field closes on the
+        // way: leaving half-typed text over a page that is being replaced
+        // is the one state where the toolbar says two things at once.
+        if self.editing.is_some() {
+            self.editing = None;
+            self.clear_message();
+            self.dirty.toolbar = true;
+        }
+        match button {
+            Button::Back => self.go_back(),
+            Button::Forward => self.go_forward(),
+            // The same button, and the same code Escape reaches: while
+            // something is arriving it stops it, and otherwise it fetches
+            // the address again.
+            Button::Reload if self.loading.is_some() => return Action::Cancel,
+            Button::Reload => self.reload(),
+        }
+        Action::Continue
+    }
+
+    /// Empties the address field, leaving it open with the caret at the
+    /// start. Only reachable while it is open.
+    fn clear_address(&mut self) {
+        let Some(editing) = self.editing.as_mut() else {
+            return;
+        };
+        editing.text.clear();
+        editing.caret = 0;
+        self.dirty.toolbar = true;
     }
 
     fn focus_next(&mut self) {
@@ -1169,7 +1804,7 @@ impl Viewer {
         self.dirty = Dirty::default();
         if dirty.toolbar {
             self.draw_toolbar(framebuffer);
-            framebuffer.flush_rect(0, 0, WIDTH, TOOLBAR_HEIGHT);
+            framebuffer.flush_rect(0, 0, WIDTH, VIEWPORT_TOP);
         }
         if dirty.viewport {
             let started = tick::now_ms();
@@ -1192,21 +1827,21 @@ impl Viewer {
 
     fn draw_toolbar(&self, framebuffer: &mut Framebuffer) {
         framebuffer.fill_rect(0, 0, WIDTH, TOOLBAR_HEIGHT, CHROME_BACKGROUND);
-        // The badge comes first and is never absent. What it says is what
-        // the connection actually proved, not what the address asked for:
-        // an `https://` URL whose peer nobody identified reads
-        // `TLS UNVERIFIED` in the same red as plaintext, because to a
-        // reader the two mean the same thing -- what is on screen may not
-        // be from where the address says.
-        let (badge, badge_color) = self.badge();
-        draw_ascii(
-            framebuffer,
-            MARGIN,
-            CHROME_TEXT_Y,
-            badge,
-            CHROME_SCALE,
-            badge_color,
-        );
+        // The gap below the bar is painted here rather than by the
+        // viewport, so it belongs to the band that is cheapest to repaint
+        // and cannot be left behind by a viewport repaint that starts
+        // lower down.
+        framebuffer.fill_rect(0, TOOLBAR_HEIGHT, WIDTH, CONTENT_GAP, PAGE_BACKGROUND);
+        self.draw_buttons(framebuffer);
+        // The lock comes next and is never absent. What it says is what the
+        // connection actually proved, not what the address asked for: an
+        // `https://` URL whose peer nobody identified gets the same red
+        // open lock as plaintext, because to a reader the two mean the same
+        // thing -- what is on screen may not be from where the address
+        // says. The words are one tap away, on the lock itself.
+        let (lock, color, _) = self.security_state();
+        draw_lock(framebuffer, ICON_LEFT, lock, color);
+        draw_wifi(framebuffer, self.wifi);
 
         match (&self.editing, &self.loading) {
             (Some(editing), _) => self.draw_address_field(framebuffer, editing),
@@ -1231,71 +1866,108 @@ impl Viewer {
                 }
             }
         }
-
-        let mut summary = Summary::new();
-        match &self.loading {
-            Some(loading) => {
-                summary.push("loading ");
-                summary.push_usize(loading.received / 1024);
-                summary.push(" KiB");
-            }
-            None => {
-                summary.push_usize(self.page.order.len());
-                summary.push(" links  ");
-                summary.push_usize(self.page.layout.lines().len());
-                summary.push(" lines");
-            }
-        }
-        let width = summary.len() * CHROME_CELL;
-        draw_ascii(
-            framebuffer,
-            WIDTH.saturating_sub(MARGIN + width),
-            CHROME_TEXT_Y,
-            summary.as_str(),
-            CHROME_SCALE,
-            CHROME_TEXT,
-        );
     }
 
-    /// What the badge says, and in what colour.
+    /// Back, forward, and the one that is reload or stop depending on
+    /// whether anything is arriving.
+    ///
+    /// Greyed rather than hidden when there is nowhere to go: a button that
+    /// disappears takes the two beside it with it, and a reader who has
+    /// learned where "back" is has to find it again on every page.
+    fn draw_buttons(&self, framebuffer: &mut Framebuffer) {
+        let enabled = [
+            !self.history.is_empty(),
+            !self.forward.is_empty(),
+            // Reload always works, and so does stopping something that is
+            // on its way.
+            true,
+        ];
+        let glyphs = [
+            BACK_GLYPH,
+            FORWARD_GLYPH,
+            if self.loading.is_some() {
+                STOP_GLYPH
+            } else {
+                RELOAD_GLYPH
+            },
+        ];
+        for index in 0..BUTTON_COUNT {
+            let color = if enabled[index] {
+                CHROME_TEXT
+            } else {
+                DISABLED_COLOR
+            };
+            // Twice the body's size, centred in the button. The glyphs are
+            // half-width, so a scaled one is 16 by 32 in a 44 by 40 slot.
+            let x = BUTTONS_LEFT + index * BUTTON_WIDTH + (BUTTON_WIDTH - CELL_WIDTH * 2) / 2;
+            let y = (TOOLBAR_HEIGHT - CELL_HEIGHT * 2) / 2;
+            framebuffer.draw_text(x, y, glyphs[index], 2, color, None);
+        }
+    }
+
+    /// How the lock is drawn, in what colour, and the sentence that says
+    /// the same thing in words.
+    ///
+    /// All three from one place, because they are one statement: an icon
+    /// whose colour and whose explanation are decided separately is an icon
+    /// that can end up green beside a sentence saying nothing was proved.
     ///
     /// While a page is loading this describes the connection being made,
     /// not the page still on screen: the address field has already moved to
-    /// the new URL, and a badge left describing the old page beside the new
+    /// the new URL, and a lock left describing the old page beside the new
     /// address would be the one combination that actively misleads.
     ///
     /// A connection that has not proved anything yet says so. It does not
     /// borrow the previous page's answer and it does not guess from the
     /// scheme.
-    fn badge(&self) -> (&'static str, u16) {
+    fn security_state(&self) -> (Lock, u16, &'static str) {
         let security = match &self.loading {
             Some(loading) => match loading.security {
                 Some(security) => security,
-                None => return (CONNECTING_BADGE, CHROME_TEXT),
+                None => {
+                    return (Lock::Outline, CHROME_TEXT, CONNECTING_TEXT);
+                }
             },
             None => match self.page.security {
                 Some(security) => security,
                 // A built-in page or this viewer's error page: never
-                // fetched, and always at an `http://built-in/` address.
+                // fetched, so nothing was proved about anybody.
                 None => fetch::PageSecurity::Cleartext,
             },
         };
-        let color = if security.is_warning() {
-            INSECURE_COLOR
+        // `is_warning` is the same question the lock asks: was the peer
+        // identified at all? Plaintext and unauthenticated TLS both answer
+        // no, and both get the open lock.
+        let (lock, color) = if security.is_warning() {
+            (Lock::Open, INSECURE_COLOR)
         } else {
-            AUTHENTICATED_COLOR
+            (Lock::Closed, AUTHENTICATED_COLOR)
         };
-        (security.badge(), color)
+        (lock, color, security.explanation())
+    }
+
+    /// Puts the lock's meaning into the status line, in words.
+    ///
+    /// This is what an icon costs and what pays for it back. The toolbar
+    /// used to spell `TLS UNVERIFIED` out in fourteen cells of the space
+    /// the address needed; now it says it when asked.
+    fn explain_security(&mut self) {
+        let (_, _, explanation) = self.security_state();
+        self.say(explanation);
     }
 
     /// The address field, scrolled so the caret is always on screen.
     fn draw_address_field(&self, framebuffer: &mut Framebuffer, editing: &Editing) {
         let width = ADDRESS_RIGHT - ADDRESS_LEFT;
+        // As tall as a scaled glyph, so the clear cross at the right sits
+        // inside the field rather than half on the toolbar behind it. The
+        // text is centred in it either way: `CHROME_TEXT_Y` leaves the same
+        // eight pixels above and below.
         framebuffer.fill_rect(
             ADDRESS_LEFT - 4,
-            CHROME_TEXT_Y - 4,
+            FIELD_TOP,
             width + 8,
-            CELL_HEIGHT * CHROME_SCALE + 8,
+            FIELD_HEIGHT,
             EDIT_BACKGROUND,
         );
         // One cell is kept for the caret, so it has somewhere to sit when it
@@ -1324,17 +1996,49 @@ impl Viewer {
             CELL_HEIGHT * CHROME_SCALE,
             EDIT_CARET,
         );
+        // The cross that empties the field, inside the field's own right
+        // edge and drawn only while it is open. An address is usually
+        // edited at its end, which is what `start_editing` is arranged
+        // around; this is for the other case, where the whole thing is
+        // being replaced and deleting it a character at a time on a thumb
+        // keyboard is the expensive part.
+        //
+        // Grey rather than black when there is nothing to clear, so that
+        // the button says whether it will do anything before it is pressed.
+        let color = if editing.text.is_empty() {
+            DISABLED_COLOR
+        } else {
+            CHROME_TEXT
+        };
+        framebuffer.draw_text(
+            CLEAR_LEFT + (CLEAR_WIDTH - CELL_WIDTH * 2) / 2,
+            FIELD_TOP,
+            STOP_GLYPH,
+            2,
+            color,
+            None,
+        );
     }
 
     fn draw_status(&self, framebuffer: &mut Framebuffer) {
         framebuffer.fill_rect(0, VIEWPORT_BOTTOM, WIDTH, STATUS_HEIGHT, CHROME_BACKGROUND);
         let budget = WIDTH - 2 * MARGIN;
-        if self.loading.is_some() && self.message.is_none() {
+        if let Some(loading) = &self.loading
+            && self.message.is_none()
+        {
+            // How much has arrived, which used to sit at the right of the
+            // toolbar beside the link and line counts. Those went; this
+            // stayed, because it is the only thing on the screen that says
+            // a slow page is moving at all.
+            let mut text = Summary::new();
+            text.push("loading ");
+            text.push_usize(loading.received / 1024);
+            text.push(" KiB; Escape or the stop button stops");
             draw_ascii(
                 framebuffer,
                 MARGIN,
                 STATUS_TEXT_Y,
-                "loading; Escape stops",
+                text.as_str(),
                 CHROME_SCALE,
                 CHROME_TEXT,
             );
@@ -1508,6 +2212,175 @@ impl Viewer {
     }
 }
 
+/// How far the Wi-Fi has got, as four steps a reader can learn.
+///
+/// Not signal strength. Asking the C6 for an RSSI is an RPC round trip,
+/// and the number would answer a question this screen is not being asked:
+/// what a reader wants to know when a page will not load is whether the
+/// board is on the network at all. The bars fill up as the connection
+/// gets further along, and tapping them says exactly where it stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WifiLevel {
+    /// Off, or the link to the C6 is down. Nothing will work.
+    Off,
+    /// Trying: associating, waiting to retry, or waiting for a password.
+    Working,
+    /// Associated, but with no address yet. A fetch would fail.
+    Associated,
+    /// Associated *and* addressed, which is what a fetch needs.
+    Online,
+}
+
+impl WifiLevel {
+    /// How many of the three bars are drawn dark.
+    fn bars(self) -> usize {
+        match self {
+            WifiLevel::Off => 0,
+            WifiLevel::Working => 1,
+            WifiLevel::Associated => 2,
+            WifiLevel::Online => 3,
+        }
+    }
+}
+
+/// What the manager's state means for the indicator.
+///
+/// `Online` is the one that has to agree with something else: the browser
+/// will only fetch when `addressed_network` answers, so the icon says
+/// online exactly when that is true. An icon that reported the association
+/// and left the address out would be full bars over a page that fails with
+/// `no-network`.
+fn wifi_level(wifi: &WifiManager) -> WifiLevel {
+    use super::wifi_manager::State;
+    let addressed = wifi.stack().is_some_and(crate::net::Stack::has_address);
+    match wifi.state() {
+        State::Off | State::LinkDown | State::Failed(_) => WifiLevel::Off,
+        State::Idle
+        | State::NeedsPassword(_)
+        | State::Associating { .. }
+        | State::RetryWaiting { .. } => WifiLevel::Working,
+        State::Associated(_) | State::RequestingDhcp { .. } | State::AssociatedNoLease(_) => {
+            WifiLevel::Associated
+        }
+        State::Online(_) if addressed => WifiLevel::Online,
+        State::Online(_) => WifiLevel::Associated,
+    }
+}
+
+/// Draws the three ascending bars.
+///
+/// Bars and not the fan of arcs everything else uses, because arcs at this
+/// size are three curves two pixels thick and the panel renders them as
+/// mush. Rectangles are exact.
+fn draw_wifi(framebuffer: &mut Framebuffer, level: WifiLevel) {
+    const BAR_WIDTH: usize = 5;
+    const BAR_GAP: usize = 2;
+    const BARS: usize = 3;
+    const TALLEST: usize = 16;
+    let width = BARS * BAR_WIDTH + (BARS - 1) * BAR_GAP;
+    let left = WIFI_LEFT + (WIFI_WIDTH - width) / 2;
+    let baseline = (TOOLBAR_HEIGHT + TALLEST) / 2;
+    let lit = level.bars();
+    for index in 0..BARS {
+        // 6, 11, 16: a step of five, which is the most difference three
+        // bars can carry in sixteen pixels.
+        let height = 6 + index * 5;
+        let color = if index < lit {
+            CHROME_TEXT
+        } else {
+            DISABLED_COLOR
+        };
+        framebuffer.fill_rect(
+            left + index * (BAR_WIDTH + BAR_GAP),
+            baseline - height,
+            BAR_WIDTH,
+            height,
+            color,
+        );
+    }
+    if level == WifiLevel::Off {
+        // Struck through, because "no bars lit" and "one bar lit" are two
+        // pixels apart otherwise. Grey rather than red: red on this bar
+        // means the lock, and it means something else.
+        framebuffer.draw_line(
+            left,
+            baseline - TALLEST,
+            left + width - 1,
+            baseline - 1,
+            DISABLED_COLOR,
+        );
+    }
+}
+
+/// The three states the padlock is drawn in.
+///
+/// Two of them, not three: plaintext and unauthenticated TLS share the open
+/// lock. The reader's question is whether what is on screen is from where
+/// the address says, and neither of those answers it -- one is not
+/// encrypted and the other is encrypted to nobody in particular. The
+/// difference between them is `http://` against `https://`, which is
+/// already in the address field a few pixels to the right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lock {
+    /// Nothing was proved about who answered.
+    Open,
+    /// A pin matched.
+    Closed,
+    /// Nothing has been asked yet: a connection still being made.
+    Outline,
+}
+
+/// Draws the padlock into its slot.
+///
+/// Rectangles rather than a glyph, because the font has no padlock: the
+/// body is one, the shackle is three, and the open one is the same shackle
+/// unhooked on the left.
+fn draw_lock(framebuffer: &mut Framebuffer, slot_x: usize, lock: Lock, color: u16) {
+    // 14 by 20 inside a 24 wide slot, vertically centred in the toolbar.
+    let x = slot_x + (ICON_WIDTH - LOCK_WIDTH) / 2;
+    let y = (TOOLBAR_HEIGHT - LOCK_HEIGHT) / 2;
+    let body_y = y + LOCK_SHACKLE_HEIGHT;
+    let body_height = LOCK_HEIGHT - LOCK_SHACKLE_HEIGHT;
+    match lock {
+        Lock::Outline => {
+            framebuffer.stroke_rect(x, body_y, LOCK_WIDTH, body_height, color);
+            // A one-pixel shackle, closed. Thinner than the other two all
+            // over, which is what says "not an answer yet" without
+            // inventing a third shape.
+            framebuffer.fill_rect(x + 3, y, 1, LOCK_SHACKLE_HEIGHT, color);
+            framebuffer.fill_rect(x + 3, y, 9, 1, color);
+            framebuffer.fill_rect(x + 10, y, 1, LOCK_SHACKLE_HEIGHT, color);
+            return;
+        }
+        Lock::Closed => {
+            framebuffer.fill_rect(x + 2, y, 2, LOCK_SHACKLE_HEIGHT, color);
+            framebuffer.fill_rect(x + 2, y, 10, 2, color);
+            framebuffer.fill_rect(x + 10, y, 2, LOCK_SHACKLE_HEIGHT, color);
+        }
+        Lock::Open => {
+            // Hinged on the right and lifted clear of the body on the left,
+            // which is the shape everything else draws an open lock as.
+            framebuffer.fill_rect(x + 6, y, 2, LOCK_SHACKLE_HEIGHT / 2, color);
+            framebuffer.fill_rect(x + 6, y, 10, 2, color);
+            framebuffer.fill_rect(x + 14, y, 2, LOCK_SHACKLE_HEIGHT, color);
+        }
+    }
+    framebuffer.fill_rect(x, body_y, LOCK_WIDTH, body_height, color);
+    // The keyhole, punched back out in the toolbar's own colour so the body
+    // reads as a body rather than as a filled rectangle.
+    framebuffer.fill_rect(
+        x + LOCK_WIDTH / 2 - 1,
+        body_y + 3,
+        2,
+        body_height - 6,
+        CHROME_BACKGROUND,
+    );
+}
+
+const LOCK_WIDTH: usize = 14;
+const LOCK_HEIGHT: usize = 20;
+const LOCK_SHACKLE_HEIGHT: usize = 8;
+
 /// Writes the viewport back in vertical bands, servicing the link between
 /// them.
 ///
@@ -1648,6 +2521,7 @@ fn build_page(document: Document) -> Result<Page, Error> {
     Ok(Page {
         document,
         security: None,
+        error: false,
         layout,
         first_line: 0,
         // Nothing is focused until the reader asks: an automatically
@@ -1689,18 +2563,25 @@ fn error_page(url: &Url, headline: &str, detail: &str, status: Option<u16>) -> R
     }
     memory::push_str(
         &mut markup,
-        "</code></p><hr><p>Backspace goes back. \
+        "</code></p><hr><p>Backspace goes back, r tries again. \
          <a href=\"http://built-in/\">Home</a></p>",
     )?;
 
     // Parsed rather than laid out by hand: an error page that goes through
     // the same tokenizer, document builder and layout as every other page
     // cannot be the one place where a wrapping or drawing bug hides.
-    let url = Url::parse("http://built-in/error")?;
-    debug_assert_eq!(url.path(), ERROR_PATH);
-    let mut parser = Parser::new(url)?;
+    //
+    // The document's own address is the address that failed, not a made-up
+    // one under the built-in host. It used to be `http://built-in/error`,
+    // which put an address in the toolbar that nothing could be at: the
+    // reader could not see what had failed, could not open the field and
+    // correct a typo in it, and had nothing to reload. Everything on this
+    // page links absolutely, so nothing resolves against it.
+    let mut parser = Parser::new(url.clone())?;
     parser.feed(markup.as_bytes())?;
-    build_page(parser.finish()?)
+    let mut page = build_page(parser.finish()?)?;
+    page.error = true;
+    Ok(page)
 }
 
 /// Escapes the two characters that would otherwise be markup.
@@ -1717,27 +2598,6 @@ fn push_escaped(target: &mut String, text: &str) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-/// One line per page on the UART: what it cost and how long it took.
-fn log_page(
-    page: &Page,
-    statistics: crate::browser::document::Stats,
-    elapsed_ms: u64,
-    peak_owned: usize,
-) {
-    uart::log(b"BROWSER page\r\n");
-    uart::log_hex(b"  bytes=", statistics.input_bytes as u32);
-    uart::log_hex(b"  text=", statistics.text_bytes as u32);
-    uart::log_hex(b"  items=", statistics.items as u32);
-    uart::log_hex(b"  links=", statistics.links as u32);
-    uart::log_hex(b"  lines=", page.layout.lines().len() as u32);
-    uart::log_hex(
-        b"  owned=",
-        (statistics.owned_bytes + page.layout.owned_bytes()) as u32,
-    );
-    uart::log_hex(b"  peak=", peak_owned as u32);
-    uart::log_hex(b"  ms=", elapsed_ms as u32);
 }
 
 /// A short fixed-size text buffer for chrome lines.
@@ -1873,8 +2733,11 @@ mod builtin {
             "<title>Tab5 browser</title>\
              <h1>Tab5 browser</h1>\
              <p>This is a hypertext viewer, not a web browser. It fetches HTML \
-             over plain HTTP and shows the text and the links in it. There is \
-             no CSS, no JavaScript, no images and no TLS.</p>\
+             and plain text over HTTP or HTTPS, reads files off this device with \
+             <code>file:</code>, and shows the text and the links in it. There \
+             is no CSS, no JavaScript and no images, and an HTTPS connection \
+             proves who answered only where a pin matches -- the padlock at \
+             the top says which, and says it in words if you tap it.</p>\
              <h2>Driving it</h2>\
              <ul>\
              <li><b>Tab</b> selects the next link; the status line shows where \
@@ -1886,19 +2749,27 @@ mod builtin {
              <li>in the address field, <b>Left</b> and <b>Right</b> move the \
              caret, <b>Home</b> and <b>End</b> jump to either end, and \
              <b>Backspace</b> and <b>Delete</b> remove a character</li>\
-             <li><b>Backspace</b> goes back a page</li>\
+             <li><b>Backspace</b> or <b>[</b> goes back a page, <b>]</b> goes \
+             forward again, and <b>r</b> fetches this page again -- the three \
+             buttons at the top left do the same, and the third one stops a \
+             page that is still arriving</li>\
              <li><b>Up</b> and <b>Down</b> scroll a line, <b>Page Up</b> and \
              <b>Page Down</b> a screen, <b>Home</b> and <b>End</b> the whole \
              document</li>\
              <li><b>Space</b> is another Page Down</li>\
              <li>A touch or a click selects and follows a link; a click on the \
-             address field opens it; a mouse wheel scrolls</li>\
+             address field opens it, and while it is open the cross at its \
+             right empties it; a mouse wheel scrolls</li>\
              <li><b>Escape</b> stops a page that is loading, closes the address \
              field, and otherwise drops the selected link. It does not \
              leave</li>\
              <li><b>Ctrl+Q</b> leaves, from anywhere. So does <b>q</b> when \
              the address field is closed</li>\
              </ul>\
+             <h2>Files on this device</h2>\
+             <p><a href=\"file:///\">Browse the mounted volumes</a>. A directory \
+             becomes a page of links; a <code>.html</code> file is read as \
+             markup and everything else as plain text. Nothing is written.</p>\
              <h2>Built-in pages</h2>\
              <ul>\
              <li><a href=\"/sample\">Everything it can display</a></li>\

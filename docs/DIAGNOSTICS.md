@@ -141,6 +141,8 @@ Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起
 | --- | --- |
 | `TLS: <理由>; not connecting` | 真性乱数の種を用意できず、**1 packetも送っていない**。`entropy`コマンドで切り分ける |
 | `TLS: unsupported CertificateVerify signature scheme` | serverがこのfirmwareの実装していない署名方式を選んだ。Ed25519とECDSA P-384はClientHelloに載るが検証できない（[`NETWORK.md`](NETWORK.md)） |
+| `TLS: the server sent alert <level> <name>` | serverがalertを送って断った（画面は`tls-alert`）。`handshake_failure`は共通の暗号方式／鍵交換群が無い、`protocol_version`はTLS 1.3を話さない、`unrecognized_name`はSNIで送った名前をserverが知らない |
+| `TLS: aborting the handshake with alert <level> <name>` | serverのhandshakeをこちらが解釈できず中断した（画面は`tls-handshake`）。相手ではなくこちら側の制約である |
 | `TLS: a transaction was dropped without close()` | socketが`SocketSet`に取り残された。実装のバグで、そのsocketはリセットまで戻らない |
 
   失敗の分類は画面とコマンド出力側に出ます（`tls-cert`、`tls-pin`、`tls-alert`など）。

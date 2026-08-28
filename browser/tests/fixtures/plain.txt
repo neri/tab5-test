@@ -1,0 +1,8 @@
+plain text, not markup
+======================
+
+  indented, and the   run of spaces before this stays
+a < b && c > d -- none of these open a tag or a reference
+&amp; is four characters here, not one
+
+日本語もそのまま出ます。

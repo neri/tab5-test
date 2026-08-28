@@ -149,6 +149,20 @@ is itself part of what is being tested.</p>
   <li><a href="empty.html">empty.html</a> - a document with no text</li>
   <li><a href="links/">links/</a> - relative reference resolution</li>
 </ul>
+<h2>Character encodings</h2>
+<ul>
+  <li><a href="encoding/shift-jis">encoding/shift-jis</a> - declared by the header</li>
+  <li><a href="encoding/shift-jis-meta">encoding/shift-jis-meta</a> - declared by meta</li>
+  <li><a href="encoding/shift-jis-lying-meta">encoding/shift-jis-lying-meta</a> - header over meta</li>
+  <li><a href="encoding/shift-jis-broken">encoding/shift-jis-broken</a> - one dangling lead byte</li>
+  <li><a href="encoding/utf8-bom.html">encoding/utf8-bom.html</a> - a byte order mark</li>
+</ul>
+<h2>Media types</h2>
+<ul>
+  <li><a href="plain.txt">plain.txt</a> - text/plain, shown as itself</li>
+  <li><a href="plain-sjis.txt">plain-sjis.txt</a> - text/plain in Shift_JIS</li>
+  <li><a href="notatype.bin">notatype.bin</a> - neither HTML nor text, refused</li>
+</ul>
 <h2>Malformed markup that should still render</h2>
 <ul>
   <li><a href="broken/unclosed.html">broken/unclosed.html</a></li>
@@ -301,6 +315,77 @@ UTF8 = page(
 <p>Four byte: \U0001F600 \U0001F5FA \U0001F4A1</p>
 <p>Mixed ASCII and not: Tab5 のブラウザ test.</p>""",
 )
+
+# --- Shift_JIS ------------------------------------------------------------
+#
+# What the board has to get right is not the table -- the crate's own tests
+# cover that -- but the three ways a page says which encoding it is in, and
+# what happens when it lies. The same sentence is used for all of them so
+# that a wrong answer shows up as different text rather than as a different
+# page.
+#
+# Written as Unicode here and encoded on the way out, so this file stays
+# UTF-8 and the bytes on the wire are still real Shift_JIS.
+#
+# `cp932` and not `shift_jis`: the name variants and the circled numbers in
+# the text below are the NEC and IBM extension rows, which plain JIS X 0208
+# does not have and which every page labelled `Shift_JIS` in the wild
+# assumes. The board's table is generated from the same codec.
+SJIS_CODEC = "cp932"
+SHIFT_JIS_TEXT = """<h1>日本語の表示</h1>
+<p>このページはShift_JISで送られています。
+半角カナ（ｶﾞｷﾞｸﾞﾀﾞ）も半角のまま出るはずです。</p>
+<p>人名の異体字：髙 﨑。丸数字：①②③。</p>
+<p><a href="/simple.html">simple.html</a></p>"""
+
+SHIFT_JIS_META = (
+    '<!DOCTYPE html>\n<html><head><meta charset="Shift_JIS">'
+    "<title>日本語</title></head>\n<body>\n"
+    + SHIFT_JIS_TEXT
+    + "\n</body></html>\n"
+).encode(SJIS_CODEC)
+
+SHIFT_JIS_HEADER = (
+    "<!DOCTYPE html>\n<html><head><title>日本語</title></head>\n<body>\n"
+    + SHIFT_JIS_TEXT
+    + "\n</body></html>\n"
+).encode(SJIS_CODEC)
+
+# One two-byte character replaced by a lead byte and an ASCII one, so the
+# lead has no trail and everything after it is still aligned. What should
+# come out is one replacement character, the full stop, and the rest of the
+# page intact: the failure mode worth guarding against is the decoder that
+# loses synchronisation and turns the remainder into rubble, which a reader
+# cannot tell apart from a server that sent rubble.
+#
+# Corrupting one *byte* would not do. Shift_JIS is dense enough that almost
+# any lead and almost any trail make some other perfectly good character,
+# so a flipped byte gives a wrong page rather than a damaged one -- which is
+# what the first attempt at this fixture quietly produced.
+_BROKEN_AT = SHIFT_JIS_HEADER.index("表".encode(SJIS_CODEC))
+SHIFT_JIS_BROKEN = (
+    SHIFT_JIS_HEADER[:_BROKEN_AT] + b"\x93." + SHIFT_JIS_HEADER[_BROKEN_AT + 2 :]
+)
+
+# Text that is not markup. What has to survive is its own spacing and line
+# breaks, and the fact that the angle brackets in it are characters rather
+# than the start of anything.
+PLAIN = (
+    "plain text, not markup\n"
+    "======================\n"
+    "\n"
+    "  indented, and the   run of spaces before this stays\n"
+    "a < b && c > d -- none of these open a tag or a reference\n"
+    "&amp; is four characters here, not one\n"
+    "\n"
+    "\u65e5\u672c\u8a9e\u3082\u305d\u306e\u307e\u307e\u51fa\u307e\u3059\u3002\n"
+).encode("utf-8")
+
+UTF8_BOM = b"\xef\xbb\xbf" + page(
+    "bom",
+    "<h1>Byte order mark</h1>\n<p>The three bytes before the doctype are not text.</p>",
+)
+
 
 INLINE = page(
     "inline",
@@ -647,6 +732,133 @@ static("/broken/huge-attribute.html", "ok", HUGE_ATTRIBUTE)
 static("/broken/bad-utf8.html", "ok", BAD_UTF8)
 static("/limit/url", "ok", OVER_LONG_URL_PAGE)
 static("/limit/longline", "ok", LONG_LINE)
+
+
+@route("/encoding/shift-jis", "ok")
+def shift_jis_header(self: "FixtureHandler", request: Request) -> None:
+    """Shift_JIS declared in the header and nowhere else."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html; charset=Shift_JIS"),
+                ("Content-Length", str(len(SHIFT_JIS_HEADER))),
+                ("Connection", "close"),
+            ],
+        )
+        + SHIFT_JIS_HEADER
+    )
+
+
+@route("/encoding/shift-jis-meta", "ok")
+def shift_jis_meta(self: "FixtureHandler", request: Request) -> None:
+    """Shift_JIS declared only by `<meta>`, with no `charset` in the header.
+
+    The common shape by a wide margin: a server that serves every file as
+    `text/html` with no parameter, and pages that say it themselves.
+    """
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html"),
+                ("Content-Length", str(len(SHIFT_JIS_META))),
+                ("Connection", "close"),
+            ],
+        )
+        + SHIFT_JIS_META
+    )
+
+
+@route("/encoding/shift-jis-lying-meta", "ok")
+def shift_jis_lying_meta(self: "FixtureHandler", request: Request) -> None:
+    """A header that says Shift_JIS over a `<meta>` that says UTF-8.
+
+    The header wins. This is the one case where the two sources disagree,
+    and it happens for real whenever a page is converted and its `<meta>`
+    is not.
+    """
+    body = SHIFT_JIS_META.replace(b"Shift_JIS", b"utf-8xxxx")
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html; charset=shift_jis"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/encoding/shift-jis-broken", "ok")
+def shift_jis_broken(self: "FixtureHandler", request: Request) -> None:
+    """Shift_JIS with one lead byte whose trail byte is missing."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html; charset=shift_jis"),
+                ("Content-Length", str(len(SHIFT_JIS_BROKEN))),
+                ("Connection", "close"),
+            ],
+        )
+        + SHIFT_JIS_BROKEN
+    )
+
+
+static("/encoding/utf8-bom.html", "ok", UTF8_BOM)
+
+
+@route("/plain.txt", "ok")
+def plain_text(self: "FixtureHandler", request: Request) -> None:
+    """`text/plain`, which the viewer shows as itself rather than refusing."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(PLAIN))),
+                ("Connection", "close"),
+            ],
+        )
+        + PLAIN
+    )
+
+
+@route("/plain-sjis.txt", "ok")
+def plain_text_shift_jis(self: "FixtureHandler", request: Request) -> None:
+    """Plain text in Shift_JIS: the two decisions are independent."""
+    body = PLAIN.decode("utf-8").encode(SJIS_CODEC)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/plain; charset=shift_jis"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/notatype.bin", "error:not-html")
+def not_a_type(self: "FixtureHandler", request: Request) -> None:
+    """A media type that is neither HTML nor text, which is still refused."""
+    body = bytes(range(256)) * 4
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
 
 
 @route("/status/404", "error:status-404")
@@ -1009,6 +1221,14 @@ DUMPABLE = {
     "pre.html": PRE,
     "entity.html": ENTITY,
     "utf8.html": UTF8,
+    # Not UTF-8, and that is the point: the crate's fixture test decodes
+    # these through the same `Parser` the board does, so the bytes checked
+    # on the host are the bytes served to the board.
+    "shift-jis.sjis.html": SHIFT_JIS_HEADER,
+    "shift-jis-meta.sjis.html": SHIFT_JIS_META,
+    "shift-jis-broken.sjis.html": SHIFT_JIS_BROKEN,
+    "utf8-bom.html": UTF8_BOM,
+    "plain.txt": PLAIN,
     "inline.html": INLINE,
     "image.html": IMAGE,
     "rule.html": RULE,
@@ -1086,6 +1306,31 @@ for path, content in DOWNLOADS.items():
         )
 
 
+@route("/require-user-agent", "ok")
+def require_user_agent(self: "FixtureHandler", request: Request) -> None:
+    """403 unless the request carried a `User-Agent`, like much of the web.
+
+    Measured on 2026-08-28: `en.wikipedia.org` and `stackoverflow.com` both
+    answer 403 to this firmware's request with the header removed. That was
+    a real bug -- pages that a PC could open and the board could not -- and
+    it was invisible from here until this fixture existed, because nothing
+    else on this server cares what asked.
+
+    So it is a fixture rather than a note: if the header is ever dropped
+    again this comes back as `status` instead of `ok`.
+    """
+    agent = request.headers.get("user-agent", "")
+    if not agent:
+        body = page("no user agent", "<h1>403</h1><p>Send a User-Agent.</p>")
+        self.send_all(html_response(body, 403))
+        return
+    body = page(
+        "user agent",
+        f"<h1>User-Agent</h1><p>You said: {agent}</p>",
+    )
+    self.send_all(html_response(body, 200))
+
+
 @route("/manifest.txt", "text")
 def manifest(self: "FixtureHandler", request: Request) -> None:
     """The walk's contract, written for the connection that asked for it.
@@ -1144,6 +1389,7 @@ class FixtureServer(socketserver.ThreadingTCPServer):
 TLS_ALERT_OFFSET = 1
 TLS_ED25519_OFFSET = 2
 TLS_RSA_OFFSET = 3
+TLS_12_OFFSET = 4
 
 
 class AlertHandler(socketserver.BaseRequestHandler):
@@ -1154,10 +1400,16 @@ class AlertHandler(socketserver.BaseRequestHandler):
     a peer that said no -- rather than folding it into a timeout or a
     connection error. Seven bytes is the whole of it: a TLS record of type
     alert (0x15), version TLS 1.2 as the record layer always claims,
-    length 2, then fatal (2) and handshake_failure (40).
+    length 2, then fatal (2) and the description.
+
+    `access_denied` and not `handshake_failure`: the firmware reads
+    `handshake_failure`, `protocol_version` and `insufficient_security` as
+    "nothing in common to speak" and reports those as `tls-version`, which
+    is the more useful answer. This fixture is for the other kind of no --
+    a server that could have talked and would not.
     """
 
-    RECORD = bytes([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 40])
+    RECORD = bytes([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 49])
 
     def handle(self) -> None:
         try:
@@ -1189,9 +1441,23 @@ class TlsFixtureServer(FixtureServer):
     client certificate: the board does not send one.
     """
 
-    def __init__(self, address, handler, certificate: Path, key: Path) -> None:
+    def __init__(
+        self,
+        address,
+        handler,
+        certificate: Path,
+        key: Path,
+        version: ssl.TLSVersion = ssl.TLSVersion.TLSv1_3,
+    ) -> None:
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.context.minimum_version = ssl.TLSVersion.TLSv1_3
+        # Pinned to one version in both directions. `TLSv1_2` here is a
+        # server the board cannot talk to at all: it offers TLS 1.3 and
+        # nothing else, so there is no overlap and this answers with a
+        # `protocol_version` alert -- which is what a real TLS 1.2-only
+        # server does, and what the board has to report as `tls-version`
+        # rather than as a bare refusal.
+        self.context.minimum_version = version
+        self.context.maximum_version = version
         self.context.load_cert_chain(certfile=str(certificate), keyfile=str(key))
         super().__init__(address, handler)
 
@@ -1222,7 +1488,14 @@ PORTS: dict[str, int] = {}
 # It changes three expectations, and no server can work it out from a
 # connection: pinning is entirely the client's decision and leaves no trace
 # on the wire when it succeeds. So it is a flag rather than a guess.
-BOARD_HAS_FIXTURE_PINS = True
+#
+# False by default, because that is what an ordinary board is.
+# `tls-fixture-pins` is not a default feature, so `cargo build --release` --
+# the build `CLAUDE.md` documents and the one anybody runs -- carries no
+# pins at all. Defaulting to True meant the ordinary walk reported two
+# failures on the Ed25519 and RSA listeners, and the person running it had
+# to know to describe their normal build with a flag.
+BOARD_HAS_FIXTURE_PINS = False
 
 
 class FixtureHandler(socketserver.BaseRequestHandler):
@@ -1304,9 +1577,11 @@ class FixtureHandler(socketserver.BaseRequestHandler):
         alert = self.origin(request, PORTS["tls"] + TLS_ALERT_OFFSET, secure=True)
         ed25519 = self.origin(request, PORTS["tls"] + TLS_ED25519_OFFSET, secure=True)
         rsa = self.origin(request, PORTS["tls"] + TLS_RSA_OFFSET, secure=True)
-        # No certificate is ever offered here, so nothing about pinning
-        # applies: this one reads the same from either build.
+        tls12 = self.origin(request, PORTS["tls"] + TLS_12_OFFSET, secure=True)
+        # Neither of these gets as far as a certificate, so nothing about
+        # pinning applies and they read the same from either build.
         entries[f"{alert}/"] = "error:tls-alert"
+        entries[f"{tls12}/"] = "error:tls-version"
 
         if BOARD_HAS_FIXTURE_PINS:
             # A pin belongs to a *host*, not to a host and port. These
@@ -1395,12 +1670,14 @@ def main() -> int:
         help="port for the TLS listener, or 0 to serve plaintext only",
     )
     parser.add_argument(
-        "--unpinned-board",
+        "--pinned-board",
         action="store_true",
-        help="the board being walked has no pin for this machine's address. "
-        "changes what /manifest.txt expects of /redirect/unpinned and of the "
-        "Ed25519 and RSA listeners, which a pinned board refuses on the pin "
-        "before it reaches their signatures",
+        help="the board being walked was built with `tls-fixture-pins` and "
+        "this machine's address is in tools/pins/fixture_pins.txt. changes "
+        "what /manifest.txt expects of /redirect/unpinned and of the Ed25519 "
+        "and RSA listeners, which such a board refuses on the pin before it "
+        "reaches their signatures. off by default: `tls-fixture-pins` is not "
+        "a default feature, so an ordinary build has no pins",
     )
     parser.add_argument(
         "--tls-key-name",
@@ -1450,7 +1727,20 @@ def main() -> int:
     print(f"{len(set(MANIFEST))} endpoints; /manifest.txt lists them", flush=True)
 
     global BOARD_HAS_FIXTURE_PINS
-    BOARD_HAS_FIXTURE_PINS = not arguments.unpinned_board
+    BOARD_HAS_FIXTURE_PINS = arguments.pinned_board
+    # Said out loud, because it is an assumption about the *other* machine
+    # that nothing here can check. A walk that fails only on the Ed25519
+    # and RSA listeners is a walk against a board whose pins are not what
+    # this line says.
+    print(
+        "board assumed to be built "
+        + (
+            "WITH tls-fixture-pins (--pinned-board)"
+            if BOARD_HAS_FIXTURE_PINS
+            else "without tls-fixture-pins; pass --pinned-board if it has them"
+        ),
+        flush=True,
+    )
     PORTS["http"] = arguments.port
     extra: list[socketserver.BaseServer] = []
     if arguments.tls_port:
@@ -1462,14 +1752,21 @@ def main() -> int:
             extra.append(server)
             print(f"  {description}", flush=True)
 
-        def tls_listener(port: int, name: str, description: str) -> bool:
+        def tls_listener(
+            port: int,
+            name: str,
+            description: str,
+            version: ssl.TLSVersion = ssl.TLSVersion.TLSv1_3,
+        ) -> bool:
             certificate = keys / f"fixture-{name}.crt"
             key = keys / f"fixture-{name}.key"
             if not certificate.exists():
                 print(f"no such fixture key: {certificate}", file=sys.stderr)
                 return False
             start(
-                TlsFixtureServer((arguments.host, port), FixtureHandler, certificate, key),
+                TlsFixtureServer(
+                    (arguments.host, port), FixtureHandler, certificate, key, version
+                ),
                 f"https://{arguments.host}:{port}/  {description}",
             )
             return True
@@ -1486,7 +1783,7 @@ def main() -> int:
                 (arguments.host, arguments.tls_port + TLS_ALERT_OFFSET), AlertHandler
             ),
             f"https://{arguments.host}:{arguments.tls_port + TLS_ALERT_OFFSET}/"
-            "  a fatal handshake_failure alert",
+            "  a fatal access_denied alert",
         )
         if not tls_listener(
             arguments.tls_port + TLS_ED25519_OFFSET,
@@ -1496,6 +1793,13 @@ def main() -> int:
             return 1
         if not tls_listener(
             arguments.tls_port + TLS_RSA_OFFSET, "rsa", "an RSA-PSS certificate"
+        ):
+            return 1
+        if not tls_listener(
+            arguments.tls_port + TLS_12_OFFSET,
+            arguments.tls_key_name,
+            "TLS 1.2 only, which the board cannot speak",
+            ssl.TLSVersion.TLSv1_2,
         ):
             return 1
 

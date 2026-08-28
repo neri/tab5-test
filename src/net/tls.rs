@@ -59,6 +59,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use embedded_tls::alert::{AlertDescription, AlertLevel};
 use embedded_tls::{
     Aes128GcmSha256, CertificateEntryRef, CertificateRef, CertificateVerifyRef, CryptoProvider,
     SignatureScheme, TlsCipherSuite, TlsConfig, TlsConnection, TlsContext, TlsError, TlsVerifier,
@@ -119,8 +120,10 @@ pub enum Authentication {
 }
 
 impl Authentication {
-    /// What a toolbar or a status line prints. Never "secure", never a
-    /// padlock: `Unverified` has not earned either.
+    /// What a status line prints. Never "secure", and never a closed
+    /// padlock: `Unverified` has not earned either. The browser's toolbar
+    /// draws it as the same open lock plaintext gets, for the same reason
+    /// (`app::browser`).
     pub fn label(self) -> &'static str {
         match self {
             Self::Unverified => "TLS UNVERIFIED",
@@ -146,10 +149,25 @@ pub enum Error {
     Connect,
     /// The peer stopped responding.
     TimedOut,
-    /// No shared TLS version or cipher suite.
+    /// No shared TLS version, cipher suite or key exchange group.
+    ///
+    /// This firmware offers TLS 1.3 only, one cipher suite
+    /// (AES-128-GCM-SHA256) and one group (secp256r1). A server older than
+    /// TLS 1.3, or configured away from those, has nothing in common with
+    /// it -- which it reports as a `protocol_version` or `handshake_failure`
+    /// alert rather than as a mystery.
     Version,
-    /// The peer ended the connection with a TLS alert.
+    /// The peer ended the connection with a fatal TLS alert: it looked at
+    /// what this offered and said no.
     Alert,
+    /// This end could not accept the server's handshake and aborted it.
+    ///
+    /// The opposite direction to [`Error::Alert`], and worth keeping apart
+    /// from it: one is a server refusing this client, the other is this
+    /// client refusing a server. Reporting the second as the first sends
+    /// someone to look at the server's configuration for a limitation that
+    /// is on this side.
+    Handshake,
     /// The certificate did not parse, or its `CertificateVerify` signature
     /// was wrong, or the signature scheme is not one this can check.
     Certificate,
@@ -176,6 +194,7 @@ impl Error {
             Self::TimedOut => "tls-timeout",
             Self::Version => "tls-version",
             Self::Alert => "tls-alert",
+            Self::Handshake => "tls-handshake",
             Self::Certificate => "tls-cert",
             Self::Pin => "tls-pin",
             Self::PinMissing => "tls-pin-missing",
@@ -195,8 +214,9 @@ impl Error {
             Self::LinkLost => "the C6 link was lost during the connection",
             Self::Connect => "the TLS connection could not be established",
             Self::TimedOut => "the server stopped responding",
-            Self::Version => "the server offered no TLS 1.3 suite this supports",
+            Self::Version => "this speaks only TLS 1.3, and the server does not",
             Self::Alert => "the server rejected the connection",
+            Self::Handshake => "the server's handshake is not one this understands",
             Self::Certificate => "the server's certificate or signature is not valid",
             Self::Pin => "the server's key does not match this firmware's pin",
             Self::PinMissing => "no pin is registered for this host",
@@ -567,6 +587,57 @@ impl<CipherSuite: TlsCipherSuite> TlsVerifier<CipherSuite> for LeafVerifier<Ciph
                 Err(TlsError::InvalidCertificate)
             }
         }
+    }
+}
+
+/// Says on the UART which alert was involved, and which way it went.
+///
+/// The screen gets one word, deliberately: a reader cannot act on
+/// `unrecognized_name`. Whoever is holding a serial cable can, and the
+/// difference between `protocol_version`, `handshake_failure` and
+/// `unrecognized_name` is the difference between three quite different
+/// things to go and change.
+fn log_alert(prefix: &[u8], level: AlertLevel, description: AlertDescription) {
+    uart::log(prefix);
+    uart::log(match level {
+        AlertLevel::Warning => b"warning ".as_slice(),
+        AlertLevel::Fatal => b"fatal ".as_slice(),
+    });
+    uart::log(alert_name(description).as_bytes());
+    uart::log(b"\r\n");
+}
+
+/// RFC 8446's name for an alert, which is what its documentation and every
+/// other implementation's logs call it.
+fn alert_name(description: AlertDescription) -> &'static str {
+    match description {
+        AlertDescription::CloseNotify => "close_notify",
+        AlertDescription::UnexpectedMessage => "unexpected_message",
+        AlertDescription::BadRecordMac => "bad_record_mac",
+        AlertDescription::RecordOverflow => "record_overflow",
+        AlertDescription::HandshakeFailure => "handshake_failure",
+        AlertDescription::BadCertificate => "bad_certificate",
+        AlertDescription::UnsupportedCertificate => "unsupported_certificate",
+        AlertDescription::CertificateRevoked => "certificate_revoked",
+        AlertDescription::CertificateExpired => "certificate_expired",
+        AlertDescription::CertificateUnknown => "certificate_unknown",
+        AlertDescription::IllegalParameter => "illegal_parameter",
+        AlertDescription::UnknownCa => "unknown_ca",
+        AlertDescription::AccessDenied => "access_denied",
+        AlertDescription::DecodeError => "decode_error",
+        AlertDescription::DecryptError => "decrypt_error",
+        AlertDescription::ProtocolVersion => "protocol_version",
+        AlertDescription::InsufficientSecurity => "insufficient_security",
+        AlertDescription::InternalError => "internal_error",
+        AlertDescription::InappropriateFallback => "inappropriate_fallback",
+        AlertDescription::UserCanceled => "user_canceled",
+        AlertDescription::MissingExtension => "missing_extension",
+        AlertDescription::UnsupportedExtension => "unsupported_extension",
+        AlertDescription::UnrecognizedName => "unrecognized_name",
+        AlertDescription::BadCertificateStatusResponse => "bad_certificate_status_response",
+        AlertDescription::UnknownPskIdentity => "unknown_psk_identity",
+        AlertDescription::CertificateRequired => "certificate_required",
+        AlertDescription::NoApplicationProtocol => "no_application_protocol",
     }
 }
 
@@ -1155,7 +1226,33 @@ impl Transaction {
             _ => {}
         }
         match error {
-            TlsError::HandshakeAborted(..) | TlsError::AbortHandshake(..) => Error::Alert,
+            // The peer's alert, and this end's, are different answers to
+            // "who refused". `HandshakeAborted` carries an alert that
+            // arrived; `AbortHandshake` carries one this end is about to
+            // send because the server's handshake was not one it could
+            // follow.
+            TlsError::HandshakeAborted(level, description) => {
+                log_alert(b"TLS: the server sent alert ", level, description);
+                // Two of the alerts a server can send mean something more
+                // specific than "no": they mean it could not agree on what
+                // to speak. Saying so is the difference between a reader
+                // who knows this firmware is TLS 1.3-only and a reader who
+                // goes looking for a fault.
+                match description {
+                    AlertDescription::ProtocolVersion
+                    | AlertDescription::HandshakeFailure
+                    | AlertDescription::InsufficientSecurity => Error::Version,
+                    _ => Error::Alert,
+                }
+            }
+            TlsError::AbortHandshake(level, description) => {
+                log_alert(
+                    b"TLS: aborting the handshake with alert ",
+                    level,
+                    description,
+                );
+                Error::Handshake
+            }
             TlsError::InvalidCertificate
             | TlsError::InvalidCertificateEntry
             | TlsError::InvalidSignature

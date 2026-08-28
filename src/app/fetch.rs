@@ -27,7 +27,7 @@ use crate::net::pins;
 use crate::net::tls::Authentication;
 use crate::net::transport::Security;
 use crate::net::{self, dns};
-use crate::{tick, wifi};
+use crate::wifi;
 
 use smoltcp::wire::Ipv4Address;
 
@@ -61,7 +61,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    const fn new(name: &'static str, headline: &'static str, detail: &'static str) -> Failure {
+    pub const fn new(name: &'static str, headline: &'static str, detail: &'static str) -> Failure {
         Failure {
             name,
             headline,
@@ -100,12 +100,21 @@ pub enum PageSecurity {
 }
 
 impl PageSecurity {
-    /// The badge text. `SECURE` appears nowhere: nothing this firmware can
-    /// do earns it yet.
-    pub fn badge(self) -> &'static str {
+    /// What the toolbar's padlock means, in words.
+    ///
+    /// The whole sentence and not a label, because it is only ever read
+    /// when somebody taps the lock to ask. `SECURE` appears nowhere:
+    /// nothing this firmware can do earns it yet, and the one state that
+    /// proved anything says exactly what it proved.
+    pub fn explanation(self) -> &'static str {
         match self {
-            Self::Cleartext => "INSECURE HTTP",
-            Self::Tls(authentication) => authentication.label(),
+            Self::Cleartext => "INSECURE HTTP: plaintext; anyone carrying it can read it",
+            Self::Tls(Authentication::Unverified) => {
+                "TLS UNVERIFIED: encrypted, but nobody checked who answered"
+            }
+            Self::Tls(Authentication::Pinned) => {
+                "TLS PINNED: the peer's key matches a pin built into this firmware"
+            }
         }
     }
 
@@ -134,16 +143,30 @@ pub struct Fetch {
     parser: Option<Parser>,
     /// A limit the document hit, which stops the transfer through the sink.
     document_error: Option<Error>,
+    /// The status of a response that is being read but is not the page that
+    /// was asked for -- anything outside 2xx that still sent HTML.
+    ///
+    /// `None` for a response that succeeded, so that "is this what was
+    /// asked for" and "what number came back" stay one question. Cleared
+    /// on every redirect: it belongs to the hop, not to the navigation.
+    status: Option<u16>,
     /// Bytes received across every hop of this navigation.
     received: usize,
     /// The largest the parser was ever holding, for the memory budget.
     peak_owned: usize,
-    started_ms: u64,
 }
 
 impl Fetch {
     /// Begins a fetch. The first byte does not leave until [`Fetch::step`].
+    ///
+    /// Network schemes only. `file:` is read by `app::localfile`, which
+    /// shares this module's `Failure` and `Outcome` but none of its
+    /// machinery -- there is no name to resolve, no socket to own and no
+    /// status to interpret.
     pub fn start(url: Url, network: &mut Network<'_>) -> Result<Fetch, Failure> {
+        if !url.scheme().is_network() {
+            return Err(NOT_NETWORK);
+        }
         let mut fetch = Fetch {
             url,
             security: None,
@@ -152,9 +175,9 @@ impl Fetch {
             transaction: None,
             parser: None,
             document_error: None,
+            status: None,
             received: 0,
             peak_owned: 0,
-            started_ms: tick::now_ms(),
         };
         fetch.open(network)?;
         Ok(fetch)
@@ -177,6 +200,16 @@ impl Fetch {
         self.security
     }
 
+    /// The status of a page that came back but was not the one asked for.
+    ///
+    /// `None` when the response succeeded, which is every ordinary page.
+    /// Set alongside [`Outcome::Page`] when a server answered outside 2xx
+    /// and sent HTML anyway: that HTML is what it has to say about the
+    /// refusal, and it is shown, with this number beside it.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
     pub fn received(&self) -> usize {
         self.received + self.current_received()
     }
@@ -188,10 +221,6 @@ impl Fetch {
     /// The most the parser held at once. Zero until a body starts arriving.
     pub fn peak_owned(&self) -> usize {
         self.peak_owned
-    }
-
-    pub fn elapsed_ms(&self) -> u64 {
-        tick::now_ms().saturating_sub(self.started_ms)
     }
 
     fn current_received(&self) -> usize {
@@ -240,6 +269,9 @@ impl Fetch {
         // request ends up asking one host for another host's page.
         let security = match self.url.scheme() {
             Scheme::Http => Security::Plain,
+            // Refused here as well as in `start`, so that a caller added
+            // later cannot turn a `file:` URL into a connection to port 0.
+            Scheme::File => return Err(NOT_NETWORK),
             Scheme::Https => Security::Tls {
                 server_name: self.url.host(),
                 // The pin table is keyed by the same string that goes in
@@ -290,8 +322,19 @@ impl Fetch {
         }
         self.parser = None;
         self.document_error = None;
+        self.status = None;
         self.security = None;
 
+        // Before the downgrade rules, because this one is not about
+        // degrees of protection. A `Location: file:///...` is a server
+        // asking the board to open its own filesystem and show what is in
+        // it. Following an address the reader typed or a link they chose
+        // is their decision with the address visible; this is the server
+        // making it for them, which is exactly what a redirect must never
+        // be allowed to do.
+        if !target.scheme().is_network() {
+            return Outcome::Failed(FILE_REDIRECT);
+        }
         if from_scheme == Scheme::Https && target.scheme() == Scheme::Http {
             return Outcome::Failed(HTTPS_DOWNGRADE);
         }
@@ -326,6 +369,9 @@ impl Fetch {
         self.security = match self.url.scheme() {
             Scheme::Http => Some(PageSecurity::Cleartext),
             Scheme::Https => transaction.authentication().map(PageSecurity::Tls),
+            // Nothing was proved about anybody, because nobody was asked.
+            // A local file's page gets the same lock a built-in page does.
+            Scheme::File => None,
         };
     }
 
@@ -495,31 +541,67 @@ impl Fetch {
             // response at all.
             return Outcome::Failed(NOT_HTTP);
         }
-        if !head.is_success() {
-            return Outcome::Failed(REFUSED.with_status(status));
-        }
-        if !head.is_html() {
+        // HTML, or text that is not HTML -- a `.txt`, a `.md`, a server's
+        // own `manifest.txt`. Anything else has no reading this can give
+        // it: an image is not text, and neither is a firmware image.
+        let markup = head.is_html();
+        if !markup && !head.is_text() {
             return Outcome::Failed(NOT_HTML.with_status(status));
         }
-
-        // Only now is a document allocated. A redirect chain, an error
-        // status and a download all get this far without one.
-        match Parser::new(self.url.clone()) {
-            Ok(parser) => {
-                self.parser = Some(parser);
-                Outcome::Working
-            }
-            Err(_) => Outcome::Failed(OUT_OF_MEMORY),
+        // A status outside 2xx is read rather than refused, as long as what
+        // came with it is HTML. A server's own 404 or 500 page is usually
+        // the only thing that says which of the many possible reasons this
+        // one was -- which resource, which parameter, which login -- and
+        // discarding it left the reader with the viewer's four words and
+        // nothing else. It is still not the page that was asked for, so
+        // the number is carried out with it and the status line says so.
+        //
+        // The two failures above stay failures: a response that is not
+        // HTTP, or not HTML, has nothing to show whatever its status.
+        if !head.is_success() {
+            self.status = status;
         }
+        // Only now is a document allocated. A redirect chain, a non-HTML
+        // response and a download all get this far without one.
+        let built = if markup {
+            Parser::new(self.url.clone())
+        } else {
+            Parser::plain(self.url.clone())
+        };
+        let mut parser = match built {
+            Ok(parser) => parser,
+            Err(_) => return Outcome::Failed(OUT_OF_MEMORY),
+        };
+        // The `charset` off the head, before any body byte reaches the
+        // parser. A header outranks the document's own `<meta>`, and
+        // saying so here is also what keeps the decoder from holding the
+        // first kilobyte back to look for a `<meta>` that could not have
+        // overruled it anyway. Borrowed rather than cloned: the head is
+        // still alive here and its label is the only copy needed.
+        if let Some(charset) = head.charset.as_deref() {
+            parser.declare_charset(charset);
+        }
+        self.parser = Some(parser);
+        Outcome::Working
     }
 
     fn complete(&mut self) -> Outcome {
         let Some(parser) = self.parser.take() else {
-            return Outcome::Failed(EMPTY);
+            return Outcome::Failed(EMPTY.with_status(self.status));
         };
         self.peak_owned = self.peak_owned.max(parser.owned_bytes());
         match parser.finish() {
-            Ok(document) => Outcome::Page(document),
+            Ok(document) => {
+                // An error status whose page turned out to have no text is
+                // no better than no page at all: a blank screen and a
+                // number in the status line does not tell a reader that
+                // anything went wrong. The viewer's own error page does,
+                // so that is what an empty refusal falls back to.
+                if self.status.is_some() && document.text().trim().is_empty() {
+                    return Outcome::Failed(REFUSED.with_status(self.status));
+                }
+                Outcome::Page(document)
+            }
             Err(failure) => Outcome::Failed(Failure {
                 name: error::error_name(failure),
                 headline: "Cannot show this page",
@@ -545,6 +627,13 @@ impl Fetch {
 /// Named as constants so the one-word `name` -- which the fixture manifest
 /// is written against -- is in one place rather than spelled out at each
 /// site that produces it.
+pub const FILE_REDIRECT: Failure = Failure::new(
+    "file-redirect",
+    "Refused to open a local file",
+    "The server redirected to a `file:` address. Opening one is something \
+     the reader does with the address in front of them, not something a \
+     server gets to ask for.",
+);
 pub const HTTPS_DOWNGRADE: Failure = Failure::new(
     "https-downgrade",
     "Refused to leave HTTPS",
@@ -577,8 +666,8 @@ pub const NOT_HTTP: Failure = Failure::new(
 pub const REFUSED: Failure = Failure::new(
     "status",
     "The server refused",
-    "Its own page for this is not shown: it is not the page that was asked \
-     for.",
+    "It sent no page to go with the refusal, or nothing that could be read \
+     as one.",
 );
 pub const NOT_HTML: Failure = Failure::new(
     "not-html",
@@ -595,6 +684,11 @@ pub const NO_NETWORK: Failure = Failure::new(
     "no-network",
     "No network",
     "Leave the browser and run wificonnect, then ipconfig dhcp.",
+);
+pub const NOT_NETWORK: Failure = Failure::new(
+    "not-network",
+    "Not something to fetch",
+    "That address does not name anything on a network.",
 );
 pub const NO_SUCH_BUILTIN: Failure = Failure::new(
     "no-such-page",

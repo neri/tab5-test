@@ -56,13 +56,20 @@
     - `src/app/wifi_retry.rs`: association失敗のreason、timeout、RPC結果を、停止または待ち時間へ変換する副作用のないpolicy。reason 4の短い再試行、一般の指数backoff、10分安定後の失敗回数resetをホスト単体testで検査する
     - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する
     - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
-      toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件と
-      戻る、アドレス欄の編集、通信を必要としない組み込みページ（`http://built-in/`）を
-      持つ。文書の取得そのものは持たない（[`BROWSER.md`](BROWSER.md)）
+      toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件の
+      戻る・進む・再読込、toolbarのボタンとセキュリティの南京錠、アドレス欄の編集、
+      通信を必要としない組み込みページ（`http://built-in/`）を持つ。文書の取得
+      そのものは持たない（[`BROWSER.md`](BROWSER.md)）
     - `src/app/fetch.rs`: 1ページ分の取得の状態機械。名前解決→接続→応答headの判定
-      （redirect追跡・statusの判定・HTMLかどうか）→本文→文書。`step`は決まった量だけ
+      （redirect追跡・statusの判定・HTMLかどうか・`charset`）→本文→文書。2xx以外でも
+      HTMLなら本文を組み立て、statusを添えて返す。`step`は決まった量だけ
       進めて戻るので、画面を持つ`browser.rs`と持たない`browsertest.rs`の両方が同じ
       ものを回せる。DNS socketのslotとTCP socket handleを所有するので`close`が必須
+    - `src/app/localfile.rs`: `file:`スキームの読み出し。ディレクトリはリンクの
+      一覧ページにして一度に組み、ファイルは拡張子で読み方（`.html`はmarkup、
+      それ以外はplain text）を決めて16 KiBずつ読む。`fetch.rs`と同じ
+      start／step／closeの形で、`Failure`と`Outcome`を共有する。VFSの
+      ファイルハンドルを所有するので`close`が必須（[`BROWSER.md`](BROWSER.md)）
     - `src/app/browsertest.rs`: `hs`（1回の取得を数値で報告）と`bt`（fixture serverの
       `/manifest.txt`を巡回して期待値と突き合わせ）の診断
     - `src/app/pointer.rs`: `win`と`browser`が共有するマウスカーソル。下地の退避・
@@ -86,9 +93,15 @@
   クレート境界を意識しない
 - `browser/src/url.rs`: URL解析・検証・相対参照解決。表示するアドレスと実際に
   接続するhost／portを同じ値から生成することがこのモジュールの存在理由
+- `browser/src/encoding.rs`: ページのbyte列をtokenizerが読むUTF-8にする。
+  UTF-8とShift_JIS（Windows-31J）だけで、`charset`ラベルの判定、`<meta>`の
+  先頭1 KiB走査、chunk境界をまたぐ2 byte文字の持ち越しを持つ。変換表は
+  `browser/data/shiftjis.bin`（生成物。生成器は`tools/encoding/`）
 - `browser/src/html.rs`: 増分HTML tokenizer。byte単位の状態機械で、入力の
   chunk境界がtag名・文字参照・multi-byte文字・`</script`のどこに落ちても
-  結果が変わらない。生HTMLは保持しない
+  結果が変わらない。生HTMLは保持しない。plain mode（`Tokenizer::plain`）では
+  状態機械を回さず全byteをテキストにする——`text/plain`にもUTF-8の持ち越し、
+  U+FFFD置換、入力上限の計数は要るため
 - `browser/src/document.rs`: 文書モデル。DOMではなく、本文1本の`String`と
   それへのbyte範囲を持つ`Run`／`Block`／`Link`のflat arena
 - `browser/src/layout.rs`: 折返しレイアウト。行・piece・当たり判定・リンク順序。
