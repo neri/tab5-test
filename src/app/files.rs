@@ -320,9 +320,9 @@ fn column_width(entries: &[Entry], column: usize, rows: usize) -> usize {
 fn format_entry(entry: &Entry) -> String {
     let mut line = String::new();
     line.push_str(match entry.kind {
-        // A mount point is marked apart from a directory because it is not
-        // one: it belongs to the tree rather than to any volume, and `ls` of
-        // the root is showing the mount table, not a filesystem.
+        // A mount point is marked apart from a directory because it is an
+        // overlay from the mount table rather than an entry of the directory
+        // being listed.
         EntryKind::MountPoint => "mount ",
         EntryKind::Directory => "dir   ",
         EntryKind::File => "file  ",
@@ -999,10 +999,10 @@ pub fn make_directory(
 
 /// Resolves a `ram`/`sd0pN`/`usb0pN` name to something the VFS can mount.
 ///
-/// The mount point is derived from the name rather than given: `sd0p1` always
-/// lands on `/vol/sd0p1`. Letting a caller choose would mean the same volume
-/// could be reached by two different paths depending on how it was mounted,
-/// and nothing here needs that.
+/// The mount point is derived from the name rather than given: `ram` is `/`
+/// and `sd0p1` always lands on `/vol/sd0p1`. Letting a caller choose would
+/// mean the same volume could be reached by two different paths depending on
+/// how it was mounted, and nothing here needs that.
 pub fn mount(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -1084,7 +1084,7 @@ pub fn attach(
         }
     };
 
-    // Only the RAM disk is mounted read-write. SD and USB stay read-only in
+    // Only the RAM root is mounted read-write. SD and USB stay read-only in
     // every stage of this plan, and there is no option here to change that.
     let mode = if device == DeviceId::Ram {
         MountMode::ReadWrite
@@ -1123,11 +1123,11 @@ pub fn unmount(console: &mut Console, framebuffer: &mut Framebuffer, vfs: &mut V
     }
 }
 
-/// `/tmp` for the RAM disk, `/vol/<name>` for removable media.
+/// `/` for the RAM disk, `/vol/<name>` for removable media.
 fn mount_point(name: &str, device: DeviceId) -> Line {
     let mut point = Line::new();
     if device == DeviceId::Ram {
-        point.push_str("/tmp");
+        point.push_str("/");
     } else {
         point.push_str("/vol/");
         point.push_str(name);

@@ -393,11 +393,12 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "mount [<ram|sd0pN|usbMpN>]",
         lines: &[
             "with no argument, list mounts. with one, attach that volume:",
-            "ram lands on /tmp, everything else on /vol/<name>. usbM is the",
+            "ram is the permanent writable root /; everything else lands on",
+            "/vol/<name>. usbM is the",
             "number the host gave that drive when it attached, which 'devices'",
             "prints; it stays with the drive until it is unplugged, so pulling",
             "one stick never renumbers another. SD and USB are always",
-            "read-only; only /tmp is writable",
+            "read-only; /vol is reserved for their mount points",
         ],
     },
     HelpEntry {
@@ -461,8 +462,8 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "(FAT gives every subdirectory a . and a ..); -la does both.",
             "with no path, list the current one. a path not starting with /",
             "is taken from there, and one containing spaces goes in double",
-            "quotes. / itself holds no volume: it lists /tmp and /vol, and",
-            "the mounted volumes are under /vol",
+            "quotes. / is the writable RAM disk; /tmp is the conventional",
+            "temporary directory and external volumes are under /vol",
         ],
     },
     HelpEntry {
@@ -544,7 +545,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "write <path> <text>",
         lines: &[
             "create or replace a file with one line of text, e.g.",
-            "write /tmp/NOTE.TXT hello. only /tmp is writable; SD and USB",
+            "write /tmp/NOTE.TXT hello. the RAM root is writable; SD and USB",
             "refuse before any command reaches the medium",
         ],
     },
@@ -559,7 +560,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         lines: &[
             "create a directory. only the last component is created, so a",
             "parent that is not there is an error rather than something to",
-            "build silently. only /tmp is writable",
+            "build silently. /tmp and /vol themselves are reserved",
         ],
     },
     HelpEntry {
@@ -813,8 +814,8 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "limited by memory. it is written under a .part name and renamed",
             "when it completes, so a file under the real name is a whole",
             "one; a failed transfer takes its .part file with it. an",
-            "existing file of the same name is replaced. only /tmp is",
-            "writable, so cd there first",
+            "existing file of the same name is replaced. its .part file stays",
+            "beside the destination so completion is a same-volume rename",
         ],
     },
     HelpEntry {
@@ -5548,7 +5549,7 @@ fn cmd_tftpget(
             if error == fs::vfs::FsError::ReadOnly {
                 console.write_output_line(
                     framebuffer,
-                    "the file lands in the current directory; cd to a writable one (/tmp)",
+                    "the file lands in the current directory; leave a read-only /vol mount",
                 );
             }
             return;
@@ -5994,7 +5995,7 @@ fn cmd_httpget(
             if error == fs::vfs::FsError::ReadOnly {
                 console.write_output_line(
                     framebuffer,
-                    "the body lands in the current directory; cd to a writable one (/tmp)",
+                    "the body lands in the current directory; leave a read-only /vol mount",
                 );
             }
             return;

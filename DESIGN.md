@@ -46,6 +46,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [DEVICE_TREE_PLAN.md](docs/DEVICE_TREE_PLAN.md)、
 [FLASH_XIP_MIGRATION_PLAN.md](docs/FLASH_XIP_MIGRATION_PLAN.md)、
 [FONT_MIGRATION_PLAN.md](docs/FONT_MIGRATION_PLAN.md)、
+[ROOT_FILESYSTEM_PLAN.md](docs/ROOT_FILESYSTEM_PLAN.md)、
 [FILESYSTEM_PLAN.md](docs/FILESYSTEM_PLAN.md)、
 [FILESYSTEM_WORKFLOW_PLAN.md](docs/FILESYSTEM_WORKFLOW_PLAN.md)、
 [INPUT_MANAGER_PLAN.md](docs/INPUT_MANAGER_PLAN.md)、
@@ -66,13 +67,14 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [DNS_PLAN.md](docs/DNS_PLAN.md)、
 [TLS_PLAN.md](docs/TLS_PLAN.md)、
 [WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)、
-[BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)。
+[BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)、
+[SCALABLE_PROPORTIONAL_FONT_PLAN.md](docs/SCALABLE_PROPORTIONAL_FONT_PLAN.md)。
 
 ## 制約
 
 - ECO2で確認したレジスタ値とROM APIアドレスを使用しています。
 - PSRAMは32 MiB全体を固定アドレスへMMU割り当てし、フレームバッファ（1,843,200
-  byte）、`/tmp`のRAMディスク（固定8 MiB）、残る23,322,624 byte（約22.24 MiB）の
+  byte）、`/`へ載せるRAMディスク（固定8 MiB）、残る23,322,624 byte（約22.24 MiB）の
   ヒープの3つへ分けます。ヒープは`linked_list_allocator`によるグローバル
   アロケータです（[PSRAM.md](docs/PSRAM.md)）。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
@@ -82,8 +84,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
 - ストレージはブロック単位の読み書きとMBR表示に加えて、FAT12/16/32とexFATを
-  読み出すVFSがあります。**書き込めるのは`/tmp`（PSRAM上のFAT16 RAMディスク、
-  8 MiB、リセットで消える）だけ**で、SDとUSBはファイルシステム経由では常に
+  読み出すVFSがあります。**書き込めるのはPSRAM上のFAT16 RAMルート`/`
+  （8 MiB、リセットで消える）だけ**で、SDとUSBはファイルシステム経由では常に
   読み取り専用です。exFATは形式として読み取り専用です
   （[FILESYSTEM.md](docs/FILESYSTEM.md)）。SDのUHS-Iモードは未実装です。
   ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みですが、間欠故障の
@@ -101,7 +103,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   `SECURE`とは表示しません。SPKI pinの仕組みはありますが登録先は空です
   （[NETWORK.md](docs/NETWORK.md)、[TLS_PLAN.md](docs/TLS_PLAN.md)）。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
-  受信したファイルは`/tmp`（8 MiB、リセットで消える）へ保存できます
+  受信したファイルはRAMルート上のカレントディレクトリへ保存できます
   （[NETWORK.md](docs/NETWORK.md)、[FILESYSTEM.md](docs/FILESYSTEM.md)）。
   HTTPは同期の`httpget`と、1回のpollごとに戻る`net::http::Transaction`の
   2つの顔がありますが、実装は1つです。

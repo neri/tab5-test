@@ -4,6 +4,8 @@
 > この文書は作業計画です。実装を開始した後の仕様は現状文書とコードを優先します。
 > 現状のファイルシステム: [`FILESYSTEM.md`](FILESYSTEM.md)、
 > 段階分けの履歴: [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)
+> 本文の「書き込み先は`/tmp`だけ」とRAMディスクの`/tmp`マウントは当時の記録です。
+> 現在は[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)でRAMディスクを`/`へ移しています。
 
 ## 状態
 

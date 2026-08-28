@@ -381,16 +381,14 @@ pub fn run(
             }
         }
 
-        // A link that has died is otherwise only discovered by trying to
-        // use it, which from the reader's side looks like every page
-        // failing for its own reason.
-        if pending.as_ref().is_some_and(Pending::is_network) && addressed_network(wifi).is_none() {
-            viewer.report_lost_link();
-            // A lost association makes the manager discard the whole old
-            // stack, so any socket handles in this fetch are gone with it.
-            // If a stack still exists, close against it before dropping.
+        // A managed connection can disappear between two page-fetch steps.
+        // Its old socket belongs to the old stack and cannot survive, but a
+        // GET can: keep the navigation and restart it once reassociation and
+        // DHCP have produced a new addressed stack.
+        if pending.as_ref().is_some_and(Pending::is_network_transfer) && !network_is_addressed(wifi)
+        {
             if let Some(active) = pending.take() {
-                close_pending(active, wifi, vfs);
+                suspend_or_fail(active, &mut viewer, &mut pending, wifi, vfs);
             }
         }
 
@@ -412,6 +410,33 @@ pub fn run(
             );
         }
 
+        // `Source::WaitingForNetwork` owns no socket. It deliberately stays
+        // pending so Escape and a newer navigation still have their ordinary
+        // meanings while the manager performs reassociation and DHCP.
+        if pending
+            .as_ref()
+            .is_some_and(Pending::is_waiting_for_network)
+        {
+            if network_is_addressed(wifi) {
+                let active = pending.take().expect("network wait is pending");
+                let navigation = active.navigation;
+                pending = begin(
+                    &mut viewer,
+                    navigation,
+                    wifi,
+                    vfs,
+                    ram_disk.as_deref_mut(),
+                    input,
+                );
+            } else if !network_is_recovering(wifi) {
+                let active = pending.take().expect("network wait is pending");
+                let url = active.navigation.url.clone();
+                let how = active.navigation.how;
+                close_pending(active, wifi, vfs);
+                viewer.show_failure(&url, fetch::NO_NETWORK, how);
+            }
+        }
+
         let outcome = match pending.as_mut() {
             Some(active) => {
                 let outcome = match &mut active.source {
@@ -427,6 +452,9 @@ pub fn run(
                         };
                         Some(read.step(vfs, &mut devices))
                     }
+                    // Handled just above: it either remains waiting, becomes
+                    // a network transfer, or becomes a no-network failure.
+                    Source::WaitingForNetwork => None,
                 };
                 if outcome.is_some() {
                     viewer.update_loading(active.received(), active.security());
@@ -458,10 +486,22 @@ pub fn run(
             }
             Some(FetchOutcome::Failed(failure)) => {
                 if let Some(active) = pending.take() {
-                    let url = active.landed();
-                    let how = active.navigation.how;
-                    close_pending(active, wifi, vfs);
-                    viewer.show_failure(&url, failure, how);
+                    // A transfer can be the operation that makes a dead C6
+                    // link observable. Let the manager consume that evidence
+                    // before deciding whether this is a page failure or an
+                    // automatically recoverable Wi-Fi interruption.
+                    service_link(wifi);
+                    if active.is_network_transfer()
+                        && !network_is_addressed(wifi)
+                        && network_is_recovering(wifi)
+                    {
+                        suspend_or_fail(active, &mut viewer, &mut pending, wifi, vfs);
+                    } else {
+                        let url = active.landed();
+                        let how = active.navigation.how;
+                        close_pending(active, wifi, vfs);
+                        viewer.show_failure(&url, failure, how);
+                    }
                 }
             }
         }
@@ -506,6 +546,39 @@ fn close_pending(pending: Pending, wifi: &mut WifiManager, vfs: &mut Vfs) {
             }
         }
         Source::Local(read) => read.close(vfs),
+        Source::WaitingForNetwork => {}
+    }
+}
+
+/// Drops an interrupted transfer and either waits for the manager or reports
+/// the same no-network failure a non-managed connection has always produced.
+fn suspend_or_fail(
+    pending: Pending,
+    viewer: &mut Viewer,
+    slot: &mut Option<Pending>,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+) {
+    let Pending { source, navigation } = pending;
+    match source {
+        Source::Network(fetch) => {
+            if let Some(mut link) = raw_network(wifi) {
+                fetch.close(&mut link);
+            }
+        }
+        Source::Local(read) => read.close(vfs),
+        Source::WaitingForNetwork => {}
+    }
+    if network_is_recovering(wifi) {
+        viewer.wait_for_network(&navigation.url);
+        *slot = Some(Pending {
+            source: Source::WaitingForNetwork,
+            navigation,
+        });
+    } else {
+        let url = navigation.url.clone();
+        let how = navigation.how;
+        viewer.show_failure(&url, fetch::NO_NETWORK, how);
     }
 }
 
@@ -655,6 +728,26 @@ fn addressed_network(wifi: &mut WifiManager) -> Option<Network<'_>> {
     raw_network(wifi).filter(|network| network.stack.has_address())
 }
 
+fn network_is_addressed(wifi: &WifiManager) -> bool {
+    wifi.stack().is_some_and(crate::net::Stack::has_address)
+}
+
+/// Whether the manager is already doing work that can produce a fresh stack.
+///
+/// `Associated` is deliberately absent: that is also the terminal state of a
+/// CLI connection whose address must be configured manually. The other four
+/// states are transient states of managed reassociation or DHCP recovery.
+fn network_is_recovering(wifi: &WifiManager) -> bool {
+    use super::wifi_manager::State;
+    matches!(
+        wifi.state(),
+        State::Associating { .. }
+            | State::RetryWaiting { .. }
+            | State::RequestingDhcp { .. }
+            | State::AssociatedNoLease(_)
+    )
+}
+
 /// Starts a navigation, or answers it without leaving the board when it
 /// can.
 ///
@@ -678,6 +771,13 @@ fn begin(
     }
     if !navigation.url.scheme().is_network() {
         return begin_local(viewer, navigation, vfs, ram_disk, input);
+    }
+    if !network_is_addressed(wifi) && network_is_recovering(wifi) {
+        viewer.wait_for_network(&navigation.url);
+        return Some(Pending {
+            source: Source::WaitingForNetwork,
+            navigation,
+        });
     }
     let mut network = addressed_network(wifi);
     let Some(network) = network.as_mut() else {
@@ -792,6 +892,9 @@ struct Pending {
 enum Source {
     Network(Fetch),
     Local(LocalRead),
+    /// Reassociation and DHCP are in progress. Owns no socket; the navigation
+    /// is restarted from its original URL once a new addressed stack exists.
+    WaitingForNetwork,
 }
 
 impl Pending {
@@ -804,6 +907,7 @@ impl Pending {
         match &self.source {
             Source::Network(fetch) => fetch.url().clone(),
             Source::Local(_) => self.navigation.url.clone(),
+            Source::WaitingForNetwork => self.navigation.url.clone(),
         }
     }
 
@@ -811,14 +915,14 @@ impl Pending {
     fn security(&self) -> Option<fetch::PageSecurity> {
         match &self.source {
             Source::Network(fetch) => fetch.security(),
-            Source::Local(_) => None,
+            Source::Local(_) | Source::WaitingForNetwork => None,
         }
     }
 
     fn status(&self) -> Option<u16> {
         match &self.source {
             Source::Network(fetch) => fetch.status(),
-            Source::Local(_) => None,
+            Source::Local(_) | Source::WaitingForNetwork => None,
         }
     }
 
@@ -826,6 +930,7 @@ impl Pending {
         match &self.source {
             Source::Network(fetch) => fetch.received(),
             Source::Local(read) => read.received(),
+            Source::WaitingForNetwork => 0,
         }
     }
 
@@ -833,11 +938,16 @@ impl Pending {
         match &self.source {
             Source::Network(fetch) => fetch.peak_owned(),
             Source::Local(read) => read.peak_owned(),
+            Source::WaitingForNetwork => 0,
         }
     }
 
-    fn is_network(&self) -> bool {
+    fn is_network_transfer(&self) -> bool {
         matches!(self.source, Source::Network(_))
+    }
+
+    fn is_waiting_for_network(&self) -> bool {
+        matches!(self.source, Source::WaitingForNetwork)
     }
 }
 
@@ -1042,8 +1152,6 @@ struct Viewer {
     /// toolbar only repaints when something on it changed, and the Wi-Fi
     /// state changes a handful of times in a session.
     wifi: WifiLevel,
-    /// Whether the link was already reported as lost, so it is said once.
-    link_reported: bool,
     dirty: Dirty,
 }
 
@@ -1062,7 +1170,6 @@ impl Viewer {
             slowest_repaint_ms: 0,
             last_peak: 0,
             wifi: WifiLevel::Off,
-            link_reported: false,
             dirty: Dirty {
                 toolbar: true,
                 viewport: true,
@@ -1102,13 +1209,11 @@ impl Viewer {
         }
     }
 
-    /// Says once that the link is gone.
-    fn report_lost_link(&mut self) {
-        if self.link_reported {
-            return;
-        }
-        self.link_reported = true;
-        self.say("the Wi-Fi link is gone; leave and run wificonnect again");
+    /// Keeps the requested address visibly loading while managed Wi-Fi
+    /// reassociation and DHCP run underneath it.
+    fn wait_for_network(&mut self, url: &Url) {
+        self.begin_loading(url);
+        self.say("reconnecting Wi-Fi; this page will retry automatically");
     }
 
     /// Takes the current Wi-Fi state, repainting the bar only on a change.

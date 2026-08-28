@@ -39,7 +39,7 @@ use alloc::vec::Vec;
 use crate::delay::delay_ms;
 use crate::fs::partition::PartitionRange;
 use crate::fs::registry::{DeviceId, Devices};
-use crate::fs::vfs::{MountMode, Vfs};
+use crate::fs::vfs::{EntryKind, MountMode, Vfs};
 use crate::fs::{self, RamBlockDevice, SdSlot};
 use crate::input::InputManager;
 use crate::lcd::Display;
@@ -127,11 +127,11 @@ pub fn run(psram: Psram) {
     // The RAM disk is formatted here, once, before anything can reach it.
     // Its PSRAM span holds whatever the last boot left behind, and a stale
     // FAT header there would be read as a live filesystem, so the volume is
-    // rebuilt every time rather than probed. A failure leaves the device
-    // absent: there is no fallback that hands the span to the heap instead,
-    // because the fixed layout is what keeps the reservation useful.
-    let mut ram_disk = init_ram_disk(&psram, &mut boot_lines);
-    // The mount table outlives every command: `/tmp` is attached once here,
+    // rebuilt every time rather than probed. A failure panics: there is no
+    // alternate writable root and no fallback that hands the fixed span to
+    // the heap instead.
+    let mut ram_disk = Some(init_ram_disk(&psram));
+    // The mount table outlives every command: `/` is attached once here,
     // and whatever the user mounts later stays until they unmount it.
     let mut vfs = Vfs::new();
 
@@ -147,14 +147,11 @@ pub fn run(psram: Psram) {
     let mut auto_mount = automount::AutoMount::new();
 
     let mut input = InputManager::new();
-    if ram_disk.is_some() {
-        mount_ram_disk(
-            &mut vfs,
-            ram_disk.as_mut(),
-            input.usb_host_mut(),
-            &mut boot_lines,
-        );
-    }
+    mount_ram_disk(
+        &mut vfs,
+        ram_disk.as_mut().expect("RAM disk initialized"),
+        input.usb_host_mut(),
+    );
 
     // One owner keeps the C6 link, IP stack and the policy connecting them
     // coherent across shell commands and full-screen modes.
@@ -360,57 +357,48 @@ pub fn run(psram: Psram) {
 
 /// Claims the PSRAM RAM disk span and puts a fresh FAT16 volume on it.
 ///
-/// Failures are reported on the console as well as UART because whether
-/// `/tmp` exists changes what the shell can do. Success stays silent; RAM
-/// disk capacity remains available through the explicit memory diagnostics.
-fn init_ram_disk(psram: &Psram, boot_lines: &mut Vec<shell::Line>) -> Option<RamBlockDevice> {
-    let mut device = RamBlockDevice::claim(psram)?;
+/// The RAM root has no useful degraded mode: every writable path and the
+/// parent namespace of external mounts depend on it. A failure is logged and
+/// then panics instead of continuing with a different filesystem shape.
+fn init_ram_disk(psram: &Psram) -> RamBlockDevice {
+    let Some(mut device) = RamBlockDevice::claim(psram) else {
+        uart::log(b"FS: RAM disk claim failed\r\n");
+        panic!("RAM disk claim failed");
+    };
     match fs::format::fat16(&mut device) {
         Ok(layout) => {
             fs::format::log_layout(&layout);
-            // Without content the volume would mount and list nothing, which
-            // looks identical to a reader that cannot see entries.
+            // The seed builds `/tmp`, `/vol` and the independent reader
+            // fixtures before the volume is exposed as the root.
             if let Err(error) = fs::seed::test_files(&mut device, &layout) {
-                let mut line = shell::Line::new();
-                line.push_str("ram disk seed failed: ");
-                line.push_str(fs::seed::error_name(error));
-                uart::log(line.as_str().as_bytes());
+                uart::log(b"FS: RAM disk initial tree failed: ");
+                uart::log(fs::seed::error_name(error).as_bytes());
                 uart::log(b"\r\n");
-                boot_lines.push(line);
-                return None;
+                panic!("RAM disk initial tree failed");
             }
-            Some(device)
+            device
         }
         Err(error) => {
-            let mut line = shell::Line::new();
-            line.push_str("ram disk format failed: ");
-            line.push_str(fs::format::error_name(error));
-            uart::log(line.as_str().as_bytes());
+            uart::log(b"FS: RAM disk format failed: ");
+            uart::log(fs::format::error_name(error).as_bytes());
             uart::log(b"\r\n");
-            boot_lines.push(line);
-            None
+            panic!("RAM disk format failed");
         }
     }
 }
 
-/// Attaches the RAM disk at `/tmp`.
+/// Attaches the RAM disk at `/` and verifies its two reserved directories.
 ///
-/// The mount is explicit even though nothing else could be at `/tmp`: the
-/// VFS has no auto-mount path at all, so that a volume appearing in the tree
-/// always corresponds to something that asked for it.
-///
-/// The RAM disk is the one read-write mount. Its `MountMode` says so, but
-/// what actually keeps writes off the other media is their block adapters
-/// refusing them, so this is a statement of policy rather than the guard.
+/// It is permanent for this boot. `Vfs::umount` refuses the root path, so
+/// every later external mount keeps the same parent namespace.
 fn mount_ram_disk(
     vfs: &mut Vfs,
-    ram_disk: Option<&mut RamBlockDevice>,
+    ram_disk: &mut RamBlockDevice,
     usb_host: &mut crate::usb::UsbHost,
-    boot_lines: &mut Vec<shell::Line>,
 ) {
     let mut sd = SdSlot::new();
     let mut devices = Devices {
-        ram: ram_disk,
+        ram: Some(ram_disk),
         sd: &mut sd,
         usb: usb_host,
     };
@@ -426,19 +414,28 @@ fn mount_ram_disk(
     // than through an MBR entry.
     let outcome = vfs.mount(
         &mut devices,
-        "/tmp",
+        "/",
         DeviceId::Ram,
         None,
         range,
         MountMode::ReadWrite,
     );
     if let Err(error) = outcome {
-        let mut line = shell::Line::new();
-        line.push_str("mounting /tmp failed: ");
-        line.push_str(fs::vfs::error_name(error));
-        uart::log(line.as_str().as_bytes());
+        uart::log(b"FS: mounting RAM root failed: ");
+        uart::log(fs::vfs::error_name(error).as_bytes());
         uart::log(b"\r\n");
-        boot_lines.push(line);
+        panic!("mounting RAM root failed");
+    }
+    for path in ["/tmp", "/vol"] {
+        let ready = vfs
+            .metadata(&mut devices, path)
+            .is_ok_and(|metadata| metadata.kind == EntryKind::Directory);
+        if !ready {
+            uart::log(b"FS: RAM root missing reserved directory ");
+            uart::log(path.as_bytes());
+            uart::log(b"\r\n");
+            panic!("RAM root missing reserved directory");
+        }
     }
 }
 

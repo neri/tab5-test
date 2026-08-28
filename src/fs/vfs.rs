@@ -58,6 +58,11 @@ pub const MAX_MOUNTS: usize = 8;
 /// this at once is doing something the VFS has not been designed for yet.
 pub const MAX_OPEN_FILES: usize = 4;
 
+/// Entries whose names define the VFS namespace rather than ordinary user
+/// content on the RAM root.
+const TMP_NAME: &str = "tmp";
+const VOL_NAME: &str = "vol";
+
 /// Which medium a mount is on, and which incarnation of it.
 ///
 /// `generation` is not a USB address or an enumeration count: it is the
@@ -160,6 +165,10 @@ pub enum FsError {
     TooManyOpenFiles,
     /// The mount point exists but a handle is still open on it.
     Busy,
+    /// The path names a VFS-owned namespace entry. `/tmp` itself must stay
+    /// present, and `/vol` plus its unmounted children are reserved for
+    /// external-volume mount points.
+    ReservedPath,
     NotFound,
     NotAFile,
     NotADirectory,
@@ -193,6 +202,7 @@ pub fn error_name(error: FsError) -> &'static str {
         FsError::MountTableFull => "mount table full",
         FsError::TooManyOpenFiles => "too many open files",
         FsError::Busy => "busy: files are still open",
+        FsError::ReservedPath => "reserved path",
         FsError::NotFound => "no such file or directory",
         FsError::NotAFile => "not a file",
         FsError::NotADirectory => "not a directory",
@@ -471,11 +481,6 @@ impl Vfs {
         mode: MountMode,
     ) -> Result<(), FsError> {
         let point = path::normalize(point)?;
-        if point.is_root() {
-            // The root is the synthetic node that lists the mount points; a
-            // volume there would have nowhere to list them.
-            return Err(FsError::AlreadyMounted);
-        }
         if self.find_mount_exact(&point).is_some() {
             return Err(FsError::AlreadyMounted);
         }
@@ -636,6 +641,12 @@ impl Vfs {
     /// whether to close its files than this is to decide for it.
     pub fn umount(&mut self, point: &str) -> Result<(), FsError> {
         let point = path::normalize(point)?;
+        // The RAM root is established once during boot and is the namespace
+        // every other mount lives under. Dropping it while child mounts stay
+        // live would leave a tree whose parent volume disappeared.
+        if point.is_root() {
+            return Err(FsError::ReservedPath);
+        }
         let slot = self.find_mount_exact(&point).ok_or(FsError::NotMounted)?;
         let volume = self.mounts[slot].as_ref().expect("checked").volume;
         if self
@@ -694,12 +705,13 @@ impl Vfs {
     ) -> Result<(), FsError> {
         let path = path::normalize(path)?;
 
-        // Above the volumes the tree belongs to no medium, so there is
-        // nothing to open: the entries are the mount table, read sideways.
+        // A VFS may be inspected before its root volume is established. In
+        // that state, the only visible nodes are supplied by the mount table.
         let Some((mount, within)) = self.resolve(&path) else {
             return self.list_tree(&path, out);
         };
-        with_volume(devices, &mount, |volume| match volume {
+        let mut seen_mount_children = [false; MAX_MOUNTS];
+        let outcome = with_volume(devices, &mount, |volume| match volume {
             AnyVolume::Fat(volume) => {
                 let directory = match lookup(volume, &within)? {
                     None => volume.root_dir(),
@@ -718,16 +730,22 @@ impl Vfs {
                     let Some(file) = entry.as_entry() else {
                         continue;
                     };
+                    let name = entry.name();
+                    let overlay = self.mark_mount_children(&path, &name, &mut seen_mount_children);
                     let (date, time, _) = file.modified().to_raw();
                     out(DirEntry {
-                        name: &entry.name(),
-                        kind: if file.is_directory() {
+                        name: &name,
+                        kind: overlay.unwrap_or(if file.is_directory() {
                             EntryKind::Directory
                         } else {
                             EntryKind::File
+                        }),
+                        size: if overlay.is_some() { 0 } else { file.len() },
+                        modified: if overlay.is_some() {
+                            None
+                        } else {
+                            Timestamp::from_raw(date, time)
                         },
-                        size: file.len(),
-                        modified: Timestamp::from_raw(date, time),
                     });
                 }
                 Ok(())
@@ -745,34 +763,118 @@ impl Vfs {
                 };
                 for entry in directory.entries() {
                     let entry = entry.map_err(|_| FsError::NotAFilesystem)?;
+                    let overlay =
+                        self.mark_mount_children(&path, &entry.name, &mut seen_mount_children);
                     out(DirEntry {
                         name: &entry.name,
-                        kind: if entry.is_directory() {
+                        kind: overlay.unwrap_or(if entry.is_directory() {
                             EntryKind::Directory
                         } else {
                             EntryKind::File
-                        },
+                        }),
                         // The content length, not the allocated one: a file
                         // occupying whole clusters is still only as long as
                         // its valid data.
-                        size: entry.valid_data_length,
-                        modified: Timestamp::from_exfat(&entry.modified),
+                        size: if overlay.is_some() {
+                            0
+                        } else {
+                            entry.valid_data_length
+                        },
+                        modified: if overlay.is_some() {
+                            None
+                        } else {
+                            Timestamp::from_exfat(&entry.modified)
+                        },
                     });
                 }
                 Ok(())
             }
-        })
+        });
+        outcome?;
+        self.emit_unseen_mount_children(&path, &seen_mount_children, out);
+        Ok(())
     }
 
-    /// Lists a node of the tree that sits above the volumes: the root, or
-    /// one of the directories a mount point passes through on its way down.
+    /// Marks every mount-table child hidden by an entry the underlying
+    /// volume just listed, and answers the kind the merged tree must show.
+    /// An exact child mount wins over an intermediate synthetic directory.
+    fn mark_mount_children(
+        &self,
+        parent: &Path,
+        name: &str,
+        seen: &mut [bool; MAX_MOUNTS],
+    ) -> Option<EntryKind> {
+        let mut kind = None;
+        for (index, mount) in self.mounts.iter().enumerate() {
+            let Some(mount) = mount else {
+                continue;
+            };
+            let Some((child, is_point)) = tree_child(&mount.point, parent) else {
+                continue;
+            };
+            if !path::names_equal(child, name) {
+                continue;
+            }
+            seen[index] = true;
+            if is_point {
+                kind = Some(EntryKind::MountPoint);
+            } else if kind.is_none() {
+                kind = Some(EntryKind::Directory);
+            }
+        }
+        kind
+    }
+
+    /// Emits child mounts that had no same-named entry on the underlying
+    /// volume. Several deeper mounts may contribute one intermediate node;
+    /// that name is emitted once, and an exact mount point takes precedence.
+    fn emit_unseen_mount_children(
+        &self,
+        parent: &Path,
+        seen: &[bool; MAX_MOUNTS],
+        mut out: impl FnMut(DirEntry<'_>),
+    ) {
+        for (index, mount) in self.mounts.iter().enumerate() {
+            let Some(mount) = mount else {
+                continue;
+            };
+            let Some((name, _)) = tree_child(&mount.point, parent) else {
+                continue;
+            };
+            if seen[index] {
+                continue;
+            }
+            let earlier = self.mounts[..index].iter().flatten().any(|earlier| {
+                tree_child(&earlier.point, parent)
+                    .is_some_and(|(earlier, _)| path::names_equal(earlier, name))
+            });
+            if earlier {
+                continue;
+            }
+            let exact = self.mounts.iter().flatten().any(|candidate| {
+                tree_child(&candidate.point, parent).is_some_and(|(candidate, is_point)| {
+                    is_point && path::names_equal(candidate, name)
+                })
+            });
+            out(DirEntry {
+                name,
+                kind: if exact {
+                    EntryKind::MountPoint
+                } else {
+                    EntryKind::Directory
+                },
+                size: 0,
+                modified: None,
+            });
+        }
+    }
+
+    /// Lists a synthetic node when no mounted volume covers `path`.
     ///
-    /// `/vol` is on no medium. It exists because something is mounted under
-    /// it and stops existing when the last of those goes. Synthesizing it
-    /// here is what makes the tree navigable by the names it shows: the
-    /// root used to list `sd0p1` for a volume that only answers to
-    /// `/vol/sd0p1`, so the one name a listing offered was the one a
-    /// caller could not then use.
+    /// Production establishes the RAM root before the shell starts, so this
+    /// is principally the mount-table-only behavior used during setup or by
+    /// a separately constructed VFS. It also keeps arbitrary nested mount
+    /// layouts navigable when their parent is not backed by a volume.
     fn list_tree(&self, path: &Path, mut out: impl FnMut(DirEntry<'_>)) -> Result<(), FsError> {
         let mut found = false;
         for (index, mount) in self.mounts.iter().enumerate() {
@@ -807,8 +909,8 @@ impl Vfs {
                 modified: None,
             });
         }
-        // The root is there with nothing mounted at all; every other node
-        // of the tree exists only for as long as something is under it.
+        // The synthetic root is there with nothing mounted at all; every
+        // other synthetic node exists only while something is under it.
         if found || path.is_root() {
             Ok(())
         } else {
@@ -903,6 +1005,9 @@ impl Vfs {
         if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
             return Err(FsError::ReadOnly);
         }
+        if reserved_mutation(&mount, &path) {
+            return Err(FsError::ReservedPath);
+        }
         if within.is_root() {
             // The volume's root, which is already there.
             return Err(FsError::AlreadyExists);
@@ -942,6 +1047,9 @@ impl Vfs {
             && (mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat)
         {
             return Err(FsError::ReadOnly);
+        }
+        if mode.writable() && reserved_mutation(&mount, &path) {
+            return Err(FsError::ReservedPath);
         }
         let slot = self
             .files
@@ -1225,6 +1333,9 @@ impl Vfs {
         if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
             return Err(FsError::ReadOnly);
         }
+        if reserved_mutation(&mount, &path) {
+            return Err(FsError::ReservedPath);
+        }
 
         // One reading of the clock for the whole transfer, as everywhere
         // else that writes. See `super::clock`.
@@ -1328,6 +1439,9 @@ impl Vfs {
     ) -> Result<(), FsError> {
         let path = path::normalize(path)?;
         let (mount, within) = self.writable_mount(&path)?;
+        if reserved_mutation(&mount, &path) {
+            return Err(FsError::ReservedPath);
+        }
         if within.is_root() {
             // The volume's root is the mount, not an entry in it.
             return Err(FsError::Busy);
@@ -1374,12 +1488,14 @@ impl Vfs {
         let to = path::normalize(to)?;
         let (mount, source) = self.resolve(&from).ok_or(FsError::NotMounted)?;
         let (destination_mount, destination) = self.resolve(&to).ok_or(FsError::NotMounted)?;
+        if reserved_mutation(&mount, &from) || reserved_mutation(&destination_mount, &to) {
+            return Err(FsError::ReservedPath);
+        }
         // Asked before whether either side is writable, so that a move
         // between volumes says so whichever of them happens to be read-only.
-        // The other order made the answer depend on that -- and since `/tmp`
-        // is the only writable volume, every cross-volume move would have
-        // been reported as `read-only` instead, which is true but is not the
-        // reason it cannot work.
+        // The other order made the answer depend on that. The RAM root is
+        // writable and removable volumes are not, but crossing either way is
+        // still refused because it would be a copy rather than a rename.
         if destination_mount.volume != mount.volume {
             return Err(FsError::CrossVolume);
         }
@@ -1430,6 +1546,21 @@ impl Vfs {
         self.files.iter().flatten().any(|file| {
             file.volume == volume && path::names_equal(file.path.as_str(), path.as_str())
         })
+    }
+}
+
+/// Whether mutating `path` would alter one of the namespace entries stored
+/// on the RAM root. A mounted child under `/vol` resolves to that child
+/// mount, so its ordinary read-only policy remains the error reported there.
+fn reserved_mutation(mount: &Mount, path: &Path) -> bool {
+    if !mount.point.is_root() {
+        return false;
+    }
+    let mut components = path.components();
+    match components.next() {
+        Some(first) if path::names_equal(first, TMP_NAME) => components.next().is_none(),
+        Some(first) if path::names_equal(first, VOL_NAME) => true,
+        _ => false,
     }
 }
 
@@ -1625,6 +1756,9 @@ fn with_volume<T>(
 /// are equal -- a node is not its own child. Matching is by whole
 /// components, so `/tmpfiles` is not below `/tmp`.
 fn tree_child<'a>(point: &'a Path, parent: &Path) -> Option<(&'a str, bool)> {
+    if point.as_str() == parent.as_str() {
+        return None;
+    }
     let text = point.as_str();
     let below = if parent.is_root() {
         text

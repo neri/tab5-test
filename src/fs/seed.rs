@@ -1,9 +1,8 @@
-//! Writes a few files into the freshly formatted RAM disk.
+//! Builds the initial directory tree in the freshly formatted RAM disk.
 //!
-//! The RAM disk is the only volume this firmware may write, and the write
-//! path itself does not exist yet -- so without this there would be nothing
-//! to read anywhere except a card the developer happened to prepare on a PC,
-//! and no way to tell a broken reader from an empty volume.
+//! The RAM disk is the only volume this firmware may write. This runs before
+//! the VFS mounts it, so without a seed there would be nothing to distinguish
+//! a broken reader from an empty fresh volume.
 //!
 //! These are fixtures with a job each, not example content:
 //!
@@ -16,15 +15,14 @@
 //!   output rather than a plausible prefix.
 //!
 //! The entries are written directly rather than through the filesystem
-//! library. Doing it this way keeps the `write` feature out of the build
-//! until the write path is actually implemented, and means these fixtures
-//! test the reader against bytes laid down independently of it -- a reader
-//! and writer from the same library agreeing with each other would prove
-//! less.
+//! library. The fixtures therefore test the reader against bytes laid down
+//! independently of it -- a reader and writer from the same library agreeing
+//! with each other would prove less.
 //!
-//! Everything written lands in the first FAT sector and the first root
-//! directory sector, which bounds this to a few small files. That is all it
-//! is for; [`SeedError::TooLarge`] says so rather than silently spilling.
+//! The root contains the reserved `tmp` and `vol` directories. Fixtures land
+//! in the first sector of `tmp`, and every allocated cluster stays within the
+//! first FAT sector. That bounds this to a few small files. That is all it is
+//! for; [`SeedError::TooLarge`] says so rather than silently spilling.
 
 use super::block::{BlockDevice, BlockError};
 use super::format::{DIR_ENTRY_BYTES, Fat16Layout, NUM_FATS, ROOT_ENTRY_COUNT, SECTOR_BYTES};
@@ -35,6 +33,7 @@ const ENTRIES_PER_SECTOR: usize = SECTOR_BYTES / DIR_ENTRY_BYTES;
 const FAT_ENTRIES_PER_SECTOR: u32 = SECTOR_BYTES as u32 / 2;
 
 const ATTR_ARCHIVE: u8 = 0x20;
+const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_LONG_NAME: u8 = 0x0F;
 /// Marks the last long-name entry, which is written first because the chain
 /// is stored in reverse.
@@ -42,18 +41,20 @@ const LFN_LAST: u8 = 0x40;
 /// UTF-16 units in one long-name entry: 5 + 6 + 2.
 const LFN_CHARS: usize = 13;
 const FAT16_END_OF_CHAIN: u16 = 0xFFFF;
+const TMP_CLUSTER: u32 = 2;
+const VOL_CLUSTER: u32 = 3;
+const FIRST_FILE_CLUSTER: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SeedError {
-    /// The fixtures do not fit in the first FAT sector or the first root
-    /// directory sector.
+    /// The initial tree does not fit in the first FAT or directory sector.
     TooLarge,
     Block(BlockError),
 }
 
 pub fn error_name(error: SeedError) -> &'static str {
     match error {
-        SeedError::TooLarge => "seed files do not fit the first FAT/root sector",
+        SeedError::TooLarge => "initial tree does not fit the first FAT/directory sector",
         SeedError::Block(error) => super::block::error_name(error),
     }
 }
@@ -65,7 +66,7 @@ This volume is FAT16 on a fixed 8 MiB span of PSRAM. It is created and\r\n\
 filled from scratch on every boot, so nothing written here survives a\r\n\
 reset or a power cycle.\r\n\
 \r\n\
-The three files here exist to exercise the reader: this one is a short\r\n\
+The three files in /tmp exercise the reader: this one is a short\r\n\
 8.3 name in one cluster, 'Hello World.txt' needs long-name entries, and\r\n\
 CHAIN.TXT spans several clusters.\r\n";
 
@@ -81,27 +82,69 @@ const CHAIN_LINES: u32 = 96;
 /// Writes the fixtures into a volume `format::fat16` has just created.
 pub fn test_files(device: &mut dyn BlockDevice, layout: &Fat16Layout) -> Result<(), SeedError> {
     let mut root = [0u8; SECTOR_BYTES];
+    let mut tmp = [0u8; SECTOR_BYTES];
+    let mut vol = [0u8; SECTOR_BYTES];
     let mut fat = [0u8; SECTOR_BYTES];
     // Entries 0 and 1 are reserved: the media descriptor and the end marker
     // the formatter already wrote. Data clusters start at 2.
     fat[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]);
 
+    set_fat_entry(&mut fat, TMP_CLUSTER, FAT16_END_OF_CHAIN)?;
+    set_fat_entry(&mut fat, VOL_CLUSTER, FAT16_END_OF_CHAIN)?;
+
+    let mut root_entry = 0;
+    write_entries(
+        &mut root,
+        &mut root_entry,
+        "TMP",
+        Some("tmp"),
+        TMP_CLUSTER,
+        0,
+        ATTR_DIRECTORY,
+    )?;
+    write_entries(
+        &mut root,
+        &mut root_entry,
+        "VOL",
+        Some("vol"),
+        VOL_CLUSTER,
+        0,
+        ATTR_DIRECTORY,
+    )?;
+
+    let mut tmp_entry = 0;
+    write_dot_entry(&mut tmp, &mut tmp_entry, false, TMP_CLUSTER)?;
+    write_dot_entry(&mut tmp, &mut tmp_entry, true, 0)?;
+    let mut vol_entry = 0;
+    write_dot_entry(&mut vol, &mut vol_entry, false, VOL_CLUSTER)?;
+    write_dot_entry(&mut vol, &mut vol_entry, true, 0)?;
+
     let mut state = Seeder {
         device,
         layout,
-        next_cluster: 2,
-        next_entry: 0,
+        next_cluster: FIRST_FILE_CLUSTER,
     };
 
-    state.add(&mut root, &mut fat, "README.TXT", None, README.as_bytes())?;
     state.add(
-        &mut root,
+        &mut tmp,
+        &mut tmp_entry,
+        &mut fat,
+        "README.TXT",
+        None,
+        README.as_bytes(),
+    )?;
+    state.add(
+        &mut tmp,
+        &mut tmp_entry,
         &mut fat,
         "HELLOW~1.TXT",
         Some("Hello World.txt"),
         HELLO.as_bytes(),
     )?;
-    state.add_chain_file(&mut root, &mut fat)?;
+    state.add_chain_file(&mut tmp, &mut tmp_entry, &mut fat)?;
+
+    state.write_cluster(TMP_CLUSTER, &tmp)?;
+    state.write_cluster(VOL_CLUSTER, &vol)?;
 
     // The FAT and the directory go down last. Until they do, the clusters
     // written above are unreachable, so a failure part way through leaves an
@@ -125,26 +168,28 @@ struct Seeder<'a, 'd> {
     device: &'a mut dyn BlockDevice,
     layout: &'d Fat16Layout,
     next_cluster: u32,
-    next_entry: usize,
 }
 
 impl Seeder<'_, '_> {
     /// Writes `data` into fresh clusters and adds its directory entries.
     fn add(
         &mut self,
-        root: &mut [u8; SECTOR_BYTES],
+        directory: &mut [u8; SECTOR_BYTES],
+        next_entry: &mut usize,
         fat: &mut [u8; SECTOR_BYTES],
         short_name: &str,
         long_name: Option<&str>,
         data: &[u8],
     ) -> Result<(), SeedError> {
         let first_cluster = self.write_clusters(fat, data)?;
-        self.write_entries(
-            root,
+        write_entries(
+            directory,
+            next_entry,
             short_name,
             long_name,
             first_cluster,
             data.len() as u32,
+            ATTR_ARCHIVE,
         )
     }
 
@@ -194,79 +239,6 @@ impl Seeder<'_, '_> {
         Ok(())
     }
 
-    /// Writes the long-name entries, if any, followed by the 8.3 entry.
-    ///
-    /// The long-name chain goes in front of the short entry and in reverse
-    /// order, each entry tagged with its position and tied to the short name
-    /// by a checksum -- which is what lets a reader that does not understand
-    /// long names skip the chain as a set of volume labels and still find the
-    /// file.
-    fn write_entries(
-        &mut self,
-        root: &mut [u8; SECTOR_BYTES],
-        short_name: &str,
-        long_name: Option<&str>,
-        first_cluster: u32,
-        size: u32,
-    ) -> Result<(), SeedError> {
-        let short = pack_short_name(short_name).ok_or(SeedError::TooLarge)?;
-
-        if let Some(long_name) = long_name {
-            let units: LongName = encode_utf16(long_name)?;
-            let checksum = short_name_checksum(&short);
-            let entry_count = units.length.div_ceil(LFN_CHARS);
-            for index in (0..entry_count).rev() {
-                let mut entry = [0u8; DIR_ENTRY_BYTES];
-                entry[0] = (index as u8 + 1)
-                    | if index + 1 == entry_count {
-                        LFN_LAST
-                    } else {
-                        0
-                    };
-                entry[11] = ATTR_LONG_NAME;
-                entry[13] = checksum;
-                for slot in 0..LFN_CHARS {
-                    let position = index * LFN_CHARS + slot;
-                    // Positions past the name hold the terminator once and
-                    // then 0xFFFF padding, which is what tells a reader where
-                    // the name stops inside a fixed-size entry.
-                    let unit = match position.cmp(&units.length) {
-                        core::cmp::Ordering::Less => units.units[position],
-                        core::cmp::Ordering::Equal => 0x0000,
-                        core::cmp::Ordering::Greater => 0xFFFF,
-                    };
-                    let offset = LFN_CHAR_OFFSETS[slot];
-                    entry[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
-                }
-                self.push_entry(root, &entry)?;
-            }
-        }
-
-        let mut entry = [0u8; DIR_ENTRY_BYTES];
-        entry[0..11].copy_from_slice(&short);
-        entry[11] = ATTR_ARCHIVE;
-        // Every timestamp field stays zero. The RTC has not been read at this
-        // point in the boot, and zero is FAT's "not set" rather than a claim
-        // about when this was written (`docs/FILESYSTEM_PLAN.md`).
-        entry[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
-        entry[28..32].copy_from_slice(&size.to_le_bytes());
-        self.push_entry(root, &entry)
-    }
-
-    fn push_entry(
-        &mut self,
-        root: &mut [u8; SECTOR_BYTES],
-        entry: &[u8; DIR_ENTRY_BYTES],
-    ) -> Result<(), SeedError> {
-        if self.next_entry >= ENTRIES_PER_SECTOR || self.next_entry >= ROOT_ENTRY_COUNT as usize {
-            return Err(SeedError::TooLarge);
-        }
-        let offset = self.next_entry * DIR_ENTRY_BYTES;
-        root[offset..offset + DIR_ENTRY_BYTES].copy_from_slice(entry);
-        self.next_entry += 1;
-        Ok(())
-    }
-
     /// Builds `CHAIN.TXT` a line at a time, straight into its clusters.
     ///
     /// The content is generated rather than held as a constant so the file
@@ -276,7 +248,8 @@ impl Seeder<'_, '_> {
     /// stopping early.
     fn add_chain_file(
         &mut self,
-        root: &mut [u8; SECTOR_BYTES],
+        directory: &mut [u8; SECTOR_BYTES],
+        next_entry: &mut usize,
         fat: &mut [u8; SECTOR_BYTES],
     ) -> Result<(), SeedError> {
         const LINE_BYTES: usize = 64;
@@ -319,8 +292,100 @@ impl Seeder<'_, '_> {
         set_fat_entry(fat, cluster, FAT16_END_OF_CHAIN)?;
         self.next_cluster = cluster + 1;
 
-        self.write_entries(root, "CHAIN.TXT", None, first, total as u32)
+        write_entries(
+            directory,
+            next_entry,
+            "CHAIN.TXT",
+            None,
+            first,
+            total as u32,
+            ATTR_ARCHIVE,
+        )
     }
+}
+
+/// Writes the long-name entries, if any, followed by the 8.3 entry.
+/// The same encoder builds files and the two named directories.
+fn write_entries(
+    directory: &mut [u8; SECTOR_BYTES],
+    next_entry: &mut usize,
+    short_name: &str,
+    long_name: Option<&str>,
+    first_cluster: u32,
+    size: u32,
+    attributes: u8,
+) -> Result<(), SeedError> {
+    let short = pack_short_name(short_name).ok_or(SeedError::TooLarge)?;
+
+    if let Some(long_name) = long_name {
+        let units: LongName = encode_utf16(long_name)?;
+        let checksum = short_name_checksum(&short);
+        let entry_count = units.length.div_ceil(LFN_CHARS);
+        for index in (0..entry_count).rev() {
+            let mut entry = [0u8; DIR_ENTRY_BYTES];
+            entry[0] = (index as u8 + 1)
+                | if index + 1 == entry_count {
+                    LFN_LAST
+                } else {
+                    0
+                };
+            entry[11] = ATTR_LONG_NAME;
+            entry[13] = checksum;
+            for slot in 0..LFN_CHARS {
+                let position = index * LFN_CHARS + slot;
+                let unit = match position.cmp(&units.length) {
+                    core::cmp::Ordering::Less => units.units[position],
+                    core::cmp::Ordering::Equal => 0x0000,
+                    core::cmp::Ordering::Greater => 0xFFFF,
+                };
+                let offset = LFN_CHAR_OFFSETS[slot];
+                entry[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            push_entry(directory, next_entry, &entry)?;
+        }
+    }
+
+    let mut entry = [0u8; DIR_ENTRY_BYTES];
+    entry[0..11].copy_from_slice(&short);
+    entry[11] = attributes;
+    // Every timestamp field stays zero. The RTC has not been read at this
+    // point in boot, and zero is FAT's "not set" rather than a date.
+    entry[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+    entry[28..32].copy_from_slice(&size.to_le_bytes());
+    push_entry(directory, next_entry, &entry)
+}
+
+/// `.` or `..` in one of the seeded subdirectories. A root parent is
+/// represented by cluster zero in FAT12/16.
+fn write_dot_entry(
+    directory: &mut [u8; SECTOR_BYTES],
+    next_entry: &mut usize,
+    parent: bool,
+    cluster: u32,
+) -> Result<(), SeedError> {
+    let mut entry = [0u8; DIR_ENTRY_BYTES];
+    entry[..11].fill(b' ');
+    entry[0] = b'.';
+    if parent {
+        entry[1] = b'.';
+    }
+    entry[11] = ATTR_DIRECTORY;
+    entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    push_entry(directory, next_entry, &entry)
+}
+
+fn push_entry(
+    directory: &mut [u8; SECTOR_BYTES],
+    next_entry: &mut usize,
+    entry: &[u8; DIR_ENTRY_BYTES],
+) -> Result<(), SeedError> {
+    if *next_entry >= ENTRIES_PER_SECTOR || *next_entry >= ROOT_ENTRY_COUNT as usize {
+        return Err(SeedError::TooLarge);
+    }
+    let offset = *next_entry * DIR_ENTRY_BYTES;
+    directory[offset..offset + DIR_ENTRY_BYTES].copy_from_slice(entry);
+    *next_entry += 1;
+    Ok(())
 }
 
 /// One 64-byte line of `CHAIN.TXT`, padded to a fixed width so the file's
