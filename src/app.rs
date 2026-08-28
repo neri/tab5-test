@@ -18,8 +18,8 @@ mod browser;
 mod browsertest;
 mod coord_test;
 mod fetch;
-mod font_test;
 mod files;
+mod font_test;
 mod localfile;
 mod lsusb;
 mod mbr;
@@ -27,11 +27,14 @@ mod membench;
 mod paint;
 mod pointer;
 mod shell;
+mod startup_screen;
 mod touch_test;
 mod wifi_manager;
 mod wifi_menu;
 mod wifi_retry;
 mod win;
+
+use alloc::vec::Vec;
 
 use crate::delay::delay_ms;
 use crate::fs::partition::PartitionRange;
@@ -69,10 +72,9 @@ pub fn run(psram: Psram) {
     };
     // One foreground hart owns the singleton for the lifetime of the app.
     let console = unsafe { crate::console::singleton() };
-    {
-        let framebuffer = display.framebuffer_mut();
-        console.clear(framebuffer);
-        console.write_output_line(framebuffer, BOOT_VERSION);
+    if !startup_screen::draw_initial(display.framebuffer_mut()) {
+        uart::log(b"STARTUP: initial screen flush failed\r\n");
+        return;
     }
     if !display.start() {
         return;
@@ -80,6 +82,8 @@ pub fn run(psram: Psram) {
     // The trap entry and machine interrupts are in place now, which is what
     // the tick's CLIC line needs; `uptime` and the IP stack both read it.
     tick::init();
+    let startup_screen_shown_ms = tick::now_ms();
+    let mut boot_lines: Vec<shell::Line> = Vec::new();
 
     match startup::complete_reboot_test_boot(psram_frequency_mhz == 200) {
         RebootTestBoot::Inactive => {}
@@ -105,7 +109,7 @@ pub fn run(psram: Psram) {
             line.push_u32(total);
             line.push_str("/");
             line.push_u32(total);
-            console.write_output_line(display.framebuffer_mut(), line.as_str());
+            boot_lines.push(line);
         }
         RebootTestBoot::Failed { completed, total } => {
             uart::log_hex(b"REBOOT TEST: FAIL completed=", completed);
@@ -117,7 +121,7 @@ pub fn run(psram: Psram) {
             line.push_str("/");
             line.push_u32(total);
             line.push_str(" (PSRAM fallback)");
-            console.write_output_line(display.framebuffer_mut(), line.as_str());
+            boot_lines.push(line);
         }
     }
     // The RAM disk is formatted here, once, before anything can reach it.
@@ -126,7 +130,7 @@ pub fn run(psram: Psram) {
     // rebuilt every time rather than probed. A failure leaves the device
     // absent: there is no fallback that hands the span to the heap instead,
     // because the fixed layout is what keeps the reservation useful.
-    let mut ram_disk = init_ram_disk(&psram, console, display.framebuffer_mut());
+    let mut ram_disk = init_ram_disk(&psram, &mut boot_lines);
     // The mount table outlives every command: `/tmp` is attached once here,
     // and whatever the user mounts later stays until they unmount it.
     let mut vfs = Vfs::new();
@@ -137,30 +141,71 @@ pub fn run(psram: Psram) {
     let mut shell_state = shell::State::new();
 
     // Volumes appear and disappear with the media they are on unless this is
-    // turned off. Its first pass runs on the first frame below, which is what
-    // mounts a stick that was already plugged in when the power came on --
-    // the bus scan it needs has already been paid for by `InputManager::new`.
+    // turned off. Its first pass runs after the startup screen's short USB
+    // discovery campaign, which mounts a stick that was already plugged in
+    // without blocking the first white frame.
     let mut auto_mount = automount::AutoMount::new();
 
     let mut input = InputManager::new();
     if ram_disk.is_some() {
         mount_ram_disk(
-            console,
-            display.framebuffer_mut(),
             &mut vfs,
             ram_disk.as_mut(),
             input.usb_host_mut(),
+            &mut boot_lines,
         );
     }
 
     // One owner keeps the C6 link, IP stack and the policy connecting them
     // coherent across shell commands and full-screen modes.
     let mut wifi_manager = wifi_manager::Manager::new();
-    match wifi_manager.begin_startup_auto_connect() {
-        Ok(true) => uart::log(b"WIFI: saved profile auto-connect started\r\n"),
-        Ok(false) if wifi_manager.is_enabled() => uart::log(b"WIFI: no saved profile\r\n"),
-        Ok(false) => uart::log(b"WIFI: persistent OFF; C6 powered down\r\n"),
-        Err(_) => uart::log(b"WIFI: saved profile probe failed; continuing boot\r\n"),
+    let initial_route = startup_screen::run(
+        &mut display,
+        &mut input,
+        &mut auto_mount,
+        &mut vfs,
+        ram_disk.as_mut(),
+        &mut wifi_manager,
+        startup_screen_shown_ms,
+    );
+    match initial_route {
+        startup_screen::InitialRoute::Browser => {
+            browser::run(
+                display.framebuffer_mut(),
+                &mut input,
+                &mut wifi_manager,
+                &mut vfs,
+                ram_disk.as_mut(),
+                None,
+            );
+            shell::drop_dead_session(console, display.framebuffer_mut(), &mut wifi_manager);
+        }
+        startup_screen::InitialRoute::WifiMenu => {
+            let outcome = wifi_menu::run(
+                display.framebuffer_mut(),
+                &mut input,
+                &mut wifi_manager,
+                wifi_menu::Entry::Startup,
+            );
+            if outcome == wifi_menu::Outcome::Online {
+                browser::run(
+                    display.framebuffer_mut(),
+                    &mut input,
+                    &mut wifi_manager,
+                    &mut vfs,
+                    ram_disk.as_mut(),
+                    None,
+                );
+            }
+            shell::drop_dead_session(console, display.framebuffer_mut(), &mut wifi_manager);
+        }
+        startup_screen::InitialRoute::Console => {}
+    }
+
+    console.clear(display.framebuffer_mut());
+    console.write_output_line(display.framebuffer_mut(), BOOT_VERSION);
+    for line in &boot_lines {
+        console.write_output_line(display.framebuffer_mut(), line.as_str());
     }
     console.write_prompt(display.framebuffer_mut());
     let mut blink_frames = 0u32;
@@ -255,7 +300,12 @@ pub fn run(psram: Psram) {
                 console.clear(framebuffer);
             }
             shell::Outcome::WifiMenu => {
-                wifi_menu::run(framebuffer, &mut input, &mut wifi_manager);
+                let _ = wifi_menu::run(
+                    framebuffer,
+                    &mut input,
+                    &mut wifi_manager,
+                    wifi_menu::Entry::Shell,
+                );
                 console.clear(framebuffer);
                 shell::drop_dead_session(console, framebuffer, &mut wifi_manager);
             }
@@ -310,16 +360,11 @@ pub fn run(psram: Psram) {
 
 /// Claims the PSRAM RAM disk span and puts a fresh FAT16 volume on it.
 ///
-/// Both outcomes are reported on the console rather than only to the UART:
-/// whether `/tmp` exists changes what the shell can do, and finding that out
-/// from a command that fails later is worse than being told at boot.
-fn init_ram_disk(
-    psram: &Psram,
-    console: &mut crate::console::Console,
-    framebuffer: &mut crate::framebuffer::Framebuffer,
-) -> Option<RamBlockDevice> {
+/// Failures are reported on the console as well as UART because whether
+/// `/tmp` exists changes what the shell can do. Success stays silent; RAM
+/// disk capacity remains available through the explicit memory diagnostics.
+fn init_ram_disk(psram: &Psram, boot_lines: &mut Vec<shell::Line>) -> Option<RamBlockDevice> {
     let mut device = RamBlockDevice::claim(psram)?;
-    let started_ms = tick::now_ms();
     match fs::format::fat16(&mut device) {
         Ok(layout) => {
             fs::format::log_layout(&layout);
@@ -329,23 +374,20 @@ fn init_ram_disk(
                 let mut line = shell::Line::new();
                 line.push_str("ram disk seed failed: ");
                 line.push_str(fs::seed::error_name(error));
-                console.write_output_line(framebuffer, line.as_str());
+                uart::log(line.as_str().as_bytes());
+                uart::log(b"\r\n");
+                boot_lines.push(line);
                 return None;
             }
-            let mut line = shell::Line::new();
-            line.push_str("ram disk: FAT16, ");
-            line.push_u32(layout.cluster_count);
-            line.push_str(" clusters, ");
-            line.push_u32((tick::now_ms() - started_ms) as u32);
-            line.push_str(" ms");
-            console.write_output_line(framebuffer, line.as_str());
             Some(device)
         }
         Err(error) => {
             let mut line = shell::Line::new();
             line.push_str("ram disk format failed: ");
             line.push_str(fs::format::error_name(error));
-            console.write_output_line(framebuffer, line.as_str());
+            uart::log(line.as_str().as_bytes());
+            uart::log(b"\r\n");
+            boot_lines.push(line);
             None
         }
     }
@@ -361,11 +403,10 @@ fn init_ram_disk(
 /// what actually keeps writes off the other media is their block adapters
 /// refusing them, so this is a statement of policy rather than the guard.
 fn mount_ram_disk(
-    console: &mut crate::console::Console,
-    framebuffer: &mut crate::framebuffer::Framebuffer,
     vfs: &mut Vfs,
     ram_disk: Option<&mut RamBlockDevice>,
     usb_host: &mut crate::usb::UsbHost,
+    boot_lines: &mut Vec<shell::Line>,
 ) {
     let mut sd = SdSlot::new();
     let mut devices = Devices {
@@ -395,7 +436,9 @@ fn mount_ram_disk(
         let mut line = shell::Line::new();
         line.push_str("mounting /tmp failed: ");
         line.push_str(fs::vfs::error_name(error));
-        console.write_output_line(framebuffer, line.as_str());
+        uart::log(line.as_str().as_bytes());
+        uart::log(b"\r\n");
+        boot_lines.push(line);
     }
 }
 

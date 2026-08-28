@@ -88,7 +88,8 @@ OFF中のscan、接続、IP関連コマンドはC6を暗黙に起動せず、`wi
 `wifiinfo`と`wifiup`は下層の診断なので一時的にセッションを捨てて張り直しますが、
 終了時にOFFならC6を再びpower downし、ONなら保存profileの通常接続を復元します。
 
-メニューのAP一覧は同じSSIDを1行へまとめ、最も強いRSSIのBSSIDと検出BSSID数を
+メニューは白背景、淡色のheader／footer／panel、黒い本文を基本色とする。AP一覧は
+同じSSIDを1行へまとめ、最も強いRSSIのBSSIDと検出BSSID数を
 15件ずつ表示します。上下／Page Up／Page Downで選択し、Enterまたは行のtapで接続、
 `R`で再scan、Escapeで終了します。`O`はWi-Fi全体のON/OFF、`F`は確認画面を経たprofile削除です。
 hidden SSIDは表示しますが選択できません。OPEN以外は最大64 byteの
@@ -103,8 +104,12 @@ hidden SSIDは表示しますが選択できません。OPEN以外は最大64 by
 最初に`WIFI_STORAGE_RAM`を選び、association成功後にだけ同じ設定を
 `WIFI_STORAGE_FLASH`で書くため、誤passwordや到達不能APで以前のprofileを置換しません。
 `Connect once`、CLI接続、再接続は毎回RAM保存を明示し、保存profileを上書きしません。
-起動時はC6 NVSからmodeとprofileを読み、ONかつprofileが存在すれば画面を開かず
-associationとDHCPを開始します。OFFならsessionとstackを作らずC6をpower downします。
+起動時はC6 NVSからmodeとprofileを読み、ONかつprofileが存在すれば白い起動画面の
+Wi-FiサブアプリがassociationとDHCPを進めます。回復可能な失敗は起動画面に限って
+500 ms間隔、初回を含め最大3回で止めます。OnlineならBrowser、profileなし、永続OFF、
+認証失敗、association／DHCPの終端失敗なら白いWi-Fiメニューへ進みます。OFFならsessionと
+stackを作らずC6をpower downします。起動画面を出ると理由別の通常retry policyへ戻り、
+進行中の接続とDHCPは同じ`Manager`が引き継ぎます。
 Stage 6の実機確認ではC6 reset、HP core reboot、完全電源断のすべてでprofile保持を確認しました。
 
 起動時自動接続または以前のメニュー接続が有効な状態で、メニューまたはCLIから別の接続を

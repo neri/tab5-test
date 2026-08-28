@@ -39,28 +39,6 @@ const STALE_RESCAN_BACKOFF_FRAMES: u32 = 60;
 const STALE_RESCAN_BACKOFF_MAX_FRAMES: u32 = 600;
 /// Frames a session must survive before the backoff is considered recovered.
 const STALE_RESCAN_SETTLED_FRAMES: u32 = 600;
-/// Root-port connect wait for the one scan run during boot.
-///
-/// The steady-state limit (`usb::connect_wait_ms`) is short because the frame
-/// loop blocks on every periodic re-probe of an empty port. The initial scan
-/// is different: it decides whether the firmware comes up with USB mass
-/// storage as its filesystem, and a device that had no VBUS until this scan
-/// started may still be powering up.
-///
-/// Measured worst case on this hardware is 246 ms, of which about 80 ms is
-/// `probe_port`'s own fixed VBUS-settle and core bring-up. Four times that
-/// leaves room for a slower device without making the boot that has nothing
-/// plugged in -- the only boot that spends this whole budget -- wait more
-/// than about a second. See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
-const BOOT_CONNECT_WAIT_MS: u32 = 1_000;
-/// TEST UNIT READY budget for the boot-time storage probe.
-///
-/// The slowest device measured answered its first TEST UNIT READY after
-/// 2,564 ms -- in a single command, not by being polled, so this budget is
-/// checked between commands rather than interrupting one. A device that
-/// never becomes ready (a card reader with no card) is what the budget is
-/// actually for: it answers "not ready" every 110 ms indefinitely.
-const BOOT_MASS_STORAGE_READY_MS: u32 = 4_000;
 const MAX_TOUCH_POINTS: usize = 10;
 
 /// A normalized key understood by application-level input consumers.
@@ -171,7 +149,10 @@ pub struct InputManager {
 }
 
 impl InputManager {
-    /// Initializes both I2C keyboards and the USB-A host.
+    /// Initializes both I2C keyboards and an empty USB-A host registry.
+    ///
+    /// The startup screen owns the first USB scan so it can show progress and
+    /// remain cancellable. Steady-state scans remain in [`Self::service`].
     pub fn new() -> Self {
         let cardkb = if crate::i2c::initialize_cardkb_bus().is_ok() {
             CardKb::init()
@@ -204,14 +185,9 @@ impl InputManager {
             uart::log(b"Touch: absent\r\n");
         }
 
-        let mut usb_host = usb::UsbHost::new();
+        let usb_host = usb::UsbHost::new();
         uart::log(b"USB ENUM: bounded retry v9\r\n");
         uart::log(b"USB STABILITY: phase-aligned split HID v24\r\n");
-        let steady_state_connect_wait = usb::set_connect_wait_ms(BOOT_CONNECT_WAIT_MS);
-        usb_host.rescan(usb::RescanReason::Manual);
-        usb::set_connect_wait_ms(steady_state_connect_wait);
-        uart::log(b"USB: initial scan complete\r\n");
-        log_boot_usb_timing(&mut usb_host);
 
         Self {
             cardkb,
@@ -593,6 +569,20 @@ impl InputManager {
     pub fn usb_host_mut(&mut self) -> &mut usb::UsbHost {
         &mut self.usb_host
     }
+
+    /// Finalizes and logs the frame-driven initial USB scan.
+    pub fn finish_boot_usb_scan(&mut self, started_ms: u64) {
+        let needs_retry = self.usb_host.bus_devices().next().is_none();
+        self.usb_host.finish_boot_scan_campaign(started_ms);
+        if needs_retry {
+            // The startup screen has made its bounded verdict, but the bus
+            // remains live. Make the first ordinary fallback rescan happen
+            // on the next `service` call instead of waiting 300 frames.
+            self.usb_reconnect_frames = ROOT_RESCAN_FRAMES;
+        }
+        uart::log(b"USB: initial scan complete\r\n");
+        log_boot_usb_timing(&self.usb_host);
+    }
 }
 
 /// Reports how long the boot scan took to reach a mass-storage device that
@@ -603,7 +593,7 @@ impl InputManager {
 /// only defensible if the numbers behind it came from real devices. The three
 /// SCSI commands it ends with are the same ones a filesystem probe issues, so
 /// they cost the boot path nothing it would not spend anyway.
-fn log_boot_usb_timing(usb_host: &mut usb::UsbHost) {
+fn log_boot_usb_timing(usb_host: &usb::UsbHost) {
     let Some(timing) = usb_host.boot_scan_timing().copied() else {
         return;
     };
@@ -622,33 +612,15 @@ fn log_boot_usb_timing(usb_host: &mut usb::UsbHost) {
     uart::log_u32(b"USB BOOT: root enumerated ms=", timing.enumerated_ms);
     uart::log_u32(b"USB BOOT: scan total ms=", timing.total_ms);
 
-    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+    if usb_host.mass_storage_inventory().next().is_none() {
         uart::log(b"USB BOOT: initial scan found no mass storage\r\n");
         return;
-    };
+    }
     uart::log_u32(
         b"USB BOOT: mass storage attached ms=",
         timing.mass_storage_ms,
     );
-    let ready = mass_storage.measure_ready_and_first_read(BOOT_MASS_STORAGE_READY_MS);
-    uart::log_u32(b"USB BOOT: unit ready ms=", ready.ready_ms);
-    uart::log_u32(b"USB BOOT: unit ready attempts=", ready.attempts);
-    uart::log_u32(b"USB BOOT: read capacity ms=", ready.capacity_ms);
-    uart::log_u32(b"USB BOOT: first LBA 0 read ms=", ready.first_read_ms);
-    match ready.outcome {
-        usb::ReadyOutcome::Usable => uart::log_u32(
-            b"USB BOOT: usable from VBUS on, total ms=",
-            timing.total_ms.saturating_add(ready.first_read_ms),
-        ),
-        // Distinct from the timeout below on purpose: this device answered
-        // every command correctly and simply has nothing in it, so a boot
-        // that needs a filesystem should move on to the next medium rather
-        // than treat the USB path as broken.
-        usb::ReadyOutcome::NoMedium => {
-            uart::log(b"USB BOOT: mass storage has no medium, not usable\r\n")
-        }
-        _ => uart::log(b"USB BOOT: mass storage did not become readable\r\n"),
-    }
+    uart::log(b"USB BOOT: readiness is handled by startup automount\r\n");
 }
 
 const fn source_after(source: KeySource) -> KeySource {

@@ -107,9 +107,10 @@ USB Mass Storageは**挿すと勝手にツリーに出て、抜くと勝手に�
 
 - **`automount off`で完全に止まります。** 止めれば従来どおり`mount`と`umount`
   だけになります
-- **黙って起きません。** マウント・アンマウントのたびにコンソールとUARTへ
+- **結果を記録します。** 通常画面ではマウント・アンマウントのたびにコンソールとUARTへ
   `automount: `で始まる1行を出します。入力途中の行があれば、いったん退避して
-  出力の下に戻します（[CONSOLE_SHELL.md](CONSOLE_SHELL.md)）
+  出力の下に戻します（[CONSOLE_SHELL.md](CONSOLE_SHELL.md)）。起動画面が表示を所有して
+  いる間だけは、白い画面を壊さないよう同じ行をUARTだけへ出します
 - **媒体同一性の仕組みを迂回しません。** 自動マウントもシェルの`mount`と同じ
   `files::attach`を通り、fingerprintを取り、新しいgenerationを振ります。抜いて
   挿し直したものは**別のマウント**で、古いハンドルは復活しません
@@ -126,10 +127,9 @@ USB Mass Storageは**挿すと勝手にツリーに出て、抜くと勝手に�
 パーティション表の無い媒体（superfloppy）はマウント先の名前が作れないので、
 その旨を出して飛ばします。
 
-電源投入時に既に挿さっているデバイスも対象です。USBのスキャン自体は
-`InputManager::new`が起動シーケンスで済ませているので、追加で乗るのはMBRの
-読み出しとボリュームのopenだけです（[STORAGE.md](STORAGE.md)の起動時予算は
-変わりません）。
+電源投入時に既に挿さっているデバイスも対象です。白い起動画面がUSB初回探索を終えると、
+同じ`AutoMount` instanceを`pending`が無くなるか4,000 ms budgetを使い切るまで進めます。
+Escapeで起動をキャンセルした場合もinstanceとdeadlineをConsole loopへ引き継ぎます。
 
 ### いつ走るか
 

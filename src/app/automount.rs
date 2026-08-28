@@ -36,8 +36,8 @@ use crate::framebuffer::Framebuffer;
 use crate::fs::block::{self, BlockError};
 use crate::fs::vfs::{FsError, Mount, Vfs, error_name};
 use crate::fs::{DeviceId, Devices, RamBlockDevice, SdSlot, mbr};
-use crate::tick;
 use crate::usb::{STORAGE_ID_LIMIT, UsbHost};
+use crate::{tick, uart};
 
 /// Whether volumes appear and disappear on their own, and what has already
 /// been offered to the tree.
@@ -146,6 +146,38 @@ impl AutoMount {
         ram_disk: Option<&mut RamBlockDevice>,
         usb_host: &mut UsbHost,
     ) {
+        let mut report = Report::console(console);
+        self.service_with_report(&mut report, framebuffer, vfs, ram_disk, usb_host);
+        report.finish(framebuffer);
+    }
+
+    /// Runs the same reconciliation while a full-screen mode owns the pixels.
+    /// Lines go to UART instead of drawing through the hidden console.
+    pub fn service_silent(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        usb_host: &mut UsbHost,
+    ) -> bool {
+        let mut report = Report::uart();
+        self.service_with_report(&mut report, framebuffer, vfs, ram_disk, usb_host);
+        report.has_warning()
+    }
+
+    /// True while an attached drive is still inside its readiness budget.
+    pub fn has_pending(&self) -> bool {
+        self.pending != 0
+    }
+
+    fn service_with_report(
+        &mut self,
+        report: &mut Report<'_>,
+        framebuffer: &mut Framebuffer,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        usb_host: &mut UsbHost,
+    ) {
         if !self.enabled {
             return;
         }
@@ -162,20 +194,18 @@ impl AutoMount {
         }
         self.seen_topology = Some(topology);
         self.next_retry_ms = now.saturating_add(RETRY_INTERVAL_MS);
-        self.reconcile(console, framebuffer, vfs, ram_disk, usb_host, now);
+        self.reconcile(report, framebuffer, vfs, ram_disk, usb_host, now);
     }
 
     fn reconcile(
         &mut self,
-        console: &mut Console,
+        report: &mut Report<'_>,
         framebuffer: &mut Framebuffer,
         vfs: &mut Vfs,
         ram_disk: Option<&mut RamBlockDevice>,
         usb_host: &mut UsbHost,
         now: u64,
     ) {
-        let mut report = Report::new(console);
-
         // Removals first. A drive that has gone must leave the tree before
         // its number can be handed to another one, and dropping a mount
         // costs nothing on a bus that may no longer have the device on it.
@@ -204,7 +234,6 @@ impl AutoMount {
         self.pending |= fresh;
 
         if self.pending == 0 {
-            report.finish(framebuffer);
             return;
         }
 
@@ -219,7 +248,7 @@ impl AutoMount {
             if examine & (1u16 << id) == 0 {
                 continue;
             }
-            match attach_device(&mut report, framebuffer, &mut devices, vfs, id) {
+            match attach_device(report, framebuffer, &mut devices, vfs, id) {
                 // Answered, one way or the other. Whatever it holds has been
                 // reported and there is nothing left to wait for.
                 Outcome::Examined => self.pending &= !(1u16 << id),
@@ -229,13 +258,11 @@ impl AutoMount {
                 Outcome::Retry(unsettled) => {
                     if now >= self.deadline_ms[id as usize] {
                         self.pending &= !(1u16 << id);
-                        report.line(framebuffer, &unsettled_line(DeviceId::Usb(id), unsettled));
+                        report.warning(framebuffer, &unsettled_line(DeviceId::Usb(id), unsettled));
                     }
                 }
             }
         }
-
-        report.finish(framebuffer);
     }
 }
 
@@ -331,7 +358,7 @@ fn attach_device(
         // here to read and the reason it stays out of the tree is this
         // firmware's -- every mount point is defined by an entry number.
         Some(Ok(mbr::Layout::SuperfloppyUnsupported(_))) => {
-            report.line(
+            report.warning(
                 framebuffer,
                 &nothing_line(device, "filesystem with no partition table; not mountable"),
             );
@@ -351,14 +378,14 @@ fn attach_device(
         // reported now with its own reason rather than retried behind a
         // message about partition tables.
         Some(Err(error)) => {
-            report.line(framebuffer, &nothing_line(device, block::error_name(error)));
+            report.warning(framebuffer, &nothing_line(device, block::error_name(error)));
             return Outcome::Examined;
         }
         // LBA 0 is not a partition table this can work from. The drive is
         // attached, so silence would read as automount not having noticed
         // it.
         Some(Ok(_)) => {
-            report.line(
+            report.warning(
                 framebuffer,
                 &nothing_line(device, "no usable partition table"),
             );
@@ -411,7 +438,7 @@ fn attach_device(
                     // below covers a drive where nothing mounted at all.
                     MountFailure::Fs(FsError::NotAFilesystem) | MountFailure::NoSuchPartition
                 ) {
-                    report.line(framebuffer, &failure_line(device, number, reason));
+                    report.warning(framebuffer, &failure_line(device, number, reason));
                 }
             }
         }
@@ -424,7 +451,7 @@ fn attach_device(
         return Outcome::Retry(unsettled);
     }
     if mounted == 0 {
-        report.line(framebuffer, &nothing_line(device, "no readable filesystem"));
+        report.warning(framebuffer, &nothing_line(device, "no readable filesystem"));
     }
     Outcome::Examined
 }
@@ -488,28 +515,52 @@ fn failure_line(device: DeviceId, partition: u8, reason: &str) -> Line {
 /// -- and taking the input line down and back up on each of those would make
 /// the cursor twitch for no reason.
 struct Report<'a> {
-    console: &'a mut Console,
+    console: Option<&'a mut Console>,
     saved: Option<InputLine>,
+    warned: bool,
 }
 
 impl<'a> Report<'a> {
-    fn new(console: &'a mut Console) -> Self {
+    fn console(console: &'a mut Console) -> Self {
         Self {
-            console,
+            console: Some(console),
             saved: None,
+            warned: false,
         }
+    }
+
+    fn uart() -> Self {
+        Self {
+            console: None,
+            saved: None,
+            warned: false,
+        }
+    }
+
+    fn has_warning(&self) -> bool {
+        self.warned
+    }
+
+    fn warning(&mut self, framebuffer: &mut Framebuffer, line: &Line) {
+        self.warned = true;
+        self.line(framebuffer, line);
     }
 
     fn line(&mut self, framebuffer: &mut Framebuffer, line: &Line) {
+        let Some(console) = self.console.as_mut() else {
+            uart::log(line.as_str().as_bytes());
+            uart::log(b"\r\n");
+            return;
+        };
         if self.saved.is_none() {
-            self.saved = Some(self.console.take_input_line(framebuffer));
+            self.saved = Some(console.take_input_line(framebuffer));
         }
-        self.console.write_output_line(framebuffer, line.as_str());
+        console.write_output_line(framebuffer, line.as_str());
     }
 
-    fn finish(self, framebuffer: &mut Framebuffer) {
-        if let Some(saved) = self.saved {
-            self.console.restore_input_line(framebuffer, saved);
+    fn finish(mut self, framebuffer: &mut Framebuffer) {
+        if let (Some(console), Some(saved)) = (self.console.as_mut(), self.saved.take()) {
+            console.restore_input_line(framebuffer, saved);
         }
     }
 }

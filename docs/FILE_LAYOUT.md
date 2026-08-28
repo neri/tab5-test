@@ -23,8 +23,8 @@
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
 - `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール。
   桁数（`COLUMNS`）だけ公開していて、`ls`の桁詰めがそれを使う
-- `src/app.rs`: コンソールのフレームループ。入力、コマンド実行、全画面モードへの
-  出入りだけを持つ。以下は`app`配下の、シェルコマンドを実行するためだけに存在する
+- `src/app.rs`: 起動画面からBrowser／Wi-Fiメニュー／Consoleへの初回遷移と、Consoleの
+  フレームループ、入力、コマンド実行、全画面モードへの出入りを持つ。以下は`app`配下の
   モジュール群で、クレート直下のハードウェア寄りモジュールからは参照されない
     - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
     - `src/app/lsusb.rs`: `lsusb`コマンドの表示。ハブを介したツリー（全interfaceを含む）と、
@@ -52,6 +52,8 @@
     - `src/app/font_test.rs`: `fonttest`コマンドで起動する16pxフォント診断画面。半角と全角、combining mark、未収録文字の枠、背景ありの再描画、太字、2倍、日本語の本文を1画面に並べる
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
+    - `src/app/startup_screen.rs`: 白背景の`Tab5`、USB／Wi-Fi状態アイコン、5秒後のEscape案内を描き、USB初回探索・自動マウントと保存Wi-Fi接続をフレーム駆動で協調実行する。完了時のBrowser／Wi-Fiメニューと、明示キャンセル時のConsoleを選ぶ
+    - `assets/startup/`: 起動画面用USB／Wi-Fiアイコン。確認用の64×64 PNGと、firmwareが`include_bytes!`で直接読む同寸法の8-bit alpha maskを置く
     - `src/app/wifi_manager.rs`: ESP-Hostedの`Rpc`、IPの`Stack`、接続元、IP設定方針、接続状態、永続ON/OFFをまとめる単一所有者。毎フレームC6とsmoltcpをpollし、起動時／メニュー接続のassociation、切断後の再接続、C6リンク再構築、DHCPを状態遷移で進める。資格情報は現在の管理対象接続が有効な間だけ固定長RAMへ保持し、association成功後のC6 NVS保存、OFF時の切断・driver停止・power down、ON、forget、直近16遷移の診断も担当する
     - `src/app/wifi_retry.rs`: association失敗のreason、timeout、RPC結果を、停止または待ち時間へ変換する副作用のないpolicy。reason 4の短い再試行、一般の指数backoff、10分安定後の失敗回数resetをホスト単体testで検査する
     - `src/app/wifi_menu.rs`: `wifi`コマンドで起動するキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する

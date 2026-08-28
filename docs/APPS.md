@@ -115,9 +115,27 @@ USB-Cの接続有無、充電中／満充電／異常の確定状態、絶対的
 セル別電圧、温度は表示しない。INA226の電流符号は基板上のシャント配線に従うため、
 充電／放電の意味付けは実機での符号確認が必要である。
 
+## 起動画面
+
+LCDを初期化すると、`src/app/startup_screen.rs`が白背景へ2倍角の`Tab5`とUSB／Wi-Fiの
+状態アイコンを表示する。アイコンは提供された240×240 PNGを64×64へ縮小したalpha maskを
+RGB565で描き、状態色のmarkerを重ねる。USB初回探索は未接続または列挙失敗でも最低2秒間
+再試行し、その判定後も通常の接続eventとfallback scanを止めない。USB自動マウント、
+保存済みWi-Fi profileのassociation／
+DHCPをフレーム駆動で並行して進め、両方が終端になるまで表示を維持する。USBの失敗は警告として
+起動を続け、Wi-Fiが`Online`なら組み込みhomeのBrowser、それ以外ならWi-Fi設定メニューへ進む。
+
+初回表示から5秒経っても処理中なら、最下行より1行上へ
+`ESC  CANCEL STARTUP AND OPEN CONSOLE`を表示する。案内の表示後だけEscapeを受け付け、
+起動待ちを打ち切ってConsoleへ進む。完了済みのmountは残し、進行中のUSB自動マウントと
+Wi-Fi接続は同じ管理器をConsoleへ引き継ぐ。Browser終了後、および起動から開いたWi-Fiメニューを
+キャンセルした後もConsoleへ進む。起動から開いたWi-Fiメニューで接続とDHCPが完了した場合は
+Browserへ進む。
+
 ## Wi-Fi設定メニュー
 
-`wifi`コマンドは`src/app/wifi_menu.rs`の全画面メニューを開く。Wi-FiがONなら既存のblocking
+`wifi`コマンドまたは起動分岐は`src/app/wifi_menu.rs`の白ベースの全画面メニューを開く。
+Wi-FiがONなら既存のblocking
 scanを実行し、同じSSIDの結果を最も強いRSSIの1行へ統合して検出BSSID数とともに15件ずつ
 表示する。上下／Page Up／Page Downで選択を移動し、Enterまたは一覧行のtapで接続、`R`で
 再scan、Escapeでシェルへ戻る。hidden SSIDは一覧に出すが、この版では選択できない。
@@ -149,7 +167,7 @@ backoffを使って自動再接続する。古いIP stackは切断時に捨て�
 DHCPを取り直す。10分安定するとbackoffの失敗回数をresetする。画面を閉じてシェルやbrowserへ
 戻っていてもフレームループが処理を続ける。
 
-保存profileがありWi-FiがONなら、起動時に画面を開かずassociationとDHCPを開始する。
+保存profileがありWi-FiがONなら、起動画面でメニューを開かずassociationとDHCPを開始する。
 `O`はWi-Fi全体のON/OFFを切り替え、OFF画面ではscanも接続も開始しない。`F`は確認画面を
 経て保存profileを削除する。ON/OFFとforgetのボタン、確認画面、AP一覧行はtapでも操作できる。
 同じ操作はシェルの`wifi on|off|status|forget`からも共通の接続管理器へ依頼する。

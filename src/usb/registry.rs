@@ -506,10 +506,10 @@ pub struct UsbHost {
     /// that never answers cannot make the frame loop cut power on every
     /// scan.
     last_power_recovery_ms: Option<u64>,
-    /// Timing of the *first* full `rescan`, which is the one
-    /// `InputManager::new` runs during boot -- the only scan whose duration
-    /// the boot-time storage decision has to live with. Later scans overwrite
-    /// `last_scan` but never this.
+    /// Timing of the startup screen's initial scan campaign.
+    ///
+    /// Later scans overwrite `last_scan` but not this campaign summary, so
+    /// boot diagnostics remain available after hot-plug rescans.
     boot_scan: Option<ScanTiming>,
 }
 
@@ -547,6 +547,22 @@ impl UsbHost {
     /// Timing of the initial scan run during boot.
     pub fn boot_scan_timing(&self) -> Option<&ScanTiming> {
         self.boot_scan.as_ref()
+    }
+
+    /// Records a frame-driven group of short scans as the one boot scan.
+    ///
+    /// The startup screen probes an empty root port in short slices so its
+    /// UI, Wi-Fi service, and Escape handling keep moving. Each slice still
+    /// uses the ordinary `rescan`, but the boot diagnostic describes the
+    /// whole campaign rather than whichever short slice happened to run
+    /// first.
+    pub fn finish_boot_scan_campaign(&mut self, started_ms: u64) {
+        let mut timing = self.last_scan.unwrap_or_default();
+        timing.started_at_ms = started_ms as u32;
+        timing.total_ms = tick::now_ms().saturating_sub(started_ms) as u32;
+        timing.connected = self.last_probe.as_ref().is_some_and(|port| port.connected);
+        timing.mass_storage = self.mass_storage_inventory().next().is_some();
+        self.boot_scan = Some(timing);
     }
 
     /// The most recent root-port probe result (VBUS/core/port state), for

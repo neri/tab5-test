@@ -46,13 +46,22 @@ SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再�
 `probe_port`が「VBUSを入れてからデバイスがpull-upを上げるまで」を待つ上限は
 runtimeに切り替えられます（`hcd::set_connect_wait_ms`）。定常値は500 msで、
 フレームループが空ポートを定期再probeする間はこの時間ずっとブロックするため
-長くできません。起動時の初回スキャンだけは`InputManager::new`が1,000 msへ
-上げ、直後に戻します。起動時にUSBメモリがあればそれを最優先のファイル
-システムにする予定があり、そのときデバイスは電源投入直後で立ち上がっている
-途中だからです。1,000 msは実測（最悪246 ms、うち約80 msは`probe_port`自身の
-固定遅延）の約4倍で、**USB-Aに何も挿していない起動だけがこの全額を払います**。
-計測手順と根拠は[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)に
-あります。`usbmargin`は計測中だけ5,000 msを使います。
+長くできません。起動時は`InputManager::new`でスキャンせず、白い起動画面が
+connect waitを1 msへ一時変更した通常の`rescan`を100 ms間隔で繰り返します。rootが
+空の場合と、接続は見えるがenable／列挙できない場合のどちらも、campaign開始から最低
+2,000 msは再試行します。列挙できればその時点で確定し、2,000 ms後も列挙できない場合は
+警告終端として起動を先へ進めます。画面にはscan開始前から`Running`を表示します。
+
+初回の成功／警告はstartup routeを決めるための有限な判定であり、USB lifecycleの停止では
+ありません。inventoryが空なら通常fallback scanを次の`InputManager::service`へ前倒しし、
+起動画面がWi-Fi待ちで残る間も通常の物理接続eventと再スキャン、自動マウントを処理します。
+次画面へ移った後も同じ`InputManager`が処理を継続します。
+
+このcampaign全体の所要時間は`UsbHost::finish_boot_scan_campaign`がboot診断へ記録します。
+Mass Storageのready待ちは初回scanから分離され、起動画面中の`AutoMount`が250 ms間隔、
+最大4,000 msの既存budgetで担当します。計測手順と従来の1,000 ms根拠は
+[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)にあります。
+`usbmargin`は計測中だけ5,000 msを使います。
 
 ## バスの所有とスキャン周期
 
@@ -105,7 +114,7 @@ Mass Storageデバイスには接続時に番号を振り、**そのデバイス
 `PhysicalConnectionChange`で同じ媒体が見つかったのは「一度持ち去られた媒体が
 戻ってきた」であり、開いているファイルを持つ側にとっては別物です。
 
-- `Manual`: シェルからの要求、起動時の初回スキャン、ルートが空のときの定期再スキャン
+- `Manual`: シェルからの要求、起動画面の初回探索、ルートが空のときの定期再スキャン
 - `Recovery`: セッションが古くなったので組み直す
 - `PowerRecovery`: こちらがVBUSを落として入れ直した後
 - `PhysicalConnectionChange`: 接続変化のedgeを観測した

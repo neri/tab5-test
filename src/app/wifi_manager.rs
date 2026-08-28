@@ -15,6 +15,8 @@ use super::wifi_retry::{self, Decision};
 const ASSOCIATION_TIMEOUT_MS: u64 = 20_000;
 const DHCP_TIMEOUT_MS: u64 = 15_000;
 const REPLACEMENT_DISCONNECT_TIMEOUT_MS: u32 = 3_000;
+const STARTUP_RETRY_DELAY_MS: u32 = 500;
+const STARTUP_MAX_ATTEMPTS: u32 = 3;
 const HISTORY_LIMIT: usize = 16;
 const NOTICE_LIMIT: usize = 16;
 
@@ -247,6 +249,7 @@ pub struct Manager {
     profile_save_attempts: u32,
     profile_save_failures: u32,
     profile_forgets: u32,
+    startup_retry_policy: bool,
 }
 
 impl Manager {
@@ -271,6 +274,7 @@ impl Manager {
             profile_save_attempts: 0,
             profile_save_failures: 0,
             profile_forgets: 0,
+            startup_retry_policy: false,
         }
     }
 
@@ -430,6 +434,41 @@ impl Manager {
 
     pub fn take_notices(&mut self) -> Vec<Notice> {
         core::mem::take(&mut self.notices)
+    }
+
+    /// Uses the splash screen's short, finite retry policy.
+    pub fn begin_startup_retry_policy(&mut self) {
+        self.startup_retry_policy = true;
+    }
+
+    /// Returns retry scheduling to the ordinary reason-specific policy.
+    ///
+    /// If Escape leaves while a short startup timer is pending, reschedule
+    /// that same failure from now instead of carrying the 500 ms deadline
+    /// into the console or Wi-Fi menu.
+    pub fn finish_startup_retry_policy(&mut self) {
+        self.startup_retry_policy = false;
+        let State::RetryWaiting {
+            next_attempt,
+            generation,
+            failure,
+            ..
+        } = self.state
+        else {
+            return;
+        };
+        let Decision::RetryAfter(delay_ms) = retry_decision(failure, self.attempt.max(1)) else {
+            return;
+        };
+        self.transition(
+            State::RetryWaiting {
+                deadline_ms: tick::now_ms().saturating_add(delay_ms as u64),
+                next_attempt,
+                generation,
+                failure,
+            },
+            Cause::RetryScheduled(delay_ms),
+        );
     }
 
     /// Enables or disables the whole Wi-Fi subsystem. `Ok(true)` means an
@@ -1116,8 +1155,18 @@ impl Manager {
     fn apply_retry_decision(
         &mut self,
         failure: Failure,
-        decision: Decision,
+        mut decision: Decision,
     ) -> Result<(), Failure> {
+        if self.startup_retry_policy && matches!(decision, Decision::RetryAfter(_)) {
+            if self.attempt >= STARTUP_MAX_ATTEMPTS {
+                self.clear_credentials();
+                self.connected_since_ms = None;
+                self.reconnecting = false;
+                self.transition(State::Failed(failure), cause_for_failure(failure));
+                return Err(failure);
+            }
+            decision = Decision::RetryAfter(STARTUP_RETRY_DELAY_MS);
+        }
         match decision {
             Decision::Stop => {
                 if self.save_pending {
@@ -1355,6 +1404,21 @@ impl Manager {
             },
             Cause::DhcpStarted,
         );
+    }
+}
+
+fn retry_decision(failure: Failure, failed_attempts: u32) -> Decision {
+    match failure {
+        Failure::Disconnected(reason) => wifi_retry::after_disconnect(reason, failed_attempts),
+        Failure::AssociationTimedOut => wifi_retry::after_timeout(failed_attempts),
+        Failure::StartStatus(status)
+        | Failure::ConnectStatus(status)
+        | Failure::ConfigStatus(status)
+        | Failure::StorageStatus(status)
+        | Failure::DisconnectStatus(status)
+        | Failure::ModeStatus(status)
+        | Failure::StopStatus(status) => wifi_retry::after_rpc_status(status, failed_attempts),
+        _ => wifi_retry::after_rpc_failure(failed_attempts),
     }
 }
 

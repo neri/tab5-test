@@ -6,18 +6,22 @@
 
 use alloc::vec::Vec;
 
-use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, HEIGHT, RED, WHITE, WIDTH, YELLOW};
+use crate::framebuffer::{BLACK, Framebuffer, HEIGHT, RED, WHITE, WIDTH};
 use crate::input::{InputManager, Key, PrimaryTouch};
 use crate::{interrupts, uart, wifi};
 
 use super::shell::Line;
 use super::wifi_manager::{Failure, Manager, ProfileChoice, ProfileSaveState, State};
 
-const BACKGROUND: u16 = 0x1082;
-const HEADER: u16 = 0x0010;
-const PANEL: u16 = 0x2104;
-const SELECTED: u16 = 0x7D7C;
-const MUTED: u16 = 0xAD55;
+const BACKGROUND: u16 = WHITE;
+const HEADER: u16 = 0xE71C;
+const FOOTER: u16 = 0xEF7D;
+const PANEL: u16 = 0xDEFB;
+const SELECTED: u16 = 0xBDF7;
+const MUTED: u16 = 0x632C;
+const PRIMARY: u16 = 0x0015;
+const SUCCESS: u16 = 0x0400;
+const WARNING: u16 = 0xA500;
 
 const HEADER_HEIGHT: usize = 78;
 const LIST_TOP: usize = 94;
@@ -43,11 +47,28 @@ enum ListAction {
     Activate(usize),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Entry {
+    Shell,
+    Startup,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Outcome {
+    Online,
+    Cancelled,
+}
+
 /// Runs until Escape leaves the screen.
 ///
 /// The manager is borrowed from `app::run`, so a connection made here
 /// remains usable by the shell after this function returns.
-pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mut Manager) {
+pub fn run(
+    framebuffer: &mut Framebuffer,
+    input: &mut InputManager,
+    manager: &mut Manager,
+    entry: Entry,
+) -> Outcome {
     uart::log(b"WIFI MENU: opened\r\n");
     input.reset_primary_touch();
     let mut selected = 0usize;
@@ -65,10 +86,34 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mu
                                 show_progress(
                                     framebuffer,
                                     "WI-FI ENABLED",
-                                    "AUTO-CONNECT STARTED - ESC RETURNS TO SHELL",
+                                    "AUTO-CONNECT STARTED - ESC CANCELS",
                                 );
+                                if entry == Entry::Startup {
+                                    loop {
+                                        if matches!(manager.state(), State::Online(_)) {
+                                            return Outcome::Online;
+                                        }
+                                        if matches!(
+                                            manager.state(),
+                                            State::Off
+                                                | State::Idle
+                                                | State::NeedsPassword(_)
+                                                | State::AssociatedNoLease(_)
+                                                | State::Failed(_)
+                                        ) {
+                                            continue 'scan;
+                                        }
+                                        let Some((key, _)) = wait_input_frame(input, manager)
+                                        else {
+                                            return Outcome::Cancelled;
+                                        };
+                                        if matches!(key, Some(Key::Escape)) {
+                                            return Outcome::Cancelled;
+                                        }
+                                    }
+                                }
                                 let _ = wait_key(input, manager);
-                                return;
+                                return Outcome::Cancelled;
                             }
                             Ok(false) => continue 'scan,
                             Err(failure) => draw_off_screen(
@@ -92,7 +137,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mu
                             draw_off_screen(framebuffer, manager.has_saved_profile(), None);
                         }
                     }
-                    Some(ListAction::Exit) | None => return,
+                    Some(ListAction::Exit) | None => return Outcome::Cancelled,
                     _ => {}
                 }
             }
@@ -117,7 +162,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mu
                     loop {
                         match wait_key(input, manager) {
                             Some(Key::Ascii(b'r' | b'R')) => break,
-                            Some(Key::Escape) | None => return,
+                            Some(Key::Escape) | None => return Outcome::Cancelled,
                             _ => {}
                         }
                     }
@@ -141,10 +186,10 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mu
             let Some(action) =
                 wait_list_action(input, manager, selected, first, access_points.len())
             else {
-                return;
+                return Outcome::Cancelled;
             };
             match action {
-                ListAction::Exit => return,
+                ListAction::Exit => return Outcome::Cancelled,
                 ListAction::Rescan => {
                     selected = 0;
                     first = 0;
@@ -251,11 +296,14 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager, manager: &mu
                     );
                     zeroize(&mut password);
                     let Some(result) = result else {
-                        return;
+                        return Outcome::Cancelled;
                     };
+                    if entry == Entry::Startup && matches!(manager.state(), State::Online(_)) {
+                        return Outcome::Online;
+                    }
                     show_result(framebuffer, &result);
                     match wait_result_action(input, manager) {
-                        ResultAction::Exit => return,
+                        ResultAction::Exit => return Outcome::Cancelled,
                         ResultAction::Rescan => {
                             selected = 0;
                             first = 0;
@@ -720,8 +768,8 @@ fn draw_access_points(
     framebuffer.draw_text(930, 30, count.as_str(), 1, MUTED, None);
 
     if access_points.is_empty() {
-        centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, YELLOW);
-        centred(framebuffer, 335, "PRESS R TO RESCAN", 1, WHITE);
+        centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, WARNING);
+        centred(framebuffer, 335, "PRESS R TO RESCAN", 1, BLACK);
     }
 
     for (visible, network) in access_points
@@ -734,10 +782,9 @@ fn draw_access_points(
         let y = LIST_TOP + visible * ROW_HEIGHT;
         let selected_row = index == selected;
         let background = if selected_row { SELECTED } else { PANEL };
-        let foreground = if selected_row { BLACK } else { WHITE };
         framebuffer.fill_rect(24, y, WIDTH - 48, ROW_HEIGHT - 3, background);
         let line = access_point_line(network);
-        framebuffer.draw_text(36, y + 6, line.as_str(), 1, foreground, None);
+        framebuffer.draw_text(36, y + 6, line.as_str(), 1, BLACK, None);
     }
 
     framebuffer.draw_text(
@@ -745,11 +792,11 @@ fn draw_access_points(
         FOOTER_TOP,
         "UP/DOWN/PAGE SELECT   ENTER/TOUCH CONNECT   O OFF   F FORGET",
         1,
-        CYAN,
+        PRIMARY,
         None,
     );
     if let Some(message) = message {
-        framebuffer.draw_text(28, FOOTER_TOP + 32, message, 1, YELLOW, None);
+        framebuffer.draw_text(28, FOOTER_TOP + 32, message, 1, WARNING, None);
     } else {
         framebuffer.draw_text(
             28,
@@ -801,9 +848,10 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
     let mut network = Line::new();
     network.push_str("NETWORK  ");
     network.push_ascii(ssid);
-    framebuffer.draw_text(90, 150, network.as_str(), 2, WHITE, None);
+    framebuffer.draw_text(90, 150, network.as_str(), 2, BLACK, None);
     framebuffer.draw_text(90, 226, "PASSWORD", 1, MUTED, None);
-    framebuffer.fill_rect(90, 258, 900, 64, WHITE);
+    framebuffer.fill_rect(90, 258, 900, 64, BLACK);
+    framebuffer.fill_rect(92, 260, 896, 60, WHITE);
 
     let mut masked = [b'*'; wifi::station::PASSWORD_MAX_BYTES];
     let masked_text = core::str::from_utf8(&masked[..length]).unwrap_or("");
@@ -814,13 +862,13 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
     let mut count = Line::new();
     count.push_u32(length as u32);
     count.push_str(" / 64 BYTES");
-    framebuffer.draw_text(1010, 279, count.as_str(), 1, CYAN, None);
+    framebuffer.draw_text(1010, 279, count.as_str(), 1, PRIMARY, None);
     framebuffer.draw_text(
         90,
         370,
         "ENTER CONNECT    BACKSPACE DELETE    ESC CANCEL",
         1,
-        CYAN,
+        PRIMARY,
         None,
     );
     framebuffer.draw_text(
@@ -839,7 +887,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
     let mut network = Line::new();
     network.push_str("NETWORK  ");
     network.push_ascii(ssid);
-    framebuffer.draw_text(90, 140, network.as_str(), 2, WHITE, None);
+    framebuffer.draw_text(90, 140, network.as_str(), 2, BLACK, None);
 
     let save_selected = choice == ProfileChoice::SaveAndAutoConnect;
     framebuffer.fill_rect(
@@ -849,14 +897,7 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         62,
         if save_selected { SELECTED } else { PANEL },
     );
-    framebuffer.draw_text(
-        110,
-        248,
-        "SAVE AND AUTO-CONNECT",
-        2,
-        if save_selected { BLACK } else { WHITE },
-        None,
-    );
+    framebuffer.draw_text(110, 248, "SAVE AND AUTO-CONNECT", 2, BLACK, None);
     framebuffer.fill_rect(
         90,
         312,
@@ -864,20 +905,13 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
         62,
         if save_selected { PANEL } else { SELECTED },
     );
-    framebuffer.draw_text(
-        110,
-        330,
-        "CONNECT ONCE",
-        2,
-        if save_selected { WHITE } else { BLACK },
-        None,
-    );
+    framebuffer.draw_text(110, 330, "CONNECT ONCE", 2, BLACK, None);
     framebuffer.draw_text(
         90,
         420,
         "UP/DOWN SELECT    ENTER CONFIRM    ESC CANCEL",
         1,
-        CYAN,
+        PRIMARY,
         None,
     );
     framebuffer.draw_text(
@@ -893,8 +927,8 @@ fn draw_profile_choice(framebuffer: &mut Framebuffer, ssid: &[u8], choice: Profi
 
 fn draw_off_screen(framebuffer: &mut Framebuffer, saved_profile: bool, message: Option<&str>) {
     draw_chrome(framebuffer, "WI-FI NETWORKS");
-    framebuffer.draw_text(1030, 30, "OFF", 1, YELLOW, None);
-    framebuffer.draw_text(500, 155, "WI-FI IS OFF", 2, YELLOW, None);
+    framebuffer.draw_text(1030, 30, "OFF", 1, WARNING, None);
+    framebuffer.draw_text(500, 155, "WI-FI IS OFF", 2, WARNING, None);
     framebuffer.draw_text(
         405,
         220,
@@ -904,19 +938,19 @@ fn draw_off_screen(framebuffer: &mut Framebuffer, saved_profile: bool, message: 
             "SAVED PROFILE: NO"
         },
         1,
-        WHITE,
+        BLACK,
         None,
     );
     framebuffer.fill_rect(220, 290, 370, 100, SELECTED);
     framebuffer.draw_text(328, 326, "O  TURN ON", 2, BLACK, None);
     framebuffer.fill_rect(690, 290, 370, 100, PANEL);
-    framebuffer.draw_text(760, 326, "F  FORGET PROFILE", 2, WHITE, None);
+    framebuffer.draw_text(760, 326, "F  FORGET PROFILE", 2, BLACK, None);
     framebuffer.draw_text(
         430,
         FOOTER_TOP,
         "TOUCH A BUTTON OR PRESS O/F",
         1,
-        CYAN,
+        PRIMARY,
         None,
     );
     framebuffer.draw_text(550, FOOTER_TOP + 32, "ESC EXIT", 1, MUTED, None);
@@ -961,13 +995,19 @@ fn confirm_forget(
         180,
         "THE SAVED SSID AND PASSWORD WILL BE DELETED",
         1,
-        YELLOW,
+        WARNING,
     );
     framebuffer.fill_rect(100, 300, 470, 90, RED);
     centred_in(framebuffer, 100, 470, 332, "Y  FORGET", 2, WHITE);
     framebuffer.fill_rect(700, 300, 470, 90, PANEL);
-    centred_in(framebuffer, 700, 470, 332, "N  CANCEL", 2, WHITE);
-    centred(framebuffer, FOOTER_TOP, "TOUCH A BUTTON OR PRESS Y/N", 1, CYAN);
+    centred_in(framebuffer, 700, 470, 332, "N  CANCEL", 2, BLACK);
+    centred(
+        framebuffer,
+        FOOTER_TOP,
+        "TOUCH A BUTTON OR PRESS Y/N",
+        1,
+        PRIMARY,
+    );
     flush(framebuffer, b"WIFI MENU: forget-confirm flush failed\r\n");
 
     loop {
@@ -993,40 +1033,46 @@ fn confirm_forget(
 fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
     framebuffer.fill(BACKGROUND);
     framebuffer.fill_rect(0, 0, WIDTH, HEADER_HEIGHT, HEADER);
-    framebuffer.draw_text(28, 24, title, 2, WHITE, None);
-    framebuffer.fill_rect(0, FOOTER_TOP - 16, WIDTH, HEIGHT - (FOOTER_TOP - 16), BLACK);
+    framebuffer.draw_text(28, 24, title, 2, BLACK, None);
+    framebuffer.fill_rect(
+        0,
+        FOOTER_TOP - 16,
+        WIDTH,
+        HEIGHT - (FOOTER_TOP - 16),
+        FOOTER,
+    );
 }
 
 fn show_progress(framebuffer: &mut Framebuffer, title: &str, detail: &str) {
     draw_chrome(framebuffer, "WI-FI SETUP");
-    framebuffer.draw_text(90, 235, title, 2, CYAN, None);
-    framebuffer.draw_text(90, 318, detail, 1, WHITE, None);
+    framebuffer.draw_text(90, 235, title, 2, PRIMARY, None);
+    framebuffer.draw_text(90, 318, detail, 1, BLACK, None);
     flush(framebuffer, b"WIFI MENU: progress-screen flush failed\r\n");
 }
 
 fn show_error(framebuffer: &mut Framebuffer, title: &str, detail: &Line, instruction: &str) {
     draw_chrome(framebuffer, "WI-FI SETUP");
     framebuffer.draw_text(90, 220, title, 2, RED, None);
-    framebuffer.draw_text(90, 304, detail.as_str(), 1, WHITE, None);
-    framebuffer.draw_text(90, 382, instruction, 1, CYAN, None);
+    framebuffer.draw_text(90, 304, detail.as_str(), 1, BLACK, None);
+    framebuffer.draw_text(90, 382, instruction, 1, PRIMARY, None);
     flush(framebuffer, b"WIFI MENU: error-screen flush failed\r\n");
 }
 
 fn show_result(framebuffer: &mut Framebuffer, result: &ConnectionResult) {
     draw_chrome(framebuffer, "WI-FI SETUP");
     let color = match result.kind {
-        ResultKind::Success => GREEN,
-        ResultKind::Warning => YELLOW,
+        ResultKind::Success => SUCCESS,
+        ResultKind::Warning => WARNING,
         ResultKind::Error => RED,
     };
     framebuffer.draw_text(90, 220, result.title, 2, color, None);
-    framebuffer.draw_text(90, 304, result.detail.as_str(), 1, WHITE, None);
+    framebuffer.draw_text(90, 304, result.detail.as_str(), 1, BLACK, None);
     framebuffer.draw_text(
         90,
         382,
         "ENTER AP LIST    R RESCAN    ESC EXIT",
         1,
-        CYAN,
+        PRIMARY,
         None,
     );
     flush(framebuffer, b"WIFI MENU: result-screen flush failed\r\n");

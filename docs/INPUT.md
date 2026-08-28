@@ -70,6 +70,11 @@ Backspaceにも同じものを割り当ててしまいます。別扱いにし�
 `InputManager`（`src/input.rs`）はキー、USBマウス、タッチをアプリケーション層で
 統合します。USB-Aの列挙とハブ状態、キーボード以外のUSBデバイスを所有するのは
 `usb::UsbHost`のままで、`InputManager`はそれを内側に持ちます。
+`InputManager::new`はI2C入力と空の`UsbHost`を作るだけで、USB初回列挙は行いません。
+初回列挙は白い起動画面が短いroot-port probeをフレーム間に繰り返して進め、探索campaignの
+完了後に通常の`InputManager::service`へ所有権を戻します。初回判定でdevice inventoryが
+空なら最初の通常fallback scanを次の`service`まで前倒しし、起動画面がWi-Fi待ちで残っている
+間も物理接続eventと再スキャンを処理します。
 
 フレーム境界ごとに`service`（接続状態の保守）と`poll_key`（キーの読み出し）を
 それぞれ1回呼びます。CardKBとTab5 Keyboardが不在のときは各60フレームごとに
