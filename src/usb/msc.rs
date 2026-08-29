@@ -1,7 +1,7 @@
 //! USB Mass Storage class driver for the SCSI Transparent Command Set over
 //! Bulk-Only Transport. The BOT envelope lives in `bot.rs`.
 
-use super::bot::{self, BotInterface, BulkOnlyTransport};
+use super::bot::{self, BotInterface, BulkOnlyTransport, CommandResult};
 use super::protocol::EnumeratedDevice;
 use crate::delay::delay_ms;
 use crate::{tick, uart};
@@ -24,13 +24,32 @@ const CDB_FLAG_FUA: u8 = 0x08;
 /// OPERATION CODE) or, as one of this project's real USB sticks does,
 /// `0x24` (INVALID FIELD IN CDB). Either way asking again is pointless.
 const SENSE_KEY_ILLEGAL_REQUEST: u8 = 0x05;
+/// SPC sense key 7, DATA PROTECT: the medium is write protected. Worth
+/// telling apart from every other write failure because nothing about the
+/// transport went wrong and no amount of retrying or re-enumerating will
+/// change the answer -- the switch on the card, or the device's own policy,
+/// has to change.
+const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 const SCSI_READ_CAPACITY_10: u8 = 0x25;
+/// VPD page 0x00: the list of pages the device actually supports. Asked for
+/// first, because a device that does not implement EVPD at all is under no
+/// obligation to say so in a way the individual pages can be told apart from
+/// a plain INQUIRY -- see [`UsbMassStorage::vital_product_data`].
+pub const VPD_PAGE_SUPPORTED: u8 = 0x00;
+/// VPD page 0x80, the unit serial number.
+pub const VPD_PAGE_UNIT_SERIAL: u8 = 0x80;
+/// VPD page 0x83, the device identification list.
+pub const VPD_PAGE_DEVICE_ID: u8 = 0x83;
 const CSW_STATUS_PASSED: u8 = 0x00;
 const BLOCK_BYTES: usize = 512;
 /// The shortest observed run to an unresponsive device completed 33
 /// READ(10)s. Re-establish the BOT boundary at half that distance while EP0
 /// still answers, without resetting the root port or unrelated HID devices.
 const READS_PER_BOT_RESYNC: u8 = 16;
+/// Successful maintenance resets are frequent enough that logging every one
+/// hides the transfer failure they are meant to prevent. Keep a heartbeat in
+/// the UART log without producing hundreds of identical lines.
+const RESYNC_LOG_INTERVAL: u32 = 64;
 const INQUIRY_RESPONSE_LEN: usize = 36;
 const REQUEST_SENSE_RESPONSE_LEN: usize = 18;
 const READ_CAPACITY_10_RESPONSE_LEN: usize = 8;
@@ -42,6 +61,17 @@ const VPD_RESPONSE_MAX: usize = 64;
 const VPD_HEADER_LEN: usize = 4;
 const READ_CAPACITY_10_NEEDS_CAPACITY_16: u32 = 0xFFFF_FFFF;
 const READY_POLL_INTERVAL_MS: u32 = 100;
+/// Valid sense response codes: current and deferred errors, in fixed and
+/// descriptor format. A device with nothing to report still answers `0x70`
+/// with sense key 0; a buffer whose first byte is none of these has not been
+/// filled in, and reading a sense key out of it would be reading a field
+/// that was never written.
+const SENSE_RESPONSE_CODES: [u8; 4] = [0x70, 0x71, 0x72, 0x73];
+
+/// SPC sense key 0, NO SENSE: there is no specific information to report.
+/// Paired with a failed command it is a device saying that something went
+/// wrong and it has nothing to say about what.
+const SENSE_KEY_NO_SENSE: u8 = 0x00;
 /// SPC sense key 2, "the logical unit is not ready".
 const SENSE_KEY_NOT_READY: u8 = 0x02;
 /// SPC additional sense code `0x3A`, MEDIUM NOT PRESENT. Every one of its
@@ -119,6 +149,24 @@ pub fn find_msc_interface(config: &[u8]) -> Option<MscInterface> {
     bot::find_interface(config, INTERFACE_SUBCLASS_SCSI_TRANSPARENT)
 }
 
+/// What a [`UsbMassStorage::write_blocks`] call achieved.
+///
+/// Three outcomes rather than a `bool` because the caller acts differently
+/// on each: a write-protected medium is a settled answer to show the user,
+/// and a failed transfer is a medium whose state is now unknown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The device accepted every block. Whether they have reached the
+    /// medium is [`UsbMassStorage::synchronize_cache`]'s question.
+    Written,
+    /// The device answered DATA PROTECT. Nothing was written and nothing
+    /// will be until the medium stops being read-only.
+    WriteProtected,
+    /// The transfer failed, or the device rejected it for some other
+    /// reason. How much of it reached the medium is not known.
+    Failed,
+}
+
 /// What a [`UsbMassStorage::synchronize_cache`] call achieved.
 ///
 /// "Unsupported" has to be distinguishable from "failed": a device that
@@ -137,16 +185,42 @@ pub enum CacheSync {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+enum ResyncDirection {
+    Read,
+    Write,
+}
+
 pub struct UsbMassStorage {
     bot: BulkOnlyTransport,
     read_retries: u32,
     reads_since_resync: u8,
     maintenance_resyncs: u32,
+    read_maintenance_resyncs: u32,
+    write_maintenance_resyncs: u32,
     /// Set once the device has answered SYNCHRONIZE CACHE(10) with ILLEGAL
     /// REQUEST/INVALID COMMAND. Asking again would fail the same way, and
     /// every failed command leaves sense data that has to be collected
     /// before the next one -- cheaper and safer to stop asking.
     cache_sync_unsupported: bool,
+    /// Which VPD pages the device listed as supported, read once per
+    /// attachment. `None` until asked; the two flags are false when the
+    /// device has no usable page list at all.
+    /// Whether a WRITE(10) covering more than one block has been issued on
+    /// this attachment yet. Noted once, because it is a shape the transport
+    /// has never been accepted at: `usbwritetest` and `usbzero` both write a
+    /// single block, so the filesystem is the first caller to put several
+    /// packets in one OUT data phase.
+    multi_block_write_noted: bool,
+    vpd_pages_queried: bool,
+    vpd_has_unit_serial: bool,
+    vpd_has_device_id: bool,
+    /// The last unit serial page this attachment returned, and how long it
+    /// was. Kept so that a *different* answer can be reported with both
+    /// values side by side; reporting every read would drown the log, since
+    /// the media-identity check gathers one before each write.
+    last_serial: [u8; VPD_RESPONSE_MAX],
+    last_serial_length: Option<usize>,
 }
 
 impl UsbMassStorage {
@@ -158,14 +232,26 @@ impl UsbMassStorage {
             read_retries: 0,
             reads_since_resync: 0,
             maintenance_resyncs: 0,
+            read_maintenance_resyncs: 0,
+            write_maintenance_resyncs: 0,
             cache_sync_unsupported: false,
+            multi_block_write_noted: false,
+            vpd_pages_queried: false,
+            vpd_has_unit_serial: false,
+            vpd_has_device_id: false,
+            last_serial: [0; VPD_RESPONSE_MAX],
+            last_serial_length: None,
         })
     }
 
     pub fn inquiry(&mut self) -> Option<[u8; INQUIRY_RESPONSE_LEN]> {
         let mut data = [0u8; INQUIRY_RESPONSE_LEN];
         let cdb = [SCSI_INQUIRY, 0, 0, 0, INQUIRY_RESPONSE_LEN as u8, 0];
-        let result = self.bot.execute_command(&cdb, true, &mut data)?;
+        let result = self.execute_replayable_query(
+            &cdb,
+            &mut data,
+            b"USB MSC: retrying INQUIRY after BOT recovery\r\n",
+        )?;
         if result.status != CSW_STATUS_PASSED {
             uart::log_hex(
                 b"USB MSC: INQUIRY failed, CSW status=",
@@ -186,13 +272,63 @@ impl UsbMassStorage {
     /// These are the closest thing SCSI has to a medium identity, and unlike
     /// USB's `iSerialNumber` they describe the storage device rather than the
     /// enclosure. Both are optional, and plenty of USB sticks answer neither.
-    /// A device that does not support them answers CHECK CONDITION, which is
-    /// reported as `None` -- absence, not failure, and the caller records
-    /// that this source had nothing to say rather than treating the medium as
-    /// unidentifiable.
+    ///
+    /// **The page is only asked for if the device lists it.** A device that
+    /// does not implement EVPD is supposed to answer CHECK CONDITION, and a
+    /// real one here does not: it returns its *standard* INQUIRY response
+    /// instead. That cannot be told apart by the page code the response is
+    /// supposed to echo, because a standard INQUIRY's byte 1 is the
+    /// removable-medium bit -- `0x80` on every USB stick -- which is exactly
+    /// the page code a unit-serial request carries. The check passed on the
+    /// coincidence, and what came back was the INQUIRY response followed by
+    /// whatever the device had left in its buffer from the last block it
+    /// read. Folded into a media fingerprint that made the identity of a
+    /// perfectly stationary stick appear to change between one read and the
+    /// next. Asking page 0x00 first is what removes the guess.
     ///
     /// Returns the page's payload, without the four-byte header.
     pub fn vital_product_data(&mut self, page: u8, out: &mut [u8]) -> Option<usize> {
+        if !self.lists_vital_product_page(page) {
+            return None;
+        }
+        self.read_vital_product_page(page, out)
+    }
+
+    /// Whether the device's own supported-pages list names `page`.
+    ///
+    /// Read once per attachment: the answer cannot change while the device
+    /// stays plugged in, and the read costs a command that would otherwise
+    /// be paid before every write by the media check.
+    fn lists_vital_product_page(&mut self, page: u8) -> bool {
+        if !self.vpd_pages_queried {
+            self.vpd_pages_queried = true;
+            let mut list = [0u8; VPD_RESPONSE_MAX];
+            if let Some(length) = self.read_vital_product_page(VPD_PAGE_SUPPORTED, &mut list) {
+                let list = &list[..length];
+                // A compliant list names page 0x00 itself first and ascends
+                // from there. This is the second half of the defence: a
+                // device whose INQUIRY byte 1 happens to be 0x00 would get
+                // past the page-code echo above, and its vendor strings are
+                // not an ascending list starting at zero.
+                let plausible = list.first() == Some(&VPD_PAGE_SUPPORTED)
+                    && list.windows(2).all(|pair| pair[0] < pair[1]);
+                if plausible {
+                    self.vpd_has_unit_serial = list.contains(&VPD_PAGE_UNIT_SERIAL);
+                    self.vpd_has_device_id = list.contains(&VPD_PAGE_DEVICE_ID);
+                } else {
+                    uart::log(b"USB MSC: no usable VPD page list; identity uses INQUIRY only\r\n");
+                }
+            }
+        }
+        match page {
+            VPD_PAGE_SUPPORTED => true,
+            VPD_PAGE_UNIT_SERIAL => self.vpd_has_unit_serial,
+            VPD_PAGE_DEVICE_ID => self.vpd_has_device_id,
+            _ => false,
+        }
+    }
+
+    fn read_vital_product_page(&mut self, page: u8, out: &mut [u8]) -> Option<usize> {
         let mut data = [0u8; VPD_RESPONSE_MAX];
         // EVPD set in byte 1, page code in byte 2, allocation length in 3-4.
         let cdb = [
@@ -203,7 +339,11 @@ impl UsbMassStorage {
             VPD_RESPONSE_MAX as u8,
             0,
         ];
-        let result = self.bot.execute_command(&cdb, true, &mut data)?;
+        let result = self.execute_replayable_query(
+            &cdb,
+            &mut data,
+            b"USB MSC: retrying INQUIRY(EVPD) after BOT recovery\r\n",
+        )?;
         if result.status != CSW_STATUS_PASSED {
             // Not logged as an error: declining to answer is a legal reply,
             // and the sense data still has to be collected so the next
@@ -219,19 +359,79 @@ impl UsbMassStorage {
         if data[1] != page {
             return None;
         }
-        let length = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let declared = u16::from_be_bytes([data[2], data[3]]) as usize;
         let available = result.transferred - VPD_HEADER_LEN;
-        let length = length.min(available).min(out.len());
+        let length = declared.min(available).min(out.len());
         out[..length].copy_from_slice(&data[VPD_HEADER_LEN..VPD_HEADER_LEN + length]);
+        if page == VPD_PAGE_UNIT_SERIAL {
+            self.note_serial(&out[..length], result.transferred, declared);
+        }
         Some(length)
+    }
+
+    /// Reports a unit serial that differs from the last one this attachment
+    /// gave, with both values and the transfer that produced the new one.
+    ///
+    /// The device cannot have changed -- a physical swap ends the attachment
+    /// and this state with it -- so a difference is a fault, and which of
+    /// the three numbers moved says whose. A shorter `transferred` is the
+    /// transport returning less than the device sent; a different `declared`
+    /// is the device answering differently; the same numbers with different
+    /// bytes is the payload itself being mangled.
+    fn note_serial(&mut self, serial: &[u8], transferred: usize, declared: usize) {
+        let unchanged = self
+            .last_serial_length
+            .is_some_and(|length| length == serial.len() && self.last_serial[..length] == *serial);
+        if unchanged {
+            return;
+        }
+        if let Some(length) = self.last_serial_length {
+            uart::log(b"USB MSC: unit serial changed while attached\r\n");
+            log_bytes(b"USB MSC:   was: ", &self.last_serial[..length]);
+        } else {
+            uart::log(b"USB MSC: unit serial\r\n");
+        }
+        log_bytes(b"USB MSC:   now: ", serial);
+        uart::log_u32(b"USB MSC:   transferred=", transferred as u32);
+        uart::log_u32(b"USB MSC:   declared=", declared as u32);
+        // `vital_product_data` cannot produce more than a VPD response holds,
+        // but this is the one place that would panic if it ever did.
+        let kept = serial.len().min(self.last_serial.len());
+        self.last_serial[..kept].copy_from_slice(&serial[..kept]);
+        self.last_serial_length = Some(kept);
     }
 
     pub fn test_unit_ready(&mut self) -> Option<bool> {
         let mut no_data = [];
-        let result =
-            self.bot
-                .execute_command(&[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0], true, &mut no_data)?;
+        let cdb = [SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+        let result = self.execute_replayable_query(
+            &cdb,
+            &mut no_data,
+            b"USB MSC: retrying TEST UNIT READY after BOT recovery\r\n",
+        )?;
         Some(result.status == CSW_STATUS_PASSED)
+    }
+
+    /// Executes one identification/readiness query, replaying it once when
+    /// BOT Reset Recovery completed. These commands do not modify the medium
+    /// and their response buffers are replaced by the retry, so replay is
+    /// safe. WRITE(10), cache flush, and REQUEST SENSE deliberately do not
+    /// use this path: their completion or diagnostic meaning can be lost
+    /// across a transport reset.
+    fn execute_replayable_query(
+        &mut self,
+        cdb: &[u8],
+        data: &mut [u8],
+        retry_message: &[u8],
+    ) -> Option<CommandResult> {
+        match self.bot.execute_command(cdb, true, data) {
+            Some(result) => Some(result),
+            None if self.bot.last_recovery_succeeded() => {
+                uart::log(retry_message);
+                self.bot.execute_command(cdb, true, data)
+            }
+            None => None,
+        }
     }
 
     pub fn wait_until_ready(&mut self, attempts: u32) -> bool {
@@ -239,11 +439,6 @@ impl UsbMassStorage {
             match self.test_unit_ready() {
                 Some(true) => return true,
                 Some(false) => {}
-                // A transport failure has already run BOT Reset Recovery in
-                // execute_command. Continue only when that full sequence
-                // succeeded; otherwise a new CBW would enter an unknown
-                // device-side BOT phase.
-                None if self.bot.last_recovery_succeeded() => {}
                 None => return false,
             }
             if attempt + 1 < attempts {
@@ -280,9 +475,6 @@ impl UsbMassStorage {
                         return timing;
                     }
                 }
-                // execute_command has already run BOT Reset Recovery. Only a
-                // completed recovery leaves the device in a known BOT phase.
-                None if self.bot.last_recovery_succeeded() => {}
                 None => {
                     timing.ready_ms = elapsed_ms(start);
                     timing.outcome = ReadyOutcome::TransportFailed;
@@ -357,10 +549,10 @@ impl UsbMassStorage {
 
     pub fn read_capacity(&mut self) -> Option<ReadCapacity> {
         let mut data = [0u8; READ_CAPACITY_10_RESPONSE_LEN];
-        let result = self.bot.execute_command(
+        let result = self.execute_replayable_query(
             &[SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            true,
             &mut data,
+            b"USB MSC: retrying READ CAPACITY(10) after BOT recovery\r\n",
         )?;
         if result.status != CSW_STATUS_PASSED {
             uart::log_hex(
@@ -420,10 +612,11 @@ impl UsbMassStorage {
             uart::log(b"USB MSC: too many blocks for one READ(10) transfer\r\n");
             return false;
         }
-        if self.reads_since_resync >= READS_PER_BOT_RESYNC {
-            if !self.proactive_resynchronize(b"USB MSC: proactive BOT resync before READ(10)\r\n") {
-                return false;
-            }
+        if self.reads_since_resync >= READS_PER_BOT_RESYNC
+            && !self.proactive_maintain(ResyncDirection::Read)
+        {
+            log_read_extent(lba, block_count, flags);
+            return false;
         }
         let cdb = [
             SCSI_READ_10,
@@ -440,6 +633,9 @@ impl UsbMassStorage {
         let result = match self.bot.execute_command(&cdb, true, buffer) {
             Some(result) => result,
             None => {
+                uart::log(b"USB MSC: READ(10) transport failed\r\n");
+                log_read_extent(lba, block_count, flags);
+                self.log_maintenance_resync_counts();
                 // execute_command has already completed BOT Reset Recovery.
                 // READ(10) is read-only, so replaying it once is safe. Do not
                 // put this retry in the generic BOT layer: a future write
@@ -452,6 +648,9 @@ impl UsbMassStorage {
                 self.read_retries = self.read_retries.wrapping_add(1);
                 uart::log(b"USB MSC: retrying READ(10) after BOT recovery\r\n");
                 let Some(result) = self.bot.execute_command(&cdb, true, buffer) else {
+                    uart::log(b"USB MSC: READ(10) retry transport failed\r\n");
+                    log_read_extent(lba, block_count, flags);
+                    self.log_maintenance_resync_counts();
                     return false;
                 };
                 result
@@ -462,11 +661,15 @@ impl UsbMassStorage {
                 b"USB MSC: READ(10) failed, CSW status=",
                 result.status as u32,
             );
+            log_read_extent(lba, block_count, flags);
+            self.log_maintenance_resync_counts();
             let _ = self.collect_sense(b"USB MSC: READ(10)");
             return false;
         }
         if result.transferred < buffer.len() {
             uart::log(b"USB MSC: short READ(10) response\r\n");
+            log_read_extent(lba, block_count, flags);
+            self.log_maintenance_resync_counts();
             return false;
         }
         self.reads_since_resync = self.reads_since_resync.saturating_add(1);
@@ -486,24 +689,32 @@ impl UsbMassStorage {
     /// uncertain block into an unknown number of them. The caller is told
     /// the write failed and decides what to do -- which is why this retry
     /// policy lives here rather than in `bot.rs`.
-    pub fn write_blocks(&mut self, lba: u32, buffer: &mut [u8]) -> bool {
+    pub fn write_blocks(&mut self, lba: u32, buffer: &mut [u8]) -> WriteOutcome {
         if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
             uart::log(
                 b"USB MSC: block transfer length must be a nonzero multiple of 512 bytes\r\n",
             );
-            return false;
+            return WriteOutcome::Failed;
         }
         let block_count = buffer.len() / BLOCK_BYTES;
         if block_count > u16::MAX as usize {
             uart::log(b"USB MSC: too many blocks for one WRITE(10) transfer\r\n");
-            return false;
+            return WriteOutcome::Failed;
+        }
+        if block_count > 1 && !self.multi_block_write_noted {
+            self.multi_block_write_noted = true;
+            uart::log_u32(
+                b"USB MSC: first multi-block WRITE(10) on this device, blocks=",
+                block_count as u32,
+            );
         }
         // WRITE is both rare and unsafe to replay after a transport failure.
         // Start every one at a freshly synchronized BOT boundary instead of
         // carrying accumulated endpoint/device state into the one command we
         // cannot recover by simply issuing again.
-        if !self.proactive_resynchronize(b"USB MSC: proactive BOT resync before WRITE(10)\r\n") {
-            return false;
+        if !self.proactive_maintain(ResyncDirection::Write) {
+            log_write_extent(lba, block_count);
+            return WriteOutcome::Failed;
         }
         let cdb = [
             SCSI_WRITE_10,
@@ -519,7 +730,9 @@ impl UsbMassStorage {
         ];
         let Some(result) = self.bot.execute_command(&cdb, false, buffer) else {
             uart::log(b"USB MSC: WRITE(10) transport failed, not retrying\r\n");
-            return false;
+            log_write_extent(lba, block_count);
+            self.log_maintenance_resync_counts();
+            return WriteOutcome::Failed;
         };
         if result.status != CSW_STATUS_PASSED {
             // The status alone does not say why: a write-protected device
@@ -530,20 +743,66 @@ impl UsbMassStorage {
                 b"USB MSC: WRITE(10) failed, CSW status=",
                 result.status as u32,
             );
-            let _ = self.collect_sense(b"USB MSC: WRITE(10)");
-            return false;
+            log_write_extent(lba, block_count);
+            self.log_maintenance_resync_counts();
+            let protected = self
+                .collect_sense(b"USB MSC: WRITE(10)")
+                .is_some_and(|sense| (sense[2] & 0x0F) == SENSE_KEY_DATA_PROTECT);
+            if protected {
+                uart::log(b"USB MSC: medium is write protected\r\n");
+                return WriteOutcome::WriteProtected;
+            }
+            return WriteOutcome::Failed;
         }
-        true
+        WriteOutcome::Written
     }
 
-    fn proactive_resynchronize(&mut self, message: &[u8]) -> bool {
-        uart::log(message);
-        if !self.bot.resynchronize() {
+    fn proactive_maintain(&mut self, direction: ResyncDirection) -> bool {
+        if !self.bot.maintain_command_boundary() {
+            uart::log(match direction {
+                ResyncDirection::Read => {
+                    b"USB MSC: proactive host cleanup failed before READ(10)\r\n"
+                }
+                ResyncDirection::Write => {
+                    b"USB MSC: proactive host cleanup failed before WRITE(10)\r\n"
+                }
+            });
+            self.log_maintenance_resync_counts();
             return false;
         }
         self.reads_since_resync = 0;
         self.maintenance_resyncs = self.maintenance_resyncs.wrapping_add(1);
+        let direction_count = match direction {
+            ResyncDirection::Read => {
+                self.read_maintenance_resyncs = self.read_maintenance_resyncs.wrapping_add(1);
+                self.read_maintenance_resyncs
+            }
+            ResyncDirection::Write => {
+                self.write_maintenance_resyncs = self.write_maintenance_resyncs.wrapping_add(1);
+                self.write_maintenance_resyncs
+            }
+        };
+        if direction_count == 1 || direction_count % RESYNC_LOG_INTERVAL == 0 {
+            uart::log_u32(
+                match direction {
+                    ResyncDirection::Read => b"USB MSC: proactive host cleanups before READ(10)=",
+                    ResyncDirection::Write => b"USB MSC: proactive host cleanups before WRITE(10)=",
+                },
+                direction_count,
+            );
+        }
         true
+    }
+
+    fn log_maintenance_resync_counts(&self) {
+        uart::log_u32(
+            b"USB MSC:   proactive READ cleanups=",
+            self.read_maintenance_resyncs,
+        );
+        uart::log_u32(
+            b"USB MSC:   proactive WRITE cleanups=",
+            self.write_maintenance_resyncs,
+        );
     }
 
     /// Asks the device to commit its write cache to the medium
@@ -574,11 +833,40 @@ impl UsbMassStorage {
                 b"USB MSC: SYNCHRONIZE CACHE(10) failed, CSW status=",
                 result.status as u32,
             );
-            let unsupported = self
-                .collect_sense(b"USB MSC: SYNCHRONIZE CACHE(10)")
-                .is_some_and(|sense| (sense[2] & 0x0F) == SENSE_KEY_ILLEGAL_REQUEST);
+            // Which bucket this falls in is decided by what the device
+            // says went wrong, not by the fact that something did.
+            //
+            // A named fault -- MEDIUM ERROR, HARDWARE ERROR, NOT READY -- is
+            // a diagnosis, and the caller is told the flush failed. ILLEGAL
+            // REQUEST is a device declining a command it does not implement.
+            // And a device that fails the command while reporting NO SENSE,
+            // or returning a sense buffer it never filled in, has declined
+            // it without saying so: it has reported no fault, so there is no
+            // fault here to pass on. Real sticks do exactly this, and
+            // failing every write over it would make them unusable without
+            // making anything safer -- the bytes are in the device either
+            // way, and this module's own rule is that a flush the device
+            // would not perform says nothing about the write before it.
+            //
+            // The exception is the session having died while the sense was
+            // being collected. That is a transport failure rather than an
+            // answer, and it must not be read as one.
+            let sense = self.collect_sense(b"USB MSC: SYNCHRONIZE CACHE(10)");
+            let unsupported = match sense {
+                Some(sense) => matches!(
+                    sense[2] & 0x0F,
+                    SENSE_KEY_ILLEGAL_REQUEST | SENSE_KEY_NO_SENSE
+                ),
+                None => !self.needs_reinit(),
+            };
             if unsupported {
-                uart::log(b"USB MSC: device refuses SYNCHRONIZE CACHE(10), not asking again\r\n");
+                uart::log(b"USB MSC: device will not SYNCHRONIZE CACHE(10), not asking again\r\n");
+                // Said once per attachment, at the moment it becomes true.
+                // A device that will not flush can still be written to, but
+                // nothing above this can promise the bytes survive the stick
+                // being pulled, and that has to be on the record rather than
+                // inferred from the absence of a flush line.
+                uart::log(b"USB MSC: flush unsupported; removal durability is not guaranteed\r\n");
                 self.cache_sync_unsupported = true;
                 return CacheSync::Unsupported;
             }
@@ -596,6 +884,14 @@ impl UsbMassStorage {
     fn collect_sense(&mut self, context: &[u8]) -> Option<[u8; REQUEST_SENSE_RESPONSE_LEN]> {
         let sense = self.request_sense()?;
         uart::log(context);
+        // The response code decides whether the rest of the buffer means
+        // anything. Collecting the sense still had to happen -- that is what
+        // clears the condition the device is holding -- but a caller must not
+        // read a diagnosis out of eighteen bytes the device never filled in.
+        if !SENSE_RESPONSE_CODES.contains(&(sense[0] & 0x7F)) {
+            uart::log_hex(b" invalid sense response code=", sense[0] as u32);
+            return None;
+        }
         uart::log_hex(b" sense key=", (sense[2] & 0x0F) as u32);
         uart::log_hex(b"USB MSC: ASC=", sense[12] as u32);
         uart::log_hex(b"USB MSC: ASCQ=", sense[13] as u32);
@@ -626,4 +922,59 @@ impl UsbMassStorage {
 
 fn elapsed_ms(start: u64) -> u32 {
     tick::now_ms().saturating_sub(start) as u32
+}
+
+/// Writes a short byte string as hex pairs followed by its printable form.
+///
+/// A serial number is usually ASCII, so the text is what a reader compares
+/// at a glance; the hex is there because the interesting case is the one
+/// where it is not ASCII any more. Bounded to what a VPD page can hold, so
+/// there is no formatter and no allocation behind this.
+fn log_bytes(label: &[u8], bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut line = [0u8; VPD_RESPONSE_MAX * 3 + VPD_RESPONSE_MAX + 8];
+    let mut length = 0;
+    for byte in bytes.iter().take(VPD_RESPONSE_MAX) {
+        line[length] = HEX[(byte >> 4) as usize];
+        line[length + 1] = HEX[(byte & 0x0F) as usize];
+        line[length + 2] = b' ';
+        length += 3;
+    }
+    line[length] = b'|';
+    length += 1;
+    for byte in bytes.iter().take(VPD_RESPONSE_MAX) {
+        // Anything outside printable ASCII becomes a dot, so the line stays
+        // one line whatever the device sent.
+        line[length] = if (0x20..0x7F).contains(byte) {
+            *byte
+        } else {
+            b'.'
+        };
+        length += 1;
+    }
+    line[length] = b'|';
+    line[length + 1] = b'\r';
+    line[length + 2] = b'\n';
+    length += 3;
+    uart::log(label);
+    uart::log(&line[..length]);
+}
+
+/// Names what a failed READ(10) was trying to move. FUA matters because a
+/// verification read reaches the medium while an ordinary read may be
+/// answered from the device's cache.
+fn log_read_extent(lba: u32, block_count: usize, flags: u8) {
+    uart::log_hex(b"USB MSC:   at LBA=", lba);
+    uart::log_u32(b"USB MSC:   blocks=", block_count as u32);
+    uart::log_u32(b"USB MSC:   FUA=", u32::from(flags & CDB_FLAG_FUA != 0));
+}
+
+/// Names what a failed WRITE(10) was trying to move.
+///
+/// A single block is the shape the transport has been accepted at; several
+/// blocks in one data OUT phase is not, so which of the two failed is the
+/// first thing to know about a write that did not get through.
+fn log_write_extent(lba: u32, block_count: usize) {
+    uart::log_hex(b"USB MSC:   at LBA=", lba);
+    uart::log_u32(b"USB MSC:   blocks=", block_count as u32);
 }

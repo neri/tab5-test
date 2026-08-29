@@ -21,8 +21,8 @@ use crate::framebuffer::Framebuffer;
 use crate::fs::path::{self, Path, PathError};
 use crate::fs::registry::{device_name, parse_device_name};
 use crate::fs::vfs::{
-    EntryKind, FileHandle, FsError, MountMode, OpenMode, Timestamp, Vfs, error_name, format_name,
-    mode_name, verdict_name,
+    EntryKind, FileHandle, FsError, MountMode, MountRequest, OpenMode, Timestamp, Vfs, error_name,
+    format_name, mode_name, verdict_name,
 };
 use crate::fs::{DeviceId, Devices, mbr};
 use crate::tick;
@@ -1009,19 +1009,33 @@ pub fn mount(
     devices: &mut Devices,
     vfs: &mut Vfs,
     name: &str,
+    request: MountRequest,
 ) {
     let Some((device, partition)) = parse_volume_name(name) else {
-        console.write_output_line(framebuffer, "usage: mount <ram|sd0pN|usbMpN>");
+        console.write_output_line(framebuffer, "usage: mount [-r] <ram|sd0pN|usbMpN>");
         return;
     };
 
-    match attach(devices, vfs, device, partition) {
+    match attach(devices, vfs, device, partition, request) {
         Ok(point) => {
             let mut line = Line::new();
             line.push_str("mounted ");
             line.push_str(name);
             line.push_str(" on ");
             line.push_str(point.as_str());
+            // Said here rather than left to `mounts`, because whether a
+            // volume can be written to is the thing a caller is most likely
+            // to have assumed wrongly -- an exFAT stick is read-only however
+            // it was asked for.
+            line.push_str(
+                match vfs
+                    .mounts()
+                    .find(|mount| mount.point.as_str() == point.as_str())
+                {
+                    Some(mount) if mount.mode == MountMode::ReadOnly => " (read-only)",
+                    _ => " (read-write)",
+                },
+            );
             console.write_output_line(framebuffer, line.as_str());
         }
         Err(MountFailure::NotPresent) => {
@@ -1058,6 +1072,7 @@ pub fn attach(
     vfs: &mut Vfs,
     device: DeviceId,
     partition: Option<u8>,
+    request: MountRequest,
 ) -> Result<Line, MountFailure> {
     let range = match partition {
         None => {
@@ -1084,16 +1099,14 @@ pub fn attach(
         }
     };
 
-    // Only the RAM root is mounted read-write. SD and USB stay read-only in
-    // every stage of this plan, and there is no option here to change that.
-    let mode = if device == DeviceId::Ram {
-        MountMode::ReadWrite
-    } else {
-        MountMode::ReadOnly
-    };
+    // What the volume ends up mounted as is not decided here: the caller
+    // says whether it wants the default or read-only, and the VFS settles it
+    // against the format it reads out of the boot sector. Deciding by medium
+    // -- as this used to, when only the RAM disk was writable -- would mean
+    // the shell and the VFS each holding half a policy.
     let point = mount_point(volume_name(device, partition).as_str(), device);
 
-    vfs.mount(devices, point.as_str(), device, partition, range, mode)
+    vfs.mount(devices, point.as_str(), device, partition, range, request)
         .map_err(MountFailure::Fs)?;
     Ok(point)
 }

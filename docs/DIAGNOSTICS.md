@@ -71,7 +71,7 @@ BLACK/REDです。通常のproduction設定だけを100回確認するときは`
 実際のconsole scroll 100回と全画面アプリ遷移は`ui`で一括実行し、最後に
 `ui visual: underruns=... dma_error=...`を表示します。途中の各画面は任意キーで次へ進みます。
 表示・PSRAM heap・microSD・USB MSCのread-only複合試験は`mix`で既定120分実行し、最後に
-`mix: PASS (SD/USB were read-only)`を表示します。途中経過は10分ごとにUARTへframe数を出し、
+`mix: PASS (nothing written to SD/USB)`を表示します。途中経過は10分ごとにUARTへframe数を出し、
 結果の`usb retries: packet=... command=...`はそれぞれ同一BOT phase内のQTD再投入回数と、
 BOT Reset Recovery後のREAD(10)再送回数です。複合試験前にUSBだけを短く確認する場合は`ut`を
 実行します。既定で同じ4 KiBを100回read・比較し、`completed`、transport `failures`、data
@@ -268,7 +268,14 @@ BOT層は方向別に`USB BOT: bulk IN timed out`等を出します。以前のH
 `control transfer timed out`と誤表示していました。portが接続・有効・給電されたままで
 Recoveryできれば、続けて`USB BOT: reset recovery complete`と
 `USB MSC: retrying READ(10) after BOT recovery`が出ます。Recovery自体が完了しなければ
-`reset recovery failed`となり、READ(10)の1回再送も失敗した場合は呼び出し元へ失敗を返します。
+`reset recovery failed`となり、READ(10)または再送安全な照会の1回再送も失敗した場合は
+呼び出し元へ失敗を返します。媒体確認に使うTEST UNIT READY、READ CAPACITY(10)、
+INQUIRY／INQUIRY(EVPD)は媒体を変更しないため、Recovery後に1回再送し、
+`USB MSC: retrying <command> after BOT recovery`を出します。
+失敗したcommandは`USB BOT: failed command opcode=`にCDB opcode、続く行にattach後の
+command tag、data byte数、IN方向かを必ず出します。`opcode=0x00`はTEST UNIT READY、
+`0x12`はINQUIRY、`0x25`はREAD CAPACITY(10)、`0x28`はREAD(10)、`0x2A`はWRITE(10)、
+`0x35`はSYNCHRONIZE CACHE(10)です。
 Bulk QTDは1 packetに限定し、約1秒でhaltしなければ同じDATA PIDで最大4回再投入します。
 合計約5秒で応答しなければBOT Resetへ進みます。BOT ResetのIN statusを含むcontrol packetは約1秒で、
 いずれもCPU周波数からiteration数を算出します。`packet_retries`にはstatus 1とtimeoutの両方による
@@ -284,8 +291,11 @@ Bulk IN／OUTの`CLEAR_FEATURE(ENDPOINT_HALT)`を実行し、両toggleをDATA0�
 実機で最短33 READ後にBulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔で
 BOT境界を再確立する予防策です。root portやHIDはresetしません。`ut`開始ログは
 `USB TEST: phase-aligned split HID v24`、実行回数は`proactive_resyncs=`で確認します。
-WRITE(10)の直前にも同じ再同期を行い、
-`USB MSC: proactive BOT resync before WRITE(10)`を出します。
+WRITE(10)の直前にも同じ再同期を行います。成功ログは方向別の初回と64回ごとだけを
+`USB MSC: proactive BOT resyncs before READ(10)=N`または
+`USB MSC: proactive BOT resyncs before WRITE(10)=N`として出します。再同期または
+READ／WRITE転送が失敗した場合は間引かず、LBA、block数、READのFUA有無、および方向別の
+累計再同期回数を続けて出します。大量転送の同一行で、直前の異常ログを埋もれさせないためです。
 
 `usbhw`はSplit Transactionのレジスタに加え、USB割り込みのsource、global enable、
 総ISR回数、channel 0／periodic channel 1〜4／root-port／spurious回数、`GINTMSK`／`HAINTMSK`／`HCINTMSK0..4`、

@@ -29,13 +29,13 @@
 //! [`super::stream`] is there to absorb, and it is worth measuring before it
 //! is worth optimizing.
 
-use hadris_fat::FatVolumeReadExt;
 use hadris_fat::dir::FileEntry;
 use hadris_fat::error::Error as FatError;
 use hadris_fat::exfat::{ExFatFileReader, ExFatVolume};
 use hadris_fat::sync::FatVolume;
 use hadris_fat::sync::dir::FatDir;
 use hadris_fat::sync::write::FileWriter;
+use hadris_fat::{FatVolumeReadExt, FatVolumeWriteExt};
 use hadris_io::{Read, Seek, SeekFrom, Write};
 
 use super::block::BlockError;
@@ -46,6 +46,7 @@ use super::partition::{PartitionBlockDevice, PartitionRange};
 use super::path::{self, Path, PathError};
 use super::registry::{DeviceId, Devices};
 use super::stream::BlockStream;
+use crate::uart;
 use crate::usb::{ConnectionEpoch, Location, UsbHost};
 
 /// Mount points available at once. Two SD partitions, a handful of USB
@@ -82,13 +83,33 @@ pub struct VolumeId {
 
 /// Whether the VFS will let a write through to this mount.
 ///
-/// This is the policy half of the read-only rule. The other half is the
-/// block adapters refusing writes outright, so a mount marked read-write by
-/// mistake still cannot reach an SD card or a USB stick.
+/// The whole of the read-only rule now lives here. The block adapters used
+/// to refuse writes outright as a second line, but a device that cannot be
+/// written to is not something the adapters can usefully believe once SD and
+/// USB are writable media -- so what a mount may do is decided in one place,
+/// at mount time, from [`MountRequest`] and the volume's format.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MountMode {
     ReadOnly,
     ReadWrite,
+}
+
+/// What a caller asks for when mounting, before the format is known.
+///
+/// The caller does not choose [`MountMode`] because it cannot: the mode
+/// depends on what is on the volume, and that is read out of the boot sector
+/// inside [`Vfs::mount`]. So the shell asks for one of these two and the VFS
+/// settles the rest -- which is also what keeps `mount` and automount from
+/// having to agree on a policy separately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountRequest {
+    /// Whatever the format supports: read-write for FAT, read-only for
+    /// exFAT.
+    Default,
+    /// Read-only whatever the format is. The only knob there is, because
+    /// the other direction -- forcing exFAT read-write -- is not something
+    /// this firmware can honour.
+    ReadOnly,
 }
 
 /// Which filesystem is on a volume.
@@ -101,9 +122,10 @@ pub enum MountMode {
 pub enum VolumeFormat {
     Fat,
     /// exFAT, always read-only. The library's exFAT support is an explicitly
-    /// unstable preview, and every exFAT volume this firmware can reach is
-    /// on removable media that is read-only by policy regardless, so there
-    /// is nothing for a write path here to write to.
+    /// unstable preview, and a preview that writes is a preview that can
+    /// destroy a volume rather than fail to read one -- so this is the one
+    /// format [`MountRequest::Default`] does not make writable, and there is
+    /// no request that does.
     Exfat,
 }
 
@@ -179,7 +201,10 @@ pub enum FsError {
     NotSeekable,
     /// The volume has no room left.
     NoSpace,
-    /// The device this mount names is not currently there.
+    /// The device this mount names could not be reached. Either it is gone,
+    /// or its transport session has failed and needs rebuilding -- which the
+    /// block layer tells apart but this does not, because both leave the
+    /// mount unusable until somebody intervenes.
     DeviceNotPresent,
     /// The volume is not a filesystem this firmware can read.
     NotAFilesystem,
@@ -209,7 +234,7 @@ pub fn error_name(error: FsError) -> &'static str {
         FsError::ReadOnly => "read-only",
         FsError::NotSeekable => "can only write at the start or the end of a file",
         FsError::NoSpace => "no space left on volume",
-        FsError::DeviceNotPresent => "device not present",
+        FsError::DeviceNotPresent => "device not reachable",
         FsError::NotAFilesystem => "not a readable filesystem",
         FsError::CrossVolume => "cannot move between volumes",
         FsError::StaleHandle => "handle no longer valid",
@@ -478,7 +503,7 @@ impl Vfs {
         device: DeviceId,
         partition: Option<u8>,
         range: PartitionRange,
-        mode: MountMode,
+        request: MountRequest,
     ) -> Result<(), FsError> {
         let point = path::normalize(point)?;
         if self.find_mount_exact(&point).is_some() {
@@ -507,10 +532,29 @@ impl Vfs {
                 match bootsector::identify(&sector) {
                     Some(VolumeKind::Fat) => Ok(VolumeFormat::Fat),
                     Some(VolumeKind::Exfat) => Ok(VolumeFormat::Exfat),
-                    None => Err(FsError::NotAFilesystem),
+                    None => {
+                        // The user can see this partition in `devices` and in
+                        // `usbmbr`, so refusing it with one word invites the
+                        // conclusion that the medium is broken. Which field
+                        // of the boot sector this layer would not accept is
+                        // the difference between a damaged volume and a
+                        // check here that is too strict.
+                        uart::log(b"FS: no boot sector at the partition start: ");
+                        uart::log(bootsector::rejection_reason(&sector).as_bytes());
+                        uart::log(b"\r\n");
+                        Err(FsError::NotAFilesystem)
+                    }
                 }
             })
             .ok_or(FsError::DeviceNotPresent)??;
+
+        // The format decides the mode, which is why the request could not:
+        // exFAT is read-only however it was asked for, and FAT is writable
+        // unless the caller said otherwise.
+        let mode = match (request, format) {
+            (MountRequest::Default, VolumeFormat::Fat) => MountMode::ReadWrite,
+            (MountRequest::ReadOnly, _) | (_, VolumeFormat::Exfat) => MountMode::ReadOnly,
+        };
 
         let location = match device {
             DeviceId::Usb(id) => devices.usb.mass_storage_location(id),
@@ -570,7 +614,8 @@ impl Vfs {
             let verdict = if moved {
                 Verdict::Disconnected
             } else {
-                match devices.fingerprint(mount.volume.device, Some(mount.range.start_lba)) {
+                let current = devices.fingerprint(mount.volume.device, Some(mount.range.start_lba));
+                let verdict = match current {
                     None => Verdict::DeviceAbsent,
                     Some(current) if current.matches(&mount.fingerprint) => Verdict::Unchanged,
                     Some(current) if !current.sources.beyond_geometry() => {
@@ -585,7 +630,14 @@ impl Vfs {
                         }
                     }
                     Some(_) => Verdict::Changed,
+                };
+                // Same reasoning as the pre-write check: this verdict drops a
+                // mount, so what disagreed goes on the record rather than
+                // just the conclusion.
+                if verdict == Verdict::Changed {
+                    log_medium_mismatch(&mount, current.as_ref(), b"identity differs on ");
                 }
+                verdict
             };
             if matches!(verdict, Verdict::Changed | Verdict::Disconnected) {
                 self.next_generation += 1;
@@ -991,9 +1043,9 @@ impl Vfs {
     /// almost always mistyped it, and building the whole chain silently
     /// would turn that typo into a directory tree.
     ///
-    /// FAT only. exFAT is read-only here for the reasons in
-    /// [`VolumeFormat::Exfat`], and so is every mount that is not the RAM
-    /// disk.
+    /// FAT only. exFAT is read-only for the reasons in
+    /// [`VolumeFormat::Exfat`], and so is any mount made with
+    /// [`MountRequest::ReadOnly`].
     pub fn create_dir(&mut self, devices: &mut Devices, path: &str) -> Result<(), FsError> {
         let path = path::normalize(path)?;
         let Some((mount, within)) = self.resolve(&path) else {
@@ -1013,26 +1065,21 @@ impl Vfs {
             return Err(FsError::AlreadyExists);
         }
 
-        // One reading of the clock for the whole operation. See
-        // `super::clock`.
-        clock::sample();
-        let outcome = with_volume(devices, &mount, |volume| {
-            let AnyVolume::Fat(volume) = volume else {
-                // Unreachable: the format was checked above.
-                return Err(FsError::ReadOnly);
-            };
+        self.write_volume(devices, &mount, |volume| {
             create_directory(volume, &within)?;
             volume.sync().map_err(map_write_error)
-        });
-        clock::clear();
-        outcome
+        })
     }
 
-    /// Opens a file for reading.
+    /// Opens a file, creating it when `mode` is one that does.
     ///
-    /// There is no mode argument because there is only one mode. Creating,
-    /// truncating and appending arrive with the write path; until then an
-    /// open that could do any of them would be a promise this cannot keep.
+    /// A writable mode is refused here rather than at the first write, so a
+    /// caller that cannot write finds out before it has anything invested.
+    /// Creating the file is the one block write this performs, and the only
+    /// part that goes through [`Self::write_volume`] -- `Truncate` does not
+    /// empty an existing file until something is actually written through
+    /// the handle, so opening one and closing it again leaves the medium
+    /// exactly as it was.
     pub fn open(
         &mut self,
         devices: &mut Devices,
@@ -1057,17 +1104,19 @@ impl Vfs {
             .position(Option::is_none)
             .ok_or(FsError::TooManyOpenFiles)?;
 
-        let size = with_volume(devices, &mount, |volume| match volume {
+        // The look is read-only, and reports "not there" rather than
+        // creating anything. Creating is a write, and a write to a removable
+        // medium has to be preceded by the identity check in
+        // [`Self::confirm_medium`] -- which cannot run from inside a volume
+        // that is already open.
+        let existing = with_volume(devices, &mount, |volume| match volume {
             AnyVolume::Fat(volume) => match lookup(volume, &within) {
                 Ok(Some(entry)) if entry.is_directory() => Err(FsError::NotAFile),
-                Ok(Some(entry)) => Ok(entry.len()),
+                Ok(Some(entry)) => Ok(Some(entry.len())),
                 Ok(None) => Err(FsError::NotAFile),
                 // A missing file is only an error for a mode that is not
                 // there to create one.
-                Err(FsError::NotFound) if mode.writable() => {
-                    create(volume, &within)?;
-                    Ok(0)
-                }
+                Err(FsError::NotFound) if mode.writable() => Ok(None),
                 Err(error) => Err(error),
             },
             AnyVolume::Exfat(volume) => {
@@ -1079,9 +1128,23 @@ impl Vfs {
                 if entry.is_directory() {
                     return Err(FsError::NotAFile);
                 }
-                Ok(entry.valid_data_length)
+                Ok(Some(entry.valid_data_length))
             }
         })?;
+        let size = match existing {
+            Some(size) => size,
+            None => {
+                // The one block write `open` performs, through the same path
+                // as every other. `sync` is part of it: an entry that is in
+                // the library's cache and not on the medium is a file the
+                // handle can be used against and a reboot cannot find.
+                self.write_volume(devices, &mount, |volume| {
+                    create(volume, &within)?;
+                    volume.sync().map_err(map_write_error)
+                })?;
+                0
+            }
+        };
 
         self.files[slot] = Some(OpenFile {
             volume: mount.volume,
@@ -1232,10 +1295,6 @@ impl Vfs {
         if mount.mode == MountMode::ReadOnly || mount.format == VolumeFormat::Exfat {
             return Err(FsError::ReadOnly);
         }
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-
         // The first write of a truncating open starts the file over; every
         // other write goes on the end. Anything else is a position the
         // writer cannot be put at.
@@ -1243,19 +1302,31 @@ impl Vfs {
         if !from_start && file.offset != file.size {
             return Err(FsError::NotSeekable);
         }
+        // An empty write is nothing to do only when it is not also the one
+        // that empties the file. Opening for truncation and closing again
+        // still leaves the medium alone -- nothing was written through the
+        // handle -- but asking to write no bytes is asking for the file to
+        // be replaced by nothing, and that is a real change.
+        if buffer.is_empty() && !from_start {
+            return Ok(0);
+        }
 
-        // One reading of the clock for the whole operation, taken before any
-        // of it starts. See `super::clock`.
-        clock::sample();
-        let outcome = with_volume(devices, &mount, |volume| {
-            let AnyVolume::Fat(volume) = volume else {
-                // Unreachable: the mount's format was checked above. Kept as
-                // a refusal rather than a panic, because "this volume is not
-                // writable" is a true statement whatever led here.
-                return Err(FsError::ReadOnly);
-            };
-            let entry = lookup(volume, &file.path)?.ok_or(FsError::NotFound)?;
+        let path = file.path;
+        let count = self.write_volume(devices, &mount, |volume| {
+            let entry = lookup(volume, &path)?.ok_or(FsError::NotFound)?;
             let mut writer = if from_start {
+                // Replacing a file means freeing its chain, not writing over
+                // the front of it. Without this the tail of a longer
+                // previous version stays linked: the new length hides it
+                // from a reader, and the next append -- which walks the
+                // chain rather than the length -- carries on from that tail
+                // instead of from the end of what was just written.
+                volume.truncate(&entry, 0).map_err(map_write_error)?;
+                // The entry in hand still names the first cluster that was
+                // just freed. Reading it back is what makes the writer
+                // allocate a fresh chain rather than write into clusters
+                // that are now on the free list.
+                let entry = lookup(volume, &path)?.ok_or(FsError::NotFound)?;
                 FileWriter::new(volume, &entry).map_err(|_| FsError::NotAFile)?
             } else {
                 FileWriter::new_append(volume, &entry).map_err(|_| FsError::NotAFile)?
@@ -1268,9 +1339,7 @@ impl Vfs {
             writer.finish().map_err(map_write_error)?;
             volume.sync().map_err(map_write_error)?;
             Ok(count)
-        });
-        clock::clear();
-        let count = outcome?;
+        })?;
 
         if let Some(file) = self.files[handle.0].as_mut() {
             if from_start {
@@ -1337,13 +1406,7 @@ impl Vfs {
             return Err(FsError::ReservedPath);
         }
 
-        // One reading of the clock for the whole transfer, as everywhere
-        // else that writes. See `super::clock`.
-        clock::sample();
-        let outcome = with_volume(devices, &mount, |volume| {
-            let AnyVolume::Fat(volume) = volume else {
-                return Err(FsError::ReadOnly);
-            };
+        self.write_volume(devices, &mount, |volume| {
             // `lookup` reports a missing entry as `Err(NotFound)`, not as
             // `Ok(None)` -- which it answers only for the volume's root.
             // Creating on the `None` arm therefore never creates anything,
@@ -1360,6 +1423,12 @@ impl Vfs {
             };
             let mut writer = match mode {
                 OpenMode::Truncate => {
+                    // The same replacement rule as `Vfs::write`: free the old
+                    // chain before the transfer starts, then read the entry
+                    // back so the writer allocates rather than reusing
+                    // clusters it has just given away.
+                    volume.truncate(&entry, 0).map_err(map_write_error)?;
+                    let entry = lookup(volume, &within)?.ok_or(FsError::NotAFile)?;
                     FileWriter::new(volume, &entry).map_err(|_| FsError::NotAFile)?
                 }
                 // `Read` was refused above; this is `Append`.
@@ -1407,9 +1476,7 @@ impl Vfs {
                 written,
                 interrupted,
             })
-        });
-        clock::clear();
-        outcome
+        })
     }
 
     /// Removes a file.
@@ -1449,11 +1516,7 @@ impl Vfs {
         if self.is_open(mount.volume, &within) {
             return Err(FsError::Busy);
         }
-        clock::sample();
-        let outcome = with_volume(devices, &mount, |volume| {
-            let AnyVolume::Fat(volume) = volume else {
-                return Err(FsError::ReadOnly);
-            };
+        self.write_volume(devices, &mount, |volume| {
             let entry = lookup(volume, &within)?.ok_or(FsError::NotFound)?;
             // Asked for by kind so that `rm` cannot take a directory and
             // `rmdir` cannot take a file. The library would delete either.
@@ -1467,9 +1530,7 @@ impl Vfs {
             volume.delete(&entry).map_err(map_write_error)?;
             volume.sync().map_err(map_write_error)?;
             Ok(())
-        });
-        clock::clear();
-        outcome
+        })
     }
 
     /// Renames `from` to `to`, which may move it to another directory on the
@@ -1493,9 +1554,9 @@ impl Vfs {
         }
         // Asked before whether either side is writable, so that a move
         // between volumes says so whichever of them happens to be read-only.
-        // The other order made the answer depend on that. The RAM root is
-        // writable and removable volumes are not, but crossing either way is
-        // still refused because it would be a copy rather than a rename.
+        // The other order made the answer depend on that. Crossing is
+        // refused even when both sides are writable, because moving a file
+        // between volumes is a copy rather than a rename.
         if destination_mount.volume != mount.volume {
             return Err(FsError::CrossVolume);
         }
@@ -1510,11 +1571,7 @@ impl Vfs {
             return Err(FsError::Busy);
         }
         let name = destination.file_name().ok_or(FsError::NotAFile)?;
-        clock::sample();
-        let outcome = with_volume(devices, &mount, |volume| {
-            let AnyVolume::Fat(volume) = volume else {
-                return Err(FsError::ReadOnly);
-            };
+        self.write_volume(devices, &mount, |volume| {
             let entry = lookup(volume, &source)?.ok_or(FsError::NotFound)?;
             let parent = parent_of(volume, &destination)?;
             volume
@@ -1522,9 +1579,7 @@ impl Vfs {
                 .map_err(map_write_error)?;
             volume.sync().map_err(map_write_error)?;
             Ok(())
-        });
-        clock::clear();
-        outcome
+        })
     }
 
     /// The mount covering `path`, refusing one that cannot be written to.
@@ -1539,6 +1594,134 @@ impl Vfs {
         Ok((mount, within))
     }
 
+    /// Runs one mutating operation against `mount`, with everything writing
+    /// to a removable medium needs around it.
+    ///
+    /// Every write path goes through here, so the three things that have to
+    /// happen around one cannot be forgotten by any of them:
+    ///
+    /// - the medium is confirmed to be the one the mount was made against,
+    ///   before a single block is written to it;
+    /// - the clock is sampled once for the whole operation, so every entry
+    ///   the operation writes carries the same timestamp (`super::clock`);
+    /// - a failure that came from the medium takes the mount down with it.
+    ///
+    /// The volume arrives already narrowed to FAT. exFAT is never
+    /// read-write, so a caller that got past [`Self::writable_mount`] cannot
+    /// be looking at one.
+    fn write_volume<T>(
+        &mut self,
+        devices: &mut Devices,
+        mount: &Mount,
+        body: impl FnOnce(&mut FatVolume<BlockStream<'_>>) -> Result<T, FsError>,
+    ) -> Result<T, FsError> {
+        self.confirm_medium(devices, mount)?;
+        clock::sample();
+        let outcome = with_volume(devices, mount, |volume| {
+            let AnyVolume::Fat(volume) = volume else {
+                // Unreachable: the mount's format was checked above. Kept as
+                // a refusal rather than a panic, because "this volume is not
+                // writable" is a true statement whatever led here.
+                return Err(FsError::ReadOnly);
+            };
+            body(volume)
+        });
+        clock::clear();
+        self.settle_after_write(mount, &outcome);
+        outcome
+    }
+
+    /// Confirms the medium behind `mount` is still the one it was made
+    /// against, before anything is written to it.
+    ///
+    /// The per-operation geometry check in [`with_volume`] is not enough
+    /// here. A card of the same size swapped into the same slot, or a
+    /// different card put into a USB reader that never disconnected, gets
+    /// past it -- and reading a stale volume gives a wrong answer, while
+    /// *writing* one destroys a filesystem that was never asked about.
+    ///
+    /// So the full fingerprint is gathered, at the cost of a few bus
+    /// commands per mutating operation, and anything short of agreement
+    /// drops the mount without writing: a mismatch, a device that is not
+    /// answering, and a fingerprint with nothing behind it but a capacity,
+    /// which cannot tell two same-sized media apart and so is not evidence
+    /// of anything.
+    ///
+    /// The RAM disk is exempt. It is rebuilt at every boot and cannot be
+    /// swapped, so there is no second medium for this to distinguish.
+    fn confirm_medium(&mut self, devices: &mut Devices, mount: &Mount) -> Result<(), FsError> {
+        if mount.volume.device == DeviceId::Ram {
+            return Ok(());
+        }
+        let current = devices.fingerprint(mount.volume.device, Some(mount.range.start_lba));
+        let verdict = match current {
+            None => Err(FsError::DeviceNotPresent),
+            Some(current)
+                if current.matches(&mount.fingerprint) && current.sources.beyond_geometry() =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(FsError::Block(BlockError::MediaChanged)),
+        };
+        if verdict.is_err() {
+            // Logged rather than left as one word on the console. This check
+            // drops a mount, so "media changed" is an expensive thing to be
+            // told without being told which part disagreed -- and the part
+            // that disagreed is the difference between a swapped card and a
+            // device that answered one of its optional identity pages this
+            // time and not last time.
+            log_medium_mismatch(mount, current.as_ref(), b"refusing a write on ");
+            self.drop_mount(mount);
+        }
+        verdict
+    }
+
+    /// Applies the failure policy for a write that has just finished.
+    ///
+    /// A failure that came from the medium leaves the volume in a state
+    /// nothing here can describe: some of a multi-block transfer may have
+    /// landed, the FAT and the directory entry may disagree, and the next
+    /// operation would build on whichever half survived. The mount goes, its
+    /// handles go stale, and the user re-mounts when they have decided what
+    /// to do -- which is also where a PC's `fsck` fits in.
+    ///
+    /// Everything else keeps the mount. A full volume, a name that is taken,
+    /// a path that is not there: the medium did exactly what was asked and
+    /// answered, and there is nothing to recover from.
+    ///
+    /// The RAM disk is exempt for the same reason as everywhere else: it is
+    /// the root the whole namespace hangs off, it is not removable, and
+    /// dropping it would leave the tree without a parent.
+    fn settle_after_write<T>(&mut self, mount: &Mount, outcome: &Result<T, FsError>) {
+        if mount.volume.device == DeviceId::Ram {
+            return;
+        }
+        if matches!(
+            outcome,
+            Err(FsError::Block(_)) | Err(FsError::DeviceNotPresent)
+        ) {
+            self.drop_mount(mount);
+        }
+    }
+
+    /// Takes `mount` out of the table, so every handle on it goes stale.
+    ///
+    /// The generation moves on as well as the slot being cleared: re-mounting
+    /// the same medium has to produce a volume an old handle cannot match,
+    /// which is what generations are for.
+    fn drop_mount(&mut self, mount: &Mount) {
+        let Some(slot) = self.find_mount_exact(&mount.point) else {
+            return;
+        };
+        // Something else may have been mounted here in the meantime -- and
+        // if it has, it is not this mount's to drop.
+        if self.mounts[slot].is_none_or(|current| current.volume != mount.volume) {
+            return;
+        }
+        self.next_generation += 1;
+        self.mounts[slot] = None;
+    }
+
     /// Whether a handle is open on this exact file.
     fn is_open(&self, volume: VolumeId, path: &Path) -> bool {
         // Both are normalized paths within the same volume, so the
@@ -1551,7 +1734,7 @@ impl Vfs {
 
 /// Whether mutating `path` would alter one of the namespace entries stored
 /// on the RAM root. A mounted child under `/vol` resolves to that child
-/// mount, so its ordinary read-only policy remains the error reported there.
+/// mount, so what is reported there is that mount's own policy.
 fn reserved_mutation(mount: &Mount, path: &Path) -> bool {
     if !mount.point.is_root() {
         return false;
@@ -1576,6 +1759,64 @@ pub struct StreamWrite<T> {
     pub interrupted: Option<FsError>,
 }
 
+/// Says on the UART why the filesystem driver would not open a volume whose
+/// boot sector this layer had already accepted.
+///
+/// Distinct from the boot-sector refusal, which reports the same
+/// [`FsError::NotAFilesystem`]: this is the driver reading further in and
+/// finding something it will not work with. The library's own wording is
+/// passed through rather than summarized, because the useful cases are the
+/// ones where it names a limit it imposes -- a cluster larger than it
+/// supports, say -- and a limit restated here would be a second copy to keep
+/// in agreement with a dependency.
+fn log_driver_refusal(driver: &[u8], error: &FatError) {
+    uart::log(b"FS: the ");
+    uart::log(driver);
+    uart::log(b" driver refused a volume whose boot sector passed: ");
+    match error {
+        FatError::CorruptFilesystem { context } => uart::log(context.as_bytes()),
+        FatError::UnsupportedFatType(what) => uart::log(what.as_bytes()),
+        FatError::InvalidBootSignature { .. } => uart::log(b"invalid boot signature"),
+        FatError::Io(_) | FatError::IoContext { .. } => {
+            uart::log(b"the medium failed while it was being read")
+        }
+        _ => uart::log(b"no further detail"),
+    }
+    uart::log(b"\r\n");
+}
+
+/// Says on the UART why a medium comparison disagreed.
+///
+/// The two fingerprints side by side, in the three fields that decide the
+/// comparison. A capacity that moved is a different medium; sources that
+/// moved mean the device answered a different set of questions, which is
+/// not the same thing and is worth being able to tell apart.
+fn log_medium_mismatch(mount: &Mount, current: Option<&Fingerprint>, context: &[u8]) {
+    uart::log(b"FS: medium ");
+    uart::log(context);
+    uart::log(mount.point.as_str().as_bytes());
+    uart::log(b"\r\n");
+    let Some(current) = current else {
+        uart::log(b"FS:   the device did not answer at all\r\n");
+        return;
+    };
+    uart::log_hex(b"FS:   want blocks=", mount.fingerprint.block_count as u32);
+    uart::log_hex(b"FS:   have blocks=", current.block_count as u32);
+    uart::log_hex(b"FS:   want sources=", mount.fingerprint.sources.bits());
+    uart::log_hex(b"FS:   have sources=", current.sources.bits());
+    // The one line that names what moved. A bit set here with the same bit
+    // set in both `sources` means that source answered both times and said
+    // something different; a bit set here that is missing from `have
+    // sources` means it simply did not answer this time, which is not
+    // evidence of a different medium at all.
+    uart::log_hex(
+        b"FS:   differing=",
+        mount.fingerprint.differing_sources(current),
+    );
+    // Bit order matches `fingerprint::Sources::bits`.
+    uart::log(b"FS:   bits: 1=sd_cid 2=inquiry 4=serial 8=devid 10=mbr 20=boot\r\n");
+}
+
 /// Turns a filesystem library error into this layer's vocabulary.
 ///
 /// Most of the library's variants describe on-disk damage in more detail
@@ -1594,11 +1835,42 @@ fn map_write_error(error: FatError) -> FsError {
             FsError::Path(PathError::InvalidCharacter)
         }
         FatError::AlreadyExists => FsError::AlreadyExists,
-        // Everything left is either an I/O failure or the volume not being
-        // what it claimed. Neither is something the caller distinguishes by
-        // acting differently, and both mean the same thing: this volume did
-        // not do what was asked.
+        // The medium failed, rather than the volume being wrong or full.
+        // These two have to stay apart from everything else: the write
+        // policy tears a mount down for a failed transfer and keeps it for a
+        // full volume, and flattening both into `NotAFilesystem` would make
+        // a card that ran out of space look like a card that broke.
+        FatError::Io(error) => FsError::Block(map_io_error(error)),
+        FatError::IoContext { source, .. } => FsError::Block(map_io_error(source)),
+        // Everything left is the volume not being what it claimed. Not
+        // something the caller distinguishes by acting differently: this
+        // volume did not do what was asked.
         _ => FsError::NotAFilesystem,
+    }
+}
+
+/// Recovers a block error from what survived the filesystem library.
+///
+/// `hadris_fat` erases the source error to a portable kind on its way in, so
+/// this is the other half of [`super::stream::StreamError`]'s `kind` -- the
+/// two are written to be read together. The narrowing is real: a card that
+/// was not ready and one whose transfer failed both arrive as `Other`. What
+/// matters at this layer survives it, which is that the medium is the thing
+/// that failed.
+fn map_io_error(error: hadris_io::Error) -> BlockError {
+    // `hadris_io::Error` is `#[non_exhaustive]`; a variant added later that
+    // carries no kind is treated as a plain transfer failure.
+    let kind = match error {
+        hadris_io::Error::Source(kind) => kind,
+        hadris_io::Error::Context { kind, .. } => kind,
+        _ => return BlockError::DeviceError,
+    };
+    match kind {
+        hadris_io::ErrorKind::PermissionDenied => BlockError::WriteProtected,
+        hadris_io::ErrorKind::NotConnected => BlockError::MediaRemoved,
+        hadris_io::ErrorKind::InvalidInput => BlockError::OutOfRange,
+        hadris_io::ErrorKind::Unsupported => BlockError::UnsupportedBlockSize,
+        _ => BlockError::DeviceError,
     }
 }
 
@@ -1736,12 +2008,18 @@ fn with_volume<T>(
                 FatVolume::builder(stream)
                     .time_provider(&clock::PROVIDER)
                     .open()
-                    .map_err(|_| FsError::NotAFilesystem)?,
+                    .map_err(|error| {
+                        log_driver_refusal(b"FAT", &error);
+                        FsError::NotAFilesystem
+                    })?,
             ),
             // No clock is configured for exFAT: nothing here writes to one,
             // so there is no entry for a timestamp to end up in.
             VolumeFormat::Exfat => {
-                AnyVolume::Exfat(ExFatVolume::open(stream).map_err(|_| FsError::NotAFilesystem)?)
+                AnyVolume::Exfat(ExFatVolume::open(stream).map_err(|error| {
+                    log_driver_refusal(b"exFAT", &error);
+                    FsError::NotAFilesystem
+                })?)
             }
         };
         body(&mut volume)

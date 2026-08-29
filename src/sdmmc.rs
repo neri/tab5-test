@@ -414,7 +414,11 @@ pub fn init() -> Option<SdCard> {
         uart::log(b"SDMMC: CMD7 (SELECT_CARD) failed\r\n");
         return None;
     }
-    wait_data_not_busy();
+    // A card that never goes idle here is reported by the poll itself and
+    // left to the identification sequence below to trip over. Failing
+    // activation on it would turn one slow card into no card at all, which
+    // is a harsher answer than this step has evidence for.
+    let _ = wait_data_not_busy();
 
     let bus_width_4bit = set_bus_width_4bit(rca_arg);
 
@@ -596,7 +600,9 @@ fn switch_func(switch_mode: bool, group1_function: u32) -> Option<[u8; 64]> {
     if !ok {
         return None;
     }
-    wait_data_not_busy();
+    // CMD6 moves no data to the medium, so a lingering busy is a slow card
+    // rather than an incomplete write; the same reasoning as after CMD7.
+    let _ = wait_data_not_busy();
 
     if !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
         uart::log(b"SDMMC: CMD6 cache invalidate refused\r\n");
@@ -827,7 +833,19 @@ fn read_aligned(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
 }
 
 /// Writes consecutive blocks via CMD25 (`WRITE_MULTIPLE_BLOCK`) from
-/// `buffer`, with the same length and alignment handling as `read_blocks`.
+/// `buffer`, whose length must be a nonzero multiple of 512 bytes.
+///
+/// Unlike `read_blocks` this takes a shared slice, and every call copies
+/// through [`DmaStaging`] rather than only an unaligned one. The `&mut` on
+/// the read side exists because DMA writes into the caller's buffer; nothing
+/// of the sort happens here, and the block layer above hands writes down as
+/// `&[u8]` -- a signature this must not be satisfied by casting away.
+/// Staging unconditionally is also the path `sdwritetest` has been accepted
+/// on: its pattern buffer is a plain stack array, so the aligned fast path
+/// was never the one real hardware exercised.
+///
+/// One CMD25 therefore covers at most [`DMA_STAGING_BYTES`]; longer buffers
+/// are split into that many blocks at a time.
 ///
 /// There is no single-block command special case on this side. CMD24
 /// (`WRITE_SINGLE_BLOCK`) is not implemented, and `sdwritetest`/`sdzero` --
@@ -837,12 +855,9 @@ fn read_aligned(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
 ///
 /// Callers are responsible for not overwriting data they care about -- there
 /// is no partition/filesystem awareness at this layer.
-pub fn write_blocks(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
+pub fn write_blocks(card: &SdCard, lba: u32, buffer: &[u8]) -> bool {
     if !valid_block_length(buffer) {
         return false;
-    }
-    if is_dma_aligned(buffer) {
-        return transfer_blocks(card, lba, buffer, true);
     }
     // Staging matters more here than on the read side: a refused writeback
     // means the card is sent whatever was in RAM instead of what the caller
@@ -1041,7 +1056,16 @@ pub fn data_transfer_on(
     // (DAT0 held low) afterward. Sending the next command before that clears
     // got no response at all (RTO) on real hardware -- confirmed with
     // back-to-back write/read/write calls in `sdwritetest`.
-    wait_data_not_busy();
+    //
+    // For a write this is also the completion boundary itself: the bytes are
+    // not on the medium until the card lets DAT0 go, so a card still busy
+    // when the budget runs out has not completed the transfer and the
+    // failure is reported rather than logged and passed over.
+    if !wait_data_not_busy() {
+        uart::log(label);
+        uart::log(b": card stayed busy after the data phase\r\n");
+        return false;
+    }
 
     if !is_write && !cache_writeback_invalidate(buffer.as_ptr() as usize, buffer.len()) {
         // The data is in RAM but the CPU would read its own stale copy, so
@@ -1383,15 +1407,23 @@ fn wait_command_taken(iterations: u32) -> bool {
 /// programming flash for a long time -- SD spec allows up to 250ms per
 /// block, so the budget here is generous rather than tuned to any one call
 /// site.
-fn wait_data_not_busy() {
+///
+/// `false` means the budget ran out with DAT0 still low. On a write that is
+/// the card never having finished programming what it was sent, so the
+/// caller must report the transfer as failed rather than let a log line be
+/// the only trace of it: the data phase completing says only that the bytes
+/// left the host.
+#[must_use]
+fn wait_data_not_busy() -> bool {
     let mut timeout = 200_000_000u32; // ~550ms at 360 MHz
     while unsafe { read(STATUS) } & (1 << 9) != 0 {
         if timeout == 0 {
             uart::log(b"SDMMC: card stayed busy\r\n");
-            return;
+            return false;
         }
         timeout -= 1;
     }
+    true
 }
 
 /// # Safety

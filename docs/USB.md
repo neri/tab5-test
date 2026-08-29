@@ -297,6 +297,11 @@ VBUSの自動power cycleは1回の再列挙につき最大1回で、さらに前
 保留状態として記録します。以後は約1秒ごとにHubの接続／change bitだけをquietに読み、同じdeviceを
 reset・再列挙し続けません。抜き差しを検出した場合、または`usbrescan`／`mix`が明示的にfull rescan
 した場合だけ列挙を再試行します。これにより列挙失敗ログがconsole操作を妨げる連続出力になりません。
+device descriptorまたは`SET_ADDRESS`までに失敗したポートは、次のoccupied portをresetする前に
+`CLEAR_FEATURE(PORT_ENABLE)`で無効化します。失敗deviceをDefault state（address 0）のままenableして
+おくと、後続portのaddress 0列挙と同時に応答して、先に失敗したMSC一台が後続のkeyboard／mouseまで
+列挙不能にするためです。無効化しても接続statusは残り、次のPORT_RESETで再enableできるので、物理的な
+抜き差しまたはfull rescanによる再試行は妨げません。
 
 セルフパワーハブはupstreamを抜いても下流deviceへ給電し続けるため、再接続時に古いdevice
 address／configurationや`C_PORT_RESET`が残り得ます。下流port列挙では古い`C_PORT_RESET`を
@@ -341,14 +346,18 @@ FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上�
   失ってdeviceがpacketを受理済みでも、同じPIDのduplicateは再消費されません。4 KiB Bulk INも
   MPS単位に分割し、各packetの完了とDATA PIDをsoftwareが確定してから次へ進みます。
   13/36/8 byteの短いIN応答は、QTD長をMPS倍数に保つ内蔵SRAM staging経由で受信します。
-  連続READ(10)では、成功16回ごとにcommand間でMass Storage Resetと両Bulk endpointの
-  halt解除を行い、DATA toggleをDATA0へ予防的に再同期します。実機ではFS-onlyで最短33回、
+  channel 0のdescriptor完了はQTD statusだけでなくHCINT.XferComplとQTD Active解除も検査します。
+  ChHltdだけの古い完了snapshotや、hardwareがまだ所有するQTDを新しいpacketの成功として回収しません。
+  連続READ(10)では、成功16回ごとにcommand間でchannel／FIFO cleanupを行います。実機ではFS-onlyで最短33回、
   High-Speed直結でも52回後にBulk INからEP0まで無応答になったため、応答が残っている間に
-  BOT境界だけを再確立する緩和策です。High-Speed直結の`ut 100`は予防再同期6回、retry 0で
+  controller側の古い受信状態を捨てる緩和策です。正常command間ではdeviceのMass Storage Resetと
+  endpoint CLEAR_FEATUREを行わず、DATA toggleを継続します。High-Speed直結の`ut 100`は予防cleanup 6回、retry 0で
   100/100を完走しました。FS-onlyハブ＋HID併用でも同条件で100/100を完走し、試験後も
   HIDは動作しました。root portとHIDはresetしません。
-  WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じBOT再同期を行い、
-  常にDATA0へ揃えたcommand境界から開始します。
+  WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じhost cleanupを行います。
+  channel回復とDWC FIFO flushを外した実機A/Bでは、
+  直前commandのCSWが次commandへ残って2回目のWRITEで停止したため、controller側residueのcleanupも
+  維持します。実際のtransport failureでは従来どおりcleanup後に完全なBOT Reset Recoveryを実行します。
 - rootへ直接接続したHID Boot keyboardは、attach時にstaticな512-byte aligned
   32-entry frame list／QTD bankを割り当て、`HCCHAR.eptype=INTR`で常時待機します。report完了IRQを
   前景がtakeして次QTDをrearmするため、idle中にchannel 0をpollしません。この常設経路は

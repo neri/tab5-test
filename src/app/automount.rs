@@ -34,7 +34,7 @@ use super::shell::Line;
 use crate::console::{Console, InputLine};
 use crate::framebuffer::Framebuffer;
 use crate::fs::block::{self, BlockError};
-use crate::fs::vfs::{FsError, Mount, Vfs, error_name};
+use crate::fs::vfs::{FsError, Mount, MountRequest, Vfs, error_name};
 use crate::fs::{DeviceId, Devices, RamBlockDevice, SdSlot, mbr};
 use crate::usb::{STORAGE_ID_LIMIT, UsbHost};
 use crate::{tick, uart};
@@ -411,7 +411,11 @@ fn attach_device(
             mounted += 1;
             continue;
         }
-        match files::attach(devices, vfs, device, Some(number)) {
+        // The same request a typed `mount` with no `-r` makes: the format
+        // decides. An automatically mounted FAT stick is writable, and an
+        // exFAT one is not, because automount is not a different policy from
+        // the command -- it is the command run without being asked.
+        match files::attach(devices, vfs, device, Some(number), MountRequest::Default) {
             Ok(point) => {
                 mounted += 1;
                 report.line(

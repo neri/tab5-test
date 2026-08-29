@@ -28,6 +28,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [GRAPHICS.md](docs/GRAPHICS.md) | `Framebuffer`の描画API、CW回転による論理↔ネイティブ座標変換 |
 | [FONT.md](docs/FONT.md) | 16pxビットマップフォント、文字幅の契約、収録範囲、生成物の形式と再生成 |
 | [CONSOLE_SHELL.md](docs/CONSOLE_SHELL.md) | コンソールのセル管理と部分書き戻し、シェル、再起動、全体電源断 |
+| [CONSOLE_COMMAND_REVIEW.md](docs/CONSOLE_COMMAND_REVIEW.md) | シェルコマンド全数の棚卸しと、一般実用／専門家向け／開発検証専用の分類 |
 | [INPUT.md](docs/INPUT.md) | ソフトI2C、CardKB／USBキーボード、`Key`正規化、`InputManager`、ポインタ、タッチコントローラー |
 | [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、`win`デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
@@ -42,12 +43,14 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかったDW-GDMA／SDHOSTの制約 |
 
 作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）:
+[COMMAND_RETIREMENT_PLAN.md](docs/COMMAND_RETIREMENT_PLAN.md)、
 [DISPLAY_UNDERRUN_REFACTOR_PLAN.md](docs/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)、
 [DEVICE_TREE_PLAN.md](docs/DEVICE_TREE_PLAN.md)、
 [FLASH_XIP_MIGRATION_PLAN.md](docs/FLASH_XIP_MIGRATION_PLAN.md)、
 [FONT_MIGRATION_PLAN.md](docs/FONT_MIGRATION_PLAN.md)、
 [ROOT_FILESYSTEM_PLAN.md](docs/ROOT_FILESYSTEM_PLAN.md)、
 [FILESYSTEM_PLAN.md](docs/FILESYSTEM_PLAN.md)、
+[FILESYSTEM_WRITE_REFACTOR_PLAN.md](docs/FILESYSTEM_WRITE_REFACTOR_PLAN.md)、
 [FILESYSTEM_WORKFLOW_PLAN.md](docs/FILESYSTEM_WORKFLOW_PLAN.md)、
 [INPUT_MANAGER_PLAN.md](docs/INPUT_MANAGER_PLAN.md)、
 [PPA_FILL_PLAN.md](docs/PPA_FILL_PLAN.md)、
@@ -84,12 +87,14 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
 - ストレージはブロック単位の読み書きとMBR表示に加えて、FAT12/16/32とexFATを
-  読み出すVFSがあります。**書き込めるのはPSRAM上のFAT16 RAMルート`/`
-  （8 MiB、リセットで消える）だけ**で、SDとUSBはファイルシステム経由では常に
-  読み取り専用です。exFATは形式として読み取り専用です
+  読み出すVFSがあります。書き込めるのはFATで、PSRAM上のFAT16 RAMルート`/`
+  （8 MiB、リセットで消える）に加えてSDカードとUSB Mass Storage上のFATが
+  **既定で読み書き**です（`mount -r`で読み取り専用にできます）。exFATは形式として
+  読み取り専用です。電断に対する原子性や自動修復は保証しません——保証するのは
+  エラーを返さず完了した通常操作が同じ内容で読み出せることまでです
   （[FILESYSTEM.md](docs/FILESYSTEM.md)）。SDのUHS-Iモードは未実装です。
   ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みですが、間欠故障の
-  根本原因は未特定で、各WRITE前の予防的BOT再同期を必要とします
+  根本原因は未特定で、各WRITE前のhost controller FIFO cleanupを必要とします
   （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
   [STORAGE.md](docs/STORAGE.md)）。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で

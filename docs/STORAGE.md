@@ -72,23 +72,31 @@ Bulk QTDはCPU周波数から約1秒で一度区切り、同じBOT phaseのま�
 Bulk転送がtimeout／transaction error、またはCSW不正になった場合は、BOT Reset
 Recovery（Mass Storage Reset class request、Bulk IN／OUTそれぞれの
 `CLEAR_FEATURE(ENDPOINT_HALT)`、host toggleのDATA0復帰）を実行します。
-読み出し専用のREAD(10)だけはRecovery後に1回再送します。**WRITE(10)は自動再送しません。**
-途中で失敗した書き込みはメディアへ一部だけ届いている可能性があり、再送すると不確かな
+読み出し専用のREAD(10)と、媒体確認に使うTEST UNIT READY、READ CAPACITY(10)、
+INQUIRY／INQUIRY(EVPD)はRecovery後に1回再送します。**WRITE(10)は自動再送しません。**
+途中で失敗した書き込みはメディアへ
+一部だけ届いている可能性があり、再送すると不確かな
 ブロックが増えるだけだからです。この方針を保つため、再送処理はBOT共通層ではなく
-`UsbMassStorage::read_blocks`に限定してあります。
+commandの意味を知るMSC class driverのREADと再送安全な照会に限定してあります。
 
-反復READ(10)では、成功16回ごとにcommand間で予防的BOT再同期を行います。Mass Storage
-Resetと両Bulk endpointのhalt解除でhost／deviceのDATA toggleをDATA0へ揃える処理で、root
-portはresetしません。FS-onlyでは33〜40回、High-Speed直結でも52回後にBulkとEP0が無応答に
-なった実測に対し、EP0が応答している間にBOT境界を再確立する緩和策です。実行回数は`ut`の
-`proactive_resyncs`に表示します。High-Speed直結の`ut 100`は予防再同期6回、retry 0で
-100/100を完走しています。FS-onlyハブ＋HID併用でも同条件で100/100を完走し、試験後も
+反復READ(10)では、成功16回ごとにcommand間でhost controllerのchannel／FIFO cleanupを行います。
+FS-onlyでは33〜40回、High-Speed直結でも52回後にBulkとEP0が無応答になった実測に対し、
+controller側の古い受信状態を次commandへ持ち越さない緩和策です。正常command間ではdeviceへ
+Mass Storage Reset／CLEAR_FEATUREを送らず、software／deviceのDATA toggleを継続します。実行回数は`ut`の
+`proactive_resyncs`に表示します。host cleanupだけに変更した実機でも`ut 100`をPASSしました。
+従来のHigh-Speed直結は予防再同期6回、retry 0で100/100を完走し、FS-onlyハブ＋HID併用でも同条件で完走して試験後も
 HIDは動作しました。High-Speedハブ＋Low-Speed HID＋High-Speed MSCの第24版最終回帰も
 100/100、failure／mismatch 0、予防再同期6回、packet／command retry 0でPASSしています。
 
-WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にもMass Storage Resetと
-両Bulk endpointのhalt解除を行います。蓄積したtransport状態を持ち込まず、DATA0へ揃えた
-BOT command境界から開始するための予防再同期であり、WRITE失敗時に再送するものではありません。
+WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じhost cleanupを行います。
+WRITE失敗時に再送するものではありません。DWC RX/TX FIFO cleanupを外すA/Bでは、直前commandの
+正常なCSW（expected tag `N`に対してreceived tag `N-1`）が残り、従来は数百回進んだ試験が
+WRITE前cleanup 2回で停止しました。FIFO cleanupは根本解決ではありませんが、controller側に残った
+古い受信状態を次のBOT commandへ持ち越さないために必要な緩和策です。
+host cleanupだけへ変更した同一起動で`ut 100`と`fswritetest /vol/usb0p1 1 1`の両方がPASSし、
+READ／WRITEとも正常command間のdevice-facing Reset Recoveryを必要としないことを実機確認しました。
+予防再同期の成功ログはREAD／WRITEそれぞれ初回と64回ごとに間引きますが、失敗ログは
+LBA、block数、READのFUA有無、方向別の累計再同期回数を含めて必ず出します。
 High-Speed直結の`usbwritetest 2`は10/10回、pattern照合、原本復元、周辺LBA照合がすべて
 成功しています。pattern書き込みと復元を合わせて計20回のWRITEを連続成功しました。
 FS-onlyハブ＋HID併用でも10/10回成功しました。給電中のHID事前接続ハブも上流再接続を
@@ -136,6 +144,12 @@ descriptor DMAのQTD status 1はESP-IDF 5.5.3と同じくpacket error
 経路は使用しません。QTDのIN byte数はMPSの倍数にする必要があるため、
 13 byte CSW、36 byte INQUIRY、8 byte READ CAPACITYはMPSサイズの内蔵SRAM stagingへ受け、
 実受信byteだけを呼び出し側へコピーします。
+短い応答が要求長を超えた場合は、要求長、HCDが報告した実受信長、先頭16 byteを4つの
+little-endian wordでUARTへ記録します。READ CAPACITYの8 byte要求に対して13 byteかつ先頭
+`0x53425355`（ASCII `USBS`）なら、容量dataではなくCSWを受けたことになり、hostとdeviceの
+BOT phase不一致をbyte数計上の誤りから区別できます。同じblockには、そのpacketを成功扱いした
+channel-0のHCINTとQTD controlも記録します。通常のdescriptor-DMA成功はHCINTのXferComplと
+QTD Active解除の両方を必要とし、ChHltdだけ、またはActiveの残ったdescriptorは成功として返しません。
 
 起動時のスキャンは、USB MSCが見つかった場合にTEST UNIT READY／READ
 CAPACITY(10)／READ(10) LBA 0までを実行し（ready待ちの上限は4,000 ms）、
@@ -161,12 +175,21 @@ USB Mass Storage、PSRAM上のRAMディスクを、論理ブロック単位の�
 で扱えるようにします。ファイルシステムそのものはまだありません。
 
 読み取り専用と読み書きでtraitを分けていません。書き込んで良いかはVFSの
-mount policyが決めることで、転送層の性質ではないためです。物理媒体（SD・USB）の
-adapterは`write_blocks`をコマンド発行前に`WriteSuppressed`で失敗させ、LBAと
-ブロック数をUARTへ記録します。成功を偽装すると、上位層がメタデータ更新は
-届いたものとして続きを組み立ててしまいます。既存の`sdwritetest`／`usbzero`
-などのraw書き込みコマンドは`sdmmc.rs`／`usb/msc.rs`を直接呼ぶので、この方針の
-対象外のまま残ります。
+mount policyが決めることで、転送層の性質ではないためです。SD・USB・RAMの
+3つとも`write_blocks`は実転送を行います。かつては物理媒体のadapterが
+コマンド発行前に無条件で失敗させていましたが、読み書き可能な媒体になった以上
+その拒否は`MountMode`の1箇所に集約してあります
+（[FILESYSTEM.md](FILESYSTEM.md)）。
+
+`write_blocks`の共通条件は次のとおりです。
+
+- `check_range`を転送前に通し、パーティション相対LBAから物理LBAへの変換は
+  `PartitionBlockDevice`だけが行います
+- 長い転送は媒体ごとの上限へ分割します
+- **部分成功は返しません。** 途中まで転送してから失敗した場合も`Err`です
+- **失敗した書き込みを自動再送しません**
+- 下位ドライバが可変スライスを要求する箇所へ、`&[u8]`から`unsafe`で可変性を
+  戻すことはしません。整列済みのstaging bufferへcopyします
 
 LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。ただしMBRと
 ファイルシステムの経路が受理する論理ブロック長は**512 byteだけ**で、それ以外は
@@ -179,6 +202,59 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
   IDMACのディスクリプタ制約、BOT recovery、予防的再同期といった媒体固有の処理は
   下層に残し、ここは結果の変換と転送分割だけを行います。SDはCSD version 1.0の
   カード（容量を復号していない）をこの層では扱いません
+
+### 媒体ごとの書き込み完了境界とflush
+
+| 媒体 | 完了境界 | `flush()` |
+| --- | --- | --- |
+| RAMディスク | メモリへの書き込みそのもの | 何もしない。永続化は保証しない |
+| SDカード | CMD25の完了後、DAT0のbusy解除まで確認した時点 | 何もしない（上の境界で既に達成済み） |
+| USB MSC | WRITE(10)がdeviceに受理された時点 | SYNCHRONIZE CACHE(10)とready待ち |
+
+**USBのWRITE(10)は1ブロックずつです**（`MAX_WRITE_BLOCKS = 1`）。READ(10)は4 KiBまで
+まとめますが、書き込みは複数ブロックを1回のdata OUTフェーズに入れると転送層が
+戻らなくなります（[USB_WRITE_STABILITY_PLAN.md](USB_WRITE_STABILITY_PLAN.md)の
+「決定論的な再現手順」）。4 KiBの書き込みはWRITE(10) 8本になり、それぞれの前に
+予防的BOT再同期が入るので遅くなりますが、これが実機で通る唯一の形です。SDには
+この制限はありません。
+
+SDの`flush()`が何もしないのは、USBより弱い保証だからではありません。`sdmmc.rs`の
+`write_blocks`はCMD25が完了し、さらにカードがDAT0を離す（フラッシュへの書き込みを
+終えた）まで戻りません。ホスト側に遅延write cacheが無いので、押し出すものが
+ありません。`wait_data_not_busy`はtimeoutを成否として返し、busyのまま予算を
+使い切ったカードは転送の失敗として上位へ届きます。
+
+USBは`CacheSync::Flushed`が成功で、そのあとTEST UNIT READYでデバイスが戻るのを
+待ちます（100 ms間隔で最大10回）。キャッシュのコミット中はデバイスが一時的に
+応答しなくなることがあり、待たずに戻ると次のコマンド——多くは呼び出し側の
+読み戻し——が「ただ忙しいだけ」のデバイスで失敗します。`CacheSync::Failed`と
+ready待ちの失敗はI/O失敗です。
+
+**コマンドが失敗したときにどちらへ分類するかは、デバイスが何と言ったかで決めます。**
+
+| senseの内容 | 分類 |
+| --- | --- |
+| MEDIUM ERROR、HARDWARE ERROR、NOT READYなど具体的な故障 | `Failed`（I/O失敗） |
+| ILLEGAL REQUEST | `Unsupported`（実装していない） |
+| NO SENSE、またはresponse codeが`0x70`〜`0x73`でない無効なsense | `Unsupported` |
+| senseを取る途中でBOT sessionが死んだ | `Failed` |
+
+3行目は実機で踏みました。CSW status `0x01`で失敗しながらsenseを18 byteのゼロで
+返す個体があります。**故障を1つも報告していない応答**なので、渡せる故障もありません。
+`msc.rs`自身の規定どおり「デバイスが実行しないフラッシュは直前の書き込みについて
+何も語らない」——書き込み自体はCSW PASSEDで受理済みで、ここで全書き込みを失敗させても
+データが安全になるわけではなく、このデバイスが使えなくなるだけです。senseのresponse
+codeは検証するようになっており、無効なら`invalid sense response code=`を出して
+診断には使いません。
+`CacheSync::Unsupported`は**best effortの成功**として扱います。実行しない
+フラッシュはデバイスの言い分であって、それを理由に書き込み自体を失敗させると
+そういうスティックが書けなくなるだけで安全にはなりません。ただしsession中
+最初の1回だけ`flush unsupported; removal durability is not guaranteed`を
+UARTへ出します。WRITEがdeviceへ受理されたこと以上の永続化は保証しません。
+
+`usb_msc.rs`の`write_blocks`は`WriteOutcome::WriteProtected`（sense key 0x07
+DATA PROTECT）を`BlockError::WriteProtected`へ写します。転送は何も壊れておらず、
+再試行しても答えは変わらないので、`DeviceError`とは分けてあります。
 - `src/fs/partition.rs`: `PartitionRange`（開始LBAと長さのデータ）と、I/Oの間
   だけデバイスを借りる`PartitionBlockDevice`に分けてあります。マウントが
   デバイスを所有しないので、同じディスクの`p1`と`p2`を同時に扱えます
@@ -195,7 +271,17 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
   **両方**除外します。どちらが誤りかテーブルからは判断できないためです
 - ブートセクタとして成立する条件: exFATは`EXFAT   `と`MustBeZero`領域、FATは
   jump命令・セクタ長・クラスタサイズ・FAT数・メディア記述子・ルート構成・
-  総セクタ数フィールドをそれぞれ規格が許す値かで判定します（`src/fs/bootsector.rs`）
+  総セクタ数フィールドをそれぞれ規格が許す値かで判定します（`src/fs/bootsector.rs`）。
+  **判定に落ちた場合は理由をUARTへ出します**（`no jump instruction at the start`、
+  `cluster larger than 64 KiB`など）。パーティション表には見えているものを
+  マウントできないとき、媒体が壊れているのか検査が厳しすぎるのかを一語では
+  区別できないためです
+- **判定できることと、マウントできることは別です。** この検査が受け付けるクラスタサイズの
+  上限は64 KiBですが、`hadris-fat`は32 KiBを超えるクラスタを開きません
+  （[FILESYSTEM.md](FILESYSTEM.md)の「クラスタサイズの上限」）。64 KiBクラスタの
+  ボリュームはここで「FATのブートセクタである」と正しく判定され、そのあとドライバに
+  断られます。この順序は意図的で、ブートセクタでないと答えると`mbr.rs`の
+  superfloppy判定にも嘘をつくことになるためです
 - 両方成立した場合は`AmbiguousLayout`として拒否します。推測して外すと、
   生きているボリュームの途中をパーティションとして切り出すことになるためです
 
@@ -237,6 +323,5 @@ UARTへログを出します（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。
 ## 未実装
 
 - exFATの解析（[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 5）
-- SD／USBへのファイルシステム経由の書き込み。全Stageで読み取り専用です
 - GPTの解析（MBRのみ。保護MBRは種別`0xEE`として表示されるだけ）
 - SDのUHS-Iモード（SDR50/SDR104等、100 MHz以上）

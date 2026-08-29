@@ -390,9 +390,9 @@ dependencies = [
 
 [[package]]
 name = "hadris-common"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75f2d1b972ab5baa6aaed686489e56568a7ba35ea34864fcb878b1f4ffc8c1"
+checksum = "bde64f152bae3f3769ad9ea577d1dde2b53e6558f7e1d80a7db81357ba3b206c"
 dependencies = [
  "hadris-fixed",
  "hadris-io",
@@ -403,9 +403,9 @@ dependencies = [
 
 [[package]]
 name = "hadris-fat"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f2e55913aa3102b95e4850117d92a6f8941734e48968418e9694b0e2999d8ca"
+checksum = "d8ae9e0e215766441538874f21f12340b6ae3edfb0f4f59b72794131d91bf01b"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -421,15 +421,15 @@ dependencies = [
 
 [[package]]
 name = "hadris-fixed"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e8a21d0ac22512eaffb08f1a5a0c3fdc432d171103e296c3f3a74b62dc219f0"
+checksum = "180bcbed00c242dd5536dd3057f9f9a84364cf1ad066d78a2da5553c4a9d626c"
 
 [[package]]
 name = "hadris-io"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0453cdaf618d562112b9e62957ca5b49ad5d4a10e382a6f68d2e1a75da25f8fa"
+checksum = "221c30d8f5ef8fd4ef384a28b92202c7952fd240e08b76501832550095d09c12"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -438,18 +438,18 @@ dependencies = [
 
 [[package]]
 name = "hadris-macros"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d95245da3cf494f10cd677f0fdba375ffa8eca4990890de3f19742a1ef88b64"
+checksum = "b8d9dd36e24610fa44d804c87762d641be064894b2513ce1dda3ce678a36ffe2"
 dependencies = [
  "proc-macro2",
 ]
 
 [[package]]
 name = "hadris-path"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "351b73ecd5556a7f3709fd1d61dff9149e7b7f9aab4e2483400c9b29d35b2afc"
+checksum = "36bd3d8b538a8115d802da9b1be12effb3cd3f2178be8ccab61079999adedb1f"
 
 [[package]]
 name = "hash32"

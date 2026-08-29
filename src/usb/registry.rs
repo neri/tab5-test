@@ -1603,6 +1603,7 @@ impl UsbHost {
         );
 
         if !self.may_power_cycle() || !hub.supports_per_port_power() {
+            disable_failed_hub_port(hub, port);
             self.mark_unhandled_slot(port as usize);
             return None;
         }
@@ -1610,6 +1611,7 @@ impl UsbHost {
         self.last_power_recovery_ms = Some(tick::now_ms());
         if !hub.power_cycle_port(port) {
             uart::log_hex(b"USB: hub port power cycle failed on port ", port as u32);
+            disable_failed_hub_port(hub, port);
             self.mark_unhandled_slot(port as usize);
             return None;
         }
@@ -1623,6 +1625,7 @@ impl UsbHost {
                 b"USB: still unreachable after a port power cycle; hub port ",
                 port as u32,
             );
+            disable_failed_hub_port(hub, port);
             self.mark_unhandled_slot(port as usize);
         }
         device
@@ -1814,4 +1817,23 @@ fn reset_and_enumerate_hub_port(
         uart::log_hex(b", reached with split transactions; hub port ", port as u32);
     }
     protocol::enumerate_device(address, route).map(|device| (device, status.speed()))
+}
+
+/// Quarantines one failed address-0 device before the hub sweep advances to
+/// another port. USB enumeration permits only one enabled device in Default
+/// state at a time; leaving the failed one enabled can make every later HID
+/// descriptor request collide with it and turn one MSC fault into a bus-wide
+/// attach failure.
+fn disable_failed_hub_port(hub: &Hub, port: u8) {
+    if hub.disable_port(port) {
+        uart::log_hex(
+            b"USB: disabled failed address-0 device on hub port ",
+            port as u32,
+        );
+    } else {
+        uart::log_hex(
+            b"USB: could not disable failed address-0 device on hub port ",
+            port as u32,
+        );
+    }
 }

@@ -39,6 +39,11 @@
       ソートのためにエントリを一度全部集める。ボリュームを実際に取り付ける
       `attach`もここにあり、`mount`コマンドと`automount.rs`が共有する。
       `blockdev.rs`が「媒体が何か」を出すのに対し、こちらは「そこに何があるか」を出す
+    - `src/app/fswritetest.rs`: `fswritetest`コマンド。書き込み経路の受入試験一式を
+      1コマンドで走らせ、書いたバイトを読み直して照合し、PASS／FAILで答える。
+      作るものは全て`<dir>/FSWTEST`の中で、既にあれば何もせず中止する。
+      読み取り専用マウントでは「全ての変更が断られること」の試験に切り替わるので、
+      `mount -r`とexFATの確認も同じコマンドになる
     - `src/app/automount.rs`: USB Mass Storageの抜き差しに合わせた自動マウント／
       アンマウント。フレームループから毎フレーム呼ばれるが、`UsbHost::topology_epoch`が
       進んだときだけ突き合わせる。`automount`コマンドの状態もここが持つ
@@ -182,12 +187,15 @@
   （[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 1、現状は[STORAGE.md](STORAGE.md)）
     - `src/fs/block.rs`: 全媒体共通の同期`BlockDevice` trait、`BlockGeometry`、
       共通エラー`BlockError`、範囲検査。読み取り専用と読み書きでtraitを分けない
-    - `src/fs/ramdisk.rs`: PSRAM固定領域上のRAMディスク。唯一の書き込み可能な媒体で、
-      DMAが触らないのでキャッシュ操作は要らない
+    - `src/fs/ramdisk.rs`: PSRAM固定領域上のRAMディスク。DMAが触らないので
+      キャッシュ操作は要らない
     - `src/fs/sd.rs`・`src/fs/usb_msc.rs`: `sdmmc.rs`／`usb/msc.rs`の上に載る
-      adapter。媒体固有の処理は下層に残し、結果の変換・転送分割・書き込み抑止だけを持つ。
-      USB側はセッションを`UsbHost`から借りる一時的なviewである点がSD側と違う
-    - `src/fs/bootsector.rs`: FAT/exFATブートセクタの妥当性検査。MBR判定と
+      adapter。媒体固有の処理は下層に残し、結果の変換と転送分割だけを持つ。
+      3媒体とも読み書きし、書いて良いかは`MountMode`が決める
+      （[FILESYSTEM.md](FILESYSTEM.md)）。USB側はセッションを`UsbHost`から借りる
+      一時的なviewである点がSD側と違う
+    - `src/fs/bootsector.rs`: FAT/exFATブートセクタの妥当性検査。落ちた理由を
+      短い文字列で返せるので、マウント拒否の説明に使える。MBR判定と
       将来のFSドライバの両方が使う
     - `src/fs/mbr.rs`: LBA 0がMBRなのかsuperfloppyなのかの判定と、primary entryの
       検査・列挙。両方成立した場合は拒否する
@@ -204,7 +212,8 @@
     - `src/fs/stream.rs`: `BlockDevice`の上のbyte単位`Read`/`Seek`と、
       マウントあたり4 KiBの連続区間セクタキャッシュ。FATライブラリと
       ブロック層の唯一の境界
-    - `src/fs/fingerprint.rs`: 媒体の同一性確認。SDのCID、SCSIのINQUIRYとVPD、
+    - `src/fs/fingerprint.rs`: 媒体の同一性確認。合成digestに加えて情報源ごとの
+      部分digestを持ち、不一致のときにどれが動いたか名指しできる。SDのCID、SCSIのINQUIRYとVPD、
       MBRのdisk signatureとパーティション表、ボリュームのブートセクタを畳み込む。
       「どの媒体か」ではなく「さっきと同じ媒体か」に答える
     - `src/fs/path.rs`: 絶対パスの正規化、長さと文字の検査、FAT流の名前比較、

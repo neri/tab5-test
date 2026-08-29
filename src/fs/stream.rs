@@ -42,10 +42,10 @@ struct CacheBuffer([u8; (CACHE_BLOCKS * 512) as usize]);
 
 /// A block device's error on its way through the filesystem driver.
 ///
-/// `hadris_io` carries a source error unchanged, so the reason a read failed
-/// -- a removed card, a suppressed write, a range check -- survives the trip
-/// through the library and comes back out at the VFS instead of being
-/// flattened into "I/O error".
+/// `hadris_io` carries a source error as far as the filesystem library's own
+/// error type, which narrows it to an `ErrorKind`. That is still enough for
+/// the VFS to tell a failed transfer from a full volume, which is the
+/// distinction its write policy turns on.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamError(pub BlockError);
 
@@ -57,15 +57,32 @@ impl core::fmt::Display for StreamError {
 
 impl core::error::Error for StreamError {}
 
+/// The one place a [`BlockError`] is narrowed to something the filesystem
+/// library will carry.
+///
+/// `hadris_fat` erases the source error to this kind on its way into
+/// `FatError::Io`, so what survives the trip is the kind and nothing else.
+/// [`super::vfs`] widens it back out on the far side; the two must be read
+/// together, and the pairs that share a kind here are the ones that come
+/// back merged there.
 impl embedded_io::Error for StreamError {
     fn kind(&self) -> embedded_io::ErrorKind {
         match self.0 {
-            BlockError::OutOfRange => embedded_io::ErrorKind::InvalidInput,
-            BlockError::WriteSuppressed => embedded_io::ErrorKind::PermissionDenied,
+            BlockError::BadBufferLength | BlockError::OutOfRange => {
+                embedded_io::ErrorKind::InvalidInput
+            }
+            BlockError::UnsupportedBlockSize => embedded_io::ErrorKind::Unsupported,
+            BlockError::WriteProtected => embedded_io::ErrorKind::PermissionDenied,
             BlockError::MediaRemoved | BlockError::MediaChanged => {
                 embedded_io::ErrorKind::NotConnected
             }
-            _ => embedded_io::ErrorKind::Other,
+            // `NotReady` and `TemporarilyUnavailable` land here with
+            // `DeviceError`. Both say the medium may work again later, and
+            // the write policy above treats all three the same way: the
+            // operation failed and the mount goes.
+            BlockError::DeviceError | BlockError::NotReady | BlockError::TemporarilyUnavailable => {
+                embedded_io::ErrorKind::Other
+            }
         }
     }
 }

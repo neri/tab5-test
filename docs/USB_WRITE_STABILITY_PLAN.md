@@ -41,7 +41,8 @@ USB BOT: reset recovery failed
 | **チャネル0の共有が被害を広げる** | control／bulkが全部チャネル0。一度おかしくなると再列挙まで何も通らない |
 | **`reset recovery complete`は回復の証拠にならない** | 確かめているのはcontrol転送が通ったことだけ。bulkが1パケットも動かないまま「成功」と報告する |
 | **セルフパワーハブではroot VBUSのpower cycleが効かない** | 上流のVBUSが消えても下流ポートへ給電し続けるため、デバイスの状態が保存される |
-| **このUSBメモリはSYNCHRONIZE CACHE(10)非対応** | sense key 5／ASC `0x24`。安価なコントローラは非対応を`0x20`ではなく`0x24`で返す |
+| **このUSBメモリはSYNCHRONIZE CACHE(10)非対応** | sense key 5／ASC `0x24`。安価なコントローラは非対応を`0x20`ではなく`0x24`で返す。CSW `0x01`で失敗しながらsenseを18 byteのゼロで返す個体もある（response codeまで`0x00`＝規格上無効）。非対応の返し方はデバイスごとにばらつくので、senseのresponse codeを検証したうえで「故障を報告していない」応答は非対応として扱う |
+| **複数ブロックのWRITE(10)は決定論的に失敗する** | ファイルシステム経路で判明（第25版）。1回の`mkdir`のうち単一ブロックのWRITE(10)は3本とも成功し、**最初の8ブロック（4 KiB）で必ず失敗**する。3回実行して3回とも同じ。パケットはすべて受理されたあとデバイスがCSWを返さず、bulk INがtimeoutする |
 
 ## 否定した仮説
 
@@ -56,6 +57,27 @@ USB BOT: reset recovery failed
 | 電力不足だけが原因 | 電源付きハブでもHigh-Speedでは落ちる。`port since bus came up: no events`（過電流・脱落なし） |
 | チャネル0がhaltできないのが原因 | `HCINT=0x02`＝ChHltdが毎回立っており、チャネルは正常にhaltしている |
 | メディア無しは待てば来る | 空のカードリーダーは110 msごとにnot readyを返し続け、10秒待っても変わらない（sense ASC `0x3A`で即断すべき） |
+
+## 決定論的な再現手順（第25版で判明）
+
+> 第25版の試験は**複数のUSBメモリ**にまたがって行われている。規格の守り方に個体差が
+> 大きいデバイス群で、VPDページの返し方もsenseの返し方も個体ごとに違った。以下の
+> 記述は観測した挙動であって、どれか1台の性質として読まないこと。
+
+
+**これがこのプランで初めての決定論的な再現である。** ほかの症状はすべて間欠だった。
+
+複数ブロックのWRITE(10)——1回のdata OUTフェーズに512 byteパケットを複数流す形——が
+必ず失敗する。単一ブロックのWRITE(10)は通る。
+
+この形は**ファイルシステム経路が初めて発行した**。`usbwritetest`は1ブロック、
+`usbzero`は1ブロックずつのループなので、それまでどのコマンドも複数ブロックの
+WRITE(10)を出していない。受入試験が全て単一ブロックだったのはそのためで、
+「書き込みは数回に1回失敗する」という間欠故障とは**別の問題**である可能性が高い。
+
+現在は`src/fs/usb_msc.rs`の`MAX_WRITE_BLOCKS = 1`で回避している。2ブロックは未試験で、
+この定数がそのまま実験の入口になる。上記候補2（OUT側data toggle）と候補3（OUT側の
+staging／cache同期）は、この再現手順で直接試せる。
 
 ## まだ分かっていないこと
 
@@ -93,7 +115,7 @@ Low-Speedキーボードでは当初`HCINT=0x82`（XactErr＋ChHltd）で失敗�
 | ポートイベントのラッチ | ISRが消してしまう過電流・デバイス脱落の証拠 | `port since bus came up:` |
 | REQUEST SENSEでのCHECK CONDITION回収 | 失敗理由が分からないこと、senseを保持したままのデバイス | `sense key=` `ASC=` |
 | メディア無しの即断（ASC `0x3A`） | 空のカードリーダーで起動が10秒延びること | `has no medium` |
-| 成功16 READごとの予防的BOT再同期 | 33〜52回の連続READ後にBulkとEP0が無応答になる前にBOT境界を再確立 | `proactive BOT resync before READ(10)` |
+| 成功16 READごとの予防的BOT再同期 | 33〜52回の連続READ後にBulkとEP0が無応答になる前にBOT境界を再確立 | `proactive BOT resyncs before READ(10)=N`（初回と64回ごと） |
 
 詳細は[`USB.md`](USB.md)の「電力問題の切り分け」「転送失敗の巻き添え」
 「periodic HIDの停止検出」「転送失敗からの自動復帰」を参照。
@@ -104,6 +126,13 @@ Low-Speedキーボードでは当初`HCINT=0x82`（XactErr＋ChHltd）で失敗�
 - `HCINT`にXactErr（bit 7）→ トランザクションが壊れている。第19〜23版で調査した
   Split HID障害はこの形だった。
 - `USB BOT: ... during <phase>` → `CBW`／`data OUT`／`data IN`／`CSW`のどれで落ちたか。
+- `USB BOT: failed command opcode=` → 失敗したSCSI command。続くtagはattach後のcommand
+  通番、data bytesとdirectionはdata phaseの形である。主なopcodeはTEST UNIT READY `0x00`、
+  INQUIRY `0x12`、READ CAPACITY(10) `0x25`、READ(10) `0x28`、WRITE(10) `0x2A`、
+  SYNCHRONIZE CACHE(10) `0x35`。
+- `USB MSC:   at LBA=`以下 → 失敗したREAD／WRITEの範囲。READでは`FUA=1`が媒体からの
+  検証読み出し、`FUA=0`が通常読み出し。方向別`proactive READ/WRITE resyncs=`は、そのattachで
+  失敗までに実行した予防再同期の累計である。成功時の同一ログは初回と64回ごとに間引く。
 - `HCCHAR`の下位11 bitがMPS、bit 15が方向、bit 19〜18がタイプ、bit 28〜22がデバイス
   アドレス。MPS 64＋EP0はcontrol転送、MPS 512はHigh-Speed bulk。
 - `port since bus came up:` に`OVER-CURRENT`が出れば**電力問題は確定**。出ないことは
@@ -169,3 +198,17 @@ cargo run --release
 | 22 | Split keyboardを`bInterval`周期でpoll | 新HSハブ＋LS keyboardで入力正常。50,661 packet／202,076 round、error／freeze／conflict／stale token／port eventなし。この版時点ではMSC併用回帰待ち |
 | 23 | stale Split HIDの下流slotだけを切断 | 抜去・再挿入は成功。ただし通常入力は145,394 packet／436,167 roundで取りこぼし多発 |
 | 24 | periodic SSPLIT位相とLS intervalを正常化 | High-Speedハブ＋Low-Speed keyboardで入力安定、エラーログなし、10秒静止時のSplit packet増加約1,000回。同じハブのHigh-Speed MSCとの`ut 100`も100/100、retry 0、予防再同期6回でPASS。Split 1,126 packet／2,370 round、conflict 0、active 0、stale token 0、port eventなし |
+| 25 | ファイルシステム経由の書き込みを実装（[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)） | `fswritetest /vol/usb0p1`が最初の`mkdir`で失敗。WRITE(10)が4本通ったあと`bulk IN timed out during CSW`。Reset Recoveryは成功、WRITEは再送せず、MSC sessionと当該mountだけが使用不能になった——**故障時の要求どおりの挙動を実機で確認**。成功経路は未確認 |
+| 25a | 上のときのstaging bufferにアラインメント宣言が無いことが判明 | `fs/usb_msc.rs`のWRITE(10)用stagingが`[u8; 4096]`（アラインメント1）で、`hcd.rs`が転送前に行うcache writebackはROM側が行頭でない範囲を拒否する。`cache_writeback_invalidate`の結果はこちら側で捨てているため無言で通る。`align(64)`を宣言。上記「まだ分かっていないこと」候補3（OUT側のcache同期）の一部にあたる |
+| 25b | WRITE(10)のLBAとブロック数をログへ、複数ブロック初回を通知 | **単一ブロック3本成功→最初の8ブロックで失敗**を確認（LBA 0x7D50、blocks=8）。`MAX_WRITE_BLOCKS = 1`で回避。決定論的な再現手順として上に記録 |
+| 25c | 複数ブロックWRITE(10)を1ブロックへ制限 | **WRITE(10) 23本が転送故障なしで通過。** 続いて`SYNCHRONIZE CACHE(10)`が理由を返さずに失敗し、これを非対応扱いへ分類。senseのresponse code検証も追加 |
+| 25d | 予防的BOT再同期の成功ログを方向別の初回と64回ごとへ間引き、転送失敗時のREAD／WRITE範囲と方向別累計を追加 | `fswritetest` 2回はともに検査1〜3を通過したが、1回目は検査4のCSW、再列挙後の2回目は検査5のREAD data INで停止。途中の障害から復帰した箇所もあり、固定LBAではなくコマンド累積後のsession不調を示す。従来ログ1,050行中737行を占めた同一再同期行を圧縮して次回確認待ち |
+| 25e | BOT transport失敗時にCDB opcode、command tag、data長、方向を追加 | 短縮ログは1,050行から142行へ減少。検査2中のREAD(10)（LBA `0x7E20`、8 blocks、tag `0x14F`）はReset Recovery後の再送で復帰。検査4先頭のCSW timeoutはopcode `0x00`、tag `0x9E4`、data 0で、媒体確認のTEST UNIT READYと確定 |
+| 25f | TEST UNIT READYもReset Recovery成功後に1回だけ再送 | 検査4と検査8先頭のTEST UNIT READY timeoutはどちらも再送で復帰し、従来の検査4停止から検査10まで進行。途中のREAD(10)障害4回もすべて既存の再送で復帰 |
+| 25g | 媒体確認の再送安全な照会を共通化し、READ CAPACITY(10)とINQUIRY／EVPDにも1回再送を適用 | 検査10先頭の媒体確認でREAD CAPACITY(10)（opcode `0x25`、tag `0x1597`、8 bytes）がdata INでtimeoutしていた経路を回復可能にした。`fswritetest /vol/usb0p1 1 1`は**12検査PASS、45,383 ms**。ただし途中のrecoveryは多く、相互運用上の根本原因は未解明 |
+| 25h | 別メーカー媒体で再試験し、短いBulk INの超過時に要求長・実受信長・先頭16 byteを追加 | 別媒体でもREAD(10)／READ CAPACITY(10)のdata INとCSWが無応答になり、検査5でReset RecoveryのEP0まで停止した。ポートは接続・enable・給電を維持し、媒体sectorに依存しないopcode `0x25`でも再現したため、flash媒体不良説はさらに弱まった。最初のREAD CAPACITYは8 byte要求に対する長さ超過だった。次回、13 byteかつ先頭`0x53425355`ならCSW先着＝BOT phase不一致、別の値ならdevice応答またはHCD実受信長計上を調べる |
+| 25i | 失敗したハブポートを無効化してから後続ポートを列挙 | 別媒体試験後の起動scanでport 2の最初の8-byte device descriptorが失敗し、その後port 3のLS HIDとport 4のFS HIDもSTALLして一台もattachされなかった。列挙失敗portをenable／address 0のまま残していたため、`CLEAR_FEATURE(PORT_ENABLE)`で隔離して後続HIDのaddress 0列挙を保護する。実機再確認待ち |
+| 25j | 正常command間の予防再同期からpacket-failure用HCD回復／FIFO flushを除外し、CSW tag不一致の詳細を追加 | 別媒体の再試験でも検査4最初の致命的READが前回と同じtag `0xA36`、READ再同期132回、WRITE再同期254回で再現し、LBAだけ`0x43D0`から`0x4400`へ移動したためA/Bを実施。結果はexpected tag `0x16`に対してreceived tag `0x15`、residue 0、PASSEDという直前commandの正常CSWを確認し、2回目のWRITE（tag `0x27`）で停止した。flush原因説は否定され、controller側residueを掃除する緩和効果が確定したため変更を戻した |
+| 25k | 内部Bulk packet retryで初回と転送済みbyteを記録 | READ CAPACITY(10)の8-byte data phaseで13-byte `USBS`、tag `0x1A`を受信し、current commandはtag `0x1B`だったため、直前commandの正常CSW再提示を確定。先行する内部retryは無く、後のCSW／data IN timeout retryも`bytes already transferred=0`だけだった。DMA済みbyteをtimeout後に再投入する仮説は否定 |
+| 25l | channel-0成功判定にHCINT.XferComplとQTD Active解除を必須化し、異常長時にraw HCINT／QTDを追加 | 通常経路はChHltd後にQTD status 0だけで成功扱いしており、periodic HID経路が既に行うXferCompl検査を欠いていた。古いChHltd snapshotまたはhardware所有中QTDを前commandのshort packetとして回収し得るため、両条件を満たさなければtransport errorにする。実機再確認待ち。なお25k試験のMSC停止後もHID操作は可能で、故障局所化は確認済み |
+| 25m | 正常command間の予防処理をhost channel／FIFO cleanupだけにし、device-facing Reset Recoveryを実失敗時へ限定 | 25l版では誤成功検出も異常長も出ず、内部retryはすべて0 byteだったが、tag `0x1E`、`0xA36`、`0xA59`で相手がBulk INからEP0まで無応答になった。XferCompl判定漏れはこの再現の主因ではない。二媒体で同じcommand位置までにREAD前132回＋WRITE前254回のMass Storage Reset／CLEAR_FEATUREを行う非標準的な緩和策が共通しているため、controller FIFO cleanupは維持しつつdevice reset 386回を外してA/Bした。実際のfailure後は完全なBOT Reset Recoveryを維持。同一起動で**host cleanupだけの`ut 100`と`fswritetest /vol/usb0p1 1 1`が両方PASS**し、READ／WRITEとも正常command間のdevice resetが不要と確認 |

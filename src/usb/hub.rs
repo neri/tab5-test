@@ -33,6 +33,7 @@ const REQUEST_TYPE_HOST_TO_DEVICE_CLASS_OTHER: u8 = 0x23;
 
 // Port feature selectors (USB2.0 table 11-17). Only the ones this driver
 // actually sets or clears are listed.
+const FEATURE_PORT_ENABLE: u16 = 1;
 const FEATURE_PORT_RESET: u16 = 4;
 const FEATURE_PORT_POWER: u16 = 8;
 const FEATURE_C_PORT_CONNECTION: u16 = 16;
@@ -445,6 +446,14 @@ impl Hub {
     /// layer prevents registry code from depending on raw USB hub values.
     pub fn clear_port_connection_change(&self, port: u8) -> bool {
         self.clear_port_feature(port, FEATURE_C_PORT_CONNECTION)
+    }
+
+    /// Stops a device that could not leave address 0 from answering while a
+    /// later occupied port is reset and enumerated. A subsequent PORT_RESET
+    /// enables the port again, so unplug/replug discovery and full rescans can
+    /// retry it without a power cycle.
+    pub fn disable_port(&self, port: u8) -> bool {
+        self.clear_port_feature(port, FEATURE_PORT_ENABLE)
     }
 
     fn port_feature_request(&self, request: u8, port: u8, feature: u16) -> bool {

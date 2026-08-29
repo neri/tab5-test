@@ -46,14 +46,17 @@ mod registry;
 
 pub(crate) use hcd::handle_interrupt;
 pub use hcd::{
-    Speed, fs_ls_only_host_forced, interrupt_diagnostics, pi4ioe2_register, port_drop_seen,
-    port_event_history, port_over_current_seen, probe_split_support, set_connect_wait_ms,
-    set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit, set_vbus_power,
+    Speed, cache_refusal_count, fs_ls_only_host_forced, interrupt_diagnostics, pi4ioe2_register,
+    port_drop_seen, port_event_history, port_over_current_seen, probe_split_support,
+    set_connect_wait_ms, set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit,
+    set_vbus_power,
 };
 pub use hid::{DESCRIPTOR_TYPE_HID, HidDescriptor};
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};
 pub use hub::{OverCurrentProtection, PortStatus, PowerSwitching};
-pub use msc::{CacheSync, ReadyOutcome, UsbMassStorage};
+pub use msc::{
+    CacheSync, ReadyOutcome, UsbMassStorage, VPD_PAGE_DEVICE_ID, VPD_PAGE_UNIT_SERIAL, WriteOutcome,
+};
 pub use protocol::{
     DESCRIPTOR_TYPE_ENDPOINT, DESCRIPTOR_TYPE_INTERFACE, EndpointDescriptor, InterfaceDescriptor,
 };

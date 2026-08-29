@@ -78,46 +78,70 @@ fn is_exfat(sector: &[u8; 512]) -> bool {
     sector[11..64].iter().all(|&byte| byte == 0)
 }
 
-/// A FAT BPB, checked field by field against the values FAT32 specification
-/// section 3.1 permits. Anything outside them means the sector is not a BPB,
-/// whatever else it may be.
+/// The largest cluster this recognizes, in bytes.
+///
+/// The FAT32 specification tells *formatters* never to produce a cluster
+/// larger than 32 KiB, and warns that some implementations mishandle one.
+/// That is advice about what to write, not a statement that a larger volume
+/// is malformed -- and the arithmetic forces formatters past it: FAT16 holds
+/// at most 65,524 clusters, so anything above about 2 GiB needs 64 KiB
+/// clusters to be FAT16 at all. Real tools duly emit them.
+///
+/// **Recognizing one is not the same as being able to mount it.** The
+/// filesystem library refuses a cluster over 32 KiB, so such a volume is
+/// identified here and then declined by the driver, which is the honest
+/// order: the sector really is a FAT boot sector, and saying otherwise
+/// would misreport it to `mbr.rs`'s superfloppy classification as well.
+/// What the user sees is the driver's own reason on the UART.
+const MAX_CLUSTER_BYTES: u32 = 64 * 1024;
+
 fn is_fat(sector: &[u8; 512]) -> bool {
+    fat_rejection(sector).is_none()
+}
+
+/// Why this sector is not a FAT BPB, or `None` if it is one.
+///
+/// Checked field by field against the values the FAT32 specification pins
+/// down. The reason comes back rather than a bare `false` because a caller
+/// that has just refused to mount a partition the user can see in a
+/// partition table owes them more than "no".
+fn fat_rejection(sector: &[u8; 512]) -> Option<&'static str> {
     // The volume starts with a jump over the BPB: a short jump followed by a
     // NOP, or a near jump. Every formatter emits one of the two.
     let jump_ok = (sector[0] == 0xEB && sector[2] == 0x90) || sector[0] == 0xE9;
     if !jump_ok {
-        return false;
+        return Some("no jump instruction at the start");
     }
 
     let bytes_per_sector = u16_at(sector, 11);
     if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
-        return false;
+        return Some("bytes per sector is not 512, 1024, 2048 or 4096");
     }
 
-    // Sectors per cluster is a power of two from 1 to 128, and the cluster
-    // must not exceed 32 KiB.
+    // Sectors per cluster is a power of two; `u8` caps it at 128, which is
+    // also the specification's maximum.
     let sectors_per_cluster = sector[13];
     if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
-        return false;
+        return Some("sectors per cluster is not a power of two");
     }
-    if (bytes_per_sector as u32) * (sectors_per_cluster as u32) > 32 * 1024 {
-        return false;
+    if (bytes_per_sector as u32) * (sectors_per_cluster as u32) > MAX_CLUSTER_BYTES {
+        return Some("cluster larger than 64 KiB");
     }
 
     // At least one reserved sector, because the boot sector itself is one.
     if u16_at(sector, 14) == 0 {
-        return false;
+        return Some("no reserved sectors");
     }
 
     // One or two FATs. Other counts are legal in the abstract but no
     // formatter writes them, and accepting them widens the check for nothing.
     if !matches!(sector[16], 1 | 2) {
-        return false;
+        return Some("not one or two FATs");
     }
 
     // Legal media descriptors: the fixed-disk value and the removable set.
     if sector[21] != 0xF0 && sector[21] < 0xF8 {
-        return false;
+        return Some("media descriptor is not a legal value");
     }
 
     // A fixed root directory (FAT12/16) or none (FAT32), never both and
@@ -127,14 +151,14 @@ fn is_fat(sector: &[u8; 512]) -> bool {
     let fat32_shape = root_entry_count == 0 && sectors_per_fat_16 == 0;
     let fat16_shape = root_entry_count != 0 && sectors_per_fat_16 != 0;
     if fat32_shape == fat16_shape {
-        return false;
+        return Some("neither a FAT12/16 nor a FAT32 root layout");
     }
     // FAT12/16 root directories occupy whole sectors.
     if fat16_shape && (root_entry_count as usize * 32) % bytes_per_sector as usize != 0 {
-        return false;
+        return Some("root directory is not a whole number of sectors");
     }
     if fat32_shape && u32_at(sector, 36) == 0 {
-        return false;
+        return Some("FAT32 layout with no sectors per FAT");
     }
 
     // Exactly one of the two total-sector fields is used; the volume cannot
@@ -142,8 +166,25 @@ fn is_fat(sector: &[u8; 512]) -> bool {
     let total_sectors_16 = u16_at(sector, 19);
     let total_sectors_32 = u32_at(sector, 32);
     if (total_sectors_16 == 0) == (total_sectors_32 == 0) {
-        return false;
+        return Some("total sector count is zero or given twice");
     }
 
-    true
+    None
+}
+
+/// Why [`identify`] answered `None`, in a few words fit for a shell message.
+///
+/// Only meaningful for a sector `identify` rejected; a sector it accepted
+/// says so.
+pub fn rejection_reason(sector: &[u8; 512]) -> &'static str {
+    if !has_signature(sector) {
+        return "no 55 AA signature at the end of the sector";
+    }
+    if &sector[3..11] == b"EXFAT   " {
+        return "says exFAT but the FAT BPB area is not zero";
+    }
+    match fat_rejection(sector) {
+        Some(reason) => reason,
+        None => "the sector is a valid boot sector",
+    }
 }

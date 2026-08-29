@@ -8,9 +8,11 @@
 //! everything else this firmware mounts.
 //!
 //! It runs against the [`BlockDevice`] interface, not against PSRAM, so it
-//! has no idea it is formatting RAM. Pointing it at an SD card would get
-//! [`BlockError::WriteSuppressed`] from the very first write, which is the
-//! read-only mount policy working rather than a special case here.
+//! has no idea it is formatting RAM -- and nothing below it would stop it
+//! writing to an SD card either, now that removable media are writable.
+//! What keeps it aimed at the RAM disk is that it is called from one place
+//! at boot; there is no `format` command, and adding one would be adding the
+//! confirmation and the volume naming that go with it.
 
 use super::block::{BlockDevice, BlockError, SUPPORTED_BLOCK_BYTES};
 use crate::uart;

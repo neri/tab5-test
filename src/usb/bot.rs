@@ -206,6 +206,18 @@ impl BulkOnlyTransport {
             self.consecutive_recoveries = 0;
         }
         if result.is_none() {
+            // The phase says which USB transfer failed, but without the CDB
+            // it is impossible to tell a READ/WRITE failure from the
+            // no-data commands around it (TEST UNIT READY, cache flush,
+            // capacity and identity probes). Failures are rare, so keep the
+            // full command context rather than trying to rate-limit it.
+            uart::log_hex(
+                b"USB BOT: failed command opcode=",
+                cdb.first().copied().unwrap_or(0xFF) as u32,
+            );
+            uart::log_hex(b"USB BOT:   command tag=", self.next_tag);
+            uart::log_u32(b"USB BOT:   data bytes=", data.len() as u32);
+            uart::log_u32(b"USB BOT:   direction IN=", u32::from(direction_in));
             // Once a CBW has been accepted, a transport failure can leave
             // the device waiting in any BOT phase and both endpoint toggles
             // are unknown. Clearing just the endpoint that reported the
@@ -256,25 +268,29 @@ impl BulkOnlyTransport {
         self.unusable || hcd::bus_unusable()
     }
 
-    /// Re-establishes the BOT command boundary while the device is still
-    /// responsive. This is the same class reset and endpoint-toggle reset as
-    /// failure recovery, but is invoked between commands rather than after a
-    /// transport has already stopped answering.
-    pub fn resynchronize(&mut self) -> bool {
+    /// Clears controller-side residue at a healthy BOT command boundary.
+    ///
+    /// This deliberately does not send Mass Storage Reset or reset endpoint
+    /// toggles. Real filesystem traffic invoked the old proactive reset 386
+    /// times before check 4, and two different devices then stopped answering
+    /// at the same command positions. Full BOT Reset Recovery remains on the
+    /// actual transport-failure path in `execute_command`.
+    pub fn maintain_command_boundary(&mut self) -> bool {
         self.last_recovery_succeeded = false;
         if self.unusable || hcd::bus_unusable() {
             return false;
         }
+        // Keep the part the previous A/B proved useful: without this host-side
+        // cleanup, a valid tag N-1 CSW remained visible to command N and the
+        // second WRITE failed. Only the device-facing reset is removed.
         hcd::recover_channel_after_packet_failure();
-        if self.reset_recovery() {
-            self.consecutive_recoveries = 0;
-            self.reported_unusable = false;
-            true
-        } else {
-            uart::log(b"USB BOT: proactive resynchronization failed\r\n");
+        if hcd::bus_unusable() {
             self.unusable = true;
-            false
+            return false;
         }
+        self.consecutive_recoveries = 0;
+        self.reported_unusable = false;
+        true
     }
 
     /// Number of QTD suffixes resubmitted after status 1 or timeout.
@@ -325,6 +341,10 @@ impl BulkOnlyTransport {
         let status = parse_csw(&csw)?;
         if status.tag != tag {
             uart::log(b"USB BOT: CSW tag mismatch\r\n");
+            uart::log_hex(b"USB BOT:   expected tag=", tag);
+            uart::log_hex(b"USB BOT:   received tag=", status.tag);
+            uart::log_u32(b"USB BOT:   residue=", status.residue);
+            uart::log_hex(b"USB BOT:   status=", status.status as u32);
             return None;
         }
         Some(CommandResult {
@@ -345,6 +365,7 @@ impl BulkOnlyTransport {
             let chunk_len = (data.len() - offset).min(mps);
             let endpoint = self.out_endpoint();
             let outcome = self.run_bulk_packet(
+                phase,
                 &endpoint,
                 self.out_toggle,
                 &mut data[offset..offset + chunk_len],
@@ -394,6 +415,7 @@ impl BulkOnlyTransport {
             let endpoint = self.in_endpoint();
             let outcome = if direct_len > 0 {
                 self.run_bulk_packet(
+                    phase,
                     &endpoint,
                     self.in_toggle,
                     &mut buffer[received..received + direct_len],
@@ -404,7 +426,7 @@ impl BulkOnlyTransport {
                 // for CSW/INQUIRY/capacity and copy the actual short packet;
                 // passing a 13-byte CSW buffer directly as a QTD is outside
                 // the DWC contract even though it often appears to work.
-                self.run_bulk_packet(&endpoint, self.in_toggle, &mut staging.bytes[..mps])
+                self.run_bulk_packet(phase, &endpoint, self.in_toggle, &mut staging.bytes[..mps])
             };
             match outcome {
                 PacketOutcome::Ok(n) => {
@@ -412,6 +434,37 @@ impl BulkOnlyTransport {
                     if direct_len == 0 {
                         if n > remaining {
                             uart::log(b"USB BOT: Bulk IN response exceeds requested length\r\n");
+                            uart::log_u32(b"USB BOT:   requested bytes=", remaining as u32);
+                            uart::log_u32(b"USB BOT:   received bytes=", n as u32);
+                            let (hcint, qtd_control) = hcd::last_channel0_reap();
+                            uart::log_hex(b"USB BOT:   reap HCINT=", hcint);
+                            uart::log_hex(b"USB BOT:   reap QTD control=", qtd_control);
+                            // READ CAPACITY(10) asks for 8 bytes while a CSW
+                            // is 13 bytes and starts with "USBS". Seeing
+                            // 0x53425355 here proves that the device and host
+                            // disagree about the current BOT phase; words 1
+                            // through 3 then expose the CSW tag, residue and
+                            // status. A capacity-shaped first 8 bytes followed
+                            // by zeroes points instead at HCD byte accounting.
+                            // Four bounded lines are enough for either case
+                            // and cannot turn a malformed response into a
+                            // large UART dump.
+                            uart::log_hex(
+                                b"USB BOT:   bytes[0..3] LE=",
+                                staging_word(&staging.bytes, n, 0),
+                            );
+                            uart::log_hex(
+                                b"USB BOT:   bytes[4..7] LE=",
+                                staging_word(&staging.bytes, n, 4),
+                            );
+                            uart::log_hex(
+                                b"USB BOT:   bytes[8..11] LE=",
+                                staging_word(&staging.bytes, n, 8),
+                            );
+                            uart::log_hex(
+                                b"USB BOT:   bytes[12..15] LE=",
+                                staging_word(&staging.bytes, n, 12),
+                            );
                             return None;
                         }
                         buffer[received..received + n].copy_from_slice(&staging.bytes[..n]);
@@ -459,6 +512,7 @@ impl BulkOnlyTransport {
     /// consuming twice.
     fn run_bulk_packet(
         &mut self,
+        phase: &[u8],
         endpoint: &Endpoint,
         pid_data1: bool,
         buffer: &mut [u8],
@@ -486,18 +540,38 @@ impl BulkOnlyTransport {
             );
             match outcome {
                 PacketOutcome::Ok(transferred) => return PacketOutcome::Ok(transferred),
-                PacketOutcome::PacketError(_) if can_retry_error => {
+                PacketOutcome::PacketError(transferred) if can_retry_error => {
                     packet_error_retries += 1;
                     self.packet_retries = self.packet_retries.wrapping_add(1);
+                    if packet_error_retries == 1 || transferred > 0 {
+                        log_packet_retry(
+                            b"packet error",
+                            phase,
+                            endpoint,
+                            pid_data1,
+                            transferred,
+                            packet_error_retries,
+                        );
+                    }
                     hcd::recover_channel_after_packet_failure();
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
                 PacketOutcome::PacketError(transferred) => {
                     return PacketOutcome::PacketError(transferred);
                 }
-                PacketOutcome::Timeout(_) if can_retry_timeout => {
+                PacketOutcome::Timeout(transferred) if can_retry_timeout => {
                     timeout_retries += 1;
                     self.packet_retries = self.packet_retries.wrapping_add(1);
+                    if timeout_retries == 1 || transferred > 0 {
+                        log_packet_retry(
+                            b"timeout",
+                            phase,
+                            endpoint,
+                            pid_data1,
+                            transferred,
+                            timeout_retries,
+                        );
+                    }
                     hcd::recover_channel_after_packet_failure();
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
@@ -593,6 +667,17 @@ struct BulkInStaging {
     bytes: [u8; MAX_BULK_MPS],
 }
 
+/// Returns one diagnostic word from a received staging packet. Bytes beyond
+/// the HCD-reported length stay zero so a short CSW remains easy to recognize.
+fn staging_word(bytes: &[u8; MAX_BULK_MPS], received: usize, offset: usize) -> u32 {
+    let mut word = [0u8; 4];
+    if offset < received {
+        let count = (received - offset).min(word.len());
+        word[..count].copy_from_slice(&bytes[offset..offset + count]);
+    }
+    u32::from_le_bytes(word)
+}
+
 /// `CompletionWait::Interrupt` interprets one iteration as eight CPU
 /// cycles. Keep each QTD attempt near one second. Four timeout retries give
 /// flash media about five seconds overall while allowing a frozen channel to
@@ -603,6 +688,7 @@ fn bulk_timeout_iterations() -> u32 {
 
 struct CommandStatus {
     tag: u32,
+    residue: u32,
     status: u8,
 }
 
@@ -627,6 +713,7 @@ fn parse_csw(bytes: &[u8; CSW_LEN]) -> Option<CommandStatus> {
     }
     Some(CommandStatus {
         tag: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        residue: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
         status: bytes[12],
     })
 }
@@ -638,4 +725,27 @@ fn log_phase_failure(what: &[u8], phase: &[u8]) {
     uart::log(b" during ");
     uart::log(phase);
     uart::log(b"\r\n");
+}
+
+/// Describes only the first retry of a troubled packet, plus any retry whose
+/// supposedly failed QTD had already transferred bytes. The latter is the
+/// signature needed to explain a valid CSW appearing again one command late;
+/// routine zero-progress attempts remain bounded to one short block.
+fn log_packet_retry(
+    reason: &[u8],
+    phase: &[u8],
+    endpoint: &Endpoint,
+    pid_data1: bool,
+    transferred: usize,
+    attempt: u32,
+) {
+    uart::log(b"USB BOT: retrying bulk packet after ");
+    uart::log(reason);
+    uart::log(b" during ");
+    uart::log(phase);
+    uart::log(b"\r\n");
+    uart::log_u32(b"USB BOT:   direction IN=", u32::from(endpoint.is_in));
+    uart::log_u32(b"USB BOT:   DATA1=", u32::from(pid_data1));
+    uart::log_u32(b"USB BOT:   bytes already transferred=", transferred as u32);
+    uart::log_u32(b"USB BOT:   retry attempt=", attempt);
 }

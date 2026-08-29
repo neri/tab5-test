@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use super::automount::AutoMount;
 use super::wifi_manager::{self, IpPolicy, Manager as WifiManager};
-use super::{blockdev, browsertest, files, lsusb, mbr, membench};
+use super::{blockdev, browsertest, files, fswritetest, lsusb, mbr, membench};
 use crate::console::Console;
 use crate::framebuffer::Framebuffer;
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
@@ -21,7 +21,7 @@ use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use crate::browser::url::Url;
 use crate::fs;
 use crate::fs::path::{self, Path};
-use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, Vfs};
+use crate::fs::vfs::{FileHandle, MAX_OPEN_FILES, MountRequest, Vfs};
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
 use crate::{
     browser, delay, dma2d, entropy, icm, interrupts, lcd, net, pma, pmp, power, psram, rtc, sdio,
@@ -38,38 +38,193 @@ const FRAMES_PER_SECOND: u32 = 57;
 /// shown by `help <name>`.
 struct HelpEntry {
     name: &'static str,
+    /// Other names that reach the same command. Data rather than extra
+    /// match arms, so a name that works is always a name `help` can show.
+    aliases: &'static [&'static str],
+    group: Group,
+    /// What `execute` dispatches on. The table is the only place a name is
+    /// turned into one of these, so a command that is not listed here
+    /// cannot be reached from the console.
+    id: Cmd,
     usage: &'static str,
     lines: &'static [&'static str],
+}
+
+/// Whether a command is part of what this firmware is for, or scaffolding
+/// that exists only while something is still being built.
+///
+/// The split is deliberately not "who is it for". From outside the project
+/// a command that decodes the DW-GDMA arbitration registers is no more
+/// usable than one that soaks the display for two hours -- neither was
+/// written for somebody using the board. What separates them is whether
+/// they outlive the work that caused them to be written, and most of these
+/// do not.
+///
+/// `docs/CONSOLE_COMMAND_REVIEW.md` records the assignment, and for each
+/// scaffold command the work that is still keeping it alive.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Operates the board. Stays.
+    Product,
+    /// Written to get something working, or to show that it works. Goes
+    /// when that question is settled.
+    Scaffold,
+}
+
+/// One command's identity. Fieldless on purpose: it names a command without
+/// carrying anything, so [`HELP_ENTRIES`] stays a table of data and the
+/// `match` in [`execute`] stays exhaustive over it. Adding a variant without
+/// a body, or listing one that no longer exists, is a compile error rather
+/// than something the console discovers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cmd {
+    Help,
+    Clear,
+    Echo,
+    About,
+    Cpuinfo,
+    Pma,
+    Pmp,
+    Mem,
+    Alloctest,
+    Stress,
+    Displaybench,
+    Db,
+    Dp,
+    Di,
+    Ui,
+    Mix,
+    Ut,
+    Usbmargin,
+    Pf,
+    Rt,
+    Membench,
+    Uptime,
+    Backlight,
+    Icm,
+    Ppafill,
+    Paint,
+    Touchtest,
+    Coordtest,
+    Fonttest,
+    Axistest,
+    Battery,
+    Win,
+    Tls,
+    Entropy,
+    Rtc,
+    Sdinfo,
+    Sdread,
+    Sdreadn,
+    Sdwritetest,
+    Sdzero,
+    Sdmbr,
+    Devices,
+    Blkread,
+    Mount,
+    Umount,
+    Automount,
+    Mounts,
+    Fsverify,
+    Cd,
+    Pwd,
+    Ls,
+    Cat,
+    Rm,
+    Rmdir,
+    Mv,
+    Fill,
+    Fswritetest,
+    Fsopen,
+    Fsread,
+    Fsclose,
+    Write,
+    Append,
+    Mkdir,
+    Sdreadpsram,
+    Lsusb,
+    Usbinfo,
+    Usbrescan,
+    Usbfs,
+    Usbvbus,
+    Shutdown,
+    Usbhub,
+    Usbhw,
+    Usbperiodic,
+    Usbmsc,
+    Usbread,
+    Usbzero,
+    Usbwritetest,
+    Usbmbr,
+    Wifi,
+    Wifiinfo,
+    Wifiup,
+    Wifimac,
+    Wifiscan,
+    Wificonnect,
+    Wifistatus,
+    Wifisaved,
+    Wififorget,
+    Wifilog,
+    Wifidisconnect,
+    Netdump,
+    Ipconfig,
+    Nslookup,
+    Ping,
+    Tftpget,
+    Httpget,
+    Browser,
+    Bt,
+    Hs,
+    Reboot,
 }
 
 const HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
         name: "help",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Help,
         usage: "help [command]",
         lines: &["list commands, or describe one"],
     },
     HelpEntry {
         name: "clear",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Clear,
         usage: "clear",
         lines: &["clear the screen"],
     },
     HelpEntry {
         name: "echo",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Echo,
         usage: "echo <text>",
         lines: &["print text back"],
     },
     HelpEntry {
         name: "about",
+        aliases: &["version"],
+        group: Group::Product,
+        id: Cmd::About,
         usage: "about",
         lines: &["firmware banner"],
     },
     HelpEntry {
         name: "cpuinfo",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Cpuinfo,
         usage: "cpuinfo",
         lines: &["show RISC-V machine identification CSRs"],
     },
     HelpEntry {
         name: "pma",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Pma,
         usage: "pma",
         lines: &[
             "decode all RISC-V Physical Memory Attribute entries as a memory",
@@ -80,6 +235,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "pmp",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Pmp,
         usage: "pmp",
         lines: &[
             "decode all RISC-V Physical Memory Protection entries as a memory",
@@ -91,16 +249,25 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "mem",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Mem,
         usage: "mem",
         lines: &["PSRAM/RAM usage"],
     },
     HelpEntry {
         name: "alloctest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Alloctest,
         usage: "alloctest <MiB>",
         lines: &["allocate N MiB on the PSRAM heap, verify read/write"],
     },
     HelpEntry {
         name: "stress",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Stress,
         usage: "stress [count]",
         lines: &[
             "repeat a full-screen fill and report how long it took and how",
@@ -111,6 +278,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "displaybench",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Displaybench,
         usage: "displaybench <mode> [count] [phase_ms] [burst]",
         lines: &[
             "full-screen display-path diagnostic. modes: idle, sync, cpu,",
@@ -121,6 +291,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "db",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Db,
         usage: "db [count]",
         lines: &[
             "run the standard displaybench suite with one short command.",
@@ -130,6 +303,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "dp",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Dp,
         usage: "dp [count]",
         lines: &[
             "run only the production full-screen display path at the normal",
@@ -139,6 +315,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "di",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Di,
         usage: "di [minutes]",
         lines: &[
             "idle-display soak with per-frame underrun accounting; default",
@@ -147,6 +326,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ui",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Ui,
         usage: "ui",
         lines: &[
             "run 100 real console scrolls, then visit the coordinate, paint,",
@@ -156,6 +338,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "mix",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Mix,
         usage: "mix [minutes]",
         lines: &[
             "read-only combined soak: display fills, PSRAM heap verify, SD",
@@ -165,6 +350,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ut",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Ut,
         usage: "ut [count]",
         lines: &[
             "read and compare the same 4 KiB from USB Mass Storage repeatedly;",
@@ -173,6 +361,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbmargin",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbmargin,
         usage: "usbmargin [rounds]",
         lines: &[
             "measure how long USB Mass Storage takes to become readable after",
@@ -182,6 +373,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "pf",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Pf,
         usage: "pf",
         lines: &[
             "reboot once, reject the valid 200 MHz DQS result diagnostically,",
@@ -191,6 +385,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "rt",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Rt,
         usage: "rt [count]",
         lines: &[
             "reboot count times automatically; default 20, maximum 100.",
@@ -200,6 +397,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "membench",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Membench,
         usage: "membench",
         lines: &[
             "measure CPU access to SRAM, cached PSRAM, and the direct alias.",
@@ -211,16 +411,25 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "uptime",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Uptime,
         usage: "uptime",
         lines: &["time since boot"],
     },
     HelpEntry {
         name: "backlight",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Backlight,
         usage: "backlight on|off",
         lines: &["LCD backlight"],
     },
     HelpEntry {
         name: "icm",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Icm,
         usage: "icm [priority arqos]",
         lines: &[
             "display DMA arbitration and DPI FIFO underruns. with no",
@@ -232,6 +441,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ppafill",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Ppafill,
         usage: "ppafill <x> <y> <w> <h> <color> [cpu] | ppafill sweep",
         lines: &[
             "fill a rectangle through the PPA and report how long it took.",
@@ -244,16 +456,25 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "paint",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Paint,
         usage: "paint",
         lines: &["touch drawing screen"],
     },
     HelpEntry {
         name: "touchtest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Touchtest,
         usage: "touchtest",
         lines: &["live multi-touch test; use two fingers, any key exits"],
     },
     HelpEntry {
         name: "coordtest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Coordtest,
         usage: "coordtest",
         lines: &[
             "full-screen coordinate chart: a 100-pixel grid, the logical centre",
@@ -265,6 +486,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fonttest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fonttest,
         usage: "fonttest",
         lines: &[
             "full-screen 16 pixel font sheet: ASCII, kana, kanji, symbols,",
@@ -277,11 +501,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "axistest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Axistest,
         usage: "axistest",
         lines: &["tilt-controlled BMI270 ball test; any key exits"],
     },
     HelpEntry {
         name: "battery",
+        aliases: &["batinfo"],
+        group: Group::Product,
+        id: Cmd::Battery,
         usage: "battery",
         lines: &[
             "live INA226 battery monitor: pack voltage, current, power, and",
@@ -290,6 +520,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "win",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Win,
         usage: "win",
         lines: &[
             "Windows 95 desktop mock-up: a USB HID Boot Mouse moves the",
@@ -299,6 +532,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "tls",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Tls,
         usage: "tls <host|a.b.c.d>[:port] [path]",
         lines: &[
             "open a TLS 1.3 connection, fetch one page over it and report",
@@ -314,6 +550,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "entropy",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Entropy,
         usage: "entropy | entropy test [count] | entropy fail on|off",
         lines: &[
             "the SAR ADC noise source behind the hardware RNG, which TLS",
@@ -327,6 +566,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "rtc",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Rtc,
         usage: "rtc | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC) | rtc regs | rtc test",
         lines: &[
             "RX8130CE real-time clock (board I2C 0x32). with no argument,",
@@ -341,36 +583,57 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "sdinfo",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdinfo,
         usage: "sdinfo",
         lines: &["activate SD card, show CID/CSD summary"],
     },
     HelpEntry {
         name: "sdread",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdread,
         usage: "sdread <lba>",
         lines: &["read one 512-byte block, dump to UART log"],
     },
     HelpEntry {
         name: "sdreadn",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdreadn,
         usage: "sdreadn <lba> <n>",
         lines: &["read n blocks (DMA, n<=8), dump to UART log"],
     },
     HelpEntry {
         name: "sdwritetest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdwritetest,
         usage: "sdwritetest <lba>",
         lines: &["write+verify+restore 1 block at lba (DMA)"],
     },
     HelpEntry {
         name: "sdzero",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdzero,
         usage: "sdzero <lba>",
         lines: &["write a zeroed block at lba (DMA, no round-trip)"],
     },
     HelpEntry {
         name: "sdmbr",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdmbr,
         usage: "sdmbr",
         lines: &["show MBR partition table (LBA 0)"],
     },
     HelpEntry {
         name: "devices",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Devices,
         usage: "devices",
         lines: &[
             "list block devices (ram, sd0, usb0) with their geometry and",
@@ -381,6 +644,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "blkread",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Blkread,
         usage: "blkread <device> [pN] <lba>",
         lines: &[
             "read one block through the block layer and dump it to UART.",
@@ -390,24 +656,34 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "mount",
-        usage: "mount [<ram|sd0pN|usbMpN>]",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Mount,
+        usage: "mount [-r] [<ram|sd0pN|usbMpN>]",
         lines: &[
             "with no argument, list mounts. with one, attach that volume:",
             "ram is the permanent writable root /; everything else lands on",
             "/vol/<name>. usbM is the",
             "number the host gave that drive when it attached, which 'devices'",
             "prints; it stays with the drive until it is unplugged, so pulling",
-            "one stick never renumbers another. SD and USB are always",
-            "read-only; /vol is reserved for their mount points",
+            "one stick never renumbers another. FAT volumes mount read-write",
+            "and exFAT ones read-only, whatever you ask for; -r forces a FAT",
+            "volume read-only too. /vol is reserved for their mount points",
         ],
     },
     HelpEntry {
         name: "umount",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Umount,
         usage: "umount <mount point>",
         lines: &["detach a volume; refused while it still has open files"],
     },
     HelpEntry {
         name: "automount",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Automount,
         usage: "automount [on|off]",
         lines: &[
             "with no argument, report whether USB volumes mount and unmount",
@@ -420,6 +696,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "mounts",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Mounts,
         usage: "mounts",
         lines: &[
             "list what is mounted where, with each mount's media generation",
@@ -429,6 +708,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fsverify",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fsverify,
         usage: "fsverify",
         lines: &[
             "re-check every mount against the medium it was mounted from.",
@@ -439,6 +721,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "cd",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Cd,
         usage: "cd [<path>]",
         lines: &[
             "change the current directory, which every path argument is",
@@ -450,11 +735,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "pwd",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Pwd,
         usage: "pwd",
         lines: &["print the current directory"],
     },
     HelpEntry {
         name: "ls",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Ls,
         usage: "ls [-l] [-a] [<path>]",
         lines: &[
             "list a directory, names only, in name order. -l adds the kind,",
@@ -468,6 +759,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "cat",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Cat,
         usage: "cat <path> [offset]",
         lines: &[
             "print a file, e.g. cat /tmp/README.TXT. a path with spaces in",
@@ -478,6 +772,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "rm",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Rm,
         usage: "rm <path>",
         lines: &[
             "remove a file. refused while something has it open, and refused",
@@ -487,11 +784,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "rmdir",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Rmdir,
         usage: "rmdir <path>",
         lines: &["remove an empty directory; a non-empty one is refused"],
     },
     HelpEntry {
         name: "mv",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Mv,
         usage: "mv <from> <to>",
         lines: &[
             "rename, or move within one volume. only the directory entry",
@@ -501,6 +804,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fill",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fill,
         usage: "fill <path> <KiB> [chunk] [repeat]",
         lines: &[
             "write a known pattern and report how long it took. the default",
@@ -512,7 +818,30 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "fswritetest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fswritetest,
+        usage: "fswritetest <dir> [rounds] [KiB]",
+        lines: &[
+            "WRITES TO THE MEDIUM. run the whole write-path acceptance list",
+            "against a mounted volume and answer PASS or FAIL. everything it",
+            "makes goes in <dir>/FSWTEST, which it creates and removes; it",
+            "refuses to start if that name is already taken. it checks the",
+            "bytes rather than showing them, so replacing a file with a",
+            "shorter one and appending to it is actually verified.",
+            "on a read-only mount it checks that every change is refused",
+            "instead, so 'mount -r' is tested by the same command.",
+            "rounds (default 8) repeats create/append/replace/delete: raise",
+            "it to soak the WRITE path, and 'fswritetest /tmp 70' is what",
+            "shows the 8 MiB RAM disk really gives clusters back",
+        ],
+    },
+    HelpEntry {
         name: "fsopen",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fsopen,
         usage: "fsopen [<path>]",
         lines: &[
             "hold a file open across commands, read-only, or with no path",
@@ -525,6 +854,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fsread",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fsread,
         usage: "fsread <slot> [bytes]",
         lines: &[
             "read through a handle held by fsopen and report the outcome, not",
@@ -534,6 +866,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "fsclose",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Fsclose,
         usage: "fsclose <slot>",
         lines: &[
             "release a handle held by fsopen. a stale one still occupies a",
@@ -542,6 +877,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "write",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Write,
         usage: "write <path> <text>",
         lines: &[
             "create or replace a file with one line of text, e.g.",
@@ -551,11 +889,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "append",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Append,
         usage: "append <path> <text>",
         lines: &["add one line to a file, creating it if it is not there"],
     },
     HelpEntry {
         name: "mkdir",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Mkdir,
         usage: "mkdir <path>",
         lines: &[
             "create a directory. only the last component is created, so a",
@@ -565,11 +909,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "sdreadpsram",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Sdreadpsram,
         usage: "sdreadpsram <lba> <n>",
         lines: &["DMA n blocks (n<=8) into PSRAM, verify vs SRAM"],
     },
     HelpEntry {
         name: "lsusb",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Lsusb,
         usage: "lsusb [address]",
         lines: &[
             "show what is attached to USB-A as a tree through the hub, with",
@@ -582,6 +932,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbinfo",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Usbinfo,
         usage: "usbinfo",
         lines: &[
             "show every device currently attached to USB-A (direct or behind",
@@ -590,6 +943,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbrescan",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Usbrescan,
         usage: "usbrescan",
         lines: &[
             "force a fresh USB-A probe: reset the port, re-enumerate whatever",
@@ -598,6 +954,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbfs",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbfs,
         usage: "usbfs on|off",
         lines: &[
             "force the root host to FS/LS-only or restore High-Speed mode,",
@@ -606,6 +965,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbvbus",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbvbus,
         usage: "usbvbus <0-7> on|off",
         lines: &[
             "raw PI4IOE2 (0x44) output-bit toggle; bit 3 = USB-A VBUS",
@@ -614,6 +976,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "shutdown",
+        aliases: &["poweroff"],
+        group: Group::Product,
+        id: Cmd::Shutdown,
         usage: "shutdown",
         lines: &[
             "turn off the whole Tab5 through its power controller",
@@ -622,6 +987,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbhub",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbhub,
         usage: "usbhub",
         lines: &[
             "show the attached USB hub's descriptor and every port's live",
@@ -630,6 +998,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbhw",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbhw,
         usage: "usbhw",
         lines: &[
             "dump the DWC core's GHWCFG registers and probe HCSPLT to show",
@@ -638,6 +1009,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbperiodic",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbperiodic,
         usage: "usbperiodic",
         lines: &[
             "run one channel-1 HID Interrupt IN transaction through the DWC",
@@ -646,6 +1020,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbmsc",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbmsc,
         usage: "usbmsc",
         lines: &[
             "SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10) against the",
@@ -654,11 +1031,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbread",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbread,
         usage: "usbread <lba>",
         lines: &["USB MSC: read one 512-byte block (SCSI READ(10)), dump to UART log"],
     },
     HelpEntry {
         name: "usbzero",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbzero,
         usage: "usbzero <lba> [count]",
         lines: &[
             "USB MSC: overwrite 1-8 blocks with zeros and verify each one from",
@@ -668,6 +1051,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbwritetest",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbwritetest,
         usage: "usbwritetest <lba>",
         lines: &[
             "USB MSC: write a pattern to one 512-byte block (SCSI WRITE(10)),",
@@ -677,11 +1063,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "usbmbr",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbmbr,
         usage: "usbmbr",
         lines: &["USB MSC: show MBR partition table (LBA 0), same format as sdmbr"],
     },
     HelpEntry {
         name: "wifi",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifi,
         usage: "wifi [on|off|status|forget]",
         lines: &[
             "without an argument, open the Wi-Fi setup screen; on/off is",
@@ -691,6 +1083,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifiinfo",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Wifiinfo,
         usage: "wifiinfo",
         lines: &[
             "power and activate the ESP32-C6 as an SDIO card, show its",
@@ -699,6 +1094,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifiup",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Wifiup,
         usage: "wifiup",
         lines: &[
             "bring up the ESP-Hosted link to the ESP32-C6 and show what the",
@@ -707,6 +1105,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifimac",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Wifimac,
         usage: "wifimac",
         lines: &[
             "bring up the link and ask the C6 for its station MAC address",
@@ -715,6 +1116,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifiscan",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifiscan,
         usage: "wifiscan",
         lines: &[
             "bring up the C6, start Wi-Fi in station mode and list the",
@@ -723,6 +1127,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wificonnect",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wificonnect,
         usage: "wificonnect <ssid> [password]",
         lines: &[
             "join an access point and report the result. this associates",
@@ -731,11 +1138,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wifistatus",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifistatus,
         usage: "wifistatus",
         lines: &["show the access point the C6 is associated with"],
     },
     HelpEntry {
         name: "wifisaved",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Wifisaved,
         usage: "wifisaved",
         lines: &[
             "show whether the C6 currently has a station configuration;",
@@ -744,16 +1157,25 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "wififorget",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wififorget,
         usage: "wififorget",
         lines: &["delete the station profile saved in C6 flash"],
     },
     HelpEntry {
         name: "wifilog",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Wifilog,
         usage: "wifilog",
         lines: &["show the last 16 Wi-Fi manager transitions and retry decisions"],
     },
     HelpEntry {
         name: "wifidisconnect",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifidisconnect,
         usage: "wifidisconnect",
         lines: &[
             "leave the current access point for this boot; unlike 'wifi off',",
@@ -762,6 +1184,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "netdump",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Netdump,
         usage: "netdump [tx|count]",
         lines: &[
             "show the ethernet header of each frame the C6 pushes at the",
@@ -776,6 +1201,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ipconfig",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Ipconfig,
         usage: "ipconfig [dhcp|release|dns <a.b.c.d>...|<a.b.c.d[/len]> [gw]]",
         lines: &[
             "show the IPv4 settings, or change where they come from. 'dhcp'",
@@ -787,6 +1215,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "nslookup",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Nslookup,
         usage: "nslookup <name>",
         lines: &[
             "resolve a name to its A records. unlike the commands below,",
@@ -796,6 +1227,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "ping",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Ping,
         usage: "ping <host|a.b.c.d> [count]",
         lines: &[
             "send ICMP echo requests and time the replies; default 4. echo",
@@ -805,6 +1239,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "tftpget",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Tftpget,
         usage: "tftpget <host|a.b.c.d> <file>",
         lines: &[
             "read a file over TFTP (RFC 1350, 512-byte blocks, no options)",
@@ -820,6 +1257,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "httpget",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Httpget,
         usage: "httpget <host|a.b.c.d>[:port] [path] | httpget <url>",
         lines: &[
             "issue a minimal HTTP/1.0 GET, print the status and headers, and",
@@ -837,6 +1277,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "browser",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Browser,
         usage: "browser [<url>]",
         lines: &[
             "open the hypertext viewer. with no argument it starts on its",
@@ -853,7 +1296,10 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "bt",
-        usage: "bt <url> [rounds]   (also: browsertest)",
+        aliases: &["browsertest"],
+        group: Group::Scaffold,
+        id: Cmd::Bt,
+        usage: "bt <url> [rounds]",
         lines: &[
             "read /manifest.txt from the fixture server named here, then",
             "fetch every endpoint in it through the same code the browser",
@@ -869,7 +1315,10 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "hs",
-        usage: "hs <url> [r <n>|p [n]|c <n>]   (also: httpstream)",
+        aliases: &["httpstream"],
+        group: Group::Scaffold,
+        id: Cmd::Hs,
+        usage: "hs <url> [r <n>|p [n]|c <n>]",
         lines: &[
             "fetch a url through the interruptible transaction the browser",
             "uses, and print what it came to: status, how the body was",
@@ -889,6 +1338,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "reboot",
+        aliases: &["reset"],
+        group: Group::Product,
+        id: Cmd::Reboot,
         usage: "reboot",
         lines: &["restart the device"],
     },
@@ -1010,34 +1462,43 @@ pub fn execute(
 
     let (command, rest) = split_first_word(line);
     let argument = trim(rest);
-    match command {
-        b"help" => cmd_help(console, framebuffer, argument),
-        b"clear" => console.clear(framebuffer),
-        b"echo" => console.write_output_line(framebuffer, as_str(argument)),
-        b"about" | b"version" => console.write_output_line(framebuffer, "Tab5 Shell 0.1"),
-        b"cpuinfo" => cmd_cpuinfo(console, framebuffer),
-        b"pma" => cmd_pma(console, framebuffer),
-        b"pmp" => cmd_pmp(console, framebuffer),
-        b"mem" => cmd_mem(console, framebuffer),
-        b"alloctest" => cmd_alloctest(console, framebuffer, argument),
-        b"uptime" => cmd_uptime(console, framebuffer),
-        b"membench" => cmd_membench(console, framebuffer),
-        b"stress" => cmd_stress(console, framebuffer, argument),
-        b"displaybench" => cmd_displaybench(console, framebuffer, argument),
-        b"db" => cmd_displaybench_suite(console, framebuffer, argument),
-        b"dp" => cmd_displaybench_production(console, framebuffer, argument),
-        b"di" => cmd_display_idle_soak(console, framebuffer, argument),
-        b"ui" => {
+    // A name becomes a command in exactly one place, and it is the same
+    // table `help` reads. Nothing below can dispatch a command the listing
+    // does not know about, and nothing listed can be missing a body: the
+    // match is over `Cmd`, so the compiler requires an arm for every
+    // variant the table can produce.
+    let Some(entry) = lookup(command) else {
+        console.write_output_line(framebuffer, "unknown command (try 'help')");
+        return Outcome::Continue;
+    };
+    match entry.id {
+        Cmd::Help => cmd_help(console, framebuffer, argument),
+        Cmd::Clear => console.clear(framebuffer),
+        Cmd::Echo => console.write_output_line(framebuffer, as_str(argument)),
+        Cmd::About => console.write_output_line(framebuffer, "Tab5 Shell 0.1"),
+        Cmd::Cpuinfo => cmd_cpuinfo(console, framebuffer),
+        Cmd::Pma => cmd_pma(console, framebuffer),
+        Cmd::Pmp => cmd_pmp(console, framebuffer),
+        Cmd::Mem => cmd_mem(console, framebuffer),
+        Cmd::Alloctest => cmd_alloctest(console, framebuffer, argument),
+        Cmd::Uptime => cmd_uptime(console, framebuffer),
+        Cmd::Membench => cmd_membench(console, framebuffer),
+        Cmd::Stress => cmd_stress(console, framebuffer, argument),
+        Cmd::Displaybench => cmd_displaybench(console, framebuffer, argument),
+        Cmd::Db => cmd_displaybench_suite(console, framebuffer, argument),
+        Cmd::Dp => cmd_displaybench_production(console, framebuffer, argument),
+        Cmd::Di => cmd_display_idle_soak(console, framebuffer, argument),
+        Cmd::Ui => {
             if argument.is_empty() {
                 cmd_ui_scroll_bench(console, framebuffer);
                 return Outcome::VisualQa;
             }
             console.write_output_line(framebuffer, "usage: ui");
         }
-        b"mix" => cmd_mixed_soak(console, framebuffer, argument, usb_host),
-        b"ut" => cmd_usb_read_test(console, framebuffer, argument, usb_host),
-        b"usbmargin" => cmd_usb_margin(console, framebuffer, argument, usb_host),
-        b"pf" => {
+        Cmd::Mix => cmd_mixed_soak(console, framebuffer, argument, usb_host),
+        Cmd::Ut => cmd_usb_read_test(console, framebuffer, argument, usb_host),
+        Cmd::Usbmargin => cmd_usb_margin(console, framebuffer, argument, usb_host),
+        Cmd::Pf => {
             if argument.is_empty() {
                 psram::request_fallback_test();
                 console.write_output_line(framebuffer, "forcing one 200-to-80 MHz fallback...");
@@ -1045,7 +1506,7 @@ pub fn execute(
             }
             console.write_output_line(framebuffer, "usage: pf");
         }
-        b"rt" => {
+        Cmd::Rt => {
             let count = if argument.is_empty() {
                 Some(20)
             } else {
@@ -1063,42 +1524,28 @@ pub fn execute(
             }
             console.write_output_line(framebuffer, "usage: rt [1-100]");
         }
-        b"backlight" => cmd_backlight(console, framebuffer, argument),
-        b"icm" => cmd_icm(console, framebuffer, argument),
-        b"ppafill" => cmd_ppafill(console, framebuffer, argument),
-        b"entropy" => cmd_entropy(console, framebuffer, argument),
-        b"rtc" => cmd_rtc(console, framebuffer, argument),
-        b"sdinfo" => cmd_sdinfo(console, framebuffer),
-        b"sdread" => cmd_sdread(console, framebuffer, argument),
-        b"sdreadn" => cmd_sdreadn(console, framebuffer, argument),
-        b"sdwritetest" => cmd_sdwritetest(console, framebuffer, argument),
-        b"sdzero" => cmd_sdzero(console, framebuffer, argument),
-        b"sdmbr" => cmd_sdmbr(console, framebuffer),
-        b"devices" => cmd_devices(console, framebuffer, usb_host, ram_disk),
-        b"blkread" => cmd_blkread(console, framebuffer, argument, usb_host, ram_disk),
-        b"mounts" => files::show_mounts(console, framebuffer, vfs),
-        b"fsverify" => {
+        Cmd::Backlight => cmd_backlight(console, framebuffer, argument),
+        Cmd::Icm => cmd_icm(console, framebuffer, argument),
+        Cmd::Ppafill => cmd_ppafill(console, framebuffer, argument),
+        Cmd::Entropy => cmd_entropy(console, framebuffer, argument),
+        Cmd::Rtc => cmd_rtc(console, framebuffer, argument),
+        Cmd::Sdinfo => cmd_sdinfo(console, framebuffer),
+        Cmd::Sdread => cmd_sdread(console, framebuffer, argument),
+        Cmd::Sdreadn => cmd_sdreadn(console, framebuffer, argument),
+        Cmd::Sdwritetest => cmd_sdwritetest(console, framebuffer, argument),
+        Cmd::Sdzero => cmd_sdzero(console, framebuffer, argument),
+        Cmd::Sdmbr => cmd_sdmbr(console, framebuffer),
+        Cmd::Devices => cmd_devices(console, framebuffer, usb_host, ram_disk),
+        Cmd::Blkread => cmd_blkread(console, framebuffer, argument, usb_host, ram_disk),
+        Cmd::Mounts => files::show_mounts(console, framebuffer, vfs),
+        Cmd::Fsverify => {
             with_devices(usb_host, ram_disk, |devices| {
                 files::verify(console, framebuffer, devices, vfs)
             });
         }
-        b"mount" => {
-            if argument.is_empty() {
-                files::show_mounts(console, framebuffer, vfs);
-            } else if let Some(name) = single_argument(
-                console,
-                framebuffer,
-                argument,
-                "usage: mount [<ram|sd0pN|usbMpN>]",
-            ) {
-                let name = as_str(name);
-                with_devices(usb_host, ram_disk, |devices| {
-                    files::mount(console, framebuffer, devices, vfs, name)
-                });
-            }
-        }
-        b"automount" => cmd_automount(console, framebuffer, argument, auto_mount),
-        b"umount" => {
+        Cmd::Mount => cmd_mount(console, framebuffer, argument, usb_host, ram_disk, vfs),
+        Cmd::Automount => cmd_automount(console, framebuffer, argument, auto_mount),
+        Cmd::Umount => {
             if let Some(path) = single_argument(
                 console,
                 framebuffer,
@@ -1110,7 +1557,7 @@ pub fn execute(
                 files::unmount(console, framebuffer, vfs, path.as_str());
             }
         }
-        b"cd" => cmd_cd(
+        Cmd::Cd => cmd_cd(
             console,
             framebuffer,
             argument,
@@ -1119,8 +1566,8 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"pwd" => console.write_output_line(framebuffer, state.cwd.as_str()),
-        b"ls" => cmd_ls(
+        Cmd::Pwd => console.write_output_line(framebuffer, state.cwd.as_str()),
+        Cmd::Ls => cmd_ls(
             console,
             framebuffer,
             argument,
@@ -1129,7 +1576,7 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"cat" => cmd_cat(
+        Cmd::Cat => cmd_cat(
             console,
             framebuffer,
             argument,
@@ -1138,7 +1585,7 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"fsopen" => cmd_fsopen(
+        Cmd::Fsopen => cmd_fsopen(
             console,
             framebuffer,
             argument,
@@ -1147,7 +1594,7 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"fsread" => cmd_fsread(
+        Cmd::Fsread => cmd_fsread(
             console,
             framebuffer,
             argument,
@@ -1156,8 +1603,8 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"fsclose" => cmd_fsclose(console, framebuffer, argument, vfs, state),
-        b"rm" => cmd_remove(
+        Cmd::Fsclose => cmd_fsclose(console, framebuffer, argument, vfs, state),
+        Cmd::Rm => cmd_remove(
             console,
             framebuffer,
             argument,
@@ -1167,7 +1614,7 @@ pub fn execute(
             state,
             false,
         ),
-        b"rmdir" => cmd_remove(
+        Cmd::Rmdir => cmd_remove(
             console,
             framebuffer,
             argument,
@@ -1177,7 +1624,7 @@ pub fn execute(
             state,
             true,
         ),
-        b"mv" => cmd_move(
+        Cmd::Mv => cmd_move(
             console,
             framebuffer,
             argument,
@@ -1186,7 +1633,7 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"fill" => cmd_fill(
+        Cmd::Fswritetest => cmd_fswritetest(
             console,
             framebuffer,
             argument,
@@ -1195,7 +1642,16 @@ pub fn execute(
             vfs,
             state,
         ),
-        b"write" => cmd_write(
+        Cmd::Fill => cmd_fill(
+            console,
+            framebuffer,
+            argument,
+            usb_host,
+            ram_disk,
+            vfs,
+            state,
+        ),
+        Cmd::Write => cmd_write(
             console,
             framebuffer,
             argument,
@@ -1205,7 +1661,7 @@ pub fn execute(
             state,
             fs::vfs::OpenMode::Truncate,
         ),
-        b"append" => cmd_write(
+        Cmd::Append => cmd_write(
             console,
             framebuffer,
             argument,
@@ -1215,7 +1671,7 @@ pub fn execute(
             state,
             fs::vfs::OpenMode::Append,
         ),
-        b"mkdir" => {
+        Cmd::Mkdir => {
             if let Some(path) =
                 single_argument(console, framebuffer, argument, "usage: mkdir <path>")
                     .and_then(|path| absolute(console, framebuffer, state, path))
@@ -1225,54 +1681,54 @@ pub fn execute(
                 });
             }
         }
-        b"sdreadpsram" => cmd_sdreadpsram(console, framebuffer, argument),
-        b"lsusb" => cmd_lsusb(console, framebuffer, argument, usb_host),
-        b"usbinfo" => cmd_usbinfo(console, framebuffer, usb_host),
-        b"usbrescan" => cmd_usbrescan(console, framebuffer, usb_host),
-        b"usbfs" => cmd_usbfs(console, framebuffer, argument, usb_host),
-        b"usbvbus" => cmd_usbvbus(console, framebuffer, argument),
-        b"usbhub" => cmd_usbhub(console, framebuffer, usb_host),
-        b"usbhw" => cmd_usbhw(console, framebuffer, usb_host),
-        b"usbperiodic" => cmd_usbperiodic(console, framebuffer, usb_host),
-        b"usbmsc" => cmd_usbmsc(console, framebuffer, usb_host),
-        b"usbread" => cmd_usbread(console, framebuffer, argument, usb_host),
-        b"usbwritetest" => cmd_usb_write_test(console, framebuffer, argument, usb_host),
-        b"usbzero" => cmd_usbzero(console, framebuffer, argument, usb_host),
-        b"usbmbr" => cmd_usbmbr(console, framebuffer, usb_host),
-        b"wifi" => {
+        Cmd::Sdreadpsram => cmd_sdreadpsram(console, framebuffer, argument),
+        Cmd::Lsusb => cmd_lsusb(console, framebuffer, argument, usb_host),
+        Cmd::Usbinfo => cmd_usbinfo(console, framebuffer, usb_host),
+        Cmd::Usbrescan => cmd_usbrescan(console, framebuffer, usb_host),
+        Cmd::Usbfs => cmd_usbfs(console, framebuffer, argument, usb_host),
+        Cmd::Usbvbus => cmd_usbvbus(console, framebuffer, argument),
+        Cmd::Usbhub => cmd_usbhub(console, framebuffer, usb_host),
+        Cmd::Usbhw => cmd_usbhw(console, framebuffer, usb_host),
+        Cmd::Usbperiodic => cmd_usbperiodic(console, framebuffer, usb_host),
+        Cmd::Usbmsc => cmd_usbmsc(console, framebuffer, usb_host),
+        Cmd::Usbread => cmd_usbread(console, framebuffer, argument, usb_host),
+        Cmd::Usbwritetest => cmd_usb_write_test(console, framebuffer, argument, usb_host),
+        Cmd::Usbzero => cmd_usbzero(console, framebuffer, argument, usb_host),
+        Cmd::Usbmbr => cmd_usbmbr(console, framebuffer, usb_host),
+        Cmd::Wifi => {
             if argument.is_empty() {
                 return Outcome::WifiMenu;
             }
             cmd_wifi_control(console, framebuffer, argument, wifi_manager);
             drop_dead_session(console, framebuffer, wifi_manager);
         }
-        b"wifiinfo" => {
+        Cmd::Wifiinfo => {
             let was_enabled = wifi_manager.is_enabled();
             wifi_manager.clear_link();
             cmd_wifiinfo(console, framebuffer);
             restore_after_wifi_diagnostic(console, framebuffer, wifi_manager, was_enabled);
         }
-        b"wifiup" => {
+        Cmd::Wifiup => {
             let was_enabled = wifi_manager.is_enabled();
             wifi_manager.clear_link();
             cmd_wifiup(console, framebuffer);
             restore_after_wifi_diagnostic(console, framebuffer, wifi_manager, was_enabled);
         }
-        b"wifimac" => {
+        Cmd::Wifimac => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, _) = wifi_manager.options_mut();
                 cmd_wifimac(console, framebuffer, wifi_session);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"wifiscan" => {
+        Cmd::Wifiscan => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, _) = wifi_manager.options_mut();
                 cmd_wifiscan(console, framebuffer, wifi_session);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"wificonnect" => {
+        Cmd::Wificonnect => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let result = cmd_wificonnect(console, framebuffer, argument, wifi_manager);
                 match result {
@@ -1289,14 +1745,14 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"wifistatus" => {
+        Cmd::Wifistatus => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, _) = wifi_manager.options_mut();
                 cmd_wifistatus(console, framebuffer, wifi_session);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"wifisaved" => {
+        Cmd::Wifisaved => {
             if wifi_manager.is_enabled() {
                 cmd_wifisaved(console, framebuffer, wifi_manager);
                 drop_dead_session(console, framebuffer, wifi_manager);
@@ -1311,16 +1767,16 @@ pub fn execute(
                 );
             }
         }
-        b"wififorget" => {
+        Cmd::Wififorget => {
             cmd_wififorget(console, framebuffer, wifi_manager);
             drop_dead_session(console, framebuffer, wifi_manager);
         }
-        b"wifilog" => {
+        Cmd::Wifilog => {
             wifi_manager.service();
             cmd_wifilog(console, framebuffer, wifi_manager);
             drop_dead_session(console, framebuffer, wifi_manager);
         }
-        b"wifidisconnect" => {
+        Cmd::Wifidisconnect => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let disconnected = {
                     let (wifi_session, _) = wifi_manager.options_mut();
@@ -1336,14 +1792,14 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"netdump" => {
+        Cmd::Netdump => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, _) = wifi_manager.options_mut();
                 cmd_netdump(console, framebuffer, argument, wifi_session);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"ipconfig" => {
+        Cmd::Ipconfig => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let policy = {
                     let (wifi_session, net_stack) = wifi_manager.options_mut();
@@ -1355,21 +1811,21 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"nslookup" => {
+        Cmd::Nslookup => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_nslookup(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"ping" => {
+        Cmd::Ping => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_ping(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"tftpget" => {
+        Cmd::Tftpget => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_tftpget(
@@ -1386,21 +1842,21 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"browsertest" | b"bt" => {
+        Cmd::Bt => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_browsertest(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"httpstream" | b"hs" => {
+        Cmd::Hs => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_httpstream(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"httpget" => {
+        Cmd::Httpget => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_httpget(
@@ -1417,21 +1873,21 @@ pub fn execute(
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"tls" => {
+        Cmd::Tls => {
             if wifi_command_allowed(console, framebuffer, wifi_manager) {
                 let (wifi_session, net_stack) = wifi_manager.options_mut();
                 cmd_tls(console, framebuffer, argument, wifi_session, net_stack);
                 drop_dead_session(console, framebuffer, wifi_manager);
             }
         }
-        b"paint" => return Outcome::Paint,
-        b"touchtest" => return Outcome::TouchTest,
-        b"coordtest" => return Outcome::CoordTest,
-        b"fonttest" => return Outcome::FontTest,
-        b"axistest" => return Outcome::AxisTest,
-        b"battery" | b"batinfo" => return Outcome::Battery,
-        b"win" => return Outcome::Win,
-        b"browser" => {
+        Cmd::Paint => return Outcome::Paint,
+        Cmd::Touchtest => return Outcome::TouchTest,
+        Cmd::Coordtest => return Outcome::CoordTest,
+        Cmd::Fonttest => return Outcome::FontTest,
+        Cmd::Axistest => return Outcome::AxisTest,
+        Cmd::Battery => return Outcome::Battery,
+        Cmd::Win => return Outcome::Win,
+        Cmd::Browser => {
             let argument = trim(argument);
             // Not refused without a network: the built-in pages are in
             // flash and are exactly what somebody wants to look at when the
@@ -1446,18 +1902,17 @@ pub fn execute(
                 None => return Outcome::Continue,
             }
         }
-        b"reboot" | b"reset" => {
+        Cmd::Reboot => {
             console.write_output_line(framebuffer, "rebooting...");
             return Outcome::Reboot;
         }
-        b"shutdown" | b"poweroff" => {
+        Cmd::Shutdown => {
             if argument.is_empty() {
                 console.write_output_line(framebuffer, "shutting down...");
                 return Outcome::Shutdown;
             }
             console.write_output_line(framebuffer, "usage: shutdown");
         }
-        _ => console.write_output_line(framebuffer, "unknown command (try 'help')"),
     }
     Outcome::Continue
 }
@@ -1513,24 +1968,68 @@ pub fn shutdown() -> bool {
 /// With no argument, lists command names only; with a command name, shows
 /// its usage and description. `write_output_line` wraps at the console's
 /// column width on its own, so the name list can just be one long line.
+/// Finds a command by the name that was typed, which may be an alias.
+///
+/// The one place a console name becomes a [`Cmd`]. `execute` and `help`
+/// both go through it, so the set of names that run something and the set
+/// of names `help` can describe are the same set by construction.
+fn lookup(name: &[u8]) -> Option<&'static HelpEntry> {
+    let name = as_str(name);
+    HELP_ENTRIES
+        .iter()
+        .find(|entry| entry.name == name || entry.aliases.contains(&name))
+}
+
+/// Writes one group's command names as a single line. The console wraps at
+/// its own width, so this stays one call however long the group gets.
+fn list_group(console: &mut Console, framebuffer: &mut Framebuffer, group: Group) {
+    let mut names = String::new();
+    for entry in HELP_ENTRIES.iter().filter(|entry| entry.group == group) {
+        if !names.is_empty() {
+            names.push(' ');
+        }
+        names.push_str(entry.name);
+    }
+    console.write_output_line(framebuffer, &names);
+}
+
 fn cmd_help(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[u8]) {
     if argument.is_empty() {
-        console.write_output_line(framebuffer, "commands (help <name> for details):");
-        let mut names = String::new();
-        for (index, entry) in HELP_ENTRIES.iter().enumerate() {
-            if index > 0 {
-                names.push(' ');
-            }
-            names.push_str(entry.name);
-        }
-        console.write_output_line(framebuffer, &names);
+        console.write_output_line(
+            framebuffer,
+            "commands (help <name> for details; help all also lists the diagnostic ones):",
+        );
+        list_group(console, framebuffer, Group::Product);
         return;
     }
 
-    let name = as_str(argument);
-    match HELP_ENTRIES.iter().find(|entry| entry.name == name) {
+    // Checked before command names. Nothing is called `all`, and nothing
+    // may be: a command whose name is shadowed here could not be described
+    // from the console.
+    if argument == b"all" {
+        console.write_output_line(framebuffer, "commands:");
+        list_group(console, framebuffer, Group::Product);
+        console.write_output_line(
+            framebuffer,
+            "diagnostics and benchmarks (development scaffolding):",
+        );
+        list_group(console, framebuffer, Group::Scaffold);
+        return;
+    }
+
+    match lookup(argument) {
         Some(entry) => {
             console.write_output_line(framebuffer, entry.usage);
+            if !entry.aliases.is_empty() {
+                let mut line = String::from("also: ");
+                for (index, alias) in entry.aliases.iter().enumerate() {
+                    if index > 0 {
+                        line.push(' ');
+                    }
+                    line.push_str(alias);
+                }
+                console.write_output_line(framebuffer, &line);
+            }
             for line in entry.lines {
                 console.write_output_line(framebuffer, line);
             }
@@ -2464,7 +2963,7 @@ fn cmd_mixed_soak(
     let mut line = Line::new();
     line.push_str("mix: running ");
     line.push_u32(minutes);
-    line.push_str(" minutes; external media are read-only...");
+    line.push_str(" minutes; nothing is written to external media...");
     console.write_output_line(framebuffer, line.as_str());
 
     icm::set_display_priority(15, 15);
@@ -2587,7 +3086,7 @@ fn cmd_mixed_soak(
             console.write_output_line(framebuffer, line.as_str());
         }
         None if underruns == 0 && dma_error == 0 && elapsed_frames >= target_frames => {
-            console.write_output_line(framebuffer, "mix: PASS (SD/USB were read-only)");
+            console.write_output_line(framebuffer, "mix: PASS (nothing written to SD/USB)");
         }
         None => console.write_output_line(framebuffer, "mix: FAIL: incomplete or underrun"),
     }
@@ -3416,7 +3915,10 @@ fn cmd_entropy(console: &mut Console, framebuffer: &mut Framebuffer, argument: &
 
 fn cmd_entropy_show(console: &mut Console, framebuffer: &mut Framebuffer) {
     if entropy::failure_is_forced() {
-        console.write_output_line(framebuffer, "entropy: failure is forced ('entropy fail off')");
+        console.write_output_line(
+            framebuffer,
+            "entropy: failure is forced ('entropy fail off')",
+        );
     }
     let mut bytes = [0u8; entropy::SEED_BYTES];
     let taken = {
@@ -5549,7 +6051,7 @@ fn cmd_tftpget(
             if error == fs::vfs::FsError::ReadOnly {
                 console.write_output_line(
                     framebuffer,
-                    "the file lands in the current directory; leave a read-only /vol mount",
+                    "the file lands in the current directory; cd off a read-only mount",
                 );
             }
             return;
@@ -5854,63 +6356,62 @@ fn cmd_httpget(
     // own in either direction -- a `httpget` that quietly used TLS would be
     // as wrong as an `https://` one that quietly did not.
     let parsed;
-    let (host, port, path, secure) = if browser::url::has_scheme(
-        core::str::from_utf8(target).unwrap_or(""),
-    ) {
-        if !trim(rest).is_empty() {
-            console.write_output_line(
-                framebuffer,
-                "a url carries its own path; do not give a second one",
-            );
-            return;
-        }
-        let Ok(text) = core::str::from_utf8(target) else {
-            console.write_output_line(framebuffer, "the address has to be ASCII");
-            return;
-        };
-        parsed = match browser::url::Url::parse(text) {
-            Ok(url) => url,
-            Err(error) => {
-                let mut line = Line::new();
-                line.push_str("bad address: ");
-                line.push_str(browser::url::error_text(error));
-                console.write_output_line(framebuffer, line.as_str());
+    let (host, port, path, secure) =
+        if browser::url::has_scheme(core::str::from_utf8(target).unwrap_or("")) {
+            if !trim(rest).is_empty() {
+                console.write_output_line(
+                    framebuffer,
+                    "a url carries its own path; do not give a second one",
+                );
                 return;
             }
+            let Ok(text) = core::str::from_utf8(target) else {
+                console.write_output_line(framebuffer, "the address has to be ASCII");
+                return;
+            };
+            parsed = match browser::url::Url::parse(text) {
+                Ok(url) => url,
+                Err(error) => {
+                    let mut line = Line::new();
+                    line.push_str("bad address: ");
+                    line.push_str(browser::url::error_text(error));
+                    console.write_output_line(framebuffer, line.as_str());
+                    return;
+                }
+            };
+            let Ok(request_target) = parsed.request_target() else {
+                console.write_output_line(framebuffer, "out of memory");
+                return;
+            };
+            // Leaked into a local so the borrows below outlive this block; the
+            // `Url` owns its strings and is dropped with the command.
+            let path = match request_target.as_str() {
+                "" => "/",
+                path => path,
+            };
+            let path: alloc::vec::Vec<u8> = path.as_bytes().to_vec();
+            (
+                parsed.host().as_bytes(),
+                parsed.port(),
+                path,
+                parsed.scheme() == browser::url::Scheme::Https,
+            )
+        } else {
+            let path = match trim(rest) {
+                b"" => b"/".as_slice(),
+                path => path,
+            };
+            // The port has to come off before anything else: whatever is left
+            // is the host, and it is a name as often as an address.
+            let Some((host, port)) = split_host_port(target) else {
+                console.write_output_line(
+                    framebuffer,
+                    "usage: httpget <host|a.b.c.d>[:port] [path] | httpget <url>",
+                );
+                return;
+            };
+            (host, port, path.to_vec(), false)
         };
-        let Ok(request_target) = parsed.request_target() else {
-            console.write_output_line(framebuffer, "out of memory");
-            return;
-        };
-        // Leaked into a local so the borrows below outlive this block; the
-        // `Url` owns its strings and is dropped with the command.
-        let path = match request_target.as_str() {
-            "" => "/",
-            path => path,
-        };
-        let path: alloc::vec::Vec<u8> = path.as_bytes().to_vec();
-        (
-            parsed.host().as_bytes(),
-            parsed.port(),
-            path,
-            parsed.scheme() == browser::url::Scheme::Https,
-        )
-    } else {
-        let path = match trim(rest) {
-            b"" => b"/".as_slice(),
-            path => path,
-        };
-        // The port has to come off before anything else: whatever is left
-        // is the host, and it is a name as often as an address.
-        let Some((host, port)) = split_host_port(target) else {
-            console.write_output_line(
-                framebuffer,
-                "usage: httpget <host|a.b.c.d>[:port] [path] | httpget <url>",
-            );
-            return;
-        };
-        (host, port, path.to_vec(), false)
-    };
     let path = path.as_slice();
 
     // A path with no last component -- `/`, or one ending in `/` -- names no
@@ -5995,7 +6496,7 @@ fn cmd_httpget(
             if error == fs::vfs::FsError::ReadOnly {
                 console.write_output_line(
                     framebuffer,
-                    "the body lands in the current directory; leave a read-only /vol mount",
+                    "the body lands in the current directory; cd off a read-only mount",
                 );
             }
             return;
@@ -6690,7 +7191,7 @@ fn cmd_sdwritetest(console: &mut Console, framebuffer: &mut Framebuffer, argumen
         *byte = (index as u8) ^ 0xA5;
     }
 
-    if !sdmmc::write_blocks(&card, lba, &mut pattern) {
+    if !sdmmc::write_blocks(&card, lba, &pattern) {
         console.write_output_line(framebuffer, "pattern write failed, see UART log");
         return;
     }
@@ -6705,8 +7206,8 @@ fn cmd_sdwritetest(console: &mut Console, framebuffer: &mut Framebuffer, argumen
         },
     );
 
-    let mut restore = original;
-    let restored = sdmmc::write_blocks(&card, lba, &mut restore);
+    let restore = original;
+    let restored = sdmmc::write_blocks(&card, lba, &restore);
     let mut check = [0u8; 512];
     let restore_ok = restored && sdmmc::read_blocks(&card, lba, &mut check) && check == original;
     console.write_output_line(
@@ -6731,8 +7232,8 @@ fn cmd_sdzero(console: &mut Console, framebuffer: &mut Framebuffer, argument: &[
         return;
     };
 
-    let mut zero = [0u8; 512];
-    if !sdmmc::write_blocks(&card, lba, &mut zero) {
+    let zero = [0u8; 512];
+    if !sdmmc::write_blocks(&card, lba, &zero) {
         console.write_output_line(framebuffer, "zero write failed, see UART log");
         return;
     }
@@ -6948,6 +7449,61 @@ fn cmd_move(
 /// The measurement `docs/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks for:
 /// the streaming write path against the repeated-open one it replaces, on
 /// the same volume with the same arguments.
+/// `fswritetest <dir> [rounds] [KiB]`.
+fn cmd_fswritetest(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+    state: &State,
+) {
+    const USAGE: &str = "usage: fswritetest <dir> [rounds] [KiB]";
+    let Some((path_text, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    if path_text.is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let (rounds_text, rest) = split_first_word(trim(rest));
+    let rounds = if rounds_text.is_empty() {
+        fswritetest::DEFAULT_ROUNDS
+    } else {
+        match parse_u32(rounds_text) {
+            Some(rounds) => rounds,
+            None => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    let (kib_text, rest) = split_first_word(trim(rest));
+    let kib = if kib_text.is_empty() {
+        fswritetest::DEFAULT_CHURN_KIB
+    } else {
+        match parse_u32(kib_text) {
+            Some(kib) => kib,
+            None => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    if !trim(rest).is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let Some(path) = absolute(console, framebuffer, state, path_text) else {
+        return;
+    };
+    with_devices(usb_host, ram_disk, |devices| {
+        fswritetest::run(console, framebuffer, devices, vfs, &path, rounds, kib)
+    });
+}
+
 fn cmd_fill(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -7157,6 +7713,46 @@ fn cmd_cat(
             path.as_str(),
             offset as u64,
         )
+    });
+}
+
+/// `mount [-r] [<volume>]`.
+///
+/// Three shapes, and the one flag there is. `-r` forces a FAT volume
+/// read-only; there is no flag the other way, because forcing exFAT
+/// read-write is not something the VFS can honour and offering it would be
+/// offering something that is refused at the point of use.
+fn cmd_mount(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+    ram_disk: Option<&mut RamBlockDevice>,
+    vfs: &mut Vfs,
+) {
+    const USAGE: &str = "usage: mount [-r] [<ram|sd0pN|usbMpN>]";
+    if argument.is_empty() {
+        files::show_mounts(console, framebuffer, vfs);
+        return;
+    }
+    let Some((first, rest)) = split_argument(argument) else {
+        console.write_output_line(framebuffer, "unterminated quote");
+        return;
+    };
+    let (request, name) = if first == b"-r" {
+        (MountRequest::ReadOnly, rest)
+    } else {
+        (MountRequest::Default, argument)
+    };
+    // Re-parsed through `single_argument` so that the volume name is subject
+    // to the same "nothing left over" rule as every other command's, whether
+    // or not the flag was there.
+    let Some(name) = single_argument(console, framebuffer, name, USAGE) else {
+        return;
+    };
+    let name = as_str(name);
+    with_devices(usb_host, ram_disk, |devices| {
+        files::mount(console, framebuffer, devices, vfs, name, request)
     });
 }
 
@@ -7858,8 +8454,16 @@ fn cmd_usb_write_test(
         *byte = (index as u8) ^ 0xA5;
     }
 
-    if !mass_storage.write_blocks(lba, &mut pattern) {
-        console.write_output_line(framebuffer, "pattern write failed, see UART log");
+    let outcome = mass_storage.write_blocks(lba, &mut pattern);
+    if outcome != usb::WriteOutcome::Written {
+        console.write_output_line(
+            framebuffer,
+            if outcome == usb::WriteOutcome::WriteProtected {
+                "medium is write protected; nothing was written"
+            } else {
+                "pattern write failed, see UART log"
+            },
+        );
         if mass_storage.needs_reinit() {
             // Every remaining step would fail the same way and take seconds
             // each to do it. Keep the failure local to MSC: resetting the
@@ -7961,7 +8565,7 @@ fn cmd_usb_write_test(
             continue;
         }
         let mut restore = *original;
-        if !mass_storage.write_blocks(block_lba, &mut restore) {
+        if mass_storage.write_blocks(block_lba, &mut restore) != usb::WriteOutcome::Written {
             restore_ok = false;
             continue;
         }
@@ -8107,7 +8711,7 @@ fn cmd_usbzero(
     for offset in 0..count {
         let block_lba = lba + offset;
         let mut zero = [0u8; BLOCK];
-        if !mass_storage.write_blocks(block_lba, &mut zero) {
+        if mass_storage.write_blocks(block_lba, &mut zero) != usb::WriteOutcome::Written {
             failed_lba = Some(block_lba);
             break;
         }
@@ -8295,6 +8899,15 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
         } else {
             "  -> bits stuck; real HCSPLT would read 0x8001FFFF"
         },
+    );
+
+    let mut line = Line::new();
+    line.push_str("cache writebacks refused over DMA buffers: ");
+    line.push_u32(usb::cache_refusal_count());
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(
+        framebuffer,
+        "  -> not zero means the controller read stale RAM for that many transfers",
     );
 
     let irq = usb::interrupt_diagnostics();

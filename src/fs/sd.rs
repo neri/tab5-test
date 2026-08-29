@@ -1,10 +1,11 @@
 //! [`BlockDevice`] adapter over `sdmmc.rs`.
 //!
 //! Thin by design. Card activation, the IDMAC descriptor chain, the cache
-//! writeback and invalidate around DMA buffers, and the bus width and clock
-//! negotiation all stay in `sdmmc.rs`; this file only maps that driver's
-//! `bool` results and 32-bit LBAs onto the common interface, splits transfers
-//! the descriptor chain cannot take in one go, and refuses writes.
+//! writeback and invalidate around DMA buffers, the DMA staging on the write
+//! path, and the bus width and clock negotiation all stay in `sdmmc.rs`;
+//! this file only maps that driver's `bool` results and 32-bit LBAs onto the
+//! common interface and splits transfers the descriptor chain cannot take in
+//! one go.
 //!
 //! Rewriting the driver to implement the trait directly would have dragged
 //! all of that medium-specific handling up into a layer whose whole purpose
@@ -87,25 +88,35 @@ impl BlockDevice for SdBlockDevice {
         Ok(())
     }
 
-    /// Always fails with [`BlockError::WriteSuppressed`], without issuing a
-    /// command.
-    ///
-    /// The method exists so the interface is the same for every medium and
-    /// the day SD writes are enabled is a policy change rather than a trait
-    /// change. Until then the filesystem layer mounts this card read-only,
-    /// and a write arriving here means something above it is wrong -- so the
-    /// request is logged with its address, which is what makes the mistake
-    /// findable, rather than dropped.
     fn write_blocks(&mut self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
-        let blocks = self.geometry.blocks_for(buffer.len()).unwrap_or(0);
-        uart::log(b"FS: SD write suppressed (read-only mount policy)\r\n");
-        uart::log_hex(b"FS:   LBA=", lba as u32);
-        uart::log_hex(b"FS:   blocks=", blocks as u32);
-        Err(BlockError::WriteSuppressed)
+        check_range(&self.geometry, lba, buffer.len())?;
+        // Same reasoning as `read_blocks`: the range check has already put
+        // the transfer inside the medium, and this catches a card too large
+        // for the driver's 32-bit address rather than silently truncating.
+        let mut lba = u32::try_from(lba).map_err(|_| BlockError::OutOfRange)?;
+
+        for chunk in buffer.chunks(MAX_TRANSFER_BYTES) {
+            // A chunk that fails has left an unknown number of its blocks on
+            // the card, and the ones before it are already there. Neither is
+            // retried and neither is reported as success: the operation
+            // failed, and the layer above tears the mount down rather than
+            // trying to work out how much of it landed.
+            if !sdmmc::write_blocks(&self.card, lba, chunk) {
+                return Err(BlockError::DeviceError);
+            }
+            lba += (chunk.len() / SUPPORTED_BLOCK_BYTES as usize) as u32;
+        }
+        Ok(())
     }
 
-    /// Nothing is buffered on this side, and no command is sent for the same
-    /// reason `write_blocks` sends none.
+    /// Nothing is buffered on this side, and no command is sent.
+    ///
+    /// This is not a weaker guarantee than the USB side's SYNCHRONIZE
+    /// CACHE(10); it is the same one reached earlier. `sdmmc::write_blocks`
+    /// does not return until CMD25 has completed *and* the card has released
+    /// DAT0, which is the card saying it has finished programming what it
+    /// was sent. There is no host-side write cache between here and that
+    /// point for a flush to push out.
     fn flush(&mut self) -> Result<(), BlockError> {
         Ok(())
     }

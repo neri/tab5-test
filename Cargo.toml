@@ -26,9 +26,16 @@ tls-fixture-pins = []
 # comparison behind this choice is in `docs/FILESYSTEM_PLAN.md`.
 # `default-features = false` drops `std`, which would pull in chrono and a
 # clock this target does not have; `src/fs/clock.rs` supplies the RTC instead.
-# `write` is on for the RAM disk. It is not what keeps SD and USB read-only --
-# their block adapters refuse writes outright (`docs/FILESYSTEM.md`).
-hadris-fat = { version = "2.1.0", default-features = false, features = [
+# `write` is on: the RAM root, SD and USB Mass Storage all take writes.
+# Whether a particular volume does is a mount mode, not a build feature
+# (`docs/FILESYSTEM.md`).
+# 2.2.0 is a floor, not a preference. `FileWriter::new_append` in 2.1.0
+# positions the writer at offset 0 of the last cluster when the file's length
+# is an exact multiple of the cluster size, so an append overwrites that
+# cluster instead of allocating a new one. The RAM disk formats with 512-byte
+# clusters, which makes every 4 KiB append hit it; `fswritetest /tmp` catches
+# it at the first byte of the overwritten cluster.
+hadris-fat = { version = "2.2.0", default-features = false, features = [
     "read",
     "write",
     "lfn",
@@ -38,7 +45,7 @@ hadris-fat = { version = "2.1.0", default-features = false, features = [
     # read-only here for that reason among others -- see `docs/FILESYSTEM.md`.
     "unstable-exfat",
 ] }
-hadris-io = { version = "2.1.0", default-features = false, features = ["sync"] }
+hadris-io = { version = "2.2.0", default-features = false, features = ["sync"] }
 embedded-io = { version = "0.7", default-features = false }
 linked_list_allocator = "0.10.6"
 # Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,

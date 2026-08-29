@@ -20,6 +20,7 @@ mod coord_test;
 mod fetch;
 mod files;
 mod font_test;
+mod fswritetest;
 mod localfile;
 mod lsusb;
 mod mbr;
@@ -39,7 +40,7 @@ use alloc::vec::Vec;
 use crate::delay::delay_ms;
 use crate::fs::partition::PartitionRange;
 use crate::fs::registry::{DeviceId, Devices};
-use crate::fs::vfs::{EntryKind, MountMode, Vfs};
+use crate::fs::vfs::{EntryKind, MountRequest, Vfs};
 use crate::fs::{self, RamBlockDevice, SdSlot};
 use crate::input::InputManager;
 use crate::lcd::Display;
@@ -418,7 +419,9 @@ fn mount_ram_disk(
         DeviceId::Ram,
         None,
         range,
-        MountMode::ReadWrite,
+        // The RAM disk is FAT16, so `Default` settles on read-write. There
+        // is no separate route for the root to be mounted any other way.
+        MountRequest::Default,
     );
     if let Err(error) = outcome {
         uart::log(b"FS: mounting RAM root failed: ");

@@ -41,6 +41,15 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// empty, so this small bit prevents that normal polling from flooding the
 /// UART.
 static NO_DEVICE_TIMEOUT_REPORTED: AtomicBool = AtomicBool::new(false);
+/// How many cache writebacks over a DMA buffer the ROM routine has refused,
+/// and whether the first one has been described.
+///
+/// A refusal is silent by construction -- the result is dropped -- and its
+/// effect is that the controller reads whatever was in RAM instead of what
+/// the CPU just wrote. That is invisible until a device acts on a stale
+/// command, so the count is kept and the first one is named.
+static CACHE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static CACHE_REFUSAL_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Every port event seen since the bus was last brought up, as HPRT bits.
 ///
@@ -144,6 +153,12 @@ static USB_LAST_WAIT_CYCLES: AtomicU32 = AtomicU32::new(0);
 static USB_MAX_WAIT_CYCLES: AtomicU32 = AtomicU32::new(0);
 static USB_TRANSFER_GENERATION: AtomicU32 = AtomicU32::new(0);
 static USB_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Raw completion and QTD control word from the most recently reaped
+/// channel-0 descriptor. BOT reads these immediately when a short response
+/// has an impossible length, tying the protocol symptom to the exact HCD
+/// state without logging every successful packet.
+static USB_LAST_REAP_HCINT: AtomicU32 = AtomicU32::new(0);
+static USB_LAST_REAP_QTD_CONTROL: AtomicU32 = AtomicU32::new(0);
 static USB_REAP_COUNT: AtomicU32 = AtomicU32::new(0);
 static USB_CANCEL_COUNT: AtomicU32 = AtomicU32::new(0);
 static USB_STALE_TOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -984,6 +999,8 @@ impl<'a> Channel0Transfer<'a> {
         let qtd_address = &raw mut self.qtd as usize;
         cache_writeback_invalidate(qtd_address, 8);
         let control_after = unsafe { read(qtd_address) };
+        USB_LAST_REAP_HCINT.store(self.completion, Ordering::Release);
+        USB_LAST_REAP_QTD_CONTROL.store(control_after, Ordering::Release);
         let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
         let status = control_after & QTD_STATUS_MASK;
         let transferred = self.buffer.len().saturating_sub(remaining);
@@ -1033,6 +1050,29 @@ impl<'a> Channel0Transfer<'a> {
                 uart::log_hex(
                     b"USB: transfer QTD buffer/reserved error, status=",
                     status >> QTD_STATUS_SHIFT,
+                );
+            }
+            return PacketOutcome::Error;
+        }
+        // A halted channel is not by itself a completed transfer. In
+        // descriptor-DMA mode the successful boundary requires both the
+        // channel's XferCompl cause and hardware clearing QTD.Active. The
+        // periodic HID path already enforces XferCompl; omitting it here let
+        // a stale ChHltd snapshot/reused descriptor be accepted as a fresh
+        // short packet, observed as the previous command's 13-byte CSW in
+        // the next READ CAPACITY data phase.
+        if self.completion & HCINT_XFERCOMPL == 0 || control_after & QTD_ACTIVE != 0 {
+            if !quiet_errors {
+                uart::log(b"USB: halted QTD was not transfer-complete\r\n");
+                uart::log_hex(b"USB:   HCINT=", self.completion);
+                uart::log_hex(b"USB:   QTD control=", control_after);
+                uart::log_hex(
+                    b"USB:   XferCompl=",
+                    u32::from(self.completion & HCINT_XFERCOMPL != 0),
+                );
+                uart::log_hex(
+                    b"USB:   QTD active=",
+                    u32::from(control_after & QTD_ACTIVE != 0),
                 );
             }
             return PacketOutcome::Error;
@@ -3429,7 +3469,34 @@ fn cycle_count() -> u32 {
 /// turning refusals into failures here is a change to a verified transport
 /// that belongs with its own bus testing, not with an SD card fix.
 fn cache_writeback_invalidate(address: usize, length: usize) {
-    let _ = crate::psram::writeback_invalidate(address, length);
+    if crate::psram::writeback_invalidate(address, length) {
+        return;
+    }
+    CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    // Described once. A refusal repeats for every transfer that uses the
+    // same buffer, and the address and length are what identify which one:
+    // a 31-byte span is a CBW, 13 is a CSW, a whole number of blocks is
+    // payload.
+    if !CACHE_REFUSAL_REPORTED.swap(true, Ordering::Relaxed) {
+        uart::log(b"USB: cache writeback REFUSED over a DMA buffer\r\n");
+        uart::log_hex(b"USB:   address=", address as u32);
+        uart::log_u32(b"USB:   length=", length as u32);
+        uart::log(b"USB:   the controller will read stale RAM for this transfer\r\n");
+    }
+}
+
+/// How many cache writebacks have been refused since boot.
+pub fn cache_refusal_count() -> u32 {
+    CACHE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Most recently reaped channel-0 HCINT and QTD control word. Intended for
+/// rare upper-layer diagnostics immediately after an impossible response.
+pub fn last_channel0_reap() -> (u32, u32) {
+    (
+        USB_LAST_REAP_HCINT.load(Ordering::Acquire),
+        USB_LAST_REAP_QTD_CONTROL.load(Ordering::Acquire),
+    )
 }
 
 /// # Safety

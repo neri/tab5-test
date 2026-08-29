@@ -70,12 +70,6 @@ impl BlockGeometry {
 /// and must not be retried. A transfer that merely failed leaves the medium's
 /// identity unknown, and treating that as removal would throw away handles
 /// that are about to come back.
-// `MediaRemoved` and `MediaChanged` have no source yet: nothing tracks media
-// identity until mounts carry a generation. They are defined here anyway
-// because the vocabulary is fixed for the whole plan, and the layers being
-// written against it now have to map onto the final set rather than a
-// temporary one that grows a case at a time.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockError {
     /// The buffer length is not a whole number of logical blocks, or is zero.
@@ -96,14 +90,14 @@ pub enum BlockError {
     /// Identity is being re-verified after a transport failure. Handles stay
     /// valid; the caller retries later rather than tearing the mount down.
     TemporarilyUnavailable,
-    /// A write reached a medium this firmware mounts read-only. No command
-    /// was issued.
+    /// The medium itself refused the write: an SD card with its lock switch
+    /// on, or a USB device answering DATA PROTECT.
     ///
-    /// This is an error rather than a silently ignored no-op because a
-    /// successful return would tell the filesystem driver its metadata update
-    /// had landed, and it would go on to build the rest of the volume's state
-    /// on top of a write that never happened.
-    WriteSuppressed,
+    /// Kept apart from [`Self::DeviceError`] because nothing about the
+    /// transport went wrong and retrying cannot help. What the mount policy
+    /// refuses never reaches a device at all -- that is
+    /// [`super::vfs::FsError::ReadOnly`], decided several layers up.
+    WriteProtected,
 }
 
 /// Short label for shell and UART output. Kept here so every layer prints the
@@ -118,7 +112,7 @@ pub fn error_name(error: BlockError) -> &'static str {
         BlockError::MediaRemoved => "media removed",
         BlockError::MediaChanged => "media changed",
         BlockError::TemporarilyUnavailable => "temporarily unavailable",
-        BlockError::WriteSuppressed => "write suppressed",
+        BlockError::WriteProtected => "write protected",
     }
 }
 
