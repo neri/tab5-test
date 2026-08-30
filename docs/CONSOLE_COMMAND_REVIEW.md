@@ -63,15 +63,14 @@
 紐づけ、計画が閉じたら退役**という対応にします。判断が repo の状態から
 読めるので、後から誰が見ても同じ結論になります。
 
-計画の状態は各`*_PLAN.md`の`## 状態`から取りました（2026-08-29時点）。
+計画の状態は各`*_PLAN.md`の`## 状態`から取りました（2026-08-30時点）。
 
 | 生かしている作業 | 状態 | 足場コマンド |
 | --- | --- | --- |
 | [`SCALABLE_PROPORTIONAL_FONT_PLAN.md`](SCALABLE_PROPORTIONAL_FONT_PLAN.md) | **未着手**（Stage 0〜7すべて）。Stage 3が`fonttest`での実機比較を要求している | `fonttest` |
 | [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md) | hub statusは低頻度fallbackを維持中 | `usbperiodic` `usbhub` |
-| [`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md) | **中断**（Stage 2 CBI ADSC未解決、Stage 3〜4未着手） | `usbfs` |
-| [`BROWSER_UI_PLAN.md`](BROWSER_UI_PLAN.md) | Stage 10が実機受入待ち | `bt` `hs` |
-| [`STARTUP_SCREEN_REFACTOR_PLAN.md`](STARTUP_SCREEN_REFACTOR_PLAN.md) | 画像差し替え後の実機視認待ち | `ui` |
+| [`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md) | **凍結**（Stage 2 CBI ADSC未解決、Stage 3〜4未着手。再開予定なし） | `usbfs` |
+| [`WIFI_REFACTOR_PLAN.md`](WIFI_REFACTOR_PLAN.md) | Stage 8（長時間・異常系の実機受入）未着手 | `wifilog` |
 | [`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md) | Stage G未着手。ただし検証用の2台目ハブが無い前提で、想定どおりの未着手 | （固有のコマンドなし） |
 | **閉じた計画** | 下表 | 残り |
 
@@ -84,12 +83,12 @@
 
 | 閉じた計画 | 状態 | 足場コマンド |
 | --- | --- | --- |
-| [`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](DISPLAY_UNDERRUN_REFACTOR_PLAN.md) | Stage 0〜4完了（全受入条件合格）、Stage 5〜8は不要判定 | `stress` `displaybench` `db` `dp` `di` `icm` `membench` `mix` |
+| [`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](DISPLAY_UNDERRUN_REFACTOR_PLAN.md) | 完了（Stage 0〜4で全受入条件合格、Stage 5〜8は不要判定） | `stress` `displaybench` `db` `dp` `di` `icm` `membench` `mix` |
 | [`PPA_FILL_PLAN.md`](PPA_FILL_PLAN.md) | 完了（Stage 1〜6、実機確認済み） | `ppafill` |
 | [`FLASH_XIP_MIGRATION_PLAN.md`](FLASH_XIP_MIGRATION_PLAN.md) | 全Stage完了 | `pf` `rt` `alloctest` |
 | [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)／[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)／[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md) | 読み出し・WRITE(10)安定化とも受入完了 | `ut` `usbmargin` `usbread` `usbwritetest` `usbzero` `usbmsc` `usbmbr` `usbhw` `usbvbus` |
 | [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)／[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)／[`FILESYSTEM_WORKFLOW_PLAN.md`](FILESYSTEM_WORKFLOW_PLAN.md) | 完了（VFS、RAMルート、カレントディレクトリ、自動マウント） | `fsopen` `fsread` `fsclose` `fsverify` `fill` `blkread` `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` |
-| [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)／[`WIFI_REFACTOR_PLAN.md`](WIFI_REFACTOR_PLAN.md) | 全Stage完了／Stage 0〜7完了 | `wifiinfo` `wifiup` `wifimac` `wifisaved` `wifilog` |
+| [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md) | 全Stage完了（実機確認済み） | `wifiinfo` `wifiup` `wifimac` `wifisaved` |
 | [`TCPIP_PLAN.md`](TCPIP_PLAN.md)／[`DNS_PLAN.md`](DNS_PLAN.md) | 完了（実機確認済み） | `netdump` `httpget` |
 | [`TLS_PLAN.md`](TLS_PLAN.md) | Stage 8まで完了（2026-08-28実機受入済み） | `tls` `entropy` |
 | [`INPUT_MANAGER_PLAN.md`](INPUT_MANAGER_PLAN.md) | 完了（実機確認済み） | `touchtest` |
@@ -97,7 +96,8 @@
 | （[`BOOT.md`](BOOT.md)・[`PSRAM.md`](PSRAM.md)へ同期済み。紐づく計画なし） | メモリマップとコア識別の立ち上げ確認として書かれた。引き継いだPMAテーブルは全16エントリがロック済みで書き換えられないため、読む以上のことはできない | `cpuinfo` `pma` `pmp` |
 | [`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md) | 完了（2026-08-27） | （`fonttest`は上の未着手計画が生かしている） |
 | [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md) | HIDマウスの実証として書かれた | `win` |
-| [`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md) | 完了 | （`bt` `hs`は上のUI計画が生かしている） |
+| [`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md)／[`BROWSER_UI_PLAN.md`](BROWSER_UI_PLAN.md) | 完了（BROWSER_UIはStage 0〜10、実機確認済み） | `bt` `hs` |
+| [`STARTUP_SCREEN_REFACTOR_PLAN.md`](STARTUP_SCREEN_REFACTOR_PLAN.md) | 完了（Stage 0〜8、実機確認済み） | `ui` |
 | （紐づく計画なし） | BMI270の疎通確認として書かれた | `axistest` |
 
 ## 破壊的なコマンド

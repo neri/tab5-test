@@ -5,7 +5,10 @@
 > 現状のファイルシステム: [`FILESYSTEM.md`](FILESYSTEM.md)、
 > 段階分けの履歴: [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)
 > 本文の「書き込み先は`/tmp`だけ」とRAMディスクの`/tmp`マウントは当時の記録です。
-> 現在は[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)でRAMディスクを`/`へ移しています。
+> 現在はRAMディスクを[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)で`/`へ移し、
+> SDとUSB上のFAT12/16/32も
+> [`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)で既定
+> read-writeにしています。
 
 ## 状態
 
@@ -42,8 +45,11 @@ Stage 3-1〜3-4すべてを実機で確認した。
 - `fsopen`／`fsread`／`fsclose`を足した（ハンドル失効の観測手段）
 - 「旧書き込み経路は二乗」という前提は実測で否定された
 
-決定ゲート（書き込める媒体を増やすか）は**Aのまま**である。書き込み先は`/tmp`だけで、
-`mkdir`もそこにしか作れない。
+決定ゲート（書き込める媒体を増やすか）は本計画の中では**Aのまま**とし、書き込み先は
+`/tmp`だけ、`mkdir`もそこにしか作れないところで終えた。**この判断はその後覆っている。**
+[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)がSDとUSB上の
+FAT12/16/32を既定read-writeにし、[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)が
+RAMディスクを`/`へ移した。以下は選択肢Aを選んだ時点の記録である。
 
 [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)のStage 1〜5でVFS、FAT/exFATの読み出し、
 `/tmp`への書き込み、媒体同一性の追跡までができている。この計画はその上に、

@@ -534,7 +534,7 @@ test hookではTLSが1 packetも送られない。
 
 ### Stage 3: 未認証TLS 1.3最小接続
 
-**Stage 4と同時に実装済み（実機未確認）。** 分けなかったのは、Stage 0で決めた
+**Stage 4と同時に実装済み（2026-08-28実機確認済み）。** 分けなかったのは、Stage 0で決めた
 駆動方式ではTLSエンジンとsocketが1つのfileの表と裏だからである。engineだけ作っても
 socketが無ければ1 byteも動かず、確認できることが増えない。成果物は
 `src/net/tls.rs`と`spki/`（`tab5-spki`）の2つ。
@@ -565,7 +565,7 @@ fixture leafを使い、TLS engine、CSPRNG、signature verifierを結びます�
 
 ### Stage 4: smoltcp上の中断可能なTLS transaction
 
-**Stage 3と同時に実装済み（実機未確認）。** `Transaction`は`net::http::Transaction`と
+**Stage 3と同時に実装済み（2026-08-28実機確認済み）。** `Transaction`は`net::http::Transaction`と
 同じ所有規則で、socket handleだけを持ち、`poll`のあいだだけ`&mut Stack`と`&mut Rpc`を
 借りる。`close`忘れは`Drop`がUARTへ出す。1 pollは「socket→cipher_rx」
 「futureを1回poll」「cipher_tx→socket」の順で、復号予算は既定8 KiBである。

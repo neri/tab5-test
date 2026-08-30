@@ -918,12 +918,17 @@ URL入力自体はASCII契約のまま。address欄のcaretは半角1文字＝8 
 2行にまたがるlinkの下線、欠落文字の枠、markerの右寄せ、`pre`の空白保持が
 期待どおりであることを見てから実機へ渡している。
 
-### 実機確認（未実施）
+### 実機確認（Stage 6で実施済み）
+
+着手時は次を未実施として残していた。
 
 - 日本語fixtureの全文字、改行位置、link hit範囲がhost期待値と一致するか
 - 全角を含むlinkの左右端でhit範囲が描画と一致するか
 - 長文scroll中もC6のlink serviceが止まらず、underrunが出ないか
 - toolbarとstatusの表示、address編集、太字、code色、下線
+
+いずれもStage 6の「実機回帰: 目視（2026-08-27）」と「実機受入matrixの結果」で確認し、
+合格している。
 
 ## Stage 5の記録
 

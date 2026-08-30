@@ -4,6 +4,12 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
 > コードを優先してください。
 
+## 状態: **完了**（Stage 0〜3・4a。Stage 4b以降のファイルシステムは別計画へ移管）
+
+ブロックI/OとMBR表示までが本計画の範囲で、いずれも実機確認済みである。ファイルシステムは
+[`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)以降で実装した。現状仕様は
+[`STORAGE.md`](STORAGE.md)と[`FILESYSTEM.md`](FILESYSTEM.md)を優先する。
+
 ## 方針
 
 本計画ではESP-IDFをリンクせずレジスタ操作で実装し、1機能を1モジュール・
@@ -282,10 +288,18 @@ Linux、GPT保護MBRの0xEEなど）だけ短い名前に変換し、その他�
 表示する。GPT保護MBR（0xEE）を検出した場合はGPT自体を解析しない旨だけ
 表示する。実機で動作確認済み。
 
-### Stage 4（残り）: ファイルシステム — 保留
+### Stage 4（残り）: ファイルシステム — 別計画へ移管（完了）
 
-4b以降（FAT/exFATの実解釈、ファイル読み書き）はユーザーの指示により
-一旦後回し。着手する際の方針は変更なし:
+4b以降（FAT/exFATの実解釈、ファイル読み書き）は本計画では扱わず、
+[`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)へ移した。そちらでVFS、FAT12/16/32と
+exFATの読み出し、FATへの書き込みまで実装・実機確認済みで、SDカード上のFAT12/16/32は
+[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)により既定で
+read-writeである（exFATは形式として読み取り専用）。現状仕様は
+[`FILESYSTEM.md`](FILESYSTEM.md)を優先する。
+
+以下は移管時に書いた着手方針で、当時の記録として残す。実際の実装はこの4b〜4dの
+区分どおりには進んでおらず、ライブラリ（`hadris-fat`）採用とVFS導入という別の形に
+なっている:
 
 - 4b: FAT BPBパース（FAT16/FAT32を想定、SDXCならexFATの可能性も確認）
 - 4c: ルートディレクトリ/クラスタチェーン走査によるファイル一覧・読み込み
@@ -305,11 +319,15 @@ Linux、GPT保護MBRの0xEEなど）だけ短い名前に変換し、その他�
 - `src/sdmmc.rs`: ホスト初期化・カード活性化（4bit/High Speed含む）・
   DMA経由のブロック読み書き。すべてこのファイルに実装
   （`gpio.rs`/`i2c.rs`と同じ階層で、ペリフェラル固有の独立モジュールとする）
-- `src/mbr.rs`: `sdmbr`と`usbmbr`で共用するMBR署名・パーティションエントリの
+- `src/app/mbr.rs`: `sdmbr`と`usbmbr`で共用するMBR署名・パーティションエントリの
   パースと表示。読み込み済みの512 byteセクタだけを受け取り、SD/USBの違いは知らない
-- `src/shell.rs`: 各`sdXXX`コマンド。`sdmbr`は`sdmmc::read_block`でLBA 0を読み、
-  `mbr::show`を呼ぶ。Stage 4bでFAT対応する際は、`sdmmc.rs`とは別に
-  `src/fat.rs`を切り出す想定を維持する
+  （当初は`src/mbr.rs`。表示はapp層、VFS側の判定は`src/fs/mbr.rs`へ分かれた）
+- `src/app/shell.rs`: 各`sdXXX`コマンド。`sdmbr`は`sdmmc::read_block`でLBA 0を読み、
+  `mbr::show`を呼ぶ
+
+ファイルシステム層は`src/fat.rs`を切り出す当初想定ではなく、`src/fs/`以下の
+モジュール群（`vfs.rs`、`block.rs`、`sd.rs`、`usb_msc.rs`ほか）になった。責務の一覧は
+[`FILE_LAYOUT.md`](FILE_LAYOUT.md)にある。
 
 ## 各段階の完了条件（実機確認）
 

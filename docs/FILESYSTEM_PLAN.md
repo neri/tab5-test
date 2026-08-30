@@ -8,14 +8,16 @@
 
 ## 状態
 
-**Stage 1完了（2026-08-24、実機確認済み）。** ブロックデバイス層、MBR判定、RAMディスク
-（PSRAM固定8 MiB、起動時FAT16 format）、SD／USB／RAMのadapter、`devices`／`blkread`
-コマンドを実装し、実機でRAMディスクのFAT判定、SDのMBRとpartition相対読み出し、USBのMBRを
-確認した。FAT/exFATライブラリは`hadris-fat`を採用した（下記の選定ゲート）。VFSは未着手である。
-現状の実装は[`STORAGE.md`](STORAGE.md)の「ブロックデバイス層」節と[`PSRAM.md`](PSRAM.md)の
+**Stage 1〜4完了（実機確認済み）。Stage 5は実装済みだが完了条件の一部が未検証**
+（下記各Stage）。ブロックデバイス層、MBR判定、RAMディスク（PSRAM固定8 MiB、起動時
+FAT16 format）、SD／USB／RAMのadapter、`devices`／`blkread`コマンド、VFS、FAT12/16/32の
+読み書き、exFATの読み出しまでを実装した。FAT/exFATライブラリは`hadris-fat`を採用した
+（下記の選定ゲート）。現状の実装は[`FILESYSTEM.md`](FILESYSTEM.md)、
+[`STORAGE.md`](STORAGE.md)の「ブロックデバイス層」節、[`PSRAM.md`](PSRAM.md)の
 「32 MiBの分割」節を参照する。
 
-Stage 1〜4は完了、Stage 5は実装済みだが完了条件の一部が未検証である（下記各Stage）。
+Stage 1の完了は2026-08-24（実機確認済み）で、その時点ではRAMディスクのFAT判定、SDのMBRと
+partition相対読み出し、USBのMBRまでを確認した。
 
 Stage 1の実機確認中に、SDカードのIDMACバッファが64 byte境界を要求するのに守られておらず、
 キャッシュ無効化の失敗が握り潰されていた既存の不具合が見つかった。症状は「エラーなしで
@@ -23,13 +25,17 @@ Stage 1の実機確認中に、SDカードのIDMACバッファが64 byte境界�
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)と[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)の追補にある。
 
 Stage 0の破損イメージによるホストテストは**別タスクへ保留**した（利用者判断、2026-08-24）。
-このリポジトリはターゲット固定の単一バイナリcrateで、ホストでテストを走らせる仕組みが
-無いためである。導入するにはworkspace分割かlibターゲット追加が要る。したがって現時点の
-Stage 1〜5の完了条件からホストテスト部分は外れており、破損媒体の拒否は未検証のままである。
-`mbr.rs`と`bootsector.rs`の検査コードは書いてあるが、実際に壊れたイメージへ通してはいない。
+保留した当時の理由は「ターゲット固定の単一バイナリcrateで、ホストでテストを走らせる
+仕組みが無い」ことだったが、**その前提はすでに変わっている**——`browser`／`font`／`spki`／
+`time`のworkspace memberと、それを走らせる`mise run test`がその後入った。残っている障害は
+仕組みの不在ではなく、`src/fs/`がバイナリcrate側にあってhost testから参照できないことだけで、
+workspace memberへ切り出せば通せる。ただし現時点のStage 1〜5の完了条件からはホストテスト
+部分が外れたままで、破損媒体の拒否は未検証である。`mbr.rs`と`bootsector.rs`の検査コードは
+書いてあるが、実際に壊れたイメージへ通してはいない。
 
-SDカードとUSB Mass Storageは512 byteブロックの読み書きとMBR表示まで実装済みで、
-FAT/exFAT、VFSは未実装である。本体Flashは今回のスコープ外とし、
+SDカードとUSB Mass Storage上のFAT12/16/32は、本計画の後に
+[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)で既定
+read-writeへ広げた（exFATは形式として読み取り専用のまま）。本体Flashは今回のスコープ外とし、
 Flash専用ファイルシステムを検討する将来の別計画で扱う。既存実装の詳細は
 [`STORAGE.md`](STORAGE.md)を、SDとUSBの実機上の制約は
 [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)と[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)
@@ -39,9 +45,14 @@ Flash専用ファイルシステムを検討する将来の別計画で扱う。
 
 アプリから媒体ごとのI/O手順を隠し、パス名でファイルを扱えるようにする。最初に目指すのは、
 PCで作成したFAT媒体から安全にファイルを列挙・読み出しできることとする。書き込みはPSRAM
-RAMディスクだけで対応し、SDカードとUSB Mass Storageは全Stageで読み取り専用とする。
+RAMディスクだけで対応し、SDカードとUSB Mass Storageは本計画の全Stageで読み取り専用とする。
 exFATは読み出しを先に追加し、書き込みを実装する場合もRAMディスクだけを対象にする。
 本体Flash永続化は目的に含めない。
+
+> この「SDとUSBは読み取り専用」は本計画が固定した範囲であって、現在の仕様ではない。
+> 後続の[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)が
+> SDとUSB上のFAT12/16/32を既定read-writeにし、RAMディスクの位置づけも
+> [`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)で`/tmp`から`/`へ移っている。
 
 | 媒体 | 初期用途 | 初期のアクセス | マウント候補 | 備考 |
 | --- | --- | --- | --- | --- |

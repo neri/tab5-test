@@ -85,13 +85,22 @@ cargo build --release --no-default-features
 | コマンド | 生かしている作業 |
 | --- | --- |
 | `fonttest` | [`SCALABLE_PROPORTIONAL_FONT_PLAN.md`](SCALABLE_PROPORTIONAL_FONT_PLAN.md) 未着手。Stage 3が`fonttest`での実機比較を要求している |
-| `bt` `hs` | [`BROWSER_UI_PLAN.md`](BROWSER_UI_PLAN.md) Stage 10が実機受入待ち |
 | `usbperiodic` `usbhub` | [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md) hub statusは低頻度fallbackを維持中 |
-| `usbfs` | [`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md) 中断（Stage 2 CBI ADSC未解決） |
-| `wifimac` `wifisaved` `wifilog` | `wifilog`は再接続リトライの調査に現役。他2つは`wifi`画面から辿れず、残す理由は弱い |
+| `usbfs` | [`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md) 凍結（Stage 2 CBI ADSC未解決、再開予定なし） |
+| `wifimac` `wifisaved` `wifilog` | `wifilog`は[`WIFI_REFACTOR_PLAN.md`](WIFI_REFACTOR_PLAN.md) Stage 8（長時間・異常系の実機受入）が未着手で、再接続リトライの調査に現役。他2つは`wifi`画面から辿れず、残す理由は弱い |
+
+**振り分けの見直しが要る2件（人の判断待ち）**: `bt`／`hs`を案Cに置いた理由は
+[`BROWSER_UI_PLAN.md`](BROWSER_UI_PLAN.md) Stage 10の実機受入待ちでしたが、同計画は
+Stage 0〜10とも実機確認済みで閉じました。案Cの条件（紐づく作業に未完了Stageがある）を
+満たさなくなったので、案Aか案Bへ移せます。`browsertest`のfixture巡回という受入根拠が
+[`BROWSER.md`](BROWSER.md)にあるため、案B（`diag` featureで落とす）が素直です。
+
+`usbfs`も凍結であって未完了Stageが動く見込みは無いため、案Cに置き続ける根拠は
+「いつか再開するかもしれない」だけです。削除して差し支えないかは人が決めてください。
 
 `ui`は[`STARTUP_SCREEN_REFACTOR_PLAN.md`](STARTUP_SCREEN_REFACTOR_PLAN.md)が
-実機視認待ちですが、視認は`ui`を通さずにもできるため案Bへ置いています。
+完了したため、案Bのままで問題ありません（もともと視認は`ui`を通さずにもできる
+という理由で案Bに置いていました）。
 
 ## 段階
 

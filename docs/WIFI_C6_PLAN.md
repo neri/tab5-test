@@ -723,7 +723,7 @@ SDIO: C6 does not answer CMD5 either
 `station frames received and dropped:`も出た。`wifidisconnect`と
 誤ったパスワードでの失敗表示も確認済みで、Stage 5の到達条件をすべて満たした。
 
-### Stage 6実装時の判断（共存は実機未確認）
+### Stage 6実装時の判断（共存は下記のとおり実機確認済み）
 
 - **コントローラのリセットは初回だけ**にした。従来は`init_host`が毎回
   ペリフェラルリセットとコントローラリセットを行っており、片方のカードを

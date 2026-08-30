@@ -4,6 +4,13 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書と
 > コードを優先してください。
 
+## 状態: **完了**（Stage 0〜4・6・7を実機確認済み。Stage 5は別計画で実施済み）
+
+Stage 5（Interrupt転送の割り込み駆動化）は
+[`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md)が引き取って実装済みで、
+本計画側の記述は下記Stage 5の注記を参照する。現状仕様は[`USB.md`](USB.md)を優先する。
+多段ハブは[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md)のStage Gとして未着手のまま残る。
+
 ## 方針
 
 本計画ではESP-IDF/RTOSをリンクせずレジスタ操作で実装し、1機能を1モジュール・
@@ -109,8 +116,10 @@ Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの
   番号・エンドポイントアドレスを表示する
   → **完了。実機のHID Bootキーボードで`usbinfo`がVID/PID・クラス・
   configバイト数・HIDインターフェース番号・Interrupt INエンドポイント
-  アドレスまで表示することを確認済み。文字列記述子（製品名）の取得は
-  未実装のまま（optional扱い）**
+  アドレスまで表示することを確認済み**
+  → 追補: 文字列記述子はその後実装した。`src/usb/protocol.rs`の
+  `read_string_language`／`read_string_ascii`で取得し、`lsusb`の記述子詳細表示の
+  ときだけ発行する（[`USB.md`](USB.md)）
 
 **実機で確認できた前提（Stage 2着手時点では未確認としていたもの）**:
 - HCINTは割り込みを一切unmaskしていない状態でもステータスビット自体が
@@ -157,13 +166,18 @@ Low/Full-Speedデバイスのため、単一チャネル・単一デバイスの
   → **完了。`src/usb.rs`の`UsbKeyboard`として実装し、`lcd.rs`にCardKBと
   並列のポーリング・再接続ロジックを追加。実機のHID Bootキーボードで
   キー入力がコンソールへエコーされることを確認した（下記「踏んだ罠」の
-  2件を修正した後）。CardKBとの同時接続時の共存は未確認**
+  2件を修正した後）**
+  → 追補: CardKBとの共存はその後[`INPUT_MANAGER_PLAN.md`](INPUT_MANAGER_PLAN.md)が
+  扱い、入力源の統合と公平性まで実機確認済みである。キーボードドライバは
+  `src/usb/hid_keyboard.rs`、ポーリングは`src/input.rs`の`InputManager`へ移った
+  （[`INPUT.md`](INPUT.md)）
 
 **実装上、計画時点から具体化した判断**:
 - Interrupt転送はperiodic schedulerを使わず、Stage 2のcontrol転送と同じ
   「チャネル0を1パケット分だけ都度activateしてhalt待ちpoll」方式を、
   対象エンドポイント番号で流用している（frame list等のperiodic
-  scheduling基盤は未実装のまま）。NAK（＝まだ新しいレポートが無い）を
+  scheduling基盤はこの時点では未実装。上記Stage 5のとおり、現在はHIDを常設の
+  periodic経路で動かしている）。NAK（＝まだ新しいレポートが無い）を
   打ち切るための短いタイムアウト（`INTERRUPT_POLL_TIMEOUT_ITERATIONS`）
   と、それでも`CHENA`が下りない場合の明示的なhalt要求
   （`force_halt_channel`、`HCCHAR.CHDIS`）を追加している。このタイムアウトは
@@ -613,7 +627,18 @@ Stage 1〜3を実装した当初はSD_CARD_PLAN.mdのブロックI/O層と同じ
   参照し、`usbrescan`だけが明示的にバスを再列挙する。`usbvbus`はI/O expanderの
   VBUSビットを直接操作する診断用コマンド
 
-## Stage 5（将来）: Interrupt転送の割り込み駆動化
+## Stage 5: Interrupt転送の割り込み駆動化 ✅ 完了（別計画で実施）
+
+> **本計画では「将来」としていたが、実施済みである。**
+> [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md)が独立した計画として
+> 扱い、下記「必要な作業」の3項目はいずれもコードにある——periodic frame list
+> （`src/usb/hcd.rs`の`HFLBADDR`と`enable_periodic_hid`）、チャネルアロケータ
+> （`src/usb/hid.rs`の4スロット割り当て）、`interrupts.rs`経由のISR配線である。
+> HIDは常設のperiodic経路で動き、idle時にチャネル0のpollが止まることも実機確認済み。
+> 残っているのはhub statusの低頻度fallbackだけで、その到達点はあちらの計画にある。
+> 「着手前に確認すべき点」に挙げたLow-Speedのperiodic可否は、Split Transaction経由も
+> 含めて実機で成立した（[`USB.md`](USB.md)）。
+> 以下は着手前に本計画で整理した動機と調査内容で、当時のまま残してある。
 
 Stage 1〜4は、まずポーリングで動作確認し、必要になった時点でのみ割り込み化を
 検討する方針で一貫してきた。ただしInterrupt転送についてはコアが本来持っている自動スケジューリング
@@ -899,17 +924,15 @@ quietに読む。接続が変わらない間はresetもdescriptor readも行わ�
 ## 将来検討（範囲外）
 
 かつてここに挙げていた「USB Mass Storage」「ハブの複数ポート同時使用」
-「HSハブ配下のFS/LSデバイス」は、それぞれ`USB_MSC_PLAN.md`、
-`USB_REFACTOR_PLAN.md` Stage C、上記Stage 6で実装済みのため外した。
+「HSハブ配下のFS/LSデバイス」「真の並列転送（複数チャネル・frame list・割り込み駆動）」
+は、それぞれ`USB_MSC_PLAN.md`、`USB_REFACTOR_PLAN.md` Stage C、上記Stage 6、
+`USB_INTERRUPT_REFACTOR_PLAN.md`（本計画のStage 5）で実装済みのため外した。
 
 - HIDマウス、複合デバイス（キーボード+ホイール等）の非Bootレポート解析
 - ハブのカスケード接続（ハブの下にハブ）
 - ハブ自身のInterrupt INステータス変更エンドポイントを使った割り込み駆動の
   ポート変化検出。Stage 7でポーリングは空きポートへの`GET_STATUS`だけになり、
   全ポート使用中は完全に無音になったため、優先度は下がった
-- 真の並列転送（複数チャネル・frame list・割り込み駆動）はStage 5のまま未着手。
-  Stage 6/7がStage 5より先に完了しているのは、そちらが実害のある不具合を
-  抱えていたためで、Stage 5が不要になったわけではない
 - Full-Speed OTGコントローラ（USB-C側）を使った同時ホスト動作
   （ESP32-P4は2系統同時ホスト動作が可能とされるが、本計画のマイルストーンでは
   USB-A/High-Speedコントローラのみを対象とする）

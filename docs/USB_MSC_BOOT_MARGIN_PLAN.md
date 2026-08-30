@@ -4,7 +4,7 @@
 > この文書は作業計画です。現在の実装仕様は現状文書
 > （[`STORAGE.md`](STORAGE.md)、[`USB.md`](USB.md)）とコードを優先してください。
 
-## 状態: **Stage 1〜3完了（実機計測済み）／Stage 4は別計画**
+## 状態: **完了**（Stage 1〜3.5は実機計測済み／Stage 4は別計画で実施済み）
 
 | Stage | 状態 |
 | --- | --- |
@@ -12,7 +12,7 @@
 | 2 実機計測（デバイス別・直結／ハブ別の分布を取る） | **実機計測済み**（全条件、下記の記録） |
 | 3 計測値から起動時の待ち時間を決め、定数を確定する | **確定**（connect 1,000 ms／ready 4,000 ms） |
 | 3.5 メディア無しの即断（REQUEST SENSE ASC `0x3A`） | **実機確認済み**（1 ms／1試行で判定） |
-| 4 ファイルシステム層の起動時メディア選択へ反映 | 未着手（別計画） |
+| 4 ファイルシステム層の起動時メディア選択へ反映 | **別計画で完了**（下記Stage 4） |
 
 ## 目的
 
@@ -236,10 +236,18 @@ USB BOOT: mass storage has no medium, not usable
 メディア有りの同じリーダーとUSBメモリが従来どおり読めることも確認済みで、
 `attempts=2`のリーダーを誤って`NoMedium`と判定することはありませんでした。
 
-## Stage 4: ファイルシステム層への反映（別計画）
+## Stage 4: ファイルシステム層への反映（別計画で完了）
 
 起動時のメディア選択と、選べなかったときのフォールバックはFAT実装の計画側で
 扱います。この計画が確定させたのはそこへ渡す**時間の予算**だけです。
+
+**申し送り先は[`STARTUP_SCREEN_REFACTOR_PLAN.md`](STARTUP_SCREEN_REFACTOR_PLAN.md)の
+Stage 3（USB初回スキャンの状態機械化）とStage 4（起動時自動マウント）で、どちらも
+完了しています。** 予算は`src/input.rs`の`BOOT_MASS_STORAGE_READY_MS`として実装され、
+挿抜経路の`src/app/automount.rs`も`READY_BUDGET_MS`（4,000 ms）として同じ値を使います
+——同じ問いを別の時点で聞いているためです。現状仕様は
+[`FILESYSTEM.md`](FILESYSTEM.md)と[`STORAGE.md`](STORAGE.md)を優先します。
+
 申し送り事項:
 
 - 起動時の優先順は USB MSC → microSD →（将来の）内蔵Flash。
