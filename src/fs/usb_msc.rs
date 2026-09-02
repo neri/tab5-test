@@ -1,7 +1,6 @@
 //! [`BlockDevice`] adapter over `usb/msc.rs`.
 //!
-//! Like `sd.rs`, this only translates. BOT session state, Reset Recovery, the
-//! proactive resynchronization every sixteen reads and before every write,
+//! Like `sd.rs`, this only translates. BOT session state, Reset Recovery,
 //! the packet-level retries and the READ(10)-only replay policy all stay
 //! below it, where the knowledge of which commands are safe to repeat lives.
 //!

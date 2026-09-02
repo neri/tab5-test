@@ -203,6 +203,41 @@ Stage 3のtransport判定には`fswritetest`を使いません。失敗したmkd
 `usbrawcheck`がfilesystem外の犠牲LBAへREADを挟まないWRITE列を発行し、最後に照合と復元を
 試みます。復元不能でもfilesystem objectは残らず、`usbrescan`後に同じ範囲を再利用できます。
 
+## 解消済み: BOT command境界の予防cleanupが必要だった
+
+連続READ(10)を16回ごと、WRITE(10)を毎回、host controllerのchannel／FIFO cleanupで
+挟まないとBulkとEP0が無応答になる問題がありました（FS-onlyで最短33 READ、
+High-Speed直結でも52回）。これは緩和策であって原因の解消ではなく、正常な転送のたびに
+channelをhaltしFIFOをflushするという、実装としても診断としても筋の悪い形でした。
+
+原因側をHCDの契約として順に固めた結果、この緩和策は不要になりました。
+
+- DMA bufferはHCDが所有して64 byte整列し、cache同期の拒否は転送を開始させない。
+  呼び出し側の任意の`&mut [u8]`へalignment契約を課さない。
+- channel 0のdescriptor完了は`HCINT.XferCompl`・QTD Active解除・妥当な残量を
+  **同じ世代で**確認する。古い完了snapshotやhardware所有中のQTDを成功として回収しない。
+- 実転送長は1箇所でだけ導出し、「0 byte」と「不明」を型で区別する。
+- root-port reset後にFIFO分割を再適用する（resetで失われていた。これが
+  Full-Speed固定ハブ経路のWRITE故障の根本原因でもありました）。
+- cleanupの失敗はcommandの中止として伝播する。
+
+実機A/Bは3構成（High-Speed直結、FS-onlyハブ＋HID＋MSC、High-Speedハブ＋Low-Speed HID
+＋High-Speed MSC）で、READ側は`usbcheck 1000`が`proactive read+0`で完走、WRITE側は
+各構成100回と2メーカー媒体の`fswritetest`各10回が通りました。**予防cleanupは
+コードから撤去済みです**（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)の
+Stage 5・6）。cleanupが残るのは失敗後だけで、そこでFIFO flushがtimeoutした場合は
+Reset Recoveryを実行せずsessionを引退させます。
+
+残件:
+
+- **1回のWRITE(10)は1ブロックのまま**です（`MAX_WRITE_BLOCKS = 1`）。複数ブロックを
+  1回のdata OUTに入れると転送層が戻らなくなる問題は未解決で、予防cleanupの撤去とは
+  独立した相互運用上の制限として残ります。再評価は同計画のStage 7です。
+- **失敗cleanupがshared FIFOをskipする経路は実機で一度も発火していません。** skipは
+  persistent periodic channelがarm中のときだけ起き、`enable_periodic_hid`はsplitが要る
+  経路を拒否するため、High-Speedハブ配下のLow-Speed HIDは構造上そこへ到達しません。
+  `usbhw`の`fifo-skipped`が0のままなのはこのためです。
+
 ## VPDページ0x80の要求に標準INQUIRYを返すUSBメモリがある
 
 実機のUSBメモリで確認しました。EVPDビットを立ててページ`0x80`

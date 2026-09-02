@@ -204,12 +204,13 @@ static CHANNEL0_QTD_NEXT: AtomicU32 = AtomicU32::new(0);
 // Stage 0 observation contract (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`)
 //
 // Nothing below changes what a transfer does. It exists so that the
-// proactive host cleanup this driver still performs at healthy Bulk-Only
-// Transport command boundaries can eventually be removed against measured
-// numbers rather than against the impression that a run felt stable: every
-// later stage is compared against a baseline taken with these counters and
-// the current cleanup in place. A counter that is only maintained once the
-// behaviour has already changed cannot produce that comparison.
+// proactive host cleanup this driver used to perform at every healthy
+// Bulk-Only Transport command boundary could be removed against measured
+// numbers rather than against the impression that a run felt stable: each
+// stage was compared against a baseline taken with these counters and the
+// cleanup still in place. That removal is done (Stages 5 and 6), and the
+// counters stay because the same comparison is what any future change to
+// the failure path has to be argued from.
 // ------------------------------------------------------------------------
 
 /// Which transfer a DMA buffer belongs to, published by the layer that owns
@@ -566,16 +567,62 @@ fn log_packet_failure(kind: PacketFailureKind, requested: usize, actual: usize, 
     uart::log_hex(b"USB:   QTD final=", qtd_final);
 }
 
-/// Which FIFO a flush timed out on. The three are shared very differently:
-/// the non-periodic TX FIFO belongs to channel 0 alone, while the periodic
-/// TX and RX FIFOs are shared with every armed Interrupt endpoint.
-const FIFO_NON_PERIODIC_TX: usize = 0;
-const FIFO_PERIODIC_TX: usize = 1;
-const FIFO_RX: usize = 2;
-const FIFO_COUNT: usize = 3;
+/// One of the three host FIFOs a channel-0 cleanup can flush.
+///
+/// They are shared very differently: the non-periodic TX FIFO belongs to
+/// channel 0 alone, while the periodic TX and RX FIFOs are shared with
+/// every armed Interrupt endpoint. Naming them as a type rather than an
+/// index keeps "which FIFO timed out" attached to the failure instead of
+/// living only in a log line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fifo {
+    NonPeriodicTx,
+    PeriodicTx,
+    Rx,
+}
 
+pub const FIFO_COUNT: usize = 3;
+
+impl Fifo {
+    fn index(self) -> usize {
+        match self {
+            Fifo::NonPeriodicTx => 0,
+            Fifo::PeriodicTx => 1,
+            Fifo::Rx => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Fifo::NonPeriodicTx => "nptx",
+            Fifo::PeriodicTx => "ptx",
+            Fifo::Rx => "rx",
+        }
+    }
+}
+
+/// Column headings for the per-FIFO arrays in [`HostObservation`], in order.
+pub fn fifo_names() -> [&'static str; FIFO_COUNT] {
+    [
+        Fifo::NonPeriodicTx.name(),
+        Fifo::PeriodicTx.name(),
+        Fifo::Rx.name(),
+    ]
+}
+
+/// Flushes that completed, timed out, and were deliberately not attempted.
+///
+/// The three are kept apart per FIFO because "the cleanup did everything it
+/// set out to do", "the cleanup left the shared FIFOs alone so a keyboard
+/// would survive" and "the core never finished the flush" are different
+/// states with different consequences, and a single success/failure flag
+/// reported the first two identically -- which is how a run could print
+/// "all cleanups succeeded" while the residue this cleanup exists to remove
+/// was still in the RX FIFO.
+static FIFO_FLUSHES: [AtomicU32; FIFO_COUNT] = [const { AtomicU32::new(0) }; FIFO_COUNT];
 static FIFO_FLUSH_TIMEOUTS: [AtomicU32; FIFO_COUNT] = [const { AtomicU32::new(0) }; FIFO_COUNT];
-static FIFO_FLUSHES_SKIPPED_FOR_PERIODIC: AtomicU32 = AtomicU32::new(0);
+static FIFO_FLUSHES_SKIPPED_FOR_PERIODIC: [AtomicU32; FIFO_COUNT] =
+    [const { AtomicU32::new(0) }; FIFO_COUNT];
 /// Reported channel-0 Bulk OUT packet errors recovered by flushing only the
 /// FIFO that can contain that packet's transmit residue.
 ///
@@ -583,8 +630,8 @@ static FIFO_FLUSHES_SKIPPED_FOR_PERIODIC: AtomicU32 = AtomicU32::new(0);
 /// the old all-FIFO recovery and the rejected no-cleanup experiment.
 static OUT_PACKET_ERROR_NPTX_CLEANUPS: AtomicU32 = AtomicU32::new(0);
 
-fn note_fifo_flush_timeout(fifo: usize) {
-    FIFO_FLUSH_TIMEOUTS[fifo].fetch_add(1, Ordering::Relaxed);
+fn note_fifo_flush_timeout(fifo: Fifo) {
+    FIFO_FLUSH_TIMEOUTS[fifo.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Everything the Stage 0 baseline is compared on, in one snapshot so that
@@ -613,8 +660,12 @@ pub struct HostObservation {
     pub last_packet_failure_actual: u32,
     pub last_packet_failure_hcint: u32,
     pub last_packet_failure_qtd: u32,
+    /// Flushes that completed, per FIFO. See [`FIFO_FLUSHES`].
+    pub fifo_flushes: [u32; FIFO_COUNT],
     pub fifo_flush_timeouts: [u32; FIFO_COUNT],
-    pub fifo_flushes_skipped_for_periodic: u32,
+    /// Flushes not attempted because a periodic endpoint was armed, per
+    /// FIFO. Only the two shared FIFOs can ever be skipped.
+    pub fifo_flushes_skipped_for_periodic: [u32; FIFO_COUNT],
     pub out_packet_error_nptx_cleanups: u32,
 }
 
@@ -660,8 +711,6 @@ pub fn host_observation() -> HostObservation {
         last_packet_failure_actual: LAST_FAILED_PACKET_ACTUAL.load(Ordering::Relaxed),
         last_packet_failure_hcint: LAST_FAILED_PACKET_HCINT.load(Ordering::Relaxed),
         last_packet_failure_qtd: LAST_FAILED_PACKET_QTD.load(Ordering::Relaxed),
-        fifo_flushes_skipped_for_periodic: FIFO_FLUSHES_SKIPPED_FOR_PERIODIC
-            .load(Ordering::Relaxed),
         out_packet_error_nptx_cleanups: OUT_PACKET_ERROR_NPTX_CLEANUPS.load(Ordering::Relaxed),
         ..Default::default()
     };
@@ -677,8 +726,14 @@ pub fn host_observation() -> HostObservation {
     for (index, counter) in PACKET_FAILURES_BY_KIND.iter().enumerate() {
         observation.packet_failures_by_kind[index] = counter.load(Ordering::Relaxed);
     }
+    for (index, counter) in FIFO_FLUSHES.iter().enumerate() {
+        observation.fifo_flushes[index] = counter.load(Ordering::Relaxed);
+    }
     for (index, counter) in FIFO_FLUSH_TIMEOUTS.iter().enumerate() {
         observation.fifo_flush_timeouts[index] = counter.load(Ordering::Relaxed);
+    }
+    for (index, counter) in FIFO_FLUSHES_SKIPPED_FOR_PERIODIC.iter().enumerate() {
+        observation.fifo_flushes_skipped_for_periodic[index] = counter.load(Ordering::Relaxed);
     }
     observation
 }
@@ -743,190 +798,6 @@ fn log_no_device_timeout_once() {
     if !NO_DEVICE_TIMEOUT_REPORTED.swap(true, Ordering::Relaxed) {
         uart::log(b"USB: no device detected on USB-A within timeout\r\n");
     }
-}
-
-#[cfg(any())]
-fn clear_last_packet_failure() {
-    LAST_PACKET_FAILURE_KIND.store(PACKET_FAILURE_NONE, Ordering::Relaxed);
-}
-
-#[cfg(any())]
-fn record_packet_failure(kind: u32, hcint: u32, qtd_status: u32) {
-    LAST_PACKET_FAILURE_HCINT.store(hcint, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HPRT.store(unsafe { read(HPRT) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_QTD_STATUS.store(qtd_status, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HCCHAR.store(unsafe { read(CHAN0_HCCHAR) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HCSPLT.store(unsafe { read(CHAN0_HCSPLT) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HCTSIZ.store(unsafe { read(CHAN0_HCTSIZ) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HFNUM.store(unsafe { read(HFNUM) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_GINTSTS.store(unsafe { read(GINTSTS) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_GINTMSK.store(unsafe { read(GINTMSK) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_HCFG.store(unsafe { read(HCFG) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_UTMI_FC06.store(unsafe { read(USB_UTMI_FC06) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_USBOTG20_CTRL
-        .store(unsafe { read(HP_SYSTEM_USBOTG20_CTRL) }, Ordering::Relaxed);
-    LAST_PACKET_FAILURE_SOC_CLK_CTRL1.store(
-        unsafe { read(HP_SYS_CLKRST_SOC_CLK_CTRL1) },
-        Ordering::Relaxed,
-    );
-    LAST_PACKET_FAILURE_HP_USB_CTRL1
-        .store(unsafe { read(LP_CLKRST_HP_USB_CTRL1) }, Ordering::Relaxed);
-    // Publish last so a reader never observes a new kind with stale fields.
-    LAST_PACKET_FAILURE_KIND.store(kind, Ordering::Release);
-}
-
-/// Emits the diagnostic snapshot for the immediately preceding failed
-/// packet. Intended for a one-shot, higher-level recovery report -- callers
-/// must provide their own de-duplication policy.
-#[cfg(any())]
-pub fn log_last_packet_failure(context: &[u8]) {
-    let kind = LAST_PACKET_FAILURE_KIND.load(Ordering::Acquire);
-    uart::log(context);
-    uart::log(b": ");
-    uart::log(match kind {
-        PACKET_FAILURE_TIMEOUT => b"channel/TT timeout\r\n" as &[u8],
-        PACKET_FAILURE_STALL => b"USB STALL\r\n",
-        PACKET_FAILURE_TRANSACTION => b"transaction error\r\n",
-        PACKET_FAILURE_QTD => b"DMA QTD status error\r\n",
-        PACKET_FAILURE_INVALID_SPLIT_LENGTH => b"invalid split packet length\r\n",
-        PACKET_FAILURE_SHORT_RESPONSE => b"short control response\r\n",
-        _ => b"failure state unavailable\r\n",
-    });
-    if kind != PACKET_FAILURE_NONE {
-        uart::log_hex(
-            b"USB:   HCINT=",
-            LAST_PACKET_FAILURE_HCINT.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HPRT=",
-            LAST_PACKET_FAILURE_HPRT.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HCCHAR=",
-            LAST_PACKET_FAILURE_HCCHAR.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HCSPLT=",
-            LAST_PACKET_FAILURE_HCSPLT.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HCTSIZ=",
-            LAST_PACKET_FAILURE_HCTSIZ.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HFNUM at failure=",
-            LAST_PACKET_FAILURE_HFNUM.load(Ordering::Relaxed),
-        );
-        // A live sample separated by a millisecond tells us whether SOF/frame
-        // generation is still progressing after the failed transfer.
-        let hfnum_now = unsafe { read(HFNUM) };
-        delay_us(1_000);
-        uart::log_hex(b"USB:   HFNUM before +1ms=", hfnum_now);
-        uart::log_hex(b"USB:   HFNUM +1ms=", unsafe { read(HFNUM) });
-        uart::log_hex(
-            b"USB:   GINTSTS=",
-            LAST_PACKET_FAILURE_GINTSTS.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   GINTMSK=",
-            LAST_PACKET_FAILURE_GINTMSK.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   HCFG=",
-            LAST_PACKET_FAILURE_HCFG.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   UTMI_FC06=",
-            LAST_PACKET_FAILURE_UTMI_FC06.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   USBOTG20_CTRL=",
-            LAST_PACKET_FAILURE_USBOTG20_CTRL.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   USB SYS CLK CTRL1=",
-            LAST_PACKET_FAILURE_SOC_CLK_CTRL1.load(Ordering::Relaxed),
-        );
-        uart::log_hex(
-            b"USB:   USB PHY/CORE CTRL1=",
-            LAST_PACKET_FAILURE_HP_USB_CTRL1.load(Ordering::Relaxed),
-        );
-        if kind == PACKET_FAILURE_QTD {
-            uart::log_hex(
-                b"USB:   QTD status=",
-                LAST_PACKET_FAILURE_QTD_STATUS.load(Ordering::Relaxed),
-            );
-        }
-    }
-}
-
-#[cfg(any())]
-fn clear_split_trace() {
-    SPLIT_TRACE_NEXT.store(0, Ordering::Relaxed);
-    SPLIT_TRACE_COUNT.store(0, Ordering::Relaxed);
-    LAST_SPLIT_OUTCOME.store(SPLIT_OUTCOME_NONE, Ordering::Relaxed);
-    LAST_SPLIT_CHANNEL_ACTIVE.store(false, Ordering::Relaxed);
-}
-
-#[cfg(any())]
-fn record_split_round(phase: u32, hcint: u32) {
-    let next = SPLIT_TRACE_NEXT.fetch_add(1, Ordering::Relaxed);
-    let slot = (next as usize) % SPLIT_TRACE_CAPACITY;
-    SPLIT_TRACE_PHASE[slot].store(phase, Ordering::Relaxed);
-    SPLIT_TRACE_HCINT[slot].store(hcint, Ordering::Relaxed);
-    let count = SPLIT_TRACE_COUNT.load(Ordering::Relaxed);
-    if count < SPLIT_TRACE_CAPACITY as u32 {
-        SPLIT_TRACE_COUNT.store(count + 1, Ordering::Release);
-    }
-}
-
-/// Emits the last split packet's handshake history. Called only when a later
-/// hub control transfer has exhausted its retry budget.
-#[cfg(any())]
-pub fn log_recent_split_trace() {
-    let count = SPLIT_TRACE_COUNT.load(Ordering::Acquire) as usize;
-    if count == 0 {
-        uart::log(b"USB: no preceding split transaction recorded\r\n");
-        return;
-    }
-    uart::log(b"USB: preceding split transaction (oldest first)\r\n");
-    let next = SPLIT_TRACE_NEXT.load(Ordering::Relaxed) as usize;
-    let start = if count == SPLIT_TRACE_CAPACITY {
-        next % SPLIT_TRACE_CAPACITY
-    } else {
-        0
-    };
-    for offset in 0..count {
-        let slot = (start + offset) % SPLIT_TRACE_CAPACITY;
-        let phase = SPLIT_TRACE_PHASE[slot].load(Ordering::Relaxed);
-        let label = if phase == SPLIT_PHASE_COMPLETE {
-            b"USB:   CSPLIT HCINT=" as &[u8]
-        } else {
-            b"USB:   SSPLIT HCINT="
-        };
-        uart::log_hex(label, SPLIT_TRACE_HCINT[slot].load(Ordering::Relaxed));
-    }
-    uart::log(b"USB:   split outcome=");
-    uart::log(match LAST_SPLIT_OUTCOME.load(Ordering::Relaxed) {
-        SPLIT_OUTCOME_COMPLETE => b"complete\r\n" as &[u8],
-        SPLIT_OUTCOME_SAFE_TIMEOUT => b"safe timeout/NAK boundary\r\n",
-        SPLIT_OUTCOME_ERROR => b"transfer error\r\n",
-        _ => b"not recorded\r\n",
-    });
-    uart::log_hex(
-        b"USB:   split HCFG after cleanup=",
-        LAST_SPLIT_HCFG_AFTER.load(Ordering::Relaxed),
-    );
-    if LAST_SPLIT_CHANNEL_ACTIVE.load(Ordering::Relaxed) {
-        uart::log(b"USB:   split channel was active during cleanup\r\n");
-    }
-}
-
-/// Records a completed but too-short class/control response. This is not an
-/// HCD error, but is still enough to make a hub-port scan unreliable.
-#[cfg(any())]
-pub fn note_short_control_response() {
-    record_packet_failure(PACKET_FAILURE_SHORT_RESPONSE, 0, 0);
 }
 
 // ------------------------------------------------------------------------
@@ -1439,6 +1310,15 @@ impl PacketStaging {
     }
 }
 
+// This one lives on the stack, so unlike the QTD banks and the frame list
+// its placement cannot be read back out of the release ELF. The guarantee
+// has to be the type's, and it has to be checked here: the whole point of
+// staging is that DMA sees a cache-line-aligned span whose lines belong to
+// nothing else, and a size that is not a whole number of lines would make
+// the tail line shared with whatever the compiler put after it.
+const _: () = assert!(core::mem::align_of::<PacketStaging>() == DMA_ALIGN);
+const _: () = assert!(core::mem::size_of::<PacketStaging>() % DMA_ALIGN == 0);
+
 /// How many upcoming cache maintenance calls must refuse regardless of what
 /// the hardware would have done.
 ///
@@ -1513,6 +1393,35 @@ pub fn force_short_outs(count: u32) -> u32 {
 
 fn take_forced_short_out() -> bool {
     FORCED_SHORT_OUTS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
+            armed.checked_sub(1)
+        })
+        .is_ok()
+}
+
+/// FIFO flushes to report as having timed out.
+///
+/// The core empties these FIFOs in a handful of cycles, so a real timeout
+/// only happens when the controller is already wedged -- a state that
+/// cannot be produced on demand and that no healthy run reaches. What the
+/// injection exercises is the path above it: a cleanup that could not
+/// finish must stop the command it was preparing for rather than let it
+/// run against FIFOs that still hold the previous transfer's residue.
+///
+/// The flush is still issued to the hardware before the timeout is
+/// reported, so the injection only falsifies the driver's belief about the
+/// flush, never the FIFO contents. That keeps an injected run from leaving
+/// the controller in a state a real run never produces.
+static FORCED_FIFO_FLUSH_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+
+/// Arms `count` FIFO flushes to be reported as timed out. Returns the count
+/// that was already armed. See [`FORCED_FIFO_FLUSH_TIMEOUTS`].
+pub fn force_fifo_flush_timeouts(count: u32) -> u32 {
+    FORCED_FIFO_FLUSH_TIMEOUTS.swap(count, Ordering::Relaxed)
+}
+
+fn take_forced_fifo_flush_timeout() -> bool {
+    FORCED_FIFO_FLUSH_TIMEOUTS
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
             armed.checked_sub(1)
         })
@@ -2836,7 +2745,69 @@ fn configure_fifos(fifo_depth_words: u32) {
             ((rx_lines + nptx_lines) & 0xFFFF) | (ptx_lines << 16),
         );
     }
-    flush_fifos();
+    // Bring-up, so nothing periodic can be armed yet. A core that cannot
+    // finish a flush here will not move a packet either, and continuing
+    // would spend the whole enumeration budget proving it.
+    if let Some(fifo) = flush_all_fifos().failed_fifo() {
+        uart::log(b"USB: host FIFO partition could not be flushed, fifo=");
+        uart::log(fifo.name().as_bytes());
+        uart::log(b"\r\n");
+        note_bus_unusable();
+    }
+}
+
+/// What one channel-0 cleanup actually did to the host FIFOs.
+///
+/// A cleanup has three distinguishable results and the caller needs all
+/// three. It can finish everything it set out to do; it can deliberately
+/// leave the shared FIFOs alone because a keyboard or mouse is waiting on
+/// them, which leaves residue behind but keeps that device alive; or the
+/// core can fail to finish a flush, which means the next transfer would run
+/// against state nobody accounted for. Only the last is a failure, and
+/// collapsing the first two into one "succeeded" flag is what let a run
+/// report every cleanup as complete while the residue it exists to remove
+/// was still there.
+#[derive(Clone, Copy, Default)]
+pub struct CleanupOutcome {
+    skipped_for_periodic: u8,
+    failed: Option<Fifo>,
+}
+
+impl CleanupOutcome {
+    fn note_flushed(&mut self, fifo: Fifo) {
+        FIFO_FLUSHES[fifo.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_skipped(&mut self, fifo: Fifo) {
+        self.skipped_for_periodic |= 1 << fifo.index();
+        FIFO_FLUSHES_SKIPPED_FOR_PERIODIC[fifo.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_failed(&mut self, fifo: Fifo) {
+        // The first FIFO to fail is the one worth reporting: a later flush
+        // that also times out is a consequence of the same wedged core, and
+        // overwriting the name would point the log at the wrong one.
+        if self.failed.is_none() {
+            self.failed = Some(fifo);
+        }
+    }
+
+    /// The FIFO whose flush did not finish, if any. `None` means the
+    /// cleanup is safe to continue from, whether or not it skipped the
+    /// shared FIFOs.
+    pub fn failed_fifo(&self) -> Option<Fifo> {
+        self.failed
+    }
+
+    /// Whether a shared FIFO was left alone because a periodic endpoint was
+    /// armed.
+    ///
+    /// Not a failure: the cleanup is safe to continue from either way. It
+    /// says the residue of the failed transfer may still be in the RX FIFO,
+    /// which is the price of not destroying a live keyboard's session.
+    pub fn skipped_for_periodic(&self) -> bool {
+        self.skipped_for_periodic != 0
+    }
 }
 
 /// True while any periodic HID channel holds an armed QTD.
@@ -2853,6 +2824,19 @@ fn periodic_channels_armed() -> bool {
         || unsafe { read(HAINTMSK) } & PERIODIC_CHANNEL_MASK != 0
 }
 
+/// Which FIFOs a cleanup is allowed to touch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlushScope {
+    /// Only the FIFO channel 0's own transmissions pass through. Used when
+    /// hardware has already reported a completed OUT packet error: the
+    /// failure cannot have left anything in the receive path, and the
+    /// shared FIFOs belong to other endpoints.
+    TransmitOnly,
+    /// Everything that can safely be flushed. The shared FIFOs are still
+    /// skipped while a periodic endpoint is armed.
+    All,
+}
+
 /// Flushes what channel 0's failed transfer can have left behind, without
 /// disturbing periodic endpoints when any are armed.
 ///
@@ -2863,59 +2847,84 @@ fn periodic_channels_armed() -> bool {
 /// the cost of not skipping them is a working keyboard destroyed by an
 /// unrelated device's failure, which is the worse of the two and the one
 /// seen on real hardware.
-fn flush_channel0_fifos() {
+fn flush_channel0_fifos(scope: FlushScope) -> CleanupOutcome {
+    let mut outcome = CleanupOutcome::default();
+    flush_into(Fifo::NonPeriodicTx, &mut outcome);
+    if scope == FlushScope::TransmitOnly {
+        return outcome;
+    }
     if periodic_channels_armed() {
-        flush_non_periodic_tx_fifo();
-        // Counted, not just logged: "all cleanups succeeded" and "two of
-        // the three cleanups were skipped" are different states, and a
-        // baseline that reports them as the same one cannot tell whether a
-        // later run kept the residue this cleanup exists to remove.
-        FIFO_FLUSHES_SKIPPED_FOR_PERIODIC.fetch_add(1, Ordering::Relaxed);
+        outcome.note_skipped(Fifo::PeriodicTx);
+        outcome.note_skipped(Fifo::Rx);
         uart::log(b"USB: periodic channels armed, flushed only the non-periodic FIFO\r\n");
-        return;
+        return outcome;
     }
-    flush_fifos();
+    flush_into(Fifo::PeriodicTx, &mut outcome);
+    flush_into(Fifo::Rx, &mut outcome);
+    outcome
 }
 
-fn flush_non_periodic_tx_fifo() {
-    unsafe {
-        modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 0); // select non-periodic TX FIFO
-        modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
-    }
-    if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
-        note_fifo_flush_timeout(FIFO_NON_PERIODIC_TX);
-        uart::log(b"USB: non-periodic TX FIFO flush timed out\r\n");
-    }
+/// Flushes all three FIFOs unconditionally.
+///
+/// Only for callers that know no periodic endpoint can be armed:
+/// controller bring-up, and split mode, which excludes periodic channels by
+/// construction. Everything else goes through [`flush_channel0_fifos`],
+/// which protects a live keyboard from an unrelated device's failure.
+fn flush_all_fifos() -> CleanupOutcome {
+    let mut outcome = CleanupOutcome::default();
+    flush_into(Fifo::NonPeriodicTx, &mut outcome);
+    flush_into(Fifo::PeriodicTx, &mut outcome);
+    flush_into(Fifo::Rx, &mut outcome);
+    outcome
 }
 
-fn flush_fifos() {
-    flush_non_periodic_tx_fifo();
-    unsafe {
-        modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, 1 << 6); // select periodic TX FIFO
-        modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
-    }
-    if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
-        note_fifo_flush_timeout(FIFO_PERIODIC_TX);
-        uart::log(b"USB: periodic TX FIFO flush timed out\r\n");
-    }
-    unsafe {
-        modify(GRSTCTL, GRSTCTL_RXFFLSH, GRSTCTL_RXFFLSH);
-    }
-    if !poll_until(GRSTCTL, GRSTCTL_RXFFLSH, false, 100_000) {
-        note_fifo_flush_timeout(FIFO_RX);
-        uart::log(b"USB: RX FIFO flush timed out\r\n");
+fn flush_into(fifo: Fifo, outcome: &mut CleanupOutcome) {
+    match flush_fifo(fifo) {
+        Ok(()) => outcome.note_flushed(fifo),
+        Err(fifo) => outcome.note_failed(fifo),
     }
 }
 
-/// Restores channel 0 to the baseline used by descriptor-DMA transfers after
-/// an abandoned transfer or before a proactive BOT boundary. Periodic HID
-/// channels may be active concurrently, so [`flush_channel0_fifos`] limits
-/// the flush scope when their shared FIFOs cannot safely be discarded.
+/// Issues one FIFO flush and waits for the core to clear its request bit.
+///
+/// The error carries the FIFO rather than a bare `bool` so that a caller
+/// that has to abandon a command can say which one, and so that a timeout
+/// on the non-periodic TX FIFO -- channel 0's own, always in scope -- is
+/// not read as a timeout on a shared one that a later run might legitimately
+/// have skipped.
+fn flush_fifo(fifo: Fifo) -> Result<(), Fifo> {
+    // Both TX FIFOs share one flush request bit and are selected by
+    // `TxFNum`; the RX FIFO has its own bit and no selector.
+    let (tx_fifo_number, request) = match fifo {
+        Fifo::NonPeriodicTx => (Some(0), GRSTCTL_TXFFLSH),
+        Fifo::PeriodicTx => (Some(1 << 6), GRSTCTL_TXFFLSH),
+        Fifo::Rx => (None, GRSTCTL_RXFFLSH),
+    };
+    unsafe {
+        if let Some(number) = tx_fifo_number {
+            modify(GRSTCTL, GRSTCTL_TXFNUM_MASK, number);
+        }
+        modify(GRSTCTL, request, request);
+    }
+    let completed = poll_until(GRSTCTL, request, false, 100_000);
+    if !completed || take_forced_fifo_flush_timeout() {
+        note_fifo_flush_timeout(fifo);
+        uart::log(b"USB: FIFO flush timed out, fifo=");
+        uart::log(fifo.name().as_bytes());
+        uart::log(b"\r\n");
+        return Err(fifo);
+    }
+    Ok(())
+}
+
+/// Restores channel 0 to the baseline used by descriptor-DMA transfers:
+/// halted, unsplit, and back in Scatter/Gather DMA with its interrupt mask
+/// rearmed.
 ///
 /// This is intentionally lighter than a root-port reset: devices keep their
 /// address/configuration and a retry can resume without re-enumerating live
 /// keyboard or storage sessions.
-pub fn recover_channel_after_packet_failure() {
+fn restore_channel0() {
     if unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
         force_halt_channel();
     }
@@ -2924,31 +2933,47 @@ pub fn recover_channel_after_packet_failure() {
         modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
     }
     prepare_channel0_interrupt();
-    flush_channel0_fifos();
 }
 
-/// Restores channel 0 after hardware has reported a completed packet error.
+/// Why a packet is being cleaned up after. Both variants are real failures:
+/// this API is never reached from a packet that completed.
+#[derive(Clone, Copy)]
+pub enum FailureScope {
+    /// A timeout, an abandoned transfer, or any state the driver cannot
+    /// account for. Nothing is known about what the channel left where, so
+    /// everything in scope is flushed.
+    Abandoned,
+    /// Hardware reported a completed packet error, so the channel has
+    /// already halted and the descriptor has been reaped. An OUT failure
+    /// can only leave payload residue in the non-periodic TX FIFO; flushing
+    /// the RX and periodic TX FIFOs as well is unrelated to that packet and
+    /// used to happen only because the generic recovery API had no
+    /// direction. IN failures keep the conservative full cleanup because
+    /// receive residue can remain in the shared RX FIFO.
+    ReportedPacketError { is_in: bool },
+}
+
+/// Cleans up after a packet that failed.
 ///
-/// Unlike a timeout, the channel has already halted and the descriptor has
-/// been reaped. An OUT failure can only leave payload residue in the
-/// non-periodic TX FIFO; flushing the RX and periodic TX FIFOs as well is
-/// unrelated to that packet and used to happen only because the generic
-/// recovery API had no direction. IN failures keep the conservative existing
-/// cleanup because receive residue can remain in the shared RX FIFO.
-pub fn recover_reported_packet_error(is_in: bool) {
-    if unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
-        force_halt_channel();
-    }
-    unsafe {
-        write(CHAN0_HCSPLT, 0);
-        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
-    }
-    prepare_channel0_interrupt();
-    if is_in {
-        flush_channel0_fifos();
-    } else {
-        OUT_PACKET_ERROR_NPTX_CLEANUPS.fetch_add(1, Ordering::Relaxed);
-        flush_non_periodic_tx_fifo();
+/// The only channel-0 cleanup there is. It is reached from a timeout, a
+/// transaction error, or a channel that would not halt -- never from a
+/// healthy command. Until Stage 6 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md`
+/// this entry point was shared with a proactive cleanup that ran at every
+/// BOT command boundary, which made "how often did a transfer actually
+/// fail" impossible to read off the counters. Three real-hardware
+/// topologies then ran 1000 reads and 100 writes each with no proactive
+/// cleanup at all, so it is gone and this path is what remains.
+///
+/// The BOT Reset Recovery sequence that talks to the *device* is separate
+/// again, in `bot.rs`, and runs only after this host-side cleanup succeeds.
+pub fn recover_failed_packet(scope: FailureScope) -> CleanupOutcome {
+    restore_channel0();
+    match scope {
+        FailureScope::ReportedPacketError { is_in: false } => {
+            OUT_PACKET_ERROR_NPTX_CLEANUPS.fetch_add(1, Ordering::Relaxed);
+            flush_channel0_fifos(FlushScope::TransmitOnly)
+        }
+        _ => flush_channel0_fifos(FlushScope::All),
     }
 }
 
@@ -3174,6 +3199,12 @@ impl<T> DmaCell<T> {
         self.0.get()
     }
 }
+
+const _: () = assert!(core::mem::align_of::<PeriodicFrameList>() == 512);
+const _: () = assert!(core::mem::align_of::<PeriodicQtdBank>() == 512);
+const _: () = assert!(core::mem::align_of::<Channel0QtdBank>() == 512);
+const _: () = assert!(core::mem::align_of::<PeriodicBufferBank>() == DMA_ALIGN);
+const _: () = assert!(core::mem::size_of::<PeriodicBufferBank>() % DMA_ALIGN == 0);
 
 static PERIODIC_HID_FRAME_LIST: DmaCell<PeriodicFrameList> = DmaCell::new(PeriodicFrameList {
     entries: [0; PERIODIC_FRAME_LIST_ENTRIES],
@@ -4890,8 +4921,11 @@ fn run_split_packet(
         // FIFOs, which the next transfer -- on any endpoint, to any device
         // -- would read as its own data. Split mode excludes periodic
         // channels by construction (`enter_split_mode`), so this one can
-        // always take the full flush.
-        flush_fifos();
+        // always take the full flush. A flush that does not finish is
+        // counted and logged by `flush_fifo`; the packet this cleanup
+        // belongs to is already on its way to a failure outcome below, so
+        // nothing here rounds it up to a success.
+        let _ = flush_all_fifos();
     }
     // Restore Scatter/Gather DMA before anything can return: every other
     // packet in this driver depends on it. Splitting is cleared with it, so

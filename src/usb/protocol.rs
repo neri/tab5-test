@@ -611,7 +611,7 @@ fn retry_control_transfer<T>(
                 // root port is still enabled. Reset that controller-local
                 // state before replaying the complete transfer; a new SETUP
                 // then also resets the USB control-transfer state on EP0.
-                hcd::recover_channel_after_packet_failure();
+                let _ = hcd::recover_failed_packet(hcd::FailureScope::Abandoned);
                 delay_us(CONTROL_RETRY_DELAY_US);
             }
         }

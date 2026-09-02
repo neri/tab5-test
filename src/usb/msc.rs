@@ -42,14 +42,6 @@ pub const VPD_PAGE_UNIT_SERIAL: u8 = 0x80;
 pub const VPD_PAGE_DEVICE_ID: u8 = 0x83;
 const CSW_STATUS_PASSED: u8 = 0x00;
 const BLOCK_BYTES: usize = 512;
-/// The shortest observed run to an unresponsive device completed 33
-/// READ(10)s. Re-establish the BOT boundary at half that distance while EP0
-/// still answers, without resetting the root port or unrelated HID devices.
-const READS_PER_BOT_RESYNC: u8 = 16;
-/// Successful maintenance resets are frequent enough that logging every one
-/// hides the transfer failure they are meant to prevent. Keep a heartbeat in
-/// the UART log without producing hundreds of identical lines.
-const RESYNC_LOG_INTERVAL: u32 = 64;
 const INQUIRY_RESPONSE_LEN: usize = 36;
 const REQUEST_SENSE_RESPONSE_LEN: usize = 18;
 const READ_CAPACITY_10_RESPONSE_LEN: usize = 8;
@@ -185,19 +177,9 @@ pub enum CacheSync {
     Failed,
 }
 
-#[derive(Clone, Copy)]
-enum ResyncDirection {
-    Read,
-    Write,
-}
-
 pub struct UsbMassStorage {
     bot: BulkOnlyTransport,
     read_retries: u32,
-    reads_since_resync: u8,
-    maintenance_resyncs: u32,
-    read_maintenance_resyncs: u32,
-    write_maintenance_resyncs: u32,
     /// Set once the device has answered SYNCHRONIZE CACHE(10) with ILLEGAL
     /// REQUEST/INVALID COMMAND. Asking again would fail the same way, and
     /// every failed command leaves sense data that has to be collected
@@ -230,10 +212,6 @@ impl UsbMassStorage {
         Some(Self {
             bot,
             read_retries: 0,
-            reads_since_resync: 0,
-            maintenance_resyncs: 0,
-            read_maintenance_resyncs: 0,
-            write_maintenance_resyncs: 0,
             cache_sync_unsupported: false,
             multi_block_write_noted: false,
             vpd_pages_queried: false,
@@ -612,12 +590,6 @@ impl UsbMassStorage {
             uart::log(b"USB MSC: too many blocks for one READ(10) transfer\r\n");
             return false;
         }
-        if self.reads_since_resync >= READS_PER_BOT_RESYNC
-            && !self.proactive_maintain(ResyncDirection::Read)
-        {
-            log_read_extent(lba, block_count, flags);
-            return false;
-        }
         let cdb = [
             SCSI_READ_10,
             flags,
@@ -635,7 +607,6 @@ impl UsbMassStorage {
             None => {
                 uart::log(b"USB MSC: READ(10) transport failed\r\n");
                 log_read_extent(lba, block_count, flags);
-                self.log_maintenance_resync_counts();
                 // execute_command has already completed BOT Reset Recovery.
                 // READ(10) is read-only, so replaying it once is safe. Do not
                 // put this retry in the generic BOT layer: a future write
@@ -644,13 +615,11 @@ impl UsbMassStorage {
                 if !self.bot.last_recovery_succeeded() {
                     return false;
                 }
-                self.reads_since_resync = 0;
                 self.read_retries = self.read_retries.wrapping_add(1);
                 uart::log(b"USB MSC: retrying READ(10) after BOT recovery\r\n");
                 let Some(result) = self.bot.execute_command(&cdb, true, buffer) else {
                     uart::log(b"USB MSC: READ(10) retry transport failed\r\n");
                     log_read_extent(lba, block_count, flags);
-                    self.log_maintenance_resync_counts();
                     return false;
                 };
                 result
@@ -662,17 +631,14 @@ impl UsbMassStorage {
                 result.status as u32,
             );
             log_read_extent(lba, block_count, flags);
-            self.log_maintenance_resync_counts();
             let _ = self.collect_sense(b"USB MSC: READ(10)");
             return false;
         }
         if !result.has_exact_data() {
             uart::log(b"USB MSC: short READ(10) response\r\n");
             log_read_extent(lba, block_count, flags);
-            self.log_maintenance_resync_counts();
             return false;
         }
-        self.reads_since_resync = self.reads_since_resync.saturating_add(1);
         true
     }
 
@@ -708,14 +674,6 @@ impl UsbMassStorage {
                 block_count as u32,
             );
         }
-        // WRITE is both rare and unsafe to replay after a transport failure.
-        // Start every one at a freshly synchronized BOT boundary instead of
-        // carrying accumulated endpoint/device state into the one command we
-        // cannot recover by simply issuing again.
-        if !self.proactive_maintain(ResyncDirection::Write) {
-            log_write_extent(lba, block_count);
-            return WriteOutcome::Failed;
-        }
         let cdb = [
             SCSI_WRITE_10,
             0,
@@ -731,7 +689,6 @@ impl UsbMassStorage {
         let Some(result) = self.bot.execute_command(&cdb, false, buffer) else {
             uart::log(b"USB MSC: WRITE(10) transport failed, not retrying\r\n");
             log_write_extent(lba, block_count);
-            self.log_maintenance_resync_counts();
             return WriteOutcome::Failed;
         };
         if result.status != CSW_STATUS_PASSED {
@@ -744,7 +701,6 @@ impl UsbMassStorage {
                 result.status as u32,
             );
             log_write_extent(lba, block_count);
-            self.log_maintenance_resync_counts();
             let protected = self
                 .collect_sense(b"USB MSC: WRITE(10)")
                 .is_some_and(|sense| (sense[2] & 0x0F) == SENSE_KEY_DATA_PROTECT);
@@ -760,58 +716,9 @@ impl UsbMassStorage {
                 result.residue,
             );
             log_write_extent(lba, block_count);
-            self.log_maintenance_resync_counts();
             return WriteOutcome::Failed;
         }
         WriteOutcome::Written
-    }
-
-    fn proactive_maintain(&mut self, direction: ResyncDirection) -> bool {
-        if !self.bot.maintain_command_boundary() {
-            uart::log(match direction {
-                ResyncDirection::Read => {
-                    b"USB MSC: proactive host cleanup failed before READ(10)\r\n"
-                }
-                ResyncDirection::Write => {
-                    b"USB MSC: proactive host cleanup failed before WRITE(10)\r\n"
-                }
-            });
-            self.log_maintenance_resync_counts();
-            return false;
-        }
-        self.reads_since_resync = 0;
-        self.maintenance_resyncs = self.maintenance_resyncs.wrapping_add(1);
-        let direction_count = match direction {
-            ResyncDirection::Read => {
-                self.read_maintenance_resyncs = self.read_maintenance_resyncs.wrapping_add(1);
-                self.read_maintenance_resyncs
-            }
-            ResyncDirection::Write => {
-                self.write_maintenance_resyncs = self.write_maintenance_resyncs.wrapping_add(1);
-                self.write_maintenance_resyncs
-            }
-        };
-        if direction_count == 1 || direction_count % RESYNC_LOG_INTERVAL == 0 {
-            uart::log_u32(
-                match direction {
-                    ResyncDirection::Read => b"USB MSC: proactive host cleanups before READ(10)=",
-                    ResyncDirection::Write => b"USB MSC: proactive host cleanups before WRITE(10)=",
-                },
-                direction_count,
-            );
-        }
-        true
-    }
-
-    fn log_maintenance_resync_counts(&self) {
-        uart::log_u32(
-            b"USB MSC:   proactive READ cleanups=",
-            self.read_maintenance_resyncs,
-        );
-        uart::log_u32(
-            b"USB MSC:   proactive WRITE cleanups=",
-            self.write_maintenance_resyncs,
-        );
     }
 
     /// Asks the device to commit its write cache to the medium
@@ -910,23 +817,6 @@ impl UsbMassStorage {
     /// Monotonic count of read-only READ(10) replays in this attachment.
     pub fn read_retry_count(&self) -> u32 {
         self.read_retries
-    }
-
-    /// Successful proactive BOT boundary resets in this attachment.
-    pub fn maintenance_resync_count(&self) -> u32 {
-        self.maintenance_resyncs
-    }
-
-    /// The same count split by which command asked for it.
-    ///
-    /// READ and WRITE cleanups are removed by separate go/no-go decisions
-    /// (`docs/USB_BOT_HCD_REFACTOR_PLAN.md` stages 5 and 6), so a single
-    /// total cannot say which of the two a run actually exercised.
-    pub fn maintenance_resync_counts(&self) -> (u32, u32) {
-        (
-            self.read_maintenance_resyncs,
-            self.write_maintenance_resyncs,
-        )
     }
 
     /// The Stage 0 baseline counters of the BOT session under this device.

@@ -67,10 +67,20 @@ pub struct TransportObservation {
     /// Of those, the ones whose descriptor reported bytes already moved.
     pub retries_after_progress: u32,
     pub retry_progress_bytes: u32,
+    /// Commands that got as far as sending a CBW. A command refused before
+    /// that -- by a failed host cleanup, or by an unusable session -- never
+    /// reached the device at all, which is the distinction the FIFO-flush
+    /// fault injection gates on. A CBW that then failed mid-transfer is
+    /// still counted: part of it may have landed.
+    pub commands_started: u32,
     /// BOT Reset Recovery sequences started after a real transport failure.
     pub reset_recoveries: u32,
     /// How many of those the device did not answer.
     pub reset_recovery_failures: u32,
+    /// Host cleanups abandoned because a FIFO flush did not finish. Every
+    /// one of these stopped a packet from being resent, or retired the
+    /// session rather than running Reset Recovery through a stuck FIFO.
+    pub cleanup_failures: u32,
     /// Status wrappers whose received length was not exactly 13 bytes.
     pub csw_short: u32,
     /// Full-length wrappers whose signature was not `USBS`.
@@ -195,7 +205,7 @@ pub struct BulkOnlyTransport {
     packet_retries: u32,
     /// Stage 0 observation counters (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`).
     /// A single "retries" total cannot say whether the transport is losing
-    /// packets or the device is simply slow, and the two lead to opposite
+    /// packets or the device is simply slow, and the two led to opposite
     /// conclusions about removing the proactive cleanup.
     packet_error_retries: u32,
     timeout_retries: u32,
@@ -208,8 +218,10 @@ pub struct BulkOnlyTransport {
     /// Of those, the ones whose descriptor did report bytes already moved.
     retries_after_progress: u32,
     retry_progress_bytes: u32,
+    commands_started: u32,
     reset_recoveries: u32,
     reset_recovery_failures: u32,
+    cleanup_failures: u32,
     csw_short: u32,
     csw_bad_signature: u32,
     csw_tag_mismatch: u32,
@@ -255,8 +267,10 @@ impl BulkOnlyTransport {
             retries_refused: 0,
             retries_after_progress: 0,
             retry_progress_bytes: 0,
+            commands_started: 0,
             reset_recoveries: 0,
             reset_recovery_failures: 0,
+            cleanup_failures: 0,
             csw_short: 0,
             csw_bad_signature: 0,
             csw_tag_mismatch: 0,
@@ -294,8 +308,15 @@ impl BulkOnlyTransport {
         if result.is_some() {
             // A command that got through is the only evidence that the
             // session is healthy, so it is the only thing that clears the
-            // count.
+            // count -- and the only thing that lets the session say again
+            // that it has started skipping commands. Neither was ever
+            // cleared by the proactive boundary cleanup that used to run
+            // here: it ran whether or not anything was wrong, so letting it
+            // reset the count made a session that recovered, failed,
+            // recovered and failed again look like four independent first
+            // failures.
             self.consecutive_recoveries = 0;
+            self.reported_unusable = false;
         }
         if result.is_none() {
             // The phase says which USB transfer failed, but without the CDB
@@ -316,7 +337,29 @@ impl BulkOnlyTransport {
             // error is not sufficient. Restore the controller-local state,
             // then perform the BOT Reset Recovery sequence before allowing
             // a later command to use this persistent session.
-            hcd::recover_channel_after_packet_failure();
+            let cleanup = hcd::recover_failed_packet(hcd::FailureScope::Abandoned);
+            if let Some(fifo) = cleanup.failed_fifo() {
+                // Reset Recovery is a pair of control transfers followed by
+                // more bulk traffic, all of it through the FIFO that just
+                // refused to empty. Running it would put a fresh SETUP on
+                // top of the previous transfer's residue and report whatever
+                // came back as a recovered session.
+                self.cleanup_failures = self.cleanup_failures.saturating_add(1);
+                uart::log(b"USB BOT: host cleanup could not flush the ");
+                uart::log(fifo.name().as_bytes());
+                uart::log(b" FIFO; this session needs re-enumeration\r\n");
+                self.last_recovery_succeeded = false;
+                self.unusable = true;
+                return result;
+            }
+            if cleanup.skipped_for_periodic() {
+                // Worth saying explicitly on the failure path: this recovery
+                // deliberately left the shared FIFOs alone so that a keyboard
+                // or mouse on the same controller keeps its session. If the
+                // recovery below then does not hold, leftover receive residue
+                // is one of the candidates.
+                uart::log(b"USB BOT: recovery left the shared FIFOs to the periodic endpoints\r\n");
+            }
             self.reset_recoveries = self.reset_recoveries.saturating_add(1);
             self.last_recovery_succeeded = self.reset_recovery();
             if self.last_recovery_succeeded {
@@ -362,31 +405,6 @@ impl BulkOnlyTransport {
         self.unusable || hcd::bus_unusable()
     }
 
-    /// Clears controller-side residue at a healthy BOT command boundary.
-    ///
-    /// This deliberately does not send Mass Storage Reset or reset endpoint
-    /// toggles. Real filesystem traffic invoked the old proactive reset 386
-    /// times before check 4, and two different devices then stopped answering
-    /// at the same command positions. Full BOT Reset Recovery remains on the
-    /// actual transport-failure path in `execute_command`.
-    pub fn maintain_command_boundary(&mut self) -> bool {
-        self.last_recovery_succeeded = false;
-        if self.unusable || hcd::bus_unusable() {
-            return false;
-        }
-        // Keep the part the previous A/B proved useful: without this host-side
-        // cleanup, a valid tag N-1 CSW remained visible to command N and the
-        // second WRITE failed. Only the device-facing reset is removed.
-        hcd::recover_channel_after_packet_failure();
-        if hcd::bus_unusable() {
-            self.unusable = true;
-            return false;
-        }
-        self.consecutive_recoveries = 0;
-        self.reported_unusable = false;
-        true
-    }
-
     /// Number of one-packet QTDs resubmitted after status 1 or timeout.
     pub fn packet_retry_count(&self) -> u32 {
         self.packet_retries
@@ -401,8 +419,10 @@ impl BulkOnlyTransport {
             retries_refused: self.retries_refused,
             retries_after_progress: self.retries_after_progress,
             retry_progress_bytes: self.retry_progress_bytes,
+            commands_started: self.commands_started,
             reset_recoveries: self.reset_recoveries,
             reset_recovery_failures: self.reset_recovery_failures,
+            cleanup_failures: self.cleanup_failures,
             csw_short: self.csw_short,
             csw_bad_signature: self.csw_bad_signature,
             csw_tag_mismatch: self.csw_tag_mismatch,
@@ -431,6 +451,7 @@ impl BulkOnlyTransport {
             CBW_FLAGS_DATA_OUT
         };
         let mut cbw = build_cbw(tag, data.len() as u32, flags, cdb);
+        self.commands_started = self.commands_started.saturating_add(1);
         hcd::set_transfer_label(hcd::TransferLabel::CommandBlock);
         let Some(cbw_sent) = self.bulk_transfer_out(b"CBW", &mut cbw) else {
             uart::log(b"USB BOT: CBW send failed\r\n");
@@ -768,7 +789,7 @@ impl BulkOnlyTransport {
                 // whose toggle it has already advanced past. Ten write
                 // rounds out of ten verified this by reading the medium back
                 // with Force Unit Access.
-                PacketOutcome::PacketError(_progress) if can_retry_error => {
+                PacketOutcome::PacketError(progress) if can_retry_error => {
                     packet_error_retries += 1;
                     self.packet_retries = self.packet_retries.wrapping_add(1);
                     self.packet_error_retries = self.packet_error_retries.saturating_add(1);
@@ -786,7 +807,13 @@ impl BulkOnlyTransport {
                     // Removing it made the same status-1 QTD repeat until all
                     // 20 retries were exhausted (Stage 3, real-device round
                     // 2). Keep the same DATA PID across the cleanup.
-                    hcd::recover_reported_packet_error(endpoint.is_in);
+                    let cleanup =
+                        hcd::recover_failed_packet(hcd::FailureScope::ReportedPacketError {
+                            is_in: endpoint.is_in,
+                        });
+                    if self.note_failed_cleanup(cleanup) {
+                        return PacketOutcome::PacketError(progress);
+                    }
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
                 PacketOutcome::PacketError(progress) => {
@@ -801,7 +828,10 @@ impl BulkOnlyTransport {
                     if timeout_retries == 1 {
                         log_packet_retry(b"timeout", phase, endpoint, pid_data1, timeout_retries);
                     }
-                    hcd::recover_channel_after_packet_failure();
+                    let cleanup = hcd::recover_failed_packet(hcd::FailureScope::Abandoned);
+                    if self.note_failed_cleanup(cleanup) {
+                        return PacketOutcome::Timeout(progress);
+                    }
                     delay_ms(BULK_PACKET_RETRY_DELAY_MS);
                 }
                 PacketOutcome::Timeout(progress) => {
@@ -820,6 +850,25 @@ impl BulkOnlyTransport {
                 PacketOutcome::Error => return PacketOutcome::Error,
             }
         }
+    }
+
+    /// Records a cleanup that could not finish, returning whether the
+    /// caller must stop.
+    ///
+    /// A retry after a failed cleanup is not a retry: the resent packet
+    /// would go out through a FIFO still holding the bytes of the one that
+    /// just failed. Stopping here hands the original outcome back to
+    /// `execute_command`, whose own cleanup then fails the same way and
+    /// retires the session.
+    fn note_failed_cleanup(&mut self, cleanup: hcd::CleanupOutcome) -> bool {
+        let Some(fifo) = cleanup.failed_fifo() else {
+            return false;
+        };
+        self.cleanup_failures = self.cleanup_failures.saturating_add(1);
+        uart::log(b"USB BOT: packet cleanup could not flush the ");
+        uart::log(fifo.name().as_bytes());
+        uart::log(b" FIFO; not resending this packet\r\n");
+        true
     }
 
     /// Records an **abandoned** packet the budget would still have allowed

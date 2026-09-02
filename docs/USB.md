@@ -25,9 +25,11 @@ USB Serial/JTAG（GPIO24/25）は対象外です。
 - 1段のUSBハブ配下の複数デバイス列挙と逐次ポーリング（`src/usb/hub.rs`）。
 - USB Mass Storageの読み出し（`src/usb/msc.rs`）。詳細は
   [`STORAGE.md`](STORAGE.md)。直結・ハブ経由のどちらでも動作します。
-  書き込み（WRITE(10)、`usbwritetest`）も実装・実機受入済みですが、間欠故障の根本原因は
-  未特定で、各WRITE前の予防的BOT再同期を必要とします
-  （[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)）。
+  書き込み（WRITE(10)、`usbwritetest`）も実装・実機受入済みです。かつては間欠故障の
+  緩和として各READ 16回ごと／各WRITE直前に予防的BOT再同期を必要としましたが、
+  HCD側の契約を整えた結果それ無しで通るようになり、撤去しました
+  （[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)、
+  [`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。
 - High-Speedハブ配下にFull/Low-Speedデバイスを繋ぐ構成（Split Transaction）。
 
 ## 中断したFloppy実装
@@ -210,13 +212,53 @@ channel 1〜4で待機中のHIDのin-flightデータが道連れになり、**�
 キーボードのsessionを殺します**（実機では`usbfs on`でHIDを繋いだ後、`usbwritetest`で
 HIDのポートが死にました）。
 
-現在、`recover_channel_after_packet_failure`はperiodicチャネルがarmされている間は
+現在、channel 0のcleanupはperiodicチャネルがarmされている間は
 **non-periodic TX FIFOだけをflushします**（channel 0が送信に使うのはそこだけです）。
 skipした場合は`USB: periodic channels armed, flushed only the non-periodic FIFO`を
 出します。代償は失敗した転送の残骸がRX FIFOに残り得ることですが、動作中のキーボードを
 無関係なデバイスの失敗で壊すほうが実害が大きいと判断しています。Split転送の後始末は
 従来どおり全FIFOをflushします（Splitとperiodicは`enter_split_mode`により排他なので、
 巻き添えにするものが存在しません）。
+
+## cleanupの3つの結果と失敗の伝播
+
+FIFO flushの結果は`Fifo`（`nptx`／`ptx`／`rx`）ごとに**実行・timeout・skip**の3つを
+別々に数えます（`usbhw`の`BOT: fifo-flush`／`fifo-timeout`／`fifo-skipped`）。
+skipは失敗ではありません——上記のとおり動作中のHIDを守るための意図的な省略で、
+cleanupはそのまま続行できます。timeoutだけが失敗です。1つのcleanupが返す
+`CleanupOutcome`は、最初にtimeoutしたFIFOの名前を保持します。
+
+cleanupの入口は用途ごとに分かれています。
+
+| API | いつ | flushする範囲 |
+| --- | --- | --- |
+| `hcd::recover_failed_packet(FailureScope::Abandoned)` | timeout、halt不能、原因不明 | 全FIFO（periodic arm中はnon-periodic TXだけ） |
+| `hcd::recover_failed_packet(FailureScope::ReportedPacketError)` | coreがpacket errorを報告済み | OUTはnon-periodic TXだけ、INは上と同じ |
+
+この2つが channel 0のcleanupのすべてで、**正常に完了したpacketはどれも呼びません**。
+かつては正常なBOT command境界でも同じ入口を呼んでいましたが、READ 16回ごと・WRITE毎回の
+予防cleanupは3構成の実機A/B（各1000 read／100 write）を経て撤去しました。deviceへ
+Mass Storage Resetを送るBOT Reset Recoveryは`bot.rs`側の別手順で、host側cleanupが
+成功したときにだけ実行します。
+
+flushがtimeoutした場合は、**そのcleanupが用意していたcommandを開始しません**。
+
+- 実失敗後のrecoveryでtimeoutした場合、BOT Reset Recoveryは実行せずMSC sessionを
+  使用不能にします。Reset Recoveryのcontrol転送とその後のbulkは、いま空にできなかった
+  FIFOを通るので、実行しても「回復した」という誤った結論しか得られません。
+- packet retryのcleanupでtimeoutした場合、同じpacketを再送しません。元の失敗outcomeを
+  そのまま返し、上のcommand単位の処理へ委ねます。
+
+いずれの場合もUARTへ`could not flush the <fifo> FIFO`とその後の判断を出し、
+`MSC: cleanup-failed`へ加算します。
+
+なお`fifo-skipped`は**HIDを繋いでいても0のことがあります**。skipはpersistent periodic
+channelがarmされている間だけ起き、`enable_periodic_hid`はsplitが要る経路を拒否するので、
+High-Speedハブ配下のLow-Speed HIDは構造上periodic channelを取れません。frame poll
+fallbackで動いているHIDはchannel 1〜4を持たないため、cleanupは3 FIFOとも実行します。
+A／B／C 3構成の実機確認では`fifo-skipped`は一度も発火していません。この経路は正常なhardwareでは到達できないため、
+`usbcachefail`の[4/4]がflush timeoutを注入して確認します
+（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。
 
 ## periodic HIDの停止検出
 
@@ -369,14 +411,11 @@ FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上�
   13/36/8 byteの短いIN応答は、QTD長をMPS倍数に保つ内蔵SRAM staging経由で受信します。
   channel 0のdescriptor完了はQTD statusだけでなくHCINT.XferComplとQTD Active解除も検査します。
   ChHltdだけの古い完了snapshotや、hardwareがまだ所有するQTDを新しいpacketの成功として回収しません。
-  連続READ(10)では、成功16回ごとにcommand間でchannel／FIFO cleanupを行います。実機ではFS-onlyで最短33回、
-  High-Speed直結でも52回後にBulk INからEP0まで無応答になったため、応答が残っている間に
-  controller側の古い受信状態を捨てる緩和策です。正常command間ではdeviceのMass Storage Resetと
-  endpoint CLEAR_FEATUREを行わず、DATA toggleを継続します。High-Speed直結の`ut 100`は予防cleanup 6回、retry 0で
-  100/100を完走しました。FS-onlyハブ＋HID併用でも同条件で100/100を完走し、試験後も
-  HIDは動作しました。root portとHIDはresetしません。
-  WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じhost cleanupを行います。
-  channel回復とDWC FIFO flushを外した実機A/Bでは、
+  正常なcommand境界ではcleanupを行いません。かつては連続READ(10)の16回ごとと各WRITE(10)の
+  直前にchannel／FIFO cleanupを行っていました——FS-onlyで最短33回、High-Speed直結でも52回後に
+  Bulk INからEP0まで無応答になる故障の緩和策です。上のdescriptor完了検査とcache同期契約を
+  入れたうえで実機A/Bしたところ、3構成すべてで予防cleanup無しの`usbcheck 1000`（read）と
+  100回のWRITEが通ったため撤去しました。なお当時、channel回復とDWC FIFO flushを外した実機A/Bでは、
   直前commandのCSWが次commandへ残って2回目のWRITEで停止したため、controller側residueのcleanupも
   維持します。実際のtransport failureでは従来どおりcleanup後に完全なBOT Reset Recoveryを実行します。
 ### 実転送長とretry安全性の契約
@@ -541,7 +580,8 @@ hardwareは拒否しないので、注入する以外にこの経路へ到達す
   `Split foreground poll interval ms=10`で確認できます。High-Speedハブ＋Low-Speed keyboardの
   実機では入力が安定し、エラーログなし、10秒静止時のSplit packet増加が約1,000回
   （約100 packet/秒）であることを確認済みです。同じハブへHigh-Speed MSCを追加した最終回帰も、
-  `ut 100`が100/100、failure／mismatch 0、packet／command retry 0、予防再同期6回でPASSしました。
+  `ut 100`が100/100、failure／mismatch 0、packet／command retry 0でPASSしました
+  （当時は予防再同期6回。現在は予防cleanup自体がありません）。
   直後の`usbhw`はSplit 1,126 packet／2,370 round、conflict 0、active 0、stale token 0、
   port eventなしでした。
 - USB-Aの5V（VBUS）は2個目のPI4IOE5V6408（E2、I2Cアドレス`0x44`）のbit 3です。
@@ -659,7 +699,7 @@ Configuration Descriptor:
 | `usbwritetest <lba>` | USB MSCの1ブロック書き込み・照合・復元 |
 | `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲でraw WRITE・照合・復元。gapはWRITE command間の0〜2000 ms（既定0） |
 | `usbzero <lba> [count]` | USB MSCの1〜8ブロックをゼロで上書き（破壊的）。テスト失敗後の後始末 |
-| `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数・予防再同期数を表示） |
+| `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数を表示） |
 | `usbmargin [rounds]` | VBUSを切って入れ直し、LBA 0が読めるまでの時間を計測（read-only、既定5回、最大20回） |
 
 未対応デバイスが列挙まで成功した場合、UARTには各interfaceの

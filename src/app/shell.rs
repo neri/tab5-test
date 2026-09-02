@@ -1088,9 +1088,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         id: Cmd::Usbcachefail,
         usage: "usbcachefail",
         lines: &[
-            "USB: inject one refused DMA cache sync and check the transfer fails",
-            "before the channel is armed, publishing nothing. tests driver logic,",
-            "so one run covers every topology. may end the MSC session.",
+            "USB: inject a refused DMA cache sync, a stale completion, a short",
+            "OUT and a FIFO flush timeout, and check each one fails the transfer",
+            "instead of being absorbed. tests driver logic, so one run covers",
+            "every topology. reads only, never writes. ends the MSC session by",
+            "design; run usbrescan afterwards.",
         ],
     },
     HelpEntry {
@@ -3383,7 +3385,6 @@ fn run_usb_read_soak(
     let mut reference = [0u8; STORAGE_BYTES];
     let mut current = [0u8; STORAGE_BYTES];
     let retries_before = mass_storage.read_retry_count();
-    let resyncs_before = mass_storage.maintenance_resync_count();
     let packet_retries_before = mass_storage.packet_retry_count();
     if !mass_storage.read_blocks(0, &mut reference) {
         let mut line = Line::new();
@@ -3409,9 +3410,6 @@ fn run_usb_read_soak(
     }
 
     let retries = mass_storage.read_retry_count().wrapping_sub(retries_before);
-    let resyncs = mass_storage
-        .maintenance_resync_count()
-        .wrapping_sub(resyncs_before);
     let packet_retries = mass_storage
         .packet_retry_count()
         .wrapping_sub(packet_retries_before);
@@ -3433,8 +3431,6 @@ fn run_usb_read_soak(
     line.push_u32(packet_retries);
     line.push_str(" command_retries=");
     line.push_u32(retries);
-    line.push_str(" proactive_resyncs=");
-    line.push_u32(resyncs);
     console.write_output_line(framebuffer, line.as_str());
 
     let outcome = ReadSoakOutcome {
@@ -8792,8 +8788,6 @@ fn run_usb_write_test(
 struct UsbCheckCounters {
     host: usb::HostObservation,
     transport: usb::TransportObservation,
-    read_cleanups: u32,
-    write_cleanups: u32,
     command_retries: u32,
 }
 
@@ -8805,12 +8799,9 @@ fn usb_check_counters(usb_host: &usb::UsbHost) -> UsbCheckCounters {
             ..Default::default()
         };
     };
-    let (read_cleanups, write_cleanups) = storage.maintenance_resync_counts();
     UsbCheckCounters {
         host,
         transport: storage.transport_observation(),
-        read_cleanups,
-        write_cleanups,
         command_retries: storage.read_retry_count(),
     }
 }
@@ -9450,25 +9441,35 @@ fn write_usbcheck_deltas(
         console.write_output_line(framebuffer, line.as_str());
     }
 
-    let mut line = Line::new();
-    line.push_str("usbcheck: delta fifo-timeout");
-    for (index, name) in ["nptx", "ptx", "rx"].iter().enumerate() {
-        line.push_str(" ");
-        push_delta(
-            &mut line,
-            name,
-            after.host.fifo_flush_timeouts[index],
-            before.host.fifo_flush_timeouts[index],
-        );
+    // Flushed, timed out and skipped are three different outcomes per FIFO,
+    // and a run that reports only the first cannot say whether the shared
+    // FIFOs were cleaned or deliberately left alone for a live keyboard.
+    let fifos = usb::fifo_names();
+    for (heading, after_counts, before_counts) in [
+        (
+            "usbcheck: delta fifo-flush ",
+            &after.host.fifo_flushes,
+            &before.host.fifo_flushes,
+        ),
+        (
+            "usbcheck: delta fifo-timeout",
+            &after.host.fifo_flush_timeouts,
+            &before.host.fifo_flush_timeouts,
+        ),
+        (
+            "usbcheck: delta fifo-skipped",
+            &after.host.fifo_flushes_skipped_for_periodic,
+            &before.host.fifo_flushes_skipped_for_periodic,
+        ),
+    ] {
+        let mut line = Line::new();
+        line.push_str(heading);
+        for (index, name) in fifos.iter().enumerate() {
+            line.push_str(" ");
+            push_delta(&mut line, name, after_counts[index], before_counts[index]);
+        }
+        console.write_output_line(framebuffer, line.as_str());
     }
-    line.push_str(" ");
-    push_delta(
-        &mut line,
-        "skipped",
-        after.host.fifo_flushes_skipped_for_periodic,
-        before.host.fifo_flushes_skipped_for_periodic,
-    );
-    console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
     line.push_str("usbcheck: delta packet-cleanup ");
@@ -9481,21 +9482,19 @@ fn write_usbcheck_deltas(
     console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
-    line.push_str("usbcheck: delta proactive ");
-    push_delta(&mut line, "read", after.read_cleanups, before.read_cleanups);
-    line.push_str(" ");
-    push_delta(
-        &mut line,
-        "write",
-        after.write_cleanups,
-        before.write_cleanups,
-    );
-    line.push_str(" ");
+    line.push_str("usbcheck: delta ");
     push_delta(
         &mut line,
         "cmd-retry",
         after.command_retries,
         before.command_retries,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "cleanup-failed",
+        after.transport.cleanup_failures,
+        before.transport.cleanup_failures,
     );
     console.write_output_line(framebuffer, line.as_str());
 
@@ -9613,17 +9612,18 @@ fn write_usbcheck_deltas(
     console.write_output_line(framebuffer, line.as_str());
 }
 
-/// Proves that the three faults the HCD contract exists to catch are
+/// Proves that the four faults the HCD contract exists to catch are
 /// detected rather than absorbed.
 ///
-/// Stages 1 and 2 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` add rules that
+/// Stages 1, 2 and 4 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` add rules that
 /// working hardware never exercises: a refused DMA cache synchronization
 /// must stop the packet before the channel is armed and publish nothing; a
 /// completion arriving under a generation the slot no longer holds must not
 /// be accepted; an OUT that moved fewer bytes than it was given must not
-/// reach the layer above as a success. None of the three can be produced on
-/// demand by a device, so each is injected here. A rule that has never been
-/// seen to fire is a rule nobody knows works.
+/// reach the layer above as a success; and a host cleanup whose FIFO flush
+/// did not finish must stop the command it was preparing for. None of the
+/// four can be produced on demand by a device, so each is injected here. A
+/// rule that has never been seen to fire is a rule nobody knows works.
 ///
 /// Topology-independent: this tests the driver's own logic, so one run
 /// covers every configuration in the matrix.
@@ -9635,6 +9635,7 @@ fn cmd_usbcachefail(
     let mut all = usb_fault_cache_sync(console, framebuffer, usb_host);
     all &= usb_fault_stale_completion(console, framebuffer, usb_host);
     all &= usb_fault_short_out(console, framebuffer, usb_host);
+    all &= usb_fault_fifo_flush(console, framebuffer, usb_host);
 
     console.write_output_line(
         framebuffer,
@@ -9736,7 +9737,7 @@ fn usb_fault_cache_sync(
     }
     console.write_output_line(
         framebuffer,
-        "usbcachefail: [1/3] refusing every data-IN cache sync of the next read",
+        "usbcachefail: [1/4] refusing every data-IN cache sync of the next read",
     );
 
     let refusals_before = usb::cache_refusal_count();
@@ -9759,21 +9760,21 @@ fn usb_fault_cache_sync(
         framebuffer,
         "usbcachefail",
         refusals >= 1 && counted >= 1,
-        "[1/3] the refusal failed the packet as a cache-sync failure",
+        "[1/4] the refusal failed the packet as a cache-sync failure",
     );
     all &= write_gate_named(
         console,
         framebuffer,
         "usbcachefail",
         !read_ok,
-        "[1/3] the read failed rather than succeeding",
+        "[1/4] the read failed rather than succeeding",
     );
     all &= write_gate_named(
         console,
         framebuffer,
         "usbcachefail",
         buffer.iter().all(|byte| *byte == USB_FAULT_SENTINEL),
-        "[1/3] no bytes were published over the destination",
+        "[1/4] no bytes were published over the destination",
     );
     all
 }
@@ -9790,7 +9791,7 @@ fn usb_fault_stale_completion(
     }
     console.write_output_line(
         framebuffer,
-        "usbcachefail: [2/3] delivering the next completions under a stale generation",
+        "usbcachefail: [2/4] delivering the next completions under a stale generation",
     );
 
     let before = usb::host_observation().packet_failures_by_kind;
@@ -9813,21 +9814,21 @@ fn usb_fault_stale_completion(
         framebuffer,
         "usbcachefail",
         counted >= 1 && stale_tokens >= 1,
-        "[2/3] the stale completion was rejected and counted",
+        "[2/4] the stale completion was rejected and counted",
     );
     all &= write_gate_named(
         console,
         framebuffer,
         "usbcachefail",
         !read_ok,
-        "[2/3] the read failed rather than succeeding",
+        "[2/4] the read failed rather than succeeding",
     );
     all &= write_gate_named(
         console,
         framebuffer,
         "usbcachefail",
         buffer.iter().all(|byte| *byte == USB_FAULT_SENTINEL),
-        "[2/3] no bytes were published over the destination",
+        "[2/4] no bytes were published over the destination",
     );
     all
 }
@@ -9844,7 +9845,7 @@ fn usb_fault_short_out(
     }
     console.write_output_line(
         framebuffer,
-        "usbcachefail: [3/3] reporting the next OUT packets one byte short",
+        "usbcachefail: [3/4] reporting the next OUT packets one byte short",
     );
 
     let before = usb::host_observation().packet_failures_by_kind;
@@ -9866,16 +9867,114 @@ fn usb_fault_short_out(
         framebuffer,
         "usbcachefail",
         counted >= 1,
-        "[3/3] the short OUT was rejected and counted",
+        "[3/4] the short OUT was rejected and counted",
     );
     all &= write_gate_named(
         console,
         framebuffer,
         "usbcachefail",
         !read_ok,
-        "[3/3] the command failed rather than succeeding",
+        "[3/4] the command failed rather than succeeding",
     );
     all
+}
+
+/// Stage 4: when the host cleanup after a real failure cannot flush a FIFO,
+/// the session is retired instead of running BOT Reset Recovery through a
+/// FIFO that could not be emptied.
+///
+/// Two injections at once, because the cleanup being tested only runs after
+/// something has already failed: a refused data-IN cache sync fails the
+/// READ(10), and the FIFO flush timeout then fails the cleanup that failure
+/// triggers.
+///
+/// Until Stage 6 this check aimed at the proactive cleanup that used to run
+/// before every WRITE(10). That cleanup is gone -- three topologies ran
+/// 1000 reads and 100 writes each without it -- so the contract that
+/// remains is this one, on the failure path, which is also the one with
+/// teeth: Reset Recovery is a pair of control transfers plus more bulk
+/// traffic, all of it through the FIFO that just refused to empty.
+fn usb_fault_fifo_flush(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    if !usb_fault_reset(console, framebuffer, usb_host) {
+        return false;
+    }
+    console.write_output_line(
+        framebuffer,
+        "usbcachefail: [4/4] failing a read, then reporting its cleanup flush as timed out",
+    );
+
+    let Some(before) = usb_host
+        .mass_storage()
+        .map(usb::UsbMassStorage::transport_observation)
+    else {
+        console.write_output_line(framebuffer, "usbcachefail: [4/4] SKIP no USB Mass Storage");
+        return false;
+    };
+    let timeouts_before = usb_fault_fifo_timeout_total();
+    let mut buffer = [USB_FAULT_SENTINEL; USB_FAULT_BLOCK];
+
+    let _ = usb::force_cache_refusals(USB_FAULT_ARMED, Some(usb::TransferLabel::DataIn));
+    let _ = usb::force_fifo_flush_timeouts(USB_FAULT_ARMED);
+    let read_ok = usb_host
+        .mass_storage_mut()
+        .is_some_and(|storage| storage.read_blocks(0, &mut buffer));
+    let _ = usb::force_fifo_flush_timeouts(0);
+    let _ = usb::force_cache_refusals(0, None);
+
+    let after = usb_host
+        .mass_storage()
+        .map(usb::UsbMassStorage::transport_observation)
+        .unwrap_or_default();
+    let timeouts = usb_fault_fifo_timeout_total().wrapping_sub(timeouts_before);
+    let cleanup_failures = after.cleanup_failures.wrapping_sub(before.cleanup_failures);
+    let recoveries = after.reset_recoveries.wrapping_sub(before.reset_recoveries);
+    let retired = usb_host
+        .mass_storage()
+        .is_some_and(usb::UsbMassStorage::needs_reinit);
+
+    let mut all = write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        timeouts >= 1 && cleanup_failures >= 1,
+        "[4/4] the flush timeout failed the cleanup and was counted",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        !read_ok,
+        "[4/4] the read failed rather than succeeding",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        recoveries == 0,
+        "[4/4] no BOT Reset Recovery was attempted through the stuck FIFO",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        retired,
+        "[4/4] the session was retired for re-enumeration",
+    );
+    all
+}
+
+/// Flush timeouts across all three FIFOs. Which one the cleanup reached
+/// first depends on whether a periodic endpoint is armed, so the check adds
+/// them up rather than naming one.
+fn usb_fault_fifo_timeout_total() -> u32 {
+    usb::host_observation()
+        .fifo_flush_timeouts
+        .iter()
+        .fold(0u32, |total, count| total.wrapping_add(*count))
 }
 
 /// How many failures of `kind` have been counted since `before`.
@@ -10393,13 +10492,10 @@ fn write_bot_baseline(
         console.write_output_line(framebuffer, line.as_str());
         return;
     };
-    let (read_cleanups, write_cleanups) = storage.maintenance_resync_counts();
     write_bot_session_baseline(
         console,
         framebuffer,
         &storage.transport_observation(),
-        read_cleanups,
-        write_cleanups,
         storage.read_retry_count(),
     );
 }
@@ -10547,16 +10643,22 @@ fn write_bot_host_baseline(
     line.push_hex(host.last_packet_failure_qtd, 8);
     console.write_output_line(framebuffer, line.as_str());
 
-    let mut line = Line::new();
-    line.push_str("BOT: fifo-timeout nptx=");
-    line.push_u32(host.fifo_flush_timeouts[0]);
-    line.push_str(" ptx=");
-    line.push_u32(host.fifo_flush_timeouts[1]);
-    line.push_str(" rx=");
-    line.push_u32(host.fifo_flush_timeouts[2]);
-    line.push_str(" skipped=");
-    line.push_u32(host.fifo_flushes_skipped_for_periodic);
-    console.write_output_line(framebuffer, line.as_str());
+    let fifos = usb::fifo_names();
+    for (heading, counts) in [
+        ("BOT: fifo-flush", &host.fifo_flushes),
+        ("BOT: fifo-timeout", &host.fifo_flush_timeouts),
+        ("BOT: fifo-skipped", &host.fifo_flushes_skipped_for_periodic),
+    ] {
+        let mut line = Line::new();
+        line.push_str(heading);
+        for (index, name) in fifos.iter().enumerate() {
+            line.push_str(" ");
+            line.push_str(name);
+            line.push_str("=");
+            line.push_u32(counts[index]);
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
 
     let mut line = Line::new();
     line.push_str("BOT: packet-cleanup out-nptx=");
@@ -10570,16 +10672,10 @@ fn write_bot_session_baseline(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     transport: &usb::TransportObservation,
-    read_cleanups: u32,
-    write_cleanups: u32,
     command_retries: u32,
 ) {
     let mut line = Line::new();
-    line.push_str("MSC: proactive read=");
-    line.push_u32(read_cleanups);
-    line.push_str(" write=");
-    line.push_u32(write_cleanups);
-    line.push_str(" cmd-retry=");
+    line.push_str("MSC: cmd-retry=");
     line.push_u32(command_retries);
     console.write_output_line(framebuffer, line.as_str());
 
@@ -10592,6 +10688,13 @@ fn write_bot_session_baseline(
     line.push_u32(transport.retries_after_progress);
     line.push_str(" bytes=");
     line.push_u32(transport.retry_progress_bytes);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("MSC: commands=");
+    line.push_u32(transport.commands_started);
+    line.push_str(" cleanup-failed=");
+    line.push_u32(transport.cleanup_failures);
     console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();

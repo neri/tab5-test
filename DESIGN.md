@@ -95,9 +95,13 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   読み取り専用です。電断に対する原子性や自動修復は保証しません——保証するのは
   エラーを返さず完了した通常操作が同じ内容で読み出せることまでです
   （[FILESYSTEM.md](docs/FILESYSTEM.md)）。SDのUHS-Iモードは未実装です。
-  ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みですが、間欠故障の
-  根本原因は未特定で、各WRITE前のhost controller FIFO cleanupを必要とします
+  ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みです。かつては間欠故障の
+  緩和として各WRITE前・READ 16回ごとのhost controller FIFO cleanupを必要としましたが、
+  HCD側の契約（DMA buffer所有とcache同期、descriptor完了の検査、実転送長の単一化、
+  cleanup失敗の伝播）を整えた結果、3構成の実機A/Bで不要と確認して撤去しました。
+  1回のWRITE(10)は1ブロックのままです
   （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
+  [USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
   [STORAGE.md](docs/STORAGE.md)）。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です

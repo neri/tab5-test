@@ -75,8 +75,7 @@ BLACK/REDです。通常のproduction設定だけを100回確認するときは`
 結果の`usb retries: packet=... command=...`はそれぞれ同一BOT phase内のpacket再投入回数と、
 BOT Reset Recovery後のREAD(10)再送回数です。複合試験前にUSBだけを短く確認する場合は`ut`を
 実行します。既定で同じ4 KiBを100回read・比較し、`completed`、transport `failures`、data
-`mismatch`に加え、`packet_retries`、`command_retries`、`proactive_resyncs`を表示します。
-最後の値は、応答が止まる前にBOT command境界を再同期できた回数です。
+`mismatch`に加え、`packet_retries`と`command_retries`を表示します。
 
 `mix`の結果には`rescans=...`も表示します。BOT ResetのEP0 recoveryまで失敗したときだけroot
 portをreset・再列挙し、再接続したMSCから同じread-only 4 KiBを取得します。開始時の基準dataと
@@ -205,7 +204,7 @@ USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::re
 Hub portのdevice descriptor取得に失敗した場合、通常の増分スキャンは同じ物理接続を保留して
 接続状態だけquietに監視します。約1秒ごとにport reset／列挙エラーを出し続けることはなく、抜き差し
 または明示的なfull rescanでだけ再試行します。第9版は起動時に`USB ENUM: bounded retry v9`を出します。
-ESP-IDF既定のbalanced FIFO分割、BOT予防再同期、周期SSPLITの位相合わせを組み合わせた修正版は
+ESP-IDF既定のbalanced FIFO分割と周期SSPLITの位相合わせを組み合わせた修正版は
 続けて`USB STABILITY: fault-rescan retry v42`を出します。両classが同じbusへ登録されると
 `USB: MSC present, serializing HID and bulk on channel 0`が続きます。
 
@@ -290,17 +289,19 @@ timeout、stuff、false EOP、excessive NAKのいずれかです。BOT層は1 pa
 QTDへ分割し、各完了後にsoftwareが次のDATA PIDを決めます。成功した再投入は
 `packet_retries`へ数えます。
 
-連続READでは、成功したREAD(10)を16回処理するごとにcommand間でhost channel／FIFO cleanupを
-実行します。この正常境界ではMass Storage Reset／`CLEAR_FEATURE(ENDPOINT_HALT)`を送らず、
-両toggleを継続します。
-実機で最短33 READ後にBulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔で
-BOT境界を再確立する予防策です。root portやHIDはresetしません。`ut`開始ログは
-`USB TEST: fault-rescan retry v42`、実行回数は`proactive_resyncs=`で確認します。
-WRITE(10)の直前にも同じ再同期を行います。成功ログは方向別の初回と64回ごとだけを
-`USB MSC: proactive BOT resyncs before READ(10)=N`または
-`USB MSC: proactive BOT resyncs before WRITE(10)=N`として出します。再同期または
-READ／WRITE転送が失敗した場合は間引かず、LBA、block数、READのFUA有無、および方向別の
-累計再同期回数を続けて出します。大量転送の同一行で、直前の異常ログを埋もれさせないためです。
+正常なcommand境界ではcleanupを行いません。かつては成功したREAD(10) 16回ごとと
+WRITE(10)の直前にhost channel／FIFO cleanupを実行していました——実機で最短33 READ後に
+BulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔でBOT境界を再確立する
+予防策です。HCD側の契約を整えたうえで3構成の実機A/Bを行い、READ 1000回・WRITE 100回とも
+cleanup無しで通ったため撤去しました（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)の
+Stage 5・6）。`proactive_resyncs=`と`USB MSC: proactive ...`のログはこの撤去で消えています。
+`ut`開始ログの`USB TEST: fault-rescan retry v42`は残ります。
+
+cleanupが残っているのは**失敗後だけ**です。そこでFIFO flushがtimeoutした場合は、
+packetを再送せず、BOT Reset Recoveryも実行せずにsessionを引退させます。回数は
+`MSC: cleanup-failed`で見ます。
+
+READ／WRITE転送が失敗した場合はLBA、block数、READのFUA有無を続けて出します。
 
 受入試験1回分をまとめて実行するのは`usbcheck [reads] [lba]`です。前後のcounterを自分で
 採り、read soakと（LBAを指定した場合は）write 10回を実行し、**差分**とGo条件ごとの
@@ -348,15 +349,19 @@ Stage 0のbaseline counterを固定書式で表示します。0の項目も必�
   公開し得るかどうかを判断する数値です。`QTD=0x00000000`は「残量0で所有権解除」と
   「descriptorが書き戻されていない」を区別できない値なので、`act`をそのまま
   「全量転送済み」と読んではいけません。
-- `fifo-timeout`はTX（非periodic）／TX（periodic）／RXのflush timeout回数と、
-  periodic channelがarm中でflushを省略した回数（`skipped`）です。省略は失敗ではありませんが、
-  「全cleanup成功」とは別の状態です。
+- `fifo-flush`／`fifo-timeout`／`fifo-skipped`はTX（非periodic、`nptx`）／TX（periodic、`ptx`）／
+  RX（`rx`）それぞれについて、flushが完了した回数、timeoutした回数、periodic channelが
+  arm中で実行しなかった回数です。3つは別の状態で、まとめて「cleanup成功」と数えません。
+  skipは失敗ではなく、動作中のHIDを守るための意図的な省略です（下の「転送失敗の巻き添え」）。
+  timeoutだけが失敗で、その回のcleanupは対象のcommandを開始させません。
 - `packet-cleanup out-nptx`はreported OUT packet error後にnon-periodic TX FIFOだけをflushした
   回数です。`usbcheck`では`delta pkt-retry err`のうちOUT方向だった回数と対応します。
 
 `MSC:`で始まる行は接続中デバイスの現在のBOT sessionのもので、session再構築で0へ戻ります。
-`proactive`はREAD前／WRITE前の予防cleanup回数、`cmd-retry`はBOT Reset Recovery後の
-READ(10)再送、`pkt-retry`はpacket error／timeout別の再送回数です。`resubmit`は
+`cmd-retry`はBOT Reset Recovery後のREAD(10)再送、`cleanup-failed`は失敗後のcleanupで
+FIFO flushがtimeoutした回数、`pkt-retry`はpacket error／timeout別の再送回数です。`MSC: commands`はCBW送信まで進んだ
+command数で、`cleanup-failed`のぶんはここに入りません——「commandが失敗した」と
+「commandが始まらなかった」を区別するための対です。`resubmit`は
 転送長の契約が拒否した再送回数（`refused`）、そのうちdescriptorが実際にbyteを報告して
 いたもの（`progressed`）、そして**要求長より大きい残量**を書き戻されたdescriptorの数
 （`impossible-len`）です。最後のものは0になりません——このcoreはpacket error時に
@@ -386,36 +391,47 @@ PID／schedule情報、descriptor list addressが、直前の失敗から次のp
 `actual bytes=`、`QTD final=`が続きます。従来のログは失敗したことと`HCINT`しか言わず、
 要求byteのうち何byteが既に動いたのかを言いませんでした。
 
-`usbcachefail`はHCDの契約が守られていることを、正常なhardwareでは起こせない3つの故障を
-注入して確認します。1回の実行で3つとも試し、各段階でsessionが引退したら自動で
+`usbcachefail`はHCDの契約が守られていることを、正常なhardwareでは起こせない4つの故障を
+注入して確認します。1回の実行で4つとも試し、各段階でsessionが引退したら自動で
 再列挙してから次へ進みます。ドライバ自身の論理の試験なので接続構成ごとに繰り返す必要は
-なく、全体で1回で足ります。
+なく、全体で1回で足ります。媒体へ新しいdataは書きません。
 
-- **[1/3] cache同期拒否**（Stage 1）: DMA cache同期の拒否を**data IN phaseへ**注入し、その転送がchannelをarmする
+- **[1/4] cache同期拒否**（Stage 1）: DMA cache同期の拒否を**data IN phaseへ**注入し、その転送がchannelをarmする
 **前に**失敗すること、および宛先bufferへ1 byteも公開されないことを確認します。宛先は事前に
 `0x5A`で埋めます——deviceのdataでも、0埋めstagingでもない値なので、そのまま残っていれば
 何も上書きされていない証拠になります。正常なhardwareは拒否しないため、注入以外に
 この経路へ到達する方法はありません。ドライバ自身の論理の試験なので、接続構成ごとに
 繰り返す必要はなく1回で足ります。
 
-- **[2/3] 古い世代の完了**（Stage 2）: slotがもう持っていない世代でcompletionを渡し、
+- **[2/4] 古い世代の完了**（Stage 2）: slotがもう持っていない世代でcompletionを渡し、
   それが新しいpacketの結果として回収されないことを確認します。同期APIでは1つの
   `Channel0Transfer`が1回の`run_packet`内で生成・submit・reapされるので、この状態は
   構造上起こりません。検査はこれを置き換えるqueue型schedulerのためにあり、
   **一度も発火を観測していない検査は、動くかどうか誰も知らない検査**です。
-- **[3/3] 短いOUT**（Stage 2）: OUT packetを要求より1 byte少なく報告させ、それが
+- **[3/4] 短いOUT**（Stage 2）: OUT packetを要求より1 byte少なく報告させ、それが
   要求長分の成功として上位へ返らないことを確認します。READ(10)を使うので、
   注入が当たるのはcommand blockのOUT packetで、媒体には何も書きません。
+- **[4/4] FIFO flush timeout**（Stage 4）: **2つ同時に注入します**——data IN cache同期の
+  拒否でREAD(10)を失敗させ、その失敗が起こすcleanupのFIFO flushをtimeoutさせます。
+  試験対象のcleanupは何かが失敗した後にしか動かないためです。gateは4つ——timeoutが
+  cleanup失敗として数えられたこと、readが失敗したこと、**BOT Reset Recoveryが試行されて
+  いないこと**、sessionが引退したことです。3つ目が要点で、Reset Recoveryはcontrol転送と
+  bulkをいま空にできなかったFIFOへ通すため、実行すれば「回復した」という誤った結論しか
+  得られません。flush要求自体はhardwareへ発行してから結果だけを偽るので、注入がFIFOの
+  中身を実機の状態からずらすことはありません。Stage 6より前はWRITE(10)前の予防cleanupを
+  狙っていましたが、そのcleanupは撤去されたのでこちらへ移しました。
 
-[1/3]の注入は**操作回数ではなくphaseで狙います**。commandのdata phaseへ到達するまでのcache呼び出し
+[1/4]の注入は**操作回数ではなくphaseで狙います**。commandのdata phaseへ到達するまでのcache呼び出し
 回数は実装詳細で、間にReset Recoveryのcontrol転送も入るためです。phase指定なら回数に
 関係なく目的のpacketへ当たり、`Control`とlabelされたrecoveryは動けます。`msc.rs`は
 Reset Recovery後にREAD(10)を1回だけ再送するので、注入は再送を上回る回数armします——
 1回だけだと再送（完全に同期された転送）が成功して治ってしまい、retry方針が働いた
 だけの結果を契約違反と取り違えます。残った分は終了時に必ず解除します。
 
-2回連続の失敗はBOT層が「recoveryが効いていない」と判定する形なので、**MSC sessionは
-設計どおり使用不能になります**。その旨を表示するので`usbrescan`してください。
+2回連続の失敗はBOT層が「recoveryが効いていない」と判定する形なので、[1/4]〜[3/4]では
+**MSC sessionは設計どおり使用不能になります**。その旨を表示するので`usbrescan`して
+ください。[4/4]も同じく引退します——host側cleanupが完了できなかった以上、
+そのsessionで次のcommandを始める根拠がないためです。
 
 `usbhw`はSplit Transactionのレジスタに加え、USB割り込みのsource、global enable、
 総ISR回数、channel 0／periodic channel 1〜4／root-port／spurious回数、`GINTMSK`／`HAINTMSK`／`HCINTMSK0..4`、
@@ -483,7 +499,8 @@ scheduled resultが確定した時点で終了し、同じ窓でSSPLITを再開�
 約100 packet/秒が期待値です。実機でも10秒間に約1,000 packet増加し、入力安定・エラーログなしを
 確認済みです。rounds/packetはTTが最初のCSPLITへNYETを返す回数で変わります。
 同じHigh-Speedハブ上でLow-Speed keyboardとHigh-Speed MSCを併用した第24版の`ut 100`は
-100/100、failure／mismatch 0、packet／command retry 0、予防再同期6回でPASSしました。
+100/100、failure／mismatch 0、packet／command retry 0でPASSしました（当時は予防再同期6回。
+現在は予防cleanup自体がありません）。
 直後のsnapshotはSplit 1,126 packet／2,370 round、conflict 0、active 0、stale token 0、
 port eventなしです。
 

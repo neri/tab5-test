@@ -52,9 +52,12 @@ CPU/APBによる`SDHOST_BUFFIFO_REG`の直接読み出しと`IDSTS`のRIビッ�
 Bulk-Only Transport（BOT）でSCSIコマンドを送ります。実機確認済みなのは
 INQUIRY、TEST UNIT READY、READ CAPACITY(10)、READ(10)です。WRITE(10)は
 実装・実機受入済みです。当初はbulk転送のpacket errorからcontrol転送まで巻き込んで
-sessionが死ぬ間欠故障がありましたが、予防的BOT再同期とMSC session隔離後、High-Speed直結と
-FS-onlyハブ＋HID併用でREAD／WRITE試験を完走しています。High-Speedハブ上のLow-Speed HIDとの
-併用READ回帰も完走しています。根本原因は未特定です。
+sessionが死ぬ間欠故障があり、予防的BOT再同期とMSC session隔離で緩和していました。
+その後HCD側の契約（DMA cache同期、descriptor完了の検査、実転送長の単一化、cleanup失敗の
+伝播）を整えた結果、**予防的BOT再同期は不要になり撤去しました**
+（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。High-Speed直結、
+FS-onlyハブ＋HID併用、High-Speedハブ＋Low-Speed HID併用の3構成でREAD／WRITE試験を
+完走しています。
 確定した事実・否定した仮説・入れた緩和策は
 [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)にまとめてあります。
 Bulk転送は
@@ -82,24 +85,27 @@ INQUIRY／INQUIRY(EVPD)はRecovery後に1回再送します。**WRITE(10)は自�
 ブロックが増えるだけだからです。この方針を保つため、再送処理はBOT共通層ではなく
 commandの意味を知るMSC class driverのREADと再送安全な照会に限定してあります。
 
-反復READ(10)では、成功16回ごとにcommand間でhost controllerのchannel／FIFO cleanupを行います。
-FS-onlyでは33〜40回、High-Speed直結でも52回後にBulkとEP0が無応答になった実測に対し、
-controller側の古い受信状態を次commandへ持ち越さない緩和策です。正常command間ではdeviceへ
-Mass Storage Reset／CLEAR_FEATUREを送らず、software／deviceのDATA toggleを継続します。実行回数は`ut`の
-`proactive_resyncs`に表示します。host cleanupだけに変更した実機でも`ut 100`をPASSしました。
-従来のHigh-Speed直結は予防再同期6回、retry 0で100/100を完走し、FS-onlyハブ＋HID併用でも同条件で完走して試験後も
-HIDは動作しました。High-Speedハブ＋Low-Speed HID＋High-Speed MSCの第24版最終回帰も
-100/100、failure／mismatch 0、予防再同期6回、packet／command retry 0でPASSしています。
+正常なcommand境界ではhost cleanupを行いません。かつては反復READ(10)の16回ごとと
+各WRITE(10)の直前にhost controllerのchannel／FIFO cleanupを行っていました——FS-onlyで
+33〜40回、High-Speed直結でも52回後にBulkとEP0が無応答になる実測への緩和策です。
 
-WRITE(10)は失敗後に安全な自動再送ができないため、各WRITEの直前にも同じhost cleanupを行います。
-WRITE失敗時に再送するものではありません。DWC RX/TX FIFO cleanupを外すA/Bでは、直前commandの
-正常なCSW（expected tag `N`に対してreceived tag `N-1`）が残り、従来は数百回進んだ試験が
-WRITE前cleanup 2回で停止しました。FIFO cleanupは根本解決ではありませんが、controller側に残った
-古い受信状態を次のBOT commandへ持ち越さないために必要な緩和策です。
-host cleanupだけへ変更した同一起動で`ut 100`と`fswritetest /vol/usb0p1 1 1`の両方がPASSし、
-READ／WRITEとも正常command間のdevice-facing Reset Recoveryを必要としないことを実機確認しました。
-予防再同期の成功ログはREAD／WRITEそれぞれ初回と64回ごとに間引きますが、失敗ログは
-LBA、block数、READのFUA有無、方向別の累計再同期回数を含めて必ず出します。
+これを撤去できるかは実機A/Bで判定しました。READ側は間隔`16`／`32`／`disabled`の3設定、
+WRITE側はon/offで、いずれもbuild時に選ぶ一時的な設定です。`disabled`のbinaryで
+High-Speed直結、FS-onlyハブ＋HID＋MSC、High-Speedハブ＋Low-Speed HID＋High-Speed MSCの
+3構成とも`usbcheck 1000`（READ 1000回）が`proactive read+0`で完走し、旧故障の最短33回の
+30倍の距離を越えました。WRITE側も同じ3構成で各100回、`fswritetest`を2メーカーの媒体で
+各10回連続実行して通りました。**両方とも撤去済みです。**
+
+撤去できた理由は緩和策が不要になったからで、故障が消えたからではありません。
+持ち越しの元だったcontroller側residueは、descriptor完了の検査（`HCINT.XferCompl`と
+QTD Active解除を同じ世代で確認）、DMA bufferをHCDが所有して整列させる契約、
+実転送長を1箇所で導出する契約が、そもそも次commandへ渡らないようにしています。
+失敗後のcleanupは残っており、そこでFIFO flushがtimeoutした場合はBOT Reset Recoveryを
+実行せずsessionを引退させます（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)の`cleanup-failed`）。
+
+WRITE(10)は失敗後に安全な自動再送ができないという方針自体は変わりません。失敗した
+WRITEは再送せず、呼び出し側へ失敗を返します。
+
 High-Speed直結の`usbwritetest 2`は10/10回、pattern照合、原本復元、周辺LBA照合がすべて
 成功しています。pattern書き込みと復元を合わせて計20回のWRITEを連続成功しました。
 FS-onlyハブ＋HID併用でも10/10回成功しました。給電中のHID事前接続ハブも上流再接続を
@@ -245,7 +251,7 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
   読み書き可能な媒体で、起動ごとにFAT16でformatし直します。内容はリセットで
   消え、`flush()`は永続化を保証しません
 - `src/fs/sd.rs`・`src/fs/usb_msc.rs`: 既存ドライバの上に載る薄いadapterです。
-  IDMACのディスクリプタ制約、BOT recovery、予防的再同期といった媒体固有の処理は
+  IDMACのディスクリプタ制約、BOT recovery、packet単位の再送といった媒体固有の処理は
   下層に残し、ここは結果の変換と転送分割だけを行います。SDはCSD version 1.0の
   カード（容量を復号していない）をこの層では扱いません
 
@@ -260,9 +266,8 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
 **USBのWRITE(10)は1ブロックずつです**（`MAX_WRITE_BLOCKS = 1`）。READ(10)は4 KiBまで
 まとめますが、書き込みは複数ブロックを1回のdata OUTフェーズに入れると転送層が
 戻らなくなります（[USB_WRITE_STABILITY_PLAN.md](USB_WRITE_STABILITY_PLAN.md)の
-「決定論的な再現手順」）。4 KiBの書き込みはWRITE(10) 8本になり、それぞれの前に
-予防的BOT再同期が入るので遅くなりますが、これが実機で通る唯一の形です。SDには
-この制限はありません。
+「決定論的な再現手順」）。4 KiBの書き込みはWRITE(10) 8本になるので遅くなりますが、
+これが実機で通る唯一の形です。SDにはこの制限はありません。
 
 SDの`flush()`が何もしないのは、USBより弱い保証だからではありません。`sdmmc.rs`の
 `write_blocks`はCMD25が完了し、さらにカードがDAT0を離す（フラッシュへの書き込みを
@@ -351,9 +356,9 @@ DATA PROTECT）を`BlockError::WriteProtected`へ写します。転送は何も�
 | `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲へ単一block WRITEを発行し、最後に照合・復元するraw試験。gapは成功したWRITE command間の0〜2000 ms、既定0 |
 | `usbzero <lba> [count]` | 1〜8ブロックをゼロで上書きし、媒体から読み直して照合（破壊的） |
 | `usbmbr` | LBA 0のMBRを`sdmbr`と同じ書式で表示 |
-| `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数・予防再同期数も表示） |
+| `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数も表示） |
 | `usbcheck [reads] [lba]` | 1構成ぶんの受入試験。read soakと、LBA指定時はwrite 10回を実行し、counterの**差分**とGo条件ごとのPASS/FAILを表示（LBA省略でread-only） |
-| `usbcachefail` | DMA cache同期拒否・古い世代の完了・短いOUTの3つを注入し、いずれも吸収されず失敗になることを確認（接続構成に依存せず全体で1回。実行後は`usbrescan`） |
+| `usbcachefail` | DMA cache同期拒否・古い世代の完了・短いOUT・FIFO flush timeoutの4つを注入し、いずれも吸収されず失敗になることを確認（接続構成に依存せず全体で1回。read-onlyで媒体には書かない。実行後は`usbrescan`） |
 | `usbmargin [rounds]` | VBUS offから再投入し、LBA 0が読めるまでの各段階を計測（read-only、既定5回、最大20回） |
 | `devices` | ブロックデバイス（`ram`／`sd0`／`usb0`…）の容量と、LBA 0の判定結果（MBRの各entry、superfloppy、ambiguous、判定不能）を表示。USBは接続中の台数ぶん列挙し、接続位置とVID:PIDも出す |
 | `blkread <dev> [pN] <lba>` | ブロック層経由で1ブロック読み出してUARTへダンプ。`pN`を付けるとLBAはそのパーティション相対になり、末尾を越える指定は媒体へ届く前に拒否される |

@@ -349,7 +349,7 @@ impl Hub {
             // itself reports an error, restores the following port request.
             // Keep this recovery entirely quiet and retry the original
             // request from a fresh control-transfer SETUP.
-            hcd::recover_channel_after_packet_failure();
+            let _ = hcd::recover_failed_packet(hcd::FailureScope::Abandoned);
             self.reprime_control_pipe_quiet();
             received = protocol::control_transfer_in_quiet(&self.pipe, &setup, &mut buffer);
         }

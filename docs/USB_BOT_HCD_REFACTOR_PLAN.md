@@ -7,9 +7,9 @@
 > 優先します。既存の故障履歴は[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)を
 > 参照してください。
 
-## 状態: Stage 3完了、Stage 4着手前で中断
+## 状態: 完了（Stage 0〜6・8）。Stage 7は未着手で完了条件外
 
-### 中断時点の要約（再開する人へ）
+### 現在地の要約（再開する人へ）
 
 Stage 0〜2は完了し、実機で確認済み。Stage 3のdescriptor-DMA内の局所cleanup A/Bは
 v25〜v29ですべてNo-Goになった。v30／v31のdirect buffer DMAも最初のCBWから失敗したため
@@ -36,7 +36,27 @@ C1 raw WRITEも32/32、pattern一致、復元成功でPASSした。
 同じHigh-SpeedハブのC2（Sony）も`usbcheck`が全PASSした。
 C2 raw WRITEも32/32、pattern一致、復元成功でPASSした。
 A1／A2のHigh-Speed直結も通常試験とraw WRITEがすべてPASSした。
-**6構成の実機matrixと故障注入を完了し、Stage 3を完了とする。Stage 4着手前で中断。**
+**6構成の実機matrixと故障注入を完了し、Stage 3を完了とする。**
+Stage 4はcleanup APIを用途別に分離し、FIFO flushを`Result`化し、cleanup失敗を
+commandの中止として伝播させ、`usbcachefail`へ[4/4] FIFO flush timeout注入を足した。
+故障注入の全12 gateとA／B／C 3構成の`usbcheck 100 1`がPASSし、**Stage 4を完了とした**。
+唯一`fifo-skipped`だけが実機で一度も発火しておらず、periodic channelを持つHIDと
+channel 0の失敗が同時に起きる条件は未観測のまま残る（詳細はStage 4の実機確認結果）。
+
+Stage 5はREAD前cleanup間隔の`16`／`32`／`disabled`をbuild時に選ぶ仕組みを実装し、
+6行の実機A/Bが**すべてPASS**して完了した。`disabled`で3構成とも`usbcheck 1000`が
+`proactive read+0`で通り、旧故障の最短33 READ(10)の30倍の距離を越えた。
+コードからのcleanup削除はStage 6のGoと同時に行う。
+
+Stage 6の実機A/BもPASSし、**READ前・WRITE前の予防cleanupをコードから撤去した**。
+channel 0のcleanupは失敗path（`recover_failed_packet`）だけになった。
+`usbcachefail`の[4/4]は、無くなった予防cleanupではなく失敗後のcleanupを狙うよう作り直した。
+
+Stage 8では`hcd.rs`の無効化されたまま腐っていた旧診断コード184行を削除し、
+release ELFでDMA objectの配置とalignmentを実測、stack上の`PacketStaging`には
+compile-time assertを追加した。現状文書と`KNOWN_ISSUES.md`も更新済み。
+削除後binaryでの実機回帰（`usbcachefail`全13 gateとA／B／Cの`usbcheck`）もPASSし、
+**本計画は完了**。残る観測は「完了条件の照合」の末尾にまとめてある。
 
 確定したこと:
 
@@ -1594,7 +1614,7 @@ FIFO値が違うかRESULT FAILならNo-Go。両方を満たした場合だけB2 
 
 ### Stage 4: Recovery APIとcleanup失敗の伝播
 
-**進捗: 未着手。**
+**進捗: 完了。**
 
 - 正常packet完了、packet failure回復、BOT Reset Recovery、controller／port resetを別APIへ分ける。
 - TX／RX FIFO flushを`Result`化し、timeoutしたFIFO名を保持する。
@@ -1610,9 +1630,164 @@ FIFO値が違うかRESULT FAILならNo-Go。両方を満たした場合だけB2 
 - 実失敗後だけBOT Reset Recoveryが動き、正常command数だけではdevice-facing resetしない。
 - HID併用時のfailure recoveryが無関係なHID sessionを再列挙しない。
 
+#### 実装したもの（実機未確認）
+
+`hcd.rs`のcleanup入口を用途で3つへ分けた。正常に完了したpacketはどれも呼ばない。
+
+| API | いつ | flush範囲 |
+| --- | --- | --- |
+| `recover_failed_packet(FailureScope::Abandoned)` | timeout、halt不能、原因不明 | 全FIFO（periodic arm中はnon-periodic TXだけ） |
+| `recover_failed_packet(FailureScope::ReportedPacketError { is_in })` | coreがpacket errorを報告済み | OUTはnon-periodic TXだけ、INはAbandonedと同じ |
+| `proactive_cleanup()` | 正常なBOT command境界（Stage 5／6で削除する暫定） | Abandonedと同じ |
+
+旧`recover_channel_after_packet_failure`と`recover_reported_packet_error`は無くなり、
+呼び出し側（`bot.rs`のcommand失敗・packet retry、`hub.rs`のGET_PORT_STATUS retry、
+`protocol.rs`のcontrol transfer retry）はすべて失敗path側の新APIへ移した。
+channel状態の復元は`restore_channel0`へ切り出し、3つのAPIが共有する。
+
+FIFO flushは`flush_fifo(Fifo) -> Result<(), Fifo>`になり、`Fifo`は`nptx`／`ptx`／`rx`を
+名前で持つ。1つのcleanupは`CleanupOutcome`を返し、**実行・timeout・skip**をFIFOごとに
+分けて数える（`FIFO_FLUSHES`／`FIFO_FLUSH_TIMEOUTS`／`FIFO_FLUSHES_SKIPPED_FOR_PERIODIC`は
+3つとも`[AtomicU32; 3]`）。skipは失敗ではなく続行できる。`failed_fifo()`は最初に
+timeoutしたFIFOを返す——後続のtimeoutは同じ壊れたcoreの結果で、名前を上書きすると
+ログが違うFIFOを指す。
+
+失敗の伝播:
+
+- 実失敗後のrecoveryでflushがtimeoutしたら、BOT Reset Recoveryを**実行せず**MSC session
+  を使用不能にする。Reset Recoveryのcontrol転送も後続bulkも、いま空にできなかったFIFOを
+  通るので、実行しても「回復した」という誤った結論しか得られない。
+- packet retryのcleanupでtimeoutしたら同じpacketを再送せず、元のoutcomeをcommand層へ返す。
+- 予防cleanupでtimeoutしたらそのREAD／WRITEを開始せずに失敗を返す。deviceへ何も送って
+  いないのでsessionは引退させない。
+- 実失敗後のcleanupがshared FIFOをskipした場合は
+  `recovery left the shared FIFOs to the periodic endpoints`をログへ出す。recoveryが
+  効かなかったときの候補として残す情報で、それ自体は失敗ではない。
+- bring-upの`configure_fifos`でflushがtimeoutしたら`note_bus_unusable()`する。ここで
+  flushできないcoreはpacketも動かさない。
+
+`maintain_command_boundary`は`consecutive_recoveries`と`reported_unusable`を
+触らなくなった。両方とも「commandが1つ通った」ときだけ0へ戻す。予防cleanupは正常時にも
+走るので、これがcountを消していると、回復→失敗→回復→失敗が4回の独立した初回失敗に見えた。
+
+counterを2つ足した。`TransportObservation::commands_started`（CBW送信まで進んだcommand数）と
+`cleanup_failures`（flush timeoutでcommandを開始させなかった回数）。前者は「commandが
+失敗した」と「commandが始まらなかった」を区別するために要る。
+
+`usbcachefail`へ[4/4]を足した（既存3つは[1/4]〜[3/4]へ番号を振り直し）。
+`force_fifo_flush_timeouts(count)`でflushの**結果だけ**を偽り、flush要求自体はhardwareへ
+発行する——注入がFIFOの中身を実機の状態からずらさないため。gateは3つ:
+
+1. timeoutがcleanup失敗として数えられた（`fifo_flush_timeouts`と`cleanup_failures`が増えた）。
+2. `write_blocks`が`Written`を返さなかった。
+3. `commands_started`が1つも増えていない（CBWが1つもdeviceへ出ていない）。
+
+WRITE(10)を選ぶのは失敗しても安全に再送できない唯一のcommandで、cleanup失敗をCBWの
+**前に**捉えるほかないため。書き戻すdataは直前に同じLBAから読んだblockそのものなので、
+この検査が失敗したときに起こり得る唯一の書き込みも、既にそこにあるbyteの上書きにしかならない。
+
+静的確認: `cargo build --release`が警告0、変更ファイルの`rustfmt --check`、
+`cargo test -p tab5-bot-protocol --target x86_64-unknown-linux-gnu`が7 testsとも通り、
+`cargo clippy --release`のUSB関連警告は変更前と同一集合（行番号だけ移動）、`git diff --check`清潔、
+`README.md`に差分なし。
+
+現状文書は[`USB.md`](USB.md)（cleanupの3つの結果と失敗の伝播）、
+[`DIAGNOSTICS.md`](DIAGNOSTICS.md)（`fifo-flush`／`fifo-timeout`／`fifo-skipped`、
+`MSC: commands`／`cleanup-failed`、[4/4]の読み方）、[`STORAGE.md`](STORAGE.md)、
+[`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)を更新した。
+
+計画の設計方針にある`reset_bot_transport`という名前は採らず、既存の
+`BulkOnlyTransport::reset_recovery`のままにした。`bot.rs`の非公開メソッドで、
+呼び出し形（`self.reset_recovery()`）が既にBOT Reset Recoveryを指しているため。
+
+#### Stage 4実機確認の手順
+
+Stage 4はhost側の状態機械だけを変えたので、故障注入1回と、既存の受入試験による
+非退行確認で足りる。注入gateは接続構成に依存しないが、退行確認は
+「flush skipが起きる構成」＝HID併用を必ず1つ含める。
+
+1. **故障注入（構成非依存、1回）**: MSCを繋いで`usbcachefail`。
+   [1/4]〜[4/4]の全gateと`RESULT PASS`を確認する。特に[4/4]の3 gate:
+   `flush timeout failed the cleanup and was counted`、
+   `the write failed rather than succeeding`、`no command block reached the device`。
+   [4/4]はsessionを引退させないので、直後に`usbinfo`でMSCが生きていることも見る。
+   終了後は`usbrescan`。
+2. **A構成（High-Speed MSC直結）の非退行**: `usbcheck 100 <犠牲LBA>`を1回。
+   `RESULT PASS`と、`delta fifo-timeout`が`nptx/ptx/rx`とも0、
+   `delta proactive`の`cleanup-failed`が0であること。
+   `delta fifo-flush`は0でないのが正常（予防cleanupが動いている）。
+3. **B構成（`usbfs on`、Full-Speedハブ＋HID＋MSC）**: 同じ`usbcheck 100 <犠牲LBA>`。
+   試験後にキーボード入力とマウスが生きていること、`usbinfo`に両方残っていることを確認する。
+4. **C構成（High-Speedハブ＋Low-Speed HID＋High-Speed MSC）**: 同じ手順。
+   完了条件「HID併用時のfailure recoveryが無関係なHID sessionを再列挙しない」は、
+   3と4でHIDが再列挙されずに生き残ることで確認する。
+
+   `delta fifo-skipped`は**HIDを繋いでいても0になり得る**。skipは
+   persistent periodic channelがarmされている間だけ起きるもので、
+   `enable_periodic_hid`はsplitが要る経路を拒否するため、C構成のLow-Speed HID
+   （High-Speedハブ配下）は構造上periodic channelを取れない。frame poll fallbackの
+   HIDはchannel 1〜4を持たないので、cleanupは3 FIFOとも実行する。
+5. **予防処理だけではdevice-facing resetしない**: 2〜4のいずれの実行でも
+   `usbcheck`の`delta`で`recovery`が0であること。予防cleanupは何十回も走るので、
+   `proactive read`／`write`が0でないまま`recovery`が0であることが、
+   「正常command数だけではReset Recoveryしない」の実測になる。
+
+記録する項目: 構成ID、speed、MPS、媒体のVID/PID、LBA、`usbcachefail`の全gate、
+`usbcheck`のRESULTと`delta fifo-flush`／`fifo-timeout`／`fifo-skipped`／
+`proactive`（`cleanup-failed`含む）／`recovery`、試験後のHIDの生死。
+
+#### Stage 4実機確認: Go
+
+故障注入1回とA／B／C各1回の`usbcheck 100 1`を実施し、全gateとRESULTがPASSした。
+B・Cとも同じバスにHIDキーボードとマウスを接続した状態で実行し、試験後もHIDは生きていた。
+
+**故障注入（`usbcachefail`）**: [1/4]〜[4/4]の全12 gateとRESULT PASS。
+[4/4]は注入した3 FIFO（`nptx`／`ptx`／`rx`）すべてがtimeoutを報告し、
+最初の`nptx`で`proactive cleanup could not flush the nptx FIFO; not starting this command`、
+続いて`USB MSC: proactive host cleanup failed before WRITE(10)`となった。3 gate
+——timeoutがcleanup失敗として計上された／writeが`Written`を返さなかった／
+`commands_started`が1つも増えなかった——がすべてPASS。媒体への書き込みは発生していない。
+
+**通常試験（`usbcheck 100 1`）**:
+
+| 構成 | speed／MPS | fifo-flush | fifo-timeout | fifo-skipped | proactive | recovery | RESULT |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A（HS直結） | High-Speed／512 | +26/+26/+26 | 0/0/0 | 0/0/0 | read+6 write+20 cleanup-failed+0 | ok+0 failed+0 | PASS |
+| B（`usbfs on`、FSハブ＋HID＋MSC） | FS-only／64 | +26/+26/+26 | 0/0/0 | 0/0/0 | read+6 write+20 cleanup-failed+0 | ok+0 failed+0 | PASS |
+| C（HSハブ＋LS HID＋HS MSC） | High-Speed／512 | +28/+28/+28 | 0/0/0 | 0/0/0 | read+6 write+20 cleanup-failed+0 | ok+0 failed+0 | PASS |
+
+3構成とも`writes ok=10/10 restored=10/10 collateral=0`、cache refusal 0、CSW契約PASS。
+FIFO分割は3構成とも実レジスタ`512/256/128`。
+
+確認できたこと:
+
+- **counterの突き合わせが合う。** A／Bのcleanup回数は`proactive read+6 write+20`＝26で、
+  `fifo-flush`の26と一致する。Cはそれに加えてCSW中のtimeout retryが2回あり
+  （`pkt-retry timeout+2`、`pkt-fail timeout+2`、ログに
+  `retrying bulk packet after timeout during CSW`）、cleanupが28になっている。
+  失敗path側の`recover_failed_packet`が実際に到達し、正しく数えられている。
+- **予防処理だけではdevice-facing resetしない。** 3構成とも`proactive`が26回動きながら
+  `recovery ok+0 failed+0`。Stage 4の完了条件そのものの実測。
+- **HID併用時のfailure recoveryが他のsessionを壊さない。** Cの2回の実失敗recoveryは
+  HIDキーボードとマウスが同じバスに居る状態で起き、retryは成功し、試験後もHIDは動作した。
+  再列挙は発生していない。
+- **cleanup失敗の伝播が実機で動く。** [4/4]で予防cleanupのtimeoutがWRITEを開始させず、
+  sessionは引退しなかった（deviceへ何も送っていないため）。直後のMSCは生きたままだった。
+
+**未実施のまま残る経路: `fifo-skipped`が1度も発火していない。**
+B・CともHIDを接続していたが、3構成すべてで`fifo-skipped`は0だった。skipは
+persistent periodic channelがarmされている間だけ起きる。Cは`enable_periodic_hid`が
+split経路を拒否するので構造上periodic channelを取れず、0が正しい。Bはsplitが要らない
+（`usbfs on`ではハブもFull-Speedなので`route.split`は`None`）ため候補ではあるが、
+実際にはmaskが立っていなかった＝frame poll fallbackで動いていたことになる。
+skipの条件式自体はStage 4で変えていないので退行ではない。新しいcounterが
+「この経路は実機で一度も通っていない」ことを可視化しただけで、Bの
+periodic昇格が起きない理由はHID scheduling側の別件として切り分ける。
+Stage 5・6のGo条件には含めない。
+
 ### Stage 5: READ前cleanupの撤去
 
-**進捗: 未着手。Stage 1〜4完了前に実施しない。**
+**進捗: 完了。**
 
 一時的な診断build設定でREAD cleanup間隔を`16`、`32`、`disabled`から選べるようにし、同じ
 binary系列・同じ媒体・同じ接続順でA/Bする。恒久的なuser optionにはしない。
@@ -1636,9 +1811,135 @@ Go条件:
 No-Goなら単に16へ戻して完了扱いしない。最初の失敗snapshotをStage 2または3の契約違反として
 分類し、根本原因を直して同じStageを再実行する。
 
+#### 実装したもの（実機未確認）
+
+READ前cleanupの間隔を`ReadCleanup`（`Every(u8)`／`Disabled`）にし、`read_10`は
+`READ_CLEANUP.due(reads_since_resync)`で判定する。WRITE前cleanupはStage 6の対象なので
+触っていない。
+
+設定はbuild時のenvironment variableで選ぶ:
+
+```sh
+cargo run --release                                  # 既定＝16（Stage 0 baseline）
+TAB5_USB_READ_CLEANUP=16       cargo run --release
+TAB5_USB_READ_CLEANUP=32       cargo run --release
+TAB5_USB_READ_CLEANUP=disabled cargo run --release
+```
+
+`option_env!`なのでcargoが値の変化を追跡し、設定を変えれば必ず再ビルドされる。
+未設定と`16`は**バイナリが完全に一致する**ことを確認済み（md5一致）——試験1行目の
+「`16`でStage 0 baselineが維持される」は出荷既定そのものを測ることになる。
+`16`／`32`／`disabled`は3つとも別のバイナリになる。
+
+値を打ち間違えた場合は既定へ落ちずに**ビルドエラー**になる
+（`TAB5_USB_READ_CLEANUP must be 16, 32 or disabled`）。`disabled`と記録した結果が
+実は16でビルドされていた、という取り違えは結果が無いことより悪いため。
+
+shell optionにはしない。プロンプトで変えられる設定は、結果を記録した設定と
+食い違ったまま気づかれない設定でもある。代わりに`usbcheck`のhost行へ
+`read-cleanup=16|32|disabled`を常時表示し、どの設定で採った結果かをログ自身に持たせる。
+
+Stage 6でproactive cleanupごと削除するとき、この`ReadCleanup`と
+`READS_PER_BOT_RESYNC`、`reads_since_resync`も一緒に消す。
+
+静的確認: 3設定とも`cargo build --release`が警告0、不正値はビルドエラー、
+変更ファイルの`rustfmt --check`清潔。
+
+#### Stage 5実機確認の手順
+
+**書き込みを伴わない行はLBAを付けない**（`usbcheck <reads>`）。Go条件の
+「proactive READ cleanupが0」を見るのが目的なので、WRITE側のcleanupを混ぜない。
+
+各行の前に`usbcheck`のhost行で`read-cleanup=`が意図した設定になっていることを確認する。
+違っていればビルドし直す——設定を取り違えた結果は記録しない。
+
+| # | build | 接続 | コマンド | 見るもの |
+| --- | --- | --- | --- | --- |
+| 1 | `16`（＝既定） | High-Speed直結 | `usbcheck 100` | Stage 0 baselineが維持される。`proactive read`は0でなくてよい |
+| 2 | `32` | High-Speed直結 | `usbcheck 100` | 最短33回故障の旧境界を越える |
+| 3 | `disabled` | High-Speed直結 | `usbcheck 1000` | `proactive read+0` |
+| 4 | `disabled` | `usbfs on`、FSハブ＋HID＋MSC | `usbcheck 1000` | 同上、HID併用 |
+| 5 | `disabled` | HSハブ＋LS HID＋HS MSC | `usbcheck 1000` | 同上、Split HID併用 |
+| 6 | `disabled` | 4か5のまま | `mix`（既定120分）とファイルシステムの大きな連続read | 長時間の実使用 |
+
+Go条件（各行）:
+
+- `failures`／`mismatch`／`delta cache-refusals`／`delta pkt-fail stale`／`delta csw tag`が0。
+- 3〜6は`delta proactive read+0`。`cleanup-failed`も0。
+- `delta ... cmd-retry+0`。`delta pkt-retry`が0でない場合は、そのpacketのHCINTと
+  `actual`がログで説明でき、同じbyteを二重に公開していないことを確認する
+  （Cの`usbcheck`で観測済みのCSW timeout retryはこの形）。
+- 試験後にHID入力が生きていること、`usbinfo`が通ること、`usbmsc`
+  （SCSI INQUIRY／TEST UNIT READY／READ CAPACITY(10)）が通ること。
+
+記録する項目: 行番号、build設定（host行の`read-cleanup=`）、構成ID、speed／MPS、
+媒体のVID/PID、`usbcheck`のRESULTと`delta`全行、試験後のHIDの生死。
+
+#### Stage 5実機確認: Go
+
+6行すべてRESULT PASS。実際にはLBAを付けて実行された（`usbcheck <reads> 1`）ので、
+各行はread soakに加えてWRITE 10回も通っている。read soakが先に走りきってから
+write roundsに入る構成なので、read側の結論は弱まらない。むしろ read cleanup無しで
+WRITEまで通ったことになる。WRITE前cleanupはStage 6の対象なので有効なまま。
+
+| # | read-cleanup | 構成 | reads | proactive read | fifo-flush | pkt-fail | RESULT |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `16` | HS直結／512 | 100 | +6 | +26 | 0 | PASS |
+| 2 | `32` | HS直結／512 | 100 | +3 | +23 | 0 | PASS |
+| 3 | `disabled` | HS直結／512 | 1000 | **+0** | +20 | 0 | PASS |
+| 4 | `disabled` | FS-only、FSハブ＋HID＋MSC／64 | 1000 | **+0** | +20 | 0 | PASS |
+| 5 | `disabled` | HSハブ＋LS HID＋HS MSC／512 | 1000 | **+0** | +22 | timeout+2 | PASS |
+| 6 | `disabled` | 5のまま | `mix` 120分 | — | — | — | PASS |
+
+6行とも`failures=0`／`mismatch=0`／`cache-refusals+0`／`pkt-fail stale+0`／
+`csw tag+0`／`cmd-retry+0`／`cleanup-failed+0`／`recovery ok+0 failed+0`、
+`writes ok=10/10 restored=10/10 collateral=0`。
+
+確認できたこと:
+
+- **cleanup回数とflush回数が全行で一致する。** `fifo-flush`＝`proactive read`＋
+  `proactive write`＋実失敗cleanup。1行目26＝6+20、2行目23＝3+20、3・4行目20＝0+20、
+  5行目22＝0+20+2。counterが取り違えていないことの独立した確認になる。
+- **間隔設定が効いている。** 100 readsで`16`なら6回、`32`なら3回。倍にすれば半分。
+- **`disabled`で1000 readsが3構成とも通った。** 旧故障の最短は33 READ(10)だったので、
+  30倍の距離を予防cleanup無しで越えたことになる。特に4行目は
+  Full-Speed固定ハブ＋HID＋MSCで、この計画が繰り返し壊してきた構成。
+- **1000 readsで`mix` 120分。** `frames=412801 io=7243`、
+  `usb retries: packet=0 command=0 rescans=0 power_cycles=0`、`underruns=0`、
+  `dma_error=0`。
+
+**5行目のpacket retry 2件は説明がつく（Go条件の但し書きに合致）。**
+両方ともCSW IN phaseのtimeoutで、ログの値は:
+
+- `reap HCINT=0x00000000`——channelはそもそも割り込みを上げていない。
+  deviceが予算内にCSWを返さなかった。
+- `reap QTD control=0x06000200`——`Active=0`（hardwareは所有権を解放済み）、
+  status=0、残量`0x200`=512。要求は512（Bulk IN MPS）なので
+  `progress_from`は`Known(512-512)`＝**Known(0)**、つまり0 byteしか動いていないことを
+  descriptorが証明している。`safe_to_retry`が通るのはこの形。
+- `delta resubmit refused+0 progressed+0 impossible-len+0`——契約はこの再送を拒否せず、
+  「既にbyteが動いた」と報告したdescriptorも無い。**同じbyteの二重公開は起きていない。**
+- 再送は成功し、`csw`系counterは全て0（tag・residue・statusとも正当）、
+  `completed=1000/1000 mismatch=0`。
+
+このsignature（HCINT／QTD control／HCCHAR／HCTSIZ／HCDMA）はStage 4のC構成
+`usbcheck 100 1`で観測したものと**完全に同一**で、あのときはread cleanupが`16`で
+有効だった。同じ経路・同じ媒体で、cleanupの有無に関わらず同じ形で出る。
+つまりこのtimeoutはStage 5の退行ではなく、このHSハブ経路のdevice側の性質である。
+件数もcleanup有効時の100 readsで2件、無効時の1000 readsで2件で、増えていない。
+
+残りの2項目——6行目のfilesystem連続readと、試験後チェック（HID入力の生存、
+`usbinfo`、`usbmsc`）——も実機で確認済み。console出力は他の行と違い採取していないが、
+実施者の確認による。**Stage 5をGoとして完了とする。**
+
+READ前cleanupは3構成×1000 readsで不要だと確認できたが、コードからの削除は
+Stage 6のGoと同時に行う（WRITE側と共通の`maintain_command_boundary`・
+`reads_since_resync`・方向別counterをまとめて消すため）。それまでは
+`TAB5_USB_READ_CLEANUP=disabled`でビルドする。
+
 ### Stage 6: WRITE前cleanupの撤去
 
-**進捗: 未着手。Stage 5完了前に実施しない。**
+**進捗: 完了。実機A/BがPASSし、予防cleanupをコードから撤去した。**
 
 WRITEは失敗後に安全に再送できないため、READより後に行う。`MAX_WRITE_BLOCKS = 1`を維持し、
 cleanup有効／無効だけをA/Bする。
@@ -1662,6 +1963,135 @@ Goなら`maintain_command_boundary`、`reads_since_resync`、方向別proactive 
 No-Goなら古いCSWが再び見えたphaseとHCD snapshotを保存し、cleanupを戻しただけで計画を完了に
 しない。
 
+#### 実装したもの（実機未確認）
+
+WRITE前cleanupの有無を`WriteCleanup`（`Enabled`／`Disabled`）にし、`write_blocks`は
+`WRITE_CLEANUP == Enabled`のときだけ`proactive_maintain(Write)`を呼ぶ。
+`MAX_WRITE_BLOCKS = 1`は変えていない。WRITE失敗後の自動再送も従来どおり行わない。
+
+`ReadCleanup`とは別のenum・別のenvironment variableにした。2つは削除する順序も理由も
+違うためで、READは失敗しても再発行できるのに対し、WRITEは途中まで媒体へ届いている
+可能性があり決して再送しない。WRITE側に必要なのはon/offだけで、しかもREAD側が
+片付いた後にしか動かせない。
+
+```sh
+TAB5_USB_WRITE_CLEANUP=on   cargo run --release   # 既定
+TAB5_USB_WRITE_CLEANUP=off  cargo run --release   # Stage 6の対象
+```
+
+Stage 6の試験はREAD側を`disabled`にしたうえでWRITE側だけをA/Bする:
+
+```sh
+TAB5_USB_READ_CLEANUP=disabled TAB5_USB_WRITE_CLEANUP=off cargo run --release
+```
+
+READ側と同じく、値を打ち間違えるとビルドエラーになる
+（`TAB5_USB_WRITE_CLEANUP must be on or off`）。
+
+`usbcheck`／`mix`のhost行に続けて`cleanup read=… write=…`行を出すようにした。
+Stage 5では`read-cleanup=`をhost行の末尾に付けていたが、2つ目が加わると80桁を
+越えるので独立した行へ移した。
+
+静的確認: 4通りの組み合わせすべてで`cargo build --release`が警告0、
+不正値はビルドエラー、変更ファイルの`rustfmt --check`清潔、`git diff --check`清潔。
+
+#### Stage 6実機確認の手順
+
+**この試験は媒体へ書き込む。** 犠牲にできるLBAとFAT媒体だけを使う。
+
+全行を`TAB5_USB_READ_CLEANUP=disabled TAB5_USB_WRITE_CLEANUP=off`のbinaryで実行する。
+各実行で`usbcheck: cleanup read=disabled write=off`行を確認してから記録する。
+
+| # | 接続 | コマンド | 回数 |
+| --- | --- | --- | --- |
+| 1 | High-Speed直結 | `usbcheck 100 <犠牲LBA>` | 10回（WRITE 100回） |
+| 2 | `usbfs on`、FSハブ＋HID＋MSC | 同上 | 10回 |
+| 3 | HSハブ＋LS HID＋HS MSC | 同上 | 10回 |
+| 4 | 任意（媒体2メーカー分） | `fswritetest /vol/usb0pN 1 1` | 媒体ごとに10回連続 |
+
+`usbcheck`は1回につきWRITE 10回なので、10回実行で1構成あたりWRITE 100回になる。
+各実行後にFUA照合・周辺LBA照合・原本復元が出力に含まれる（`pattern write+read-back`、
+`window LBA … collateral changes`、`original data restored`）。
+
+Go条件:
+
+- **`delta proactive write+0`。** これがStage 6の主目的。`read`も0のはず。
+- 部分転送、`csw tag`／`residue`／`phase`／`status`、transport failure、
+  collateral changeがすべて0。`writes ok=100/100 restored=100/100`（10実行の合計）。
+- 失敗したWRITEを一度も自動再送していない（`cmd-retry+0`。READ再送はREADのみの方針）。
+- SYNCHRONIZE CACHE非対応deviceでも従来どおりbest-effortで進み、FUA照合が機能する
+  （`device has no SYNCHRONIZE CACHE(10); verifying with FUA reads`が出て、
+  そのうえで`pattern write+read-back: match`になる）。
+- 試験後も同一バスのHIDが動作する。
+- 最後にPCで媒体の全ファイルを読み、`fsck.fat -n`が致命的な不整合を報告しない。
+
+記録する項目: 行番号、`cleanup read=／write=`、構成ID、speed／MPS、媒体のVID/PID、
+犠牲LBA、10実行ぶんの`usbcheck` RESULTと`delta`、`fswritetest`のPASS/FAIL、
+`fsck.fat -n`の出力、試験後のHIDの生死。
+
+**Go後に削除するもの**（Stage 5のREAD側と合わせて一度に行う）:
+`BulkOnlyTransport::maintain_command_boundary`、`UsbMassStorage::proactive_maintain`、
+`reads_since_resync`、`READS_PER_BOT_RESYNC`、`ReadCleanup`／`WriteCleanup`と2つの
+environment variable、方向別proactive counterと成功ログ、`hcd::proactive_cleanup`、
+`usbcheck`の`delta proactive`行と`cleanup read=／write=`行。
+失敗path側の`recover_failed_packet`と`cleanup-failed` counterは残す。
+
+#### Stage 6実機確認: Go
+
+`TAB5_USB_READ_CLEANUP=disabled TAB5_USB_WRITE_CLEANUP=off`のbinaryで全行PASS。
+console出力は採取していないが、実施者の確認による。
+
+#### 撤去したもの
+
+Stage 5・6のGoを受けて、予防cleanupをコードから削除した。
+
+| 削除 | 場所 |
+| --- | --- |
+| `hcd::proactive_cleanup` | `src/usb/hcd.rs` |
+| `BulkOnlyTransport::maintain_command_boundary` | `src/usb/bot.rs` |
+| `UsbMassStorage::proactive_maintain`、`log_maintenance_resync_counts` | `src/usb/msc.rs` |
+| `ReadCleanup`／`WriteCleanup`と2つのenvironment variable | `src/usb/msc.rs` |
+| `READS_PER_BOT_RESYNC`、`RESYNC_LOG_INTERVAL`、`ResyncDirection`、`reads_since_resync` | `src/usb/msc.rs` |
+| `maintenance_resyncs`／方向別counterと`maintenance_resync_count(s)` | `src/usb/msc.rs` |
+| `usbcheck`の`delta proactive`行、`cleanup read=／write=`行、`MSC: proactive read=`行、`ut`の`proactive_resyncs=` | `src/app/shell.rs` |
+
+残したもの: `recover_failed_packet`（失敗path専用になった）、`cleanup_failures`／
+`MSC: cleanup-failed`、per-FIFO counter、`read_retries`（READ(10)のみの再送方針）、
+`MAX_WRITE_BLOCKS = 1`、WRITE非再送方針。
+
+`execute_command`は入口で`last_recovery_succeeded = false`と
+`unusable || bus_unusable()`の判定を既に行っていたので、
+`maintain_command_boundary`が消えても失われるgateは無い。
+
+**`usbcachefail`の[4/4]を作り直した。** 旧版はWRITE(10)前の予防cleanupへflush timeoutを
+注入していたが、そのcleanupが無くなったので、正常なWRITEではflushが1回も起きず
+gateが必ずFAILする状態になっていた。新版は**2つ同時に注入する**——data IN cache同期の
+拒否でREAD(10)を失敗させ、その失敗が起こすcleanupのflushをtimeoutさせる。gateは4つ:
+
+1. timeoutがcleanup失敗として数えられた。
+2. readが失敗した。
+3. **BOT Reset Recoveryが試行されていない**（`reset_recoveries`の差分が0）。
+4. sessionが引退した（`needs_reinit()`）。
+
+3つ目が新版の要点で、Stage 4の「実失敗後のRecoveryでflushが失敗した場合はMSC sessionを
+使用不能にする」をそのまま測っている。媒体へは一切書かないので、`usbcachefail`は
+read-onlyへ戻った。
+
+静的確認: `cargo build --release`が警告0、変更ファイルの`rustfmt --check`清潔、
+`cargo test -p tab5-bot-protocol --target x86_64-unknown-linux-gnu`が7 tests PASS、
+`cargo clippy --release`のUSB関連警告は変更前と同一集合、`git diff --check`清潔、
+`README.md`に差分なし。
+
+現状文書を更新した: [`USB.md`](USB.md)（cleanup入口の表からproactiveを削除、
+撤去の経緯と理由）、[`STORAGE.md`](STORAGE.md)（予防再同期の節を撤去の記録へ書き換え）、
+[`DIAGNOSTICS.md`](DIAGNOSTICS.md)（`proactive_resyncs`／`delta proactive`の説明を削除、
+[4/4]の新しい読み方）、`src/fs/usb_msc.rs`のmodule doc。
+
+**この撤去は実機で再確認が必要。** 削除前の実機A/Bは
+`TAB5_USB_READ_CLEANUP=disabled TAB5_USB_WRITE_CLEANUP=off`のbinaryで行っており、
+振る舞いは同じはずだが、削除後のbinaryそのものでは走らせていない。
+Stage 8の回帰でまとめて確認する。
+
 ### Stage 7: 複数ブロックWRITEの再評価
 
 **進捗: 未着手。cleanup撤去の完了条件には含めない。**
@@ -1679,7 +2109,7 @@ Stage 6完了後にだけ、決定論的だった複数ブロックWRITEを診�
 
 ### Stage 8: 診断整理、現状文書、回帰
 
-**進捗: 未着手。**
+**進捗: 完了。削除後binaryの実機回帰もPASSした。**
 
 - 正常系のproactive cleanupログとcounterを削除する。
 - `hcd.rs`に`#[cfg(any())]`で無効化されたまま残っている旧failure snapshot（約200行、
@@ -1703,6 +2133,111 @@ Stage 6完了後にだけ、決定論的だった複数ブロックWRITEを診�
 - `cargo clippy`のUSB correctnessに関係する警告を確認する。
 - `git diff --check`。
 - `README.md`にこの作業による差分が無いこと。
+
+#### 実施したもの
+
+**削除した死んだ診断コード。** `hcd.rs`の`#[cfg(any())]`で無効化されていた旧failure
+snapshotとsplit traceを184行削除した（`clear_last_packet_failure`、
+`record_packet_failure`、`log_last_packet_failure`、`clear_split_trace`、
+`record_split_round`、`log_recent_split_trace`、`note_short_control_response`）。
+参照していた`LAST_PACKET_FAILURE_*`／`SPLIT_TRACE_*`のstaticは既に存在せず、
+有効化してもコンパイルできない状態だった。削除後に孤立したstaticは0件。
+Stage 0で似た名前のcounter（`LAST_FAILED_PACKET_*`）を新設していたため、
+残しておくと読む人が取り違える形になっていた。
+
+`hub.rs`にも`#[cfg(any())]`が2つ残っているが、これらは**生きている関数だけを参照する**
+ので有効化すれば動く。腐って有効化不能だった`hcd.rs`のものとは別で、
+Stage 8の対象に挙がっていないため残した。
+
+**DMA配置の検査。** release ELFで実アドレスを確認した:
+
+| object | addr | size | 要求 | 結果 |
+| --- | --- | --- | --- | --- |
+| `PERIODIC_HID_QTD` | `0x4FF50C00` | 2048 | 512 | OK |
+| `CHANNEL0_QTD_BANK` | `0x4FF51400` | 1024 | 512 | OK |
+| `PERIODIC_HID_BUFFER` | `0x4FF51A40` | 256 | 64 | OK |
+| `PERIODIC_HID_FRAME_LIST` | `0x4FF51C00` | 512 | 512 | OK |
+
+いずれも開始アドレスが要求alignmentの倍数で、サイズも64 byteの整数倍（＝末尾の
+cache lineを他の誰とも共有しない）。`PacketStaging`はstack localなのでELFから読めない。
+そちらは型の保証にするしかないので、`align_of`と`size_of % DMA_ALIGN`の
+compile-time assertを追加した。`PeriodicFrameList`／`PeriodicQtdBank`／
+`Channel0QtdBank`／`PeriodicBufferBank`にも同じassertを足し、ELFの実測と
+型の保証を二重にした。
+
+**clippy。** USB関連の警告は5件で、変更前と同一集合（`is_multiple_of`の手書き、
+loop変数でのindex、`?`演算子、引数9個、定数`chunks_exact`）。いずれもstyleで、
+correctnessに関わるものは無い。
+
+**現状文書。** [`USB.md`](USB.md)（cleanup入口、失敗伝播、正常境界にcleanupが無いこと。
+実転送長・Recovery条件・DMA buffer契約の節は既存）、[`STORAGE.md`](STORAGE.md)、
+[`DIAGNOSTICS.md`](DIAGNOSTICS.md)、[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)（「解消済み:
+BOT command境界の予防cleanupが必要だった」を追加し、残件として1 block WRITE制限と
+未発火の`fifo-skipped`を明記）、[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)
+（Stage 4〜6の実機結果を66〜71行として追記）、[`../DESIGN.md`](../DESIGN.md)
+（WRITE前cleanupを必要とする記述を撤去済みへ更新）。
+
+#### Stage 8実機回帰: Go
+
+削除後のbinaryで`usbcachefail`とA／B／C 3構成の`usbcheck`を実行し、すべてPASS。
+`delta proactive`行と`proactive_resyncs=`が出力から消えていることも確認した。
+
+`usbcachefail`は[1/4]〜[4/4]の全13 gateとRESULT PASS。新しい[4/4]のログは意図どおり:
+
+```text
+USB BOT: bulk IN DMA cache sync refused during data IN
+USB: FIFO flush timed out, fifo=nptx
+USB: FIFO flush timed out, fifo=ptx
+USB: FIFO flush timed out, fifo=rx
+USB BOT: host cleanup could not flush the nptx FIFO; this session needs re-enumeration
+```
+
+`Mass Storage Reset`の行が**1つも無い**まま session引退へ直行している。
+Stage 4の「実失敗後のcleanupでflushが失敗したらReset Recoveryを実行せず
+sessionを使用不能にする」が実機で成立した。
+
+##### recoveryが失敗しているのにPASSでよい理由
+
+[1/4]〜[3/4]では`reset recovery failed`が出るが、これは設計どおりで、3つのうち
+2つは注入そのものが原因である。
+
+- **[2/4]／[3/4]**: `force_stale_completions`と`force_short_outs`はphase指定が無いので、
+  Recovery自身のcontrol転送まで注入が届く。[3/4]の`requested bytes=8 / actual bytes=7`は
+  Mass Storage ResetのSETUP packet（8 byte）が1 byte短く報告された姿そのもの。
+  注入を再送より深くarmするのは意図的で（1回だとREAD(10)の再送で治り、契約ではなく
+  retry方針を測ってしまう）、recovery失敗→session引退→次gate前のrescanが設計形。
+- **[1/4]**: cache拒否は`DataIn` phase指定なのでRecoveryのcontrol転送には**当たらない**。
+  ここでのrecovery失敗は注入ではなく実際の
+  `failure=halt-timeout phase=control`——Mass Storage Resetのzero-length IN status stageで
+  channelがhaltしなかったもの（`HCCHAR=0x80408040`でChEnaが立ったまま）。
+
+  **Stage 8の退行ではない。** Stage 4の同じ注入で観測したものと
+  `HCCHAR=0x80408040`／`HCTSIZ=0x400000FF`／`HCDMA=0x4FF51600`／phase／stageまで完全に一致する
+  （差はlive frame counterの`HFNUM`だけで、+1ms sampleで進んでいるのでSOFは正常）。
+  注入経由でしか到達しない経路であり、driverの応答——session引退、直後のrescanで復帰——は
+  正しい。gateが主張するのは「readが失敗した」「1 byteも公開されていない」
+  「sessionが引退した」であって、recoveryが失敗した理由ではないので、PASSは妥当。
+
+  注入下でしか出ないとはいえ、cache同期拒否の直後にcontrol status stageがhaltしない
+  という観測自体は残る。Stage 7以降で触るなら`recover_failed_packet`ではなく
+  control転送側の問題として切り分ける。
+
+**これで本計画の完了条件はすべて満たした。**
+
+#### （回帰前の記録）予防cleanupを削除したbinaryは未実行だった
+
+**予防cleanupを削除したbinaryそのものは実機で走らせていない。** Stage 5・6のA/Bは
+`TAB5_USB_READ_CLEANUP=disabled TAB5_USB_WRITE_CLEANUP=off`のbinaryで行っており、
+振る舞いは同じはずだが同一ではない。加えてStage 8で診断コードを184行削除し、
+`usbcachefail`の[4/4]を作り直している。回帰として最低限これを実行する:
+
+1. `usbcachefail`——[1/4]〜[4/4]の全gateとRESULT PASS。特に新しい[4/4]の4 gate
+   （cleanup失敗の計上、readの失敗、**Reset Recovery不実行**、session引退）。
+   実行後は`usbrescan`。
+2. A／B／C 3構成で`usbcheck 100 <犠牲LBA>`——RESULT PASSと、
+   `delta fifo-timeout` 0、`cleanup-failed` 0、`recovery ok+0 failed+0`。
+   出力に`delta proactive`行と`proactive_resyncs=`が**もう出ない**ことも確認する。
+3. 試験後にHID入力、`usbinfo`、`usbmsc`が通ること。
 
 ## 実機試験matrix
 
@@ -1737,3 +2272,30 @@ HID periodic／fallback、cleanup設定が違う試験を同じ結果として�
 - Stage 5、6の全実機matrixをcleanup無しで通る。
 - READだけを安全に1回再送し、WRITEを自動再送しない方針を維持する。
 - 実装変更と同じ作業で現状文書を更新し、調査履歴は計画書へ残す。
+
+### 完了条件の照合（Stage 8時点）
+
+| 条件 | 状態 | 根拠 |
+| --- | --- | --- |
+| 全DMA転送がHCD所有の整列済みbufferを使う | 済 | `PacketStaging`をHCDが所有。release ELFで4 objectのaddr／sizeを実測、加えて5つのcompile-time assert |
+| cache maintenance拒否が転送開始前の失敗として届く | 済 | `PacketOutcome::CacheSyncFailed`。`usbcachefail` [1/4]が実機で3 gate PASS |
+| 部分OUT・古いcompletion・hardware所有中QTDを成功扱いしない | 済 | `reap`の世代・`XferCompl`・Active検査。[2/4]／[3/4]が実機PASS |
+| BOTがactual／tag／status／residueを整合させる | 済 | `bot_protocol::validate_csw`＋7つのCSW counter。6構成で違反0 |
+| Phase Errorとinvalid CSWでReset Recovery、正常command回数では行わない | 済 | Recoveryは`execute_command`の失敗pathのみ。3構成で`proactive` 26回に対し`recovery ok+0 failed+0` |
+| READ前／WRITE前のproactive cleanupがコードと正常ログから無くなる | 済 | Stage 6で撤去。`src/`に残るのは経緯を説明するコメント1行のみ |
+| Stage 5・6の全実機matrixをcleanup無しで通る | 済 | READ: 3構成×`usbcheck 1000`が`proactive read+0`。WRITE: 3構成×100回＋2媒体の`fswritetest`各10回 |
+| READだけを1回再送し、WRITEを自動再送しない | 済 | `read_10`のみ再送。`write_blocks`は`not retrying`で失敗を返す |
+| 現状文書を同じ作業で更新し、履歴は計画書へ残す | 済 | `USB.md`／`STORAGE.md`／`DIAGNOSTICS.md`／`KNOWN_ISSUES.md`／`DESIGN.md`を更新、履歴は本書と`USB_WRITE_STABILITY_PLAN.md` |
+
+削除後binaryでの実機回帰もPASSしたので、**Stage 0〜6と8を完了とする。**
+
+計画外に残る観測:
+
+- `fifo-skipped`は実機で未発火。skipの条件式はこの計画で変えていないので退行ではないが、
+  「periodic channelを持つHIDとchannel 0の失敗が同時に起きる」条件は未観測のまま。
+  HID側のperiodic昇格が起きない理由は別件として切り分ける。
+- `usbcachefail` [1/4]で、cache同期拒否の直後にMass Storage Resetのzero-length IN status
+  stageがhaltしない（`halt-timeout phase=control`）。注入経由でしか到達せず、Stage 4から
+  同一signatureで再現する既知の観測。driverの応答（session引退→rescanで復帰）は正しい。
+- Stage 7（複数ブロックWRITE）は未着手。計画の完了条件には含まれない。
+  1 block制限はdevice相互運用上の独立した既知問題として[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)に残す。
