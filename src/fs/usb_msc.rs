@@ -23,27 +23,19 @@ use crate::usb::{
 /// requests are split here.
 const MAX_READ_BYTES: usize = 4096;
 
-/// Blocks per WRITE(10). **One.**
+/// Maximum blocks per WRITE(10). **Eight (4 KiB).**
 ///
-/// Not a transfer budget like [`MAX_READ_BYTES`] but a limit on the *shape*
-/// of the transfer. A WRITE(10) covering several blocks puts that many
-/// 512-byte packets into a single data OUT phase, and this transport does
-/// not come back from it: the packets are all accepted and the device then
-/// never produces a CSW, so the bulk IN times out and the BOT session has to
-/// be rebuilt.
+/// This started at one because the old transport deterministically lost the
+/// final CSW after an eight-block data OUT phase. Stage 7 of
+/// `USB_BOT_HCD_REFACTOR_PLAN.md` retested 2/4/8 blocks after the HCD/BOT
+/// contract and post-reset FIFO programming were fixed. Two media
+/// (`1234:5645` and `054C:0243`) passed ten writes at each size in both
+/// High-Speed direct and Full-Speed hub+HID topologies, including FUA
+/// read-back, adjacent guard blocks, and restoration.
 ///
-/// Observed *deterministically* -- three single-block WRITE(10)s during one
-/// `mkdir` went through, and the first eight-block one failed, in three runs
-/// out of three. That matters
-/// because the transport's other write failures
-/// (`docs/USB_WRITE_STABILITY_PLAN.md`) are intermittent, and nothing before
-/// the filesystem write path ever issued a multi-block WRITE(10):
-/// `usbwritetest` writes one block and `usbzero` loops one block at a time,
-/// so the shape had never been exercised.
-///
-/// One is the only value real hardware has accepted. Two is untested. This
-/// constant is where to experiment once the OUT data phase is understood.
-const MAX_WRITE_BLOCKS: usize = 1;
+/// Eight also matches the accepted 4 KiB READ budget and the filesystem
+/// stream cache. Larger requests stay split at this adapter boundary.
+const MAX_WRITE_BLOCKS: usize = 8;
 const MAX_WRITE_BYTES: usize = MAX_WRITE_BLOCKS * SUPPORTED_BLOCK_BYTES as usize;
 
 /// One transfer's worth of outgoing data, staged so the BOT layer can have
@@ -51,20 +43,13 @@ const MAX_WRITE_BYTES: usize = MAX_WRITE_BLOCKS * SUPPORTED_BLOCK_BYTES as usize
 ///
 /// The alternative would be casting the mutability back on to a
 /// `BlockDevice::write_blocks` buffer, which is exactly the aliasing this
-/// interface's shared slice is there to rule out. The copy is one block, so
-/// it is nothing beside the transfer it feeds.
+/// interface's shared slice is there to rule out. The copy is at most 4 KiB.
 ///
-/// Aligned to a cache line because the controller's DMA reads straight out
-/// of it. `usb/hcd.rs` writes back the CPU's cache over the transfer buffer
-/// before starting a channel and **drops the result**, on the stated
-/// grounds that every buffer DMA touches on that side declares an
-/// alignment; the ROM cache routine refuses a span that starts mid-line, and
-/// a refused writeback sends the device whatever was in RAM instead of what
-/// was just written (`docs/KNOWN_ISSUES.md`). A plain `[u8; N]` has an
-/// alignment of one, so this has to say so. 64 is
-/// `psram::CACHE_LINE_BYTES`, which also satisfies the core's own word
-/// alignment for the QTD data pointer. Every packet the BOT layer cuts out
-/// of this is at an MPS multiple from the base, so all of them inherit it.
+/// The HCD now owns an aligned per-packet DMA staging buffer and rejects a
+/// cache-maintenance failure, so this adapter no longer imposes alignment on
+/// its caller. Keeping the local staging cache-line aligned makes its own
+/// layout explicit and avoids sharing a line at either end if it is ever
+/// handed to a lower layer directly again.
 #[repr(C, align(64))]
 struct WriteStaging([u8; MAX_WRITE_BYTES]);
 

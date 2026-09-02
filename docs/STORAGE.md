@@ -161,6 +161,15 @@ filesystemの全partition外に置きます。**transport failureで復元でき
 確認し、`fswritetest`の代わりにtransport受入として採用しました。filesystem層の受入は
 別段階で行います。
 
+`usbmultiwrite <lba> <2|4|8>`は、複数block WRITE(10)を再評価したStage 7診断です。
+同じ範囲へ10回発行し、各回をflush後のFUA READで照合します。
+指定範囲の前後1 blockもguardとしてsnapshot・照合し、最後に受入済みのsingle-block WRITEで
+原本へ戻します。成功packetのrequested／actual／DATA PIDと最終CSW residueはUARTへ出ます。
+transport failureで復元不能になる可能性があるため、**指定範囲と前後guardのすべてを
+filesystem外の失ってよいLBAに置きます**。`1234:5645`と`054C:0243`の2媒体について、
+High-Speed直結とFull-Speed固定ハブ＋HIDの2 topologyで2／4／8 blockを各10回通したため、
+filesystem adapterの`MAX_WRITE_BLOCKS`は8へ増やしました。
+
 descriptor DMAを使うHigh-Speed／Split以外の既存経路では、QTD status 1をESP-IDF 5.5.3と同じくpacket error
 （CRC、transaction timeout、stuff、false EOP、excessive NAK）として扱います。
 各descriptorはendpoint MPS以下の1 packet QTDに限定し、非Split BOT Bulk OUTも1 packetごとに
@@ -263,11 +272,13 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
 | SDカード | CMD25の完了後、DAT0のbusy解除まで確認した時点 | 何もしない（上の境界で既に達成済み） |
 | USB MSC | WRITE(10)がdeviceに受理された時点 | SYNCHRONIZE CACHE(10)とready待ち |
 
-**USBのWRITE(10)は1ブロックずつです**（`MAX_WRITE_BLOCKS = 1`）。READ(10)は4 KiBまで
-まとめますが、書き込みは複数ブロックを1回のdata OUTフェーズに入れると転送層が
-戻らなくなります（[USB_WRITE_STABILITY_PLAN.md](USB_WRITE_STABILITY_PLAN.md)の
-「決定論的な再現手順」）。4 KiBの書き込みはWRITE(10) 8本になるので遅くなりますが、
-これが実機で通る唯一の形です。SDにはこの制限はありません。
+**USBのWRITE(10)は最大8ブロック（4 KiB）です**（`MAX_WRITE_BLOCKS = 8`）。READ(10)も
+4 KiBまでまとめるため、filesystem adapterの転送上限は方向で同じになりました。かつては
+複数ブロックを1回のdata OUTフェーズに入れるとCSWが戻らず、1ブロックへ制限していました
+（[USB_WRITE_STABILITY_PLAN.md](USB_WRITE_STABILITY_PLAN.md)の「決定論的な再現手順」）。
+HCD／BOT契約とroot-port reset後のFIFO再適用を修正した後、Stage 7で2媒体×2 topologyの
+2／4／8 blockを各10回通したため上限を増やしました。8ブロックを超える呼び出しはadapterで
+4 KiBごとのWRITE(10)へ分割します。WRITE失敗を自動再送しない方針は変わりません。
 
 SDの`flush()`が何もしないのは、USBより弱い保証だからではありません。`sdmmc.rs`の
 `write_blocks`はCMD25が完了し、さらにカードがDAT0を離す（フラッシュへの書き込みを
@@ -354,6 +365,7 @@ DATA PROTECT）を`BlockError::WriteProtected`へ写します。転送は何も�
 | `usbread <lba>` | SCSI READ(10)で1ブロック読み出してUARTへダンプ |
 | `usbwritetest <lba>` | SCSI WRITE(10)で1ブロックの書き込み・照合・復元（`sdwritetest`のUSB版） |
 | `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲へ単一block WRITEを発行し、最後に照合・復元するraw試験。gapは成功したWRITE command間の0〜2000 ms、既定0 |
+| `usbmultiwrite <lba> <2\|4\|8>` | 複数block WRITE(10)を同一範囲へ10回発行するStage 7診断。各回の媒体照合、前後guard検査、原本復元、packet／CSW trace付き |
 | `usbzero <lba> [count]` | 1〜8ブロックをゼロで上書きし、媒体から読み直して照合（破壊的） |
 | `usbmbr` | LBA 0のMBRを`sdmbr`と同じ書式で表示 |
 | `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数も表示） |

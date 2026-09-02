@@ -312,6 +312,13 @@ raw WRITEが不安定な段階ではfilesystem側の`fswritetest`を実行しま
 単一block WRITE列を発行します。gapは成功したWRITE commandと次WRITEの間だけ待つ0〜2000 msで、
 既定0は連続burstです。失敗してsessionが使用不能になっても`usbrescan`後に同じ犠牲範囲を再利用でき、
 filesystem repairを試験の前提にしません。
+複数block WRITE(10)のStage 7診断は`usbmultiwrite <犠牲LBA> <2|4|8>`です。同じ範囲へ
+10回発行し、各成功data OUT packetを`USB BOT TRACE:`（packet、requested、actual、DATA1）、
+最終CSWを`USB MSC TRACE:`（host actual、expected、residue、status）でUARTへ出します。
+失敗packetは通常のHCD failure log、不正CSWは通常のCSW分解ログを使います。画面の
+`accepted=10/10 verified=10 collateral=0`、復元`yes`、`RESULT PASS`が1構成の合格形です。
+Stage 7の2媒体×2 topology受入後は通常I/Oも最大8 blockを1 commandへまとめます。このコマンドは
+引き続き、guardとpacket／CSW traceを伴う回帰手段です。
 DMA cache同期の拒否経路は`usbcachefail`で確認します（下記）。
 
 `usbhw`は上記に続けて、[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)

@@ -22,9 +22,9 @@
 | 区分 | 意味 | 数 |
 | --- | --- | --- |
 | 製品（`Group::Product`） | 板を操作する。残る | 41 |
-| 足場（`Group::Scaffold`） | 何かを動かすため、動くと示すために書いた。片付いたら消える | 57 |
+| 足場（`Group::Scaffold`） | 何かを動かすため、動くと示すために書いた。片付いたら消える | 62 |
 
-`src/app/shell.rs`の`execute`が受け付ける名前は104個、`HELP_ENTRIES`は98項目です。
+`src/app/shell.rs`の`execute`が受け付ける名前は109個、`HELP_ENTRIES`は103項目です。
 差の6個は別名（後述）で、「helpにあるのに実行できない」名前はありません。
 **この表の区分がそのまま`HELP_ENTRIES`の`group`です**。片方を動かしたら
 もう片方も動かしてください。
@@ -56,14 +56,14 @@
 `usbinfo`は`lsusb`（引数なし）とほぼ同じ内容を出します。製品側にあるのは
 重複の解消先としてで、片方に寄せる余地があります。
 
-## 足場（57）と、生かしている作業
+## 足場（62）と、生かしている作業
 
 足場が消せるかどうかは、それを書かせた作業が閉じたかどうかで決まります。
 この repo では`docs/*_PLAN.md`が作業単位なので、**各足場コマンドを計画へ
 紐づけ、計画が閉じたら退役**という対応にします。判断が repo の状態から
 読めるので、後から誰が見ても同じ結論になります。
 
-計画の状態は各`*_PLAN.md`の`## 状態`から取りました（2026-08-30時点）。
+計画の状態は各`*_PLAN.md`の`## 状態`から取りました（2026-09-03時点）。
 
 | 生かしている作業 | 状態 | 足場コマンド |
 | --- | --- | --- |
@@ -87,6 +87,7 @@
 | [`PPA_FILL_PLAN.md`](PPA_FILL_PLAN.md) | 完了（Stage 1〜6、実機確認済み） | `ppafill` |
 | [`FLASH_XIP_MIGRATION_PLAN.md`](FLASH_XIP_MIGRATION_PLAN.md) | 全Stage完了 | `pf` `rt` `alloctest` |
 | [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)／[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)／[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md) | 読み出し・WRITE(10)安定化とも受入完了 | `ut` `usbmargin` `usbread` `usbwritetest` `usbzero` `usbmsc` `usbmbr` `usbhw` `usbvbus` |
+| [`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md) | Stage 0〜8完了。2媒体×2 topologyの複数block診断と、8 block上限binaryのA／B／C回帰まで実機確認済み | `usbcheck` `usbrawcheck` `usbcachefail` `usbmultiwrite` |
 | [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)／[`ROOT_FILESYSTEM_PLAN.md`](ROOT_FILESYSTEM_PLAN.md)／[`FILESYSTEM_WORKFLOW_PLAN.md`](FILESYSTEM_WORKFLOW_PLAN.md) | 完了（VFS、RAMルート、カレントディレクトリ、自動マウント） | `fsopen` `fsread` `fsclose` `fsverify` `fill` `blkread` `sdinfo` `sdmbr` `sdread` `sdreadn` `sdreadpsram` `sdwritetest` `sdzero` |
 | [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md) | 全Stage完了（実機確認済み） | `wifiinfo` `wifiup` `wifimac` `wifisaved` |
 | [`TCPIP_PLAN.md`](TCPIP_PLAN.md)／[`DNS_PLAN.md`](DNS_PLAN.md) | 完了（実機確認済み） | `netdump` `httpget` |
@@ -102,7 +103,7 @@
 
 ## 破壊的なコマンド
 
-`sdzero` `usbzero` `sdwritetest` `usbwritetest`の4つは、ファイルシステムを
+`sdzero` `usbzero` `sdwritetest` `usbwritetest` `usbmultiwrite`の5つは、ファイルシステムを
 迂回してLBAへ直接書きます。破壊性は製品／足場のどちらとも直交します——製品の
 `rm`も破壊的で、足場の`membench`は無害です。区分では表せないので、`help`側で
 警告を出すなら`HelpEntry`に別のマーカーが要ります。

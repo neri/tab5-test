@@ -7,7 +7,7 @@
 > 優先します。既存の故障履歴は[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)を
 > 参照してください。
 
-## 状態: 完了（Stage 0〜6・8）。Stage 7は未着手で完了条件外
+## 状態: 完了（Stage 0〜8、実機確認済み）
 
 ### 現在地の要約（再開する人へ）
 
@@ -56,7 +56,9 @@ Stage 8では`hcd.rs`の無効化されたまま腐っていた旧診断コー�
 release ELFでDMA objectの配置とalignmentを実測、stack上の`PacketStaging`には
 compile-time assertを追加した。現状文書と`KNOWN_ISSUES.md`も更新済み。
 削除後binaryでの実機回帰（`usbcachefail`全13 gateとA／B／Cの`usbcheck`）もPASSし、
-**本計画は完了**。残る観測は「完了条件の照合」の末尾にまとめてある。
+Stage 0〜6・8は完了した。Stage 7も診断経路の2媒体×2 topology受入、通常I/Oの8 block化、
+上限変更後binaryのA／B／C回帰をすべて完了した。**本計画のStage 0〜8は完了。**
+残る観測は「完了条件の照合」の末尾にまとめてある。
 
 確定したこと:
 
@@ -2094,7 +2096,8 @@ Stage 8の回帰でまとめて確認する。
 
 ### Stage 7: 複数ブロックWRITEの再評価
 
-**進捗: 未着手。cleanup撤去の完了条件には含めない。**
+**進捗: 完了。2媒体×2 topologyの診断、通常上限8 block化、変更後binaryのA／B／C回帰が
+すべてPASS。cleanup撤去の完了条件とは独立に受入済み。**
 
 Stage 6完了後にだけ、決定論的だった複数ブロックWRITEを診断buildで再評価する。
 
@@ -2106,6 +2109,118 @@ Stage 6完了後にだけ、決定論的だった複数ブロックWRITEを診�
 8 blockまで複数media／複数topologyで通った場合だけ`MAX_WRITE_BLOCKS`を増やす。失敗する場合は
 1 block制限をdevice相互運用上の独立した既知問題として残す。cleanup撤去に成功していても、
 このStageのNo-Goは前Stageを自動的に取り消さない。
+
+#### 実装した診断経路
+
+`usbmultiwrite <lba> <2|4|8>`を足した。通常のfilesystem adapterにある
+`MAX_WRITE_BLOCKS = 1`は変更せず、この足場コマンドだけが2／4／8 blockを1つの
+WRITE(10) data phaseへ載せる。各block数について次を1 commandで行う。
+
+1. 指定範囲と前後1 block（guard）の合計4／6／10 blockをREADして原本を保持する。
+2. 同じ指定範囲へmulti-block WRITE(10)を10回発行する。失敗したWRITEは再送しない。
+3. 各WRITE後にflush／ready待ちとFUA READを行い、全patternと2 guardを照合する。
+4. 終了後は変更が見えるblockを、受入済みのsingle-block WRITEで原本へ戻し、FUA READで
+   guardを含む全範囲の一致を確認する。
+
+成功したdata OUT packetごとにUARTへ`requested`／`actual`／`DATA1`を出し、command末尾には
+host actual、expected、CSW residue、CSW statusを出す。失敗packetは従来のHCD failure logが
+requested／actualとraw QTDを出し、不正CSWは従来の`log_csw`がresidueを含む13 byteを分解する。
+画面側はblock数、round、Bulk OUT MPS、受理／照合回数、guard変化数、packet error／timeout／
+Recoveryの差分、復元結果と最終PASS/FAILを出す。
+
+test範囲だけでなく前後guardも**失ってよいfilesystem外LBA**でなければ実行しない。
+sessionが死ぬとRAM上のsnapshotを媒体へ戻せないため、コマンド自身の復元は保証ではない。
+
+静的確認:
+
+- `cargo build --release`: 成功、警告0。
+- 変更したRust 3ファイルの`rustfmt --check`: 清潔。
+- `cargo clippy --release`: 完走。新規のUSB correctness警告なし（既存警告は残る）。
+- `git diff --check`: 清潔。
+- `README.md`: 差分なし。
+
+#### 実機確認手順
+
+最初はHigh-Speed直結の1媒体で、同じ犠牲範囲先頭を使って次の順に実行する。
+
+```text
+usbmultiwrite <LBA> 2
+usbmultiwrite <LBA> 4
+usbmultiwrite <LBA> 8
+```
+
+各行が`RESULT PASS`、`accepted=10/10 verified=10 collateral=0`、復元`yes`になることを
+確認する。UARTでは全成功packetの`actual == requested`、PIDがpacketごとに交互、各commandの
+`host actual == expected`、`CSW residue=0`、`CSW status=0`を確認する。1行でもFAILならそこで
+止め、`usbrescan`後も媒体へ書かず、別hostで媒体全体とpartitionのfilesystemを検査する。
+
+直結が全PASSした場合だけ、Full-Speed固定ハブ＋HID＋同媒体、次に別メーカー媒体の
+High-Speed直結とFull-Speed固定ハブ＋HIDで同じ3行を行う。これで2 media×2 topologyを
+満たす。各構成の試験後にHIDの生死も確認する。全12行がPASSして初めて通常I/Oの
+`MAX_WRITE_BLOCKS`を増やす候補にする。High-Speedハブ＋Low-Speed HID＋High-Speed MSCは、
+上限変更後のA／B／C回帰で別に通す。
+
+#### 実機確認 第1回: High-Speed直結1媒体はGo
+
+同じbinary・同じ犠牲LBAで、High-Speed直結の1媒体に対して2／4／8 blockを順に実行し、
+3行すべて`RESULT PASS`となった。実施者による確認で、console／UART出力そのものは採取していない。
+各コマンドのPASS gateから、10 WRITEの受理と媒体照合、guard変化0、原本復元まで通ったことは
+確認できる。`write_blocks_diagnostic`はCSW residue 0かつhost actual＝expectedでなければ
+`WriteOutcome::Written`を返さないため、短いWRITE／nonzero residueも成功には丸められていない。
+
+この結果だけでは1 media×1 topologyなので、通常I/Oの上限はまだ1 blockのままにする。
+次は同じ媒体をFull-Speed固定ハブ＋HIDへ移し、`bulk-out-mps=64`で同じ3行とHID入力を確認する。
+
+#### 実機確認 第2回: Full-Speed固定ハブ＋HIDもGo
+
+第1回と同じbinary・媒体・犠牲LBAをFull-Speed固定ハブ＋HID構成へ移し、2／4／8 blockの
+3行すべてが`RESULT PASS`となった。実施者による確認で、試験後のHID入力も正常だった。
+これで1媒体についてHigh-Speed直結とFull-Speed固定ハブ＋HIDの2 topologyを完了した。
+
+残るStage 7の上限変更前条件は別メーカー媒体での同じ2 topologyである。通常I/Oの上限は
+引き続き1 blockのままとし、別媒体のHigh-Speed直結から再開する。
+
+#### 実機確認 第3・4回: 別メーカー媒体を含む全12行がGo
+
+別メーカー媒体へ交換し、High-Speed直結、次にFull-Speed固定ハブ＋HIDで2／4／8 blockを
+各10回実行した。全6行が`RESULT PASS`、Full-Speed構成の試験後もHID入力は正常だった。
+媒体は`1234:5645`と`054C:0243`の2本。これで次の上限変更前matrix全12行がPASSした。
+
+| VID:PID | High-Speed直結 | Full-Speed固定ハブ＋HID |
+| --- | --- | --- |
+| `1234:5645` | 2／4／8 block各10回PASS | 2／4／8 block各10回PASS |
+| `054C:0243` | 2／4／8 block各10回PASS | 2／4／8 block各10回PASS |
+
+Go条件を満たしたため、`src/fs/usb_msc.rs`の`MAX_WRITE_BLOCKS`を1から8へ増やした。
+1回の通常WRITE(10)は最大4 KiBとなり、それを超える呼び出しは従来どおりadapterで分割する。
+WRITE失敗を自動再送しない方針、失敗時のmount隔離、flush／FUA確認は変えない。
+
+上限変更後の静的確認:
+
+- `cargo build --release`: 成功、警告0。
+- 変更したRust 4ファイルの`rustfmt --check`: 清潔。
+- `cargo test -p tab5-bot-protocol --target x86_64-unknown-linux-gnu`: 7 tests PASS。
+- `cargo clippy --release`: 完走。変更箇所の新規警告なし（既存の`msc.rs` 2件は残る）。
+- `git diff --check`: 清潔。
+- `README.md`: 差分なし。
+
+この変更後binaryではfilesystem経路が実際にmulti-block WRITEを使うため、A／B／Cの
+`fswritetest`回帰と通常の`usbcheck`を通してからStage 7を完了にする。
+
+#### 実機確認 第5回: 上限変更後binaryのA／B／C回帰もGo
+
+`MAX_WRITE_BLOCKS = 8`へ変更したbinaryで、次の3構成すべてについて
+`usbcheck 100 <犠牲LBA>`と`fswritetest /vol/usb0pN 1 8`を実行し、全コマンドがPASSした。
+
+| ID | 接続 | `usbcheck` | `fswritetest` | HID |
+| --- | --- | --- | --- | --- |
+| A | High-Speed直結、MPS 512 | PASS | 12検査PASS | 対象外 |
+| B | Full-Speed固定ハブ＋HID、MPS 64 | PASS | 12検査PASS | 正常 |
+| C | High-Speedハブ＋Low-Speed HID＋High-Speed MSC、MPS 512 | PASS | 12検査PASS | 正常 |
+
+試験後に媒体をunmountし、別PCで全ファイルの読み出しと`fsck.fat -n`もPASSした。
+これによりraw診断だけでなく、filesystem streamが最大4 KiBのWRITE(10)を実際に発行する経路と、
+Split HID併用まで回帰できた。**Stage 7を完了とする。**
 
 ### Stage 8: 診断整理、現状文書、回帰
 
@@ -2222,7 +2337,7 @@ sessionを使用不能にする」が実機で成立した。
   という観測自体は残る。Stage 7以降で触るなら`recover_failed_packet`ではなく
   control転送側の問題として切り分ける。
 
-**これで本計画の完了条件はすべて満たした。**
+**これでStage 0〜6・8が対象にしたcleanup撤去の完了条件はすべて満たした。**
 
 #### （回帰前の記録）予防cleanupを削除したbinaryは未実行だった
 
@@ -2273,7 +2388,7 @@ HID periodic／fallback、cleanup設定が違う試験を同じ結果として�
 - READだけを安全に1回再送し、WRITEを自動再送しない方針を維持する。
 - 実装変更と同じ作業で現状文書を更新し、調査履歴は計画書へ残す。
 
-### 完了条件の照合（Stage 8時点）
+### 完了条件の照合（全Stage完了時点）
 
 | 条件 | 状態 | 根拠 |
 | --- | --- | --- |
@@ -2284,10 +2399,11 @@ HID periodic／fallback、cleanup設定が違う試験を同じ結果として�
 | Phase Errorとinvalid CSWでReset Recovery、正常command回数では行わない | 済 | Recoveryは`execute_command`の失敗pathのみ。3構成で`proactive` 26回に対し`recovery ok+0 failed+0` |
 | READ前／WRITE前のproactive cleanupがコードと正常ログから無くなる | 済 | Stage 6で撤去。`src/`に残るのは経緯を説明するコメント1行のみ |
 | Stage 5・6の全実機matrixをcleanup無しで通る | 済 | READ: 3構成×`usbcheck 1000`が`proactive read+0`。WRITE: 3構成×100回＋2媒体の`fswritetest`各10回 |
+| Stage 7の複数block WRITEを受け入れる | 済 | 2媒体×2 topologyで2／4／8 block各10回PASS。上限8 block化後もA／B／Cの`usbcheck`／`fswritetest`、HID、PC媒体検査がPASS |
 | READだけを1回再送し、WRITEを自動再送しない | 済 | `read_10`のみ再送。`write_blocks`は`not retrying`で失敗を返す |
 | 現状文書を同じ作業で更新し、履歴は計画書へ残す | 済 | `USB.md`／`STORAGE.md`／`DIAGNOSTICS.md`／`KNOWN_ISSUES.md`／`DESIGN.md`を更新、履歴は本書と`USB_WRITE_STABILITY_PLAN.md` |
 
-削除後binaryでの実機回帰もPASSしたので、**Stage 0〜6と8を完了とする。**
+削除後binaryと8 block上限binaryの実機回帰もPASSしたので、**Stage 0〜8を完了とする。**
 
 計画外に残る観測:
 
@@ -2297,5 +2413,3 @@ HID periodic／fallback、cleanup設定が違う試験を同じ結果として�
 - `usbcachefail` [1/4]で、cache同期拒否の直後にMass Storage Resetのzero-length IN status
   stageがhaltしない（`halt-timeout phase=control`）。注入経由でしか到達せず、Stage 4から
   同一signatureで再現する既知の観測。driverの応答（session引退→rescanで復帰）は正しい。
-- Stage 7（複数ブロックWRITE）は未着手。計画の完了条件には含まれない。
-  1 block制限はdevice相互運用上の独立した既知問題として[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)に残す。

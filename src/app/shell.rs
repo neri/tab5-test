@@ -152,6 +152,7 @@ enum Cmd {
     Usbcachefail,
     Usbcheck,
     Usbrawcheck,
+    Usbmultiwrite,
     Usbhw,
     Usbperiodic,
     Usbmsc,
@@ -1082,6 +1083,22 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "usbmultiwrite",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbmultiwrite,
+        usage: "usbmultiwrite <lba> <2|4|8>",
+        lines: &[
+            "Stage 7 diagnostic: issue one multi-block WRITE(10) ten times,",
+            "logging every data-OUT packet and final CSW to UART. each round",
+            "is flushed and read back; the test range plus one guard block on",
+            "each side is snapshotted and restored with single-block writes.",
+            "DESTRUCTIVE IF THE USB SESSION DIES: all named and guard blocks",
+            "must be outside every filesystem and safe to lose. run 2 blocks,",
+            "then 4, then 8; stop at the first FAIL and run usbrescan.",
+        ],
+    },
+    HelpEntry {
         name: "usbcachefail",
         aliases: &[],
         group: Group::Scaffold,
@@ -1736,6 +1753,7 @@ pub fn execute(
         Cmd::Usbhub => cmd_usbhub(console, framebuffer, usb_host),
         Cmd::Usbcheck => cmd_usbcheck(console, framebuffer, argument, usb_host),
         Cmd::Usbrawcheck => cmd_usbrawcheck(console, framebuffer, argument, usb_host),
+        Cmd::Usbmultiwrite => cmd_usbmultiwrite(console, framebuffer, argument, usb_host),
         Cmd::Usbcachefail => cmd_usbcachefail(console, framebuffer, usb_host),
         Cmd::Usbhw => cmd_usbhw(console, framebuffer, usb_host),
         Cmd::Usbperiodic => cmd_usbperiodic(console, framebuffer, usb_host),
@@ -9098,6 +9116,291 @@ fn fill_usb_raw_pattern(block: &mut [u8; 512], lba: u32, sequence: u32) {
     block[0..4].copy_from_slice(b"URAW");
     block[4..8].copy_from_slice(&lba.to_le_bytes());
     block[8..12].copy_from_slice(&sequence.to_le_bytes());
+}
+
+/// Stage 7's deliberately narrow multi-block WRITE(10) experiment.
+///
+/// The normal filesystem adapter remains capped at one block per command.
+/// This command is the only caller that opts into 2/4/8-block commands, so
+/// an inconclusive hardware result cannot silently change production I/O.
+fn cmd_usbmultiwrite(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    const BLOCK: usize = 512;
+    const MAX_BLOCKS: usize = 8;
+    const GUARDED_BLOCKS: usize = MAX_BLOCKS + 2;
+    const MAX_TEST_BYTES: usize = MAX_BLOCKS * BLOCK;
+    const MAX_GUARDED_BYTES: usize = GUARDED_BLOCKS * BLOCK;
+    const ROUNDS: u32 = 10;
+    const USAGE: &str = "usage: usbmultiwrite <lba> <2|4|8>";
+
+    let (lba_text, rest) = split_first_word(trim(argument));
+    let (blocks_text, trailing) = split_first_word(trim(rest));
+    let (Some(first_lba), Some(blocks)) = (parse_u32(lba_text), parse_u32(blocks_text)) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    if !trim(trailing).is_empty() || !matches!(blocks, 2 | 4 | 8) {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let blocks = blocks as usize;
+    let Some(last_lba) = first_lba.checked_add(blocks as u32 - 1) else {
+        console.write_output_line(framebuffer, "test range overflows the LBA address space");
+        return;
+    };
+    let Some(guard_first) = first_lba.checked_sub(1) else {
+        console.write_output_line(
+            framebuffer,
+            "LBA 0 cannot be used: a leading guard block is required",
+        );
+        return;
+    };
+    let Some(guard_last) = last_lba.checked_add(1) else {
+        console.write_output_line(
+            framebuffer,
+            "test range has no room for the trailing guard block",
+        );
+        return;
+    };
+    let guarded_blocks = blocks + 2;
+    let test_bytes = blocks * BLOCK;
+    let guarded_bytes = guarded_blocks * BLOCK;
+
+    console.write_output_line(
+        framebuffer,
+        "WARNING: raw multi-block test; the test AND both guard blocks must be disposable",
+    );
+    console.write_output_line(
+        framebuffer,
+        "a dead USB session can prevent restoration; do not name any filesystem block",
+    );
+    let mut line = Line::new();
+    line.push_str("usbmultiwrite: test LBA ");
+    line.push_u32(first_lba);
+    line.push_str("-");
+    line.push_u32(last_lba);
+    line.push_str(" guards=");
+    line.push_u32(guard_first);
+    line.push_str("/");
+    line.push_u32(guard_last);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
+        return;
+    };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line(framebuffer, "media not ready; aborting (nothing written)");
+        return;
+    }
+    let Some(capacity) = mass_storage.read_capacity() else {
+        console.write_output_line(framebuffer, "READ CAPACITY(10) failed; aborting");
+        return;
+    };
+    if capacity.block_length != BLOCK as u32 {
+        console.write_output_line(framebuffer, "device block length is not 512; aborting");
+        return;
+    }
+    if guard_last > capacity.last_lba {
+        console.write_output_line(
+            framebuffer,
+            "guarded range extends beyond the medium; aborting",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("usbmultiwrite: blocks=");
+    line.push_u32(blocks as u32);
+    line.push_str(" rounds=");
+    line.push_u32(ROUNDS);
+    line.push_str(" bulk-out-mps=");
+    line.push_u32(mass_storage.bulk_out_mps() as u32);
+    console.write_output_line(framebuffer, line.as_str());
+    console.write_output_line(
+        framebuffer,
+        "packet requested/actual/PID and final CSW status/residue are in the UART log",
+    );
+
+    let mut snapshot = [0u8; MAX_GUARDED_BYTES];
+    if !mass_storage.read_blocks(guard_first, &mut snapshot[..guarded_bytes]) {
+        console.write_output_line(
+            framebuffer,
+            "could not snapshot the guarded range; aborting (nothing written)",
+        );
+        return;
+    }
+
+    let before = mass_storage.transport_observation();
+    let mut pattern = [0u8; MAX_TEST_BYTES];
+    let mut verify = [0u8; MAX_GUARDED_BYTES];
+    let mut writes_accepted = 0u32;
+    let mut rounds_verified = 0u32;
+    let mut collateral = 0u32;
+    let mut test_ok = true;
+
+    for round in 0..ROUNDS {
+        fill_usb_multiwrite_pattern(&mut pattern[..test_bytes], first_lba, blocks, round);
+        let mut line = Line::new();
+        line.push_str("usbmultiwrite: round ");
+        line.push_u32(round + 1);
+        line.push_str("/");
+        line.push_u32(ROUNDS);
+        console.write_output_line(framebuffer, line.as_str());
+
+        if mass_storage.write_blocks_diagnostic(first_lba, &mut pattern[..test_bytes])
+            != usb::WriteOutcome::Written
+        {
+            console.write_output_line(
+                framebuffer,
+                "multi-block WRITE failed; it was not replayed (see UART log)",
+            );
+            test_ok = false;
+            break;
+        }
+        writes_accepted += 1;
+
+        let _ = mass_storage.synchronize_cache();
+        let _ = mass_storage.wait_until_ready(10);
+        let read = mass_storage.read_blocks_from_medium(guard_first, &mut verify[..guarded_bytes])
+            || mass_storage.read_blocks(guard_first, &mut verify[..guarded_bytes]);
+        if !read {
+            console.write_output_line(framebuffer, "guarded read-back failed");
+            test_ok = false;
+            break;
+        }
+
+        let leading_ok = verify[..BLOCK] == snapshot[..BLOCK];
+        let trailing_start = (guarded_blocks - 1) * BLOCK;
+        let trailing_ok =
+            verify[trailing_start..guarded_bytes] == snapshot[trailing_start..guarded_bytes];
+        collateral += u32::from(!leading_ok) + u32::from(!trailing_ok);
+        let payload_ok = verify[BLOCK..BLOCK + test_bytes] == pattern[..test_bytes];
+        if !payload_ok || !leading_ok || !trailing_ok {
+            console.write_output_line(
+                framebuffer,
+                if payload_ok {
+                    "COLLATERAL DAMAGE: a guard block changed"
+                } else {
+                    "multi-block pattern read-back MISMATCH"
+                },
+            );
+            test_ok = false;
+            break;
+        }
+        rounds_verified += 1;
+    }
+
+    // Restore with the already accepted one-block command shape. This is
+    // not a replay of a failed multi-block WRITE: it writes the saved bytes
+    // back to each possibly changed LBA after the experiment has stopped.
+    let mut restored = !mass_storage.needs_reinit();
+    if restored {
+        let current_known = mass_storage.read_blocks(guard_first, &mut verify[..guarded_bytes]);
+        for index in 0..guarded_blocks {
+            let start = index * BLOCK;
+            let end = start + BLOCK;
+            if current_known && verify[start..end] == snapshot[start..end] {
+                continue;
+            }
+            let mut original = [0u8; BLOCK];
+            original.copy_from_slice(&snapshot[start..end]);
+            if mass_storage.write_blocks(guard_first + index as u32, &mut original)
+                != usb::WriteOutcome::Written
+            {
+                restored = false;
+                break;
+            }
+        }
+    }
+    if restored {
+        let _ = mass_storage.synchronize_cache();
+        let _ = mass_storage.wait_until_ready(10);
+        let read = mass_storage.read_blocks_from_medium(guard_first, &mut verify[..guarded_bytes])
+            || mass_storage.read_blocks(guard_first, &mut verify[..guarded_bytes]);
+        restored = read && verify[..guarded_bytes] == snapshot[..guarded_bytes];
+    }
+
+    let after = mass_storage.transport_observation();
+    let mut line = Line::new();
+    line.push_str("usbmultiwrite: accepted=");
+    line.push_u32(writes_accepted);
+    line.push_str("/");
+    line.push_u32(ROUNDS);
+    line.push_str(" verified=");
+    line.push_u32(rounds_verified);
+    line.push_str(" collateral=");
+    line.push_u32(collateral);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbmultiwrite: delta pkt-error+");
+    line.push_u32(
+        after
+            .packet_error_retries
+            .wrapping_sub(before.packet_error_retries),
+    );
+    line.push_str(" timeout+");
+    line.push_u32(after.timeout_retries.wrapping_sub(before.timeout_retries));
+    line.push_str(" recovery+");
+    line.push_u32(after.reset_recoveries.wrapping_sub(before.reset_recoveries));
+    console.write_output_line(framebuffer, line.as_str());
+
+    console.write_output_line(
+        framebuffer,
+        if restored {
+            "usbmultiwrite: original guarded range restored: yes"
+        } else {
+            "usbmultiwrite: original guarded range restored: NO -- range may be corrupted"
+        },
+    );
+    if mass_storage.needs_reinit() {
+        console.write_output_line(
+            framebuffer,
+            "MSC session unusable; run usbrescan before any further USB command",
+        );
+    }
+
+    let passed = test_ok
+        && writes_accepted == ROUNDS
+        && rounds_verified == ROUNDS
+        && collateral == 0
+        && restored;
+    console.write_output_line(
+        framebuffer,
+        if passed {
+            "usbmultiwrite: RESULT PASS"
+        } else {
+            "usbmultiwrite: RESULT FAIL"
+        },
+    );
+}
+
+fn fill_usb_multiwrite_pattern(buffer: &mut [u8], first_lba: u32, blocks: usize, round: u32) {
+    debug_assert_eq!(buffer.len(), blocks * 512);
+    let (block_buffers, remainder) = buffer.as_chunks_mut::<512>();
+    debug_assert!(remainder.is_empty());
+    for (block_index, block) in block_buffers.iter_mut().enumerate() {
+        let lba = first_lba + block_index as u32;
+        for (index, byte) in block.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(round as u8)
+                ^ (lba as u8).rotate_left((round + block_index as u32) & 7);
+        }
+        block[0..4].copy_from_slice(b"UMW7");
+        block[4..8].copy_from_slice(&lba.to_le_bytes());
+        block[8..12].copy_from_slice(&round.to_le_bytes());
+        block[12..16].copy_from_slice(&(block_index as u32).to_le_bytes());
+    }
 }
 
 /// Runs one configuration's acceptance sequence and reports its own verdict.

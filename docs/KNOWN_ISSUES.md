@@ -228,11 +228,13 @@ channelをhaltしFIFOをflushするという、実装としても診断として
 Stage 5・6）。cleanupが残るのは失敗後だけで、そこでFIFO flushがtimeoutした場合は
 Reset Recoveryを実行せずsessionを引退させます。
 
+Stage 7では`usbmultiwrite`を使い、`1234:5645`と`054C:0243`の2媒体について
+High-Speed直結とFull-Speed固定ハブ＋HIDの2 topologyで2／4／8 blockを各10回通しました。
+この結果を受け、1回のWRITE(10)上限は8 block（4 KiB）へ増やしています。旧1 block制限は
+既知問題ではなくなりました。
+
 残件:
 
-- **1回のWRITE(10)は1ブロックのまま**です（`MAX_WRITE_BLOCKS = 1`）。複数ブロックを
-  1回のdata OUTに入れると転送層が戻らなくなる問題は未解決で、予防cleanupの撤去とは
-  独立した相互運用上の制限として残ります。再評価は同計画のStage 7です。
 - **失敗cleanupがshared FIFOをskipする経路は実機で一度も発火していません。** skipは
   persistent periodic channelがarm中のときだけ起き、`enable_periodic_hid`はsplitが要る
   経路を拒否するため、High-Speedハブ配下のLow-Speed HIDは構造上そこへ到達しません。

@@ -656,6 +656,23 @@ impl UsbMassStorage {
     /// the write failed and decides what to do -- which is why this retry
     /// policy lives here rather than in `bot.rs`.
     pub fn write_blocks(&mut self, lba: u32, buffer: &mut [u8]) -> WriteOutcome {
+        self.write_blocks_inner(lba, buffer, false)
+    }
+
+    /// Diagnostic WRITE(10) with a per-packet data-OUT trace and the final
+    /// host length/status/residue tuple. The transfer and retry policy are
+    /// otherwise exactly [`Self::write_blocks`]'s, especially the rule that
+    /// a failed WRITE is never replayed.
+    pub fn write_blocks_diagnostic(&mut self, lba: u32, buffer: &mut [u8]) -> WriteOutcome {
+        self.write_blocks_inner(lba, buffer, true)
+    }
+
+    fn write_blocks_inner(
+        &mut self,
+        lba: u32,
+        buffer: &mut [u8],
+        trace_data_out: bool,
+    ) -> WriteOutcome {
         if buffer.is_empty() || buffer.len() % BLOCK_BYTES != 0 {
             uart::log(
                 b"USB MSC: block transfer length must be a nonzero multiple of 512 bytes\r\n",
@@ -686,11 +703,30 @@ impl UsbMassStorage {
             block_count as u8,
             0,
         ];
-        let Some(result) = self.bot.execute_command(&cdb, false, buffer) else {
+        if trace_data_out {
+            uart::log_hex(b"USB MSC TRACE: WRITE(10) LBA=", lba);
+            uart::log_u32(b"USB MSC TRACE: blocks=", block_count as u32);
+        }
+        let result = if trace_data_out {
+            self.bot
+                .execute_command_with_data_out_trace(&cdb, false, buffer)
+        } else {
+            self.bot.execute_command(&cdb, false, buffer)
+        };
+        let Some(result) = result else {
+            if trace_data_out {
+                uart::log(b"USB MSC TRACE: no valid final CSW\r\n");
+            }
             uart::log(b"USB MSC: WRITE(10) transport failed, not retrying\r\n");
             log_write_extent(lba, block_count);
             return WriteOutcome::Failed;
         };
+        if trace_data_out {
+            uart::log_u32(b"USB MSC TRACE: host actual=", result.transferred as u32);
+            uart::log_u32(b"USB MSC TRACE: expected=", result.expected as u32);
+            uart::log_u32(b"USB MSC TRACE: CSW residue=", result.residue);
+            uart::log_u32(b"USB MSC TRACE: CSW status=", result.status as u32);
+        }
         if result.status != CSW_STATUS_PASSED {
             // The status alone does not say why: a write-protected device
             // and a dying one fail identically here. The sense data does,
@@ -833,6 +869,12 @@ impl UsbMassStorage {
     /// a diagnostic run actually re-enumerated in High- or Full-Speed mode.
     pub fn bulk_in_mps(&self) -> u16 {
         self.bot.bulk_in_mps()
+    }
+
+    /// Enumerated Bulk OUT maximum packet size, used by the multi-block
+    /// WRITE diagnostic to make its packet trace self-describing.
+    pub fn bulk_out_mps(&self) -> u16 {
+        self.bot.bulk_out_mps()
     }
 }
 

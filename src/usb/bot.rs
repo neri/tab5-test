@@ -229,6 +229,11 @@ pub struct BulkOnlyTransport {
     csw_invalid_status: u32,
     csw_residue_mismatch: u32,
     csw_early: u32,
+    /// UART trace for the successful packets in one diagnostic data-OUT
+    /// phase. Failure packets already carry requested/actual and raw QTD
+    /// state in the HCD failure log; this fills in the successful packets
+    /// and their DATA PID without making normal WRITE(10)s noisy.
+    trace_data_out_packets: bool,
 }
 
 /// How many recoveries in a row are allowed before the session is declared
@@ -278,6 +283,7 @@ impl BulkOnlyTransport {
             csw_invalid_status: 0,
             csw_residue_mismatch: 0,
             csw_early: 0,
+            trace_data_out_packets: false,
         })
     }
 
@@ -392,6 +398,23 @@ impl BulkOnlyTransport {
         result
     }
 
+    /// Runs one command while logging every successful data-OUT packet.
+    ///
+    /// Kept as a scoped wrapper so a failed diagnostic command cannot leave
+    /// tracing enabled for unrelated filesystem traffic that follows it.
+    pub fn execute_command_with_data_out_trace(
+        &mut self,
+        cdb: &[u8],
+        direction_in: bool,
+        data: &mut [u8],
+    ) -> Option<CommandResult> {
+        let previous = self.trace_data_out_packets;
+        self.trace_data_out_packets = true;
+        let result = self.execute_command(cdb, direction_in, data);
+        self.trace_data_out_packets = previous;
+        result
+    }
+
     /// Whether the immediately preceding failed command restored the BOT
     /// session to a state in which a command-specific retry is safe.
     pub fn last_recovery_succeeded(&self) -> bool {
@@ -435,6 +458,10 @@ impl BulkOnlyTransport {
 
     pub fn bulk_in_mps(&self) -> u16 {
         self.interface.bulk_in_mps
+    }
+
+    pub fn bulk_out_mps(&self) -> u16 {
+        self.interface.bulk_out_mps
     }
 
     fn execute_command_once(
@@ -576,13 +603,20 @@ impl BulkOnlyTransport {
     fn bulk_transfer_out(&mut self, phase: &[u8], data: &mut [u8]) -> Option<usize> {
         let mps = self.interface.bulk_out_mps.max(1) as usize;
         let mut offset = 0usize;
+        let mut packet_index = 0u32;
+        let trace_packets = self.trace_data_out_packets && phase == b"data OUT";
+        if trace_packets {
+            uart::log_u32(b"USB BOT TRACE: data OUT bytes=", data.len() as u32);
+            uart::log_u32(b"USB BOT TRACE: endpoint MPS=", mps as u32);
+        }
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(mps);
             let endpoint = self.out_endpoint();
+            let pid_data1 = self.out_toggle;
             let outcome = self.run_bulk_packet(
                 phase,
                 &endpoint,
-                self.out_toggle,
+                pid_data1,
                 &mut data[offset..offset + chunk_len],
             );
             match outcome {
@@ -592,8 +626,15 @@ impl BulkOnlyTransport {
                     // moved rather than by what was asked for keeps that a
                     // property of the code instead of a comment.
                     debug_assert_eq!(sent, chunk_len);
+                    if trace_packets {
+                        uart::log_u32(b"USB BOT TRACE: packet=", packet_index);
+                        uart::log_u32(b"USB BOT TRACE:   requested=", chunk_len as u32);
+                        uart::log_u32(b"USB BOT TRACE:   actual=", sent as u32);
+                        uart::log_u32(b"USB BOT TRACE:   DATA1=", u32::from(pid_data1));
+                    }
                     self.advance_out_toggle(sent, mps);
                     offset += sent;
+                    packet_index = packet_index.saturating_add(1);
                 }
                 PacketOutcome::Timeout(_) => {
                     log_phase_failure(b"bulk OUT timed out", phase);

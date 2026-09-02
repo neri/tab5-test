@@ -30,6 +30,8 @@ USB Serial/JTAG（GPIO24/25）は対象外です。
   HCD側の契約を整えた結果それ無しで通るようになり、撤去しました
   （[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)、
   [`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。
+  通常のWRITE(10)は最大8 block（4 KiB）で、Stage 7では`1234:5645`と`054C:0243`を
+  High-Speed直結／Full-Speed固定ハブ＋HIDの両方で2／4／8 block各10回確認しました。
 - High-Speedハブ配下にFull/Low-Speedデバイスを繋ぐ構成（Split Transaction）。
 
 ## 中断したFloppy実装
@@ -698,6 +700,7 @@ Configuration Descriptor:
 | `usbmsc`／`usbread`／`usbmbr` | USB Mass Storage（[`STORAGE.md`](STORAGE.md)） |
 | `usbwritetest <lba>` | USB MSCの1ブロック書き込み・照合・復元 |
 | `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲でraw WRITE・照合・復元。gapはWRITE command間の0〜2000 ms（既定0） |
+| `usbmultiwrite <lba> <2\|4\|8>` | Stage 7の複数block WRITE(10)診断。10回の書き込み・媒体照合・前後guard検査・原本復元を行い、packet actual／PIDとCSW residueをUARTへ記録。2媒体×2 topologyの受入後も回帰手段として残す |
 | `usbzero <lba> [count]` | USB MSCの1〜8ブロックをゼロで上書き（破壊的）。テスト失敗後の後始末 |
 | `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数を表示） |
 | `usbmargin [rounds]` | VBUSを切って入れ直し、LBA 0が読めるまでの時間を計測（read-only、既定5回、最大20回） |

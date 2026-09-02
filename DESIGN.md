@@ -99,7 +99,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   緩和として各WRITE前・READ 16回ごとのhost controller FIFO cleanupを必要としましたが、
   HCD側の契約（DMA buffer所有とcache同期、descriptor完了の検査、実転送長の単一化、
   cleanup失敗の伝播）を整えた結果、3構成の実機A/Bで不要と確認して撤去しました。
-  1回のWRITE(10)は1ブロックのままです
+  複数ブロックWRITEはStage 7で2媒体×2接続構成の2／4／8 blockを各10回実機確認し、
+  1回のWRITE(10)上限を8ブロック（4 KiB）へ増やしました
   （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
   [USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
   [STORAGE.md](docs/STORAGE.md)）。
