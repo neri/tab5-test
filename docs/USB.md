@@ -200,6 +200,10 @@ VBUSの電圧降下は直接は見えません（システム全体の電流の�
 
 ## 転送失敗の巻き添え（FIFOの共有）
 
+root-port reset成功後に再適用するFIFO分割はESP-IDF v5.5.3のHigh-Speed DWC既定balanced設定と同じ
+RX/NPTX/PTX=`512/256/128` linesです。`usbcheck`のhost行は実レジスタ値を
+`fifo=512/256/128`の順で表示します。
+
 periodic TX FIFOとhost RX FIFOは**コントローラー全体で共有**で、失敗したチャネルの
 持ち物ではありません。channel 0（control／bulk）の失敗回復で全FIFOをflushすると、
 channel 1〜4で待機中のHIDのin-flightデータが道連れになり、**無関係なMSCの転送失敗が
@@ -339,12 +343,29 @@ FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上�
   約1秒になるよう算出します。CPU 360 MHz化後も固定iteration値の実時間が短縮されないための設定です。BOT commandが
   transport途中で失敗した場合は、チャネル0をidleへ戻した後、Mass Storage Reset、
   Bulk IN／OUT両endpointのhalt解除、DATA0へのtoggle同期からなるBOT Reset Recoveryを
-  実行します。安全に再送できるREAD(10)だけはRecovery後に1回再試行し、再試行数を
+  実行します。Mass Storage Reset直後はdeviceが回復するまで150 ms待ってから最初の
+  `CLEAR_FEATURE(ENDPOINT_HALT)`を送ります。この待機で実機のRecovery成功率は改善しましたが、
+  同じ媒体でもCLEAR_FEATUREが失敗するrunは残ります。安全に再送できるREAD(10)だけはRecovery後に1回再試行し、再試行数を
   session内で計数します。WRITE系commandの自動再送は行いません。
-  descriptor DMAのQTD status 1はpacket errorとして扱います。MSCのQTDは1 endpoint MPS以下に
-  限定し、toggleを進めず同一DATA PIDを50 ms間隔・最大20回の範囲で再送します。ACKだけを
+  descriptor DMAのQTD status 1はpacket errorとして扱います。CBW、CSW、Bulk IN、Splitと
+  MPS以下のBulk OUTは1 endpoint MPS以下に限定し、toggleを進めず同一DATA PIDを50 ms間隔・
+  最大20回の範囲で再送します。ACKだけを
   失ってdeviceがpacketを受理済みでも、同じPIDのduplicateは再消費されません。4 KiB Bulk INも
   MPS単位に分割し、各packetの完了とDATA PIDをsoftwareが確定してから次へ進みます。
+  非Split BOT Bulk OUTも1 packet QTDごとにchannelをarmします。v36〜v39で試した複数packet
+  QTD／複数QTD listはFull-Speed WRITEを悪化させたため撤回しており、現行経路では使いません。
+  HCCHAR MC/ECは0です。
+  reported packet error後の再投入にはcontroller cleanupが必要です。全cleanupを外した実機では
+  同じstatus 1が20回続いてWRITEが10/10から0/10へ後退しました。現在はOUT packet errorでは
+  そのpacketの送信残量を持ち得るnon-periodic TX FIFOだけをflushし、無関係なRX／periodic TX
+  FIFOは触りません。IN packet errorとchannelがhaltしないtimeoutは従来の保守的cleanupです。
+  reported OUT packet errorは、channel halt後にnon-periodic TX FIFOだけをflushし、同じDATA PIDを
+  再送します。descriptor-DMA modeをoff→onするv33／v34の実機A/Bは、B1 raw停止packetで確実に
+  反復実行しても3/32の結果を変えなかったため撤去しました。IN errorとchannelがhaltしないtimeoutは
+  RX residueも考慮した従来の保守的cleanupです。
+  HCCHARのMC/ECは通常の非周期descriptor-DMA Bulk／controlでは0、split transactionでは1にします。
+  全direct channelを1にした実機A/BではB2 READが100/100から4/100へ後退し、長いWRITE QTDだけ1に
+  限定してもWRITE 1/10のまま改善しなかったため採用しませんでした。
   13/36/8 byteの短いIN応答は、QTD長をMPS倍数に保つ内蔵SRAM staging経由で受信します。
   channel 0のdescriptor完了はQTD statusだけでなくHCINT.XferComplとQTD Active解除も検査します。
   ChHltdだけの古い完了snapshotや、hardwareがまだ所有するQTDを新しいpacketの成功として回収しません。
@@ -358,6 +379,112 @@ FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上�
   channel回復とDWC FIFO flushを外した実機A/Bでは、
   直前commandのCSWが次commandへ残って2回目のWRITEで停止したため、controller側residueのcleanupも
   維持します。実際のtransport failureでは従来どおりcleanup後に完全なBOT Reset Recoveryを実行します。
+### 実転送長とretry安全性の契約
+
+**`actual`は1箇所でだけ導出します。**QTDの残量が byte 数として意味を持つのは、その
+descriptorをhardwareが実際に書き戻した場合だけです。次の3つは`actual`を「不明」とし、
+0とは区別します。
+
+- hardwareがまだdescriptorを所有している（`QTD.Active`が立っている）
+- 残量が要求長より大きい
+- **channelが`HCINT.XferCompl`を報告していないのに、control wordが丸ごと0**——実機の
+  Full-Speedハブ経路で、timeoutしたOUTのcontrol wordが`0x00000000`で残っていました。
+  ここから読んだ残量0は「要求byteが全部動いた」を意味し、同時に「descriptorが
+  書き戻されていない」も意味します。区別が付かない値をbyte数として使えません。
+  全ビット0はそれ自体が矛盾していて、submit時に書いた`QTD_EOL`／`QTD_INTR_CPLT`を
+  1つも持たないまま全量転送を主張しています（hardwareはこれらを保持します——完了した
+  SETUPは`0x07000000`、packet errorは`0x16000200`）。
+
+`XferCompl`で完了したpacketにはこの検査を適用しません。完了経路の計算は受入試験matrixの
+全構成で成立が確認済みで、そこへ新しい失敗条件を持ち込みません。
+
+判定はこの2つの実測signatureまで狭めてあります。最初は「`XferCompl`が無いなら`QTD_EOL`が
+必要」という広い規則にしたところ、**それまで正常に再送できていたFull-Speedハブ経路の
+packet errorが`Unknown`になり、10回中10回成功していた書き込みが0回になりました。**
+安全側に倒れる規則でも、どの読み値が「あり得ない」のかは正しくなければいけません。
+
+**再送の可否は、packetが「放棄された」のか「失敗を報告された」のかで分けます。**
+
+- **channelがhaltせず放棄したpacket**は、`actual`が`Known(0)`のときだけ再送します。
+  completionが無いのでcoreがpacketの途中だった可能性を否定できません。実機では
+  64 byteのOUTのdescriptorが`0x06000000`（status成功・残量0）で、`HCINT`は
+  `0x00000000`でした。この残量をbyte数として読むと「全部出た」になり、4回再送されて
+  いました。現在はtransport errorとして即座に上げ、
+  `USB BOT: refusing to resubmit after ...`を出します。
+- **coreがpacket error（QTD status 1）を報告した1 packet QTD**は、残量に関係なく再送します。
+  USB packetは不可分で、deviceは丸ごと受け取るか全く受け取らないかのどちらかです。
+  ここでのQTDは1 packetしか運ばないので、失敗の報告は「受け取らなかった」か「受け取った
+  がhandshakeが失われた」を意味し、同じDATA PIDでの再送が両方を覆います——toggleを
+  進めた後のendpointは重複を捨てます。Full-Speed経路ではpacket errorが`ChHltd`とQTD reapまで
+  完了していても、再送前のchannel／FIFO cleanupが必要です。これを外す実機A/Bでは同じ
+  status 1が20回続いてWRITE 10/10が全滅したため、同一PIDを保ったままcleanupして再armします。
+- v36〜v39で試した複数packet QTD／複数QTD listはB2の正常WRITEを後退させたため使用しません。
+  現在の非Split BOT OUTはCBWとdataを含め、すべて1 packet QTD／1 channel activationです。
+
+**このcoreはpacket error時に不可能な残量を書き戻します。**64 byteのOUTに対して100,489、
+31 byteのCBWに対して128という値を実測しました。いずれも`Active`解除・status 1・
+`EOL`／`IOC`保持の正規のwritebackで、byte数の欄だけが残量として成立していません。
+これらは`Unknown`として弾き、`usbhw`／`usbcheck`の`impossible-len`で数えます。
+**「起きない」ことにはできない現象なので、byte数として使わないことだけを保証します。**
+
+**短いOUTは上位層へ届きません。**呼び出し側はMPS単位で分割しているので、要求より少ない
+byteで完了したOUTはdeviceがpacketの一部だけ受け取ったことを意味します。これを成功と
+すると、data toggleと呼び出し側のoffsetが、届いていないbyteの分だけ進みます。
+
+### BOT phaseとCSWの検証契約
+
+CBWは31 byte、CSWは13 byteを**ちょうど**転送した場合だけ成立します。CSWはsignature
+`USBS`、現在commandのtag、status 0（PASSED）または1（FAILED）を要求し、status 2
+（Phase Error）と未定義statusはtransport errorとしてBOT Reset Recoveryへ送ります。
+`dCSWDataResidue`は破棄せず、commandの期待data長とhost実転送長に突き合わせます。
+
+- data INは`host actual == expected - residue`でなければ矛盾です。
+- data OUTはhostが全量を転送していることを要求します。deviceが未処理byteをresidueで
+  返すことはあるため、wrapperの検証後にMSC command層が固定長commandかどうかを判定します。
+- READ(10)、WRITE(10)、READ CAPACITY(10)、REQUEST SENSE、標準INQUIRYはPASSEDに加えて
+  全量・residue 0を要求します。可変長のINQUIRY VPDは実受信長とresponse headerから
+  有効範囲を決めます。
+
+data INを省略して13 byteのCSWが先に届いた場合は、payloadへcopyする前にwrapperとして
+識別します。current tagなら同じCSWをもう一度待たずにcommand resultへ使い、前commandのtag
+ならstale CSWとしてtransport errorにします。signatureだけではpayloadと決め分けず、13 byte
+ちょうどでstatusが定義範囲にあることまで確認します。解析と長さ／residue判定は
+`tab5-bot-protocol`へ分離し、MMIOなしのhost testで検証します。
+
+### DMA bufferとcache同期の契約
+
+**controllerが読み書きするのは、HCDが所有する整列済みbufferだけです。**上位が
+`run_packet`へ渡す`&mut [u8]`にDMAは触れません。13 byteのCSW、8 byteのSETUP packet、
+4 KiB読み出しの途中から始まるsliceのいずれも、呼び出し側の努力ではcache line境界から
+始められないためです。alignmentを上位へ伝播させる方法も成立しません——MPS単位の部分slice
+を作った時点で次のpacketで崩れます。
+
+- channel 0は`PacketStaging`（64 byte整列、512 byte＝High-Speed Bulk MPS）を1 QTDごとに
+  所有します。OUTは上位sliceからstagingへcopyしてから転送し、INはstagingで受けて実受信
+  byte数だけ上位sliceへcopyします。512 byteを超える要求は転送せず拒否します。
+- 非Split channel 0のdescriptorはinternal RAMに固定した2-slot QTD bankから交互に選びます。
+  各slotは512 byte境界・512 byte strideで、retryが直前に失敗した物理QTD addressを即時再利用せず、
+  次packetも直前成功QTDとは別addressになります。channel 0は同期実行なので同時ownershipは1 slotだけ
+  です。release ELF検査がbankのaddress、alignment、2×512 byteのsizeを検証します。
+- Split packetは`SplitStaging`（64 byte整列、64 byte＝1 cache line）を使います。Splitは
+  buffer DMAなので、`HCDMA`にはこのbufferのaddressを直接書きます。
+- 常設periodic HIDのQTD bank（512 byte整列）、frame list（512 byte整列）、report buffer
+  （64 byte整列、1 slotが1 cache line）はstaticに確保します。
+- cache maintenanceの範囲は、開始addressをcache lineへ整列させ、長さを行単位へ切り上げます。
+  切り下げは行いません——他のownerのdirty lineを巻き込むためです。各objectは自身の
+  alignment以上の大きさへpaddingされるので、切り上げた範囲がobjectの外へ出ることはありません。
+
+**cache同期の拒否は転送の失敗です。**開始addressが行境界でない場合、またはROM routineが
+拒否した場合、channelをarmせずに`PacketOutcome::CacheSyncFailed`を返します。受信後の
+invalidateが拒否された場合も、上位bufferへは1 byteも公開しません。DMAが書く前のCPUの
+copy——0埋めのstaging——を渡すと、成功した短いpacketと見分けがつかなくなるためです。
+同じbufferは次も拒否されるので、この結果は再送しません。
+
+release ELFの配置検査（`tools/check_elf_layout.py`）がstaticなDMA objectのaddressと
+alignmentを検証します。拒否経路そのものは`usbcachefail`コマンドで実機確認します——正常な
+hardwareは拒否しないので、注入する以外にこの経路へ到達する方法がありません。注入は
+自分で減っていくcounterで、1回の拒否ごとに1消費されます。恒久的なmodeではありません。
+
 - rootへ直接接続したHID Boot keyboardは、attach時にstaticな512-byte aligned
   32-entry frame list／QTD bankを割り当て、`HCCHAR.eptype=INTR`で常時待機します。report完了IRQを
   前景がtakeして次QTDをrearmするため、idle中にchannel 0をpollしません。この常設経路は
@@ -530,6 +657,7 @@ Configuration Descriptor:
 | `usbvbus <0-7> on\|off` | PI4IOE2（`0x44`）の出力ビット直接操作（bit 3がVBUS）。診断用 |
 | `usbmsc`／`usbread`／`usbmbr` | USB Mass Storage（[`STORAGE.md`](STORAGE.md)） |
 | `usbwritetest <lba>` | USB MSCの1ブロック書き込み・照合・復元 |
+| `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲でraw WRITE・照合・復元。gapはWRITE command間の0〜2000 ms（既定0） |
 | `usbzero <lba> [count]` | USB MSCの1〜8ブロックをゼロで上書き（破壊的）。テスト失敗後の後始末 |
 | `ut [count]` | USB MSCの同一4 KiBをread・比較（read-only、既定100回、Recovery再送数・予防再同期数を表示） |
 | `usbmargin [rounds]` | VBUSを切って入れ直し、LBA 0が読めるまでの時間を計測（read-only、既定5回、最大20回） |

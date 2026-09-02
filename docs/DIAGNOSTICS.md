@@ -72,7 +72,7 @@ BLACK/REDです。通常のproduction設定だけを100回確認するときは`
 `ui visual: underruns=... dma_error=...`を表示します。途中の各画面は任意キーで次へ進みます。
 表示・PSRAM heap・microSD・USB MSCのread-only複合試験は`mix`で既定120分実行し、最後に
 `mix: PASS (nothing written to SD/USB)`を表示します。途中経過は10分ごとにUARTへframe数を出し、
-結果の`usb retries: packet=... command=...`はそれぞれ同一BOT phase内のQTD再投入回数と、
+結果の`usb retries: packet=... command=...`はそれぞれ同一BOT phase内のpacket再投入回数と、
 BOT Reset Recovery後のREAD(10)再送回数です。複合試験前にUSBだけを短く確認する場合は`ut`を
 実行します。既定で同じ4 KiBを100回read・比較し、`completed`、transport `failures`、data
 `mismatch`に加え、`packet_retries`、`command_retries`、`proactive_resyncs`を表示します。
@@ -205,8 +205,8 @@ USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::re
 Hub portのdevice descriptor取得に失敗した場合、通常の増分スキャンは同じ物理接続を保留して
 接続状態だけquietに監視します。約1秒ごとにport reset／列挙エラーを出し続けることはなく、抜き差し
 または明示的なfull rescanでだけ再試行します。第9版は起動時に`USB ENUM: bounded retry v9`を出します。
-1 packet QTD、BOT予防再同期、周期SSPLITの位相合わせを組み合わせた修正版は続けて
-`USB STABILITY: phase-aligned split HID v24`を出します。両classが同じbusへ登録されると
+ESP-IDF既定のbalanced FIFO分割、BOT予防再同期、周期SSPLITの位相合わせを組み合わせた修正版は
+続けて`USB STABILITY: fault-rescan retry v42`を出します。両classが同じbusへ登録されると
 `USB: MSC present, serializing HID and bulk on channel 0`が続きます。
 
 起動時の初回スキャンは、各段階の所要時間を10進ミリ秒で出します。`USB BOOT: root connect ms=`
@@ -276,7 +276,11 @@ INQUIRY／INQUIRY(EVPD)は媒体を変更しないため、Recovery後に1回再
 command tag、data byte数、IN方向かを必ず出します。`opcode=0x00`はTEST UNIT READY、
 `0x12`はINQUIRY、`0x25`はREAD CAPACITY(10)、`0x28`はREAD(10)、`0x2A`はWRITE(10)、
 `0x35`はSYNCHRONIZE CACHE(10)です。
-Bulk QTDは1 packetに限定し、約1秒でhaltしなければ同じDATA PIDで最大4回再投入します。
+非SplitのCBW／CSW／Bulk INと短いBulk OUT QTDは1 packetに限定し、約1秒でhaltしなければ
+同じDATA PIDで最大4回再投入します。v36〜v39で試したFull-Speed WRITE dataの複数packet
+QTD／複数QTD listはB2を後退させたため撤回し、現在はOUTも1 packet QTDずつ実行します。
+channel 0のQTDは固定2-slot bankをpacketごとに交互使用するため、retryの`channel HCDMA=`は直前の
+失敗packetと別の512-byte境界になります。
 合計約5秒で応答しなければBOT Resetへ進みます。BOT ResetのIN statusを含むcontrol packetは約1秒で、
 いずれもCPU周波数からiteration数を算出します。`packet_retries`にはstatus 1とtimeoutの両方による
 QTD再投入を数えます。
@@ -286,16 +290,132 @@ timeout、stuff、false EOP、excessive NAKのいずれかです。BOT層は1 pa
 QTDへ分割し、各完了後にsoftwareが次のDATA PIDを決めます。成功した再投入は
 `packet_retries`へ数えます。
 
-連続READでは、成功したREAD(10)を16回処理するごとにcommand間でMass Storage Resetと
-Bulk IN／OUTの`CLEAR_FEATURE(ENDPOINT_HALT)`を実行し、両toggleをDATA0へ戻します。
+連続READでは、成功したREAD(10)を16回処理するごとにcommand間でhost channel／FIFO cleanupを
+実行します。この正常境界ではMass Storage Reset／`CLEAR_FEATURE(ENDPOINT_HALT)`を送らず、
+両toggleを継続します。
 実機で最短33 READ後にBulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔で
 BOT境界を再確立する予防策です。root portやHIDはresetしません。`ut`開始ログは
-`USB TEST: phase-aligned split HID v24`、実行回数は`proactive_resyncs=`で確認します。
+`USB TEST: fault-rescan retry v42`、実行回数は`proactive_resyncs=`で確認します。
 WRITE(10)の直前にも同じ再同期を行います。成功ログは方向別の初回と64回ごとだけを
 `USB MSC: proactive BOT resyncs before READ(10)=N`または
 `USB MSC: proactive BOT resyncs before WRITE(10)=N`として出します。再同期または
 READ／WRITE転送が失敗した場合は間引かず、LBA、block数、READのFUA有無、および方向別の
 累計再同期回数を続けて出します。大量転送の同一行で、直前の異常ログを埋もれさせないためです。
+
+受入試験1回分をまとめて実行するのは`usbcheck [reads] [lba]`です。前後のcounterを自分で
+採り、read soakと（LBAを指定した場合は）write 10回を実行し、**差分**とGo条件ごとの
+PASS/FAILを出します。`usbhw`を2回採って目視で突き合わせる必要はありません——絶対値には
+起動時の列挙とidle HIDのpollが全部乗っているので、差分でないと比較になりませんでした。
+raw WRITEが不安定な段階ではfilesystem側の`fswritetest`を実行しません。代わりに
+`usbrawcheck <犠牲LBA> [writes] [span] [gap_ms]`で、filesystem外の範囲へREADを挟まない
+単一block WRITE列を発行します。gapは成功したWRITE commandと次WRITEの間だけ待つ0〜2000 msで、
+既定0は連続burstです。失敗してsessionが使用不能になっても`usbrescan`後に同じ犠牲範囲を再利用でき、
+filesystem repairを試験の前提にしません。
+DMA cache同期の拒否経路は`usbcachefail`で確認します（下記）。
+
+`usbhw`は上記に続けて、[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)
+Stage 0のbaseline counterを固定書式で表示します。0の項目も必ず表示します——「counterが
+無い」と「counterが0」を区別できない書式では比較になりません。行は`Line`の80 byteで
+打ち切られるため、内訳は5桁の値でも収まる単位へ分割し、列見出しを短縮しています。
+
+`BOT:`で始まる行はcontroller全体のもので、再列挙しても続きます。
+
+- `cache-refusals=`は合計と方向別（`out`／`in`／descriptor`desc`）です。拒否は転送の失敗
+  なので、`pkt-fail`の`cache`列と対になって増えます（periodic HIDのarm拒否など、
+  channel 0を通らない経路では`cache-refusals`だけが増えます）。
+- `refusal envelope`／`refusal data`は転送phase別の内訳です。列は
+  `none`（未ラベル）／`ctl`（control）／`cbw`／`csw`と、`din`（data IN）／`dout`（data OUT）／
+  `int`（Interrupt IN）です。phaseは転送を所有する層が公開するラベルで、HCDは解釈も
+  分岐もしません。
+- `refusal ch0`／`refusal periodic`はどのDMA共有オブジェクトかです。channel 0側は
+  `qtd`／`buf`（payload）／`split`（split staging）、periodic側は`per`（常設periodicの
+  descriptorとreport buffer）／`flist`（frame list）／`probe`です。`refusal last`は
+  直近の拒否のaddress／長さ／phaseです。
+- `pkt-fail`は2行で、合計と原因別内訳です。`timeout`（channelがhaltしなかった）、
+  `stall`、`xact`（CRC／babble等）はデバイスやケーブルが起こし得るもの、
+  `shortout`（OUTが要求より少ないbyteで完了した）、
+  `cache`（DMA bufferまたはdescriptorのcache同期が拒否され、armする前に失敗した）と
+  `qtderr`（QTD status 1）以降はこのドライバ自身の契約に関わるもの
+  （`qtdbad`＝未定義QTD status、`nocpl`＝XferComplなしでhalt、`stale`＝世代の合わない完了、
+  `splitrej`＝splitを開始できなかった）です。`cache`が0でない場合は転送が始まっていない
+  ので、古いRAMが送られたりDMA前のcacheが公開されたりはしていません
+  （[`USB.md`](USB.md)の「DMA bufferとcache同期の契約」）。
+- `idle-poll`は**失敗ではありません**。`SET_IDLE(0)`のHIDはキーが動くまでNAKし続けるので、
+  Interrupt INのpollが何も持たずに budget を使い切るのは正常なbusの姿です。`pkt-fail`へは
+  加算しません。静止したキーボードを繋いだまま`ut 100`を回すと数百件出ます。
+- `last-fail`は直近の失敗packetのkind、phase、方向、要求byte数、実転送byte数、
+  `HCINT`、QTD最終control wordです。要求と実転送の差は、再送が同じbyteを二重に
+  公開し得るかどうかを判断する数値です。`QTD=0x00000000`は「残量0で所有権解除」と
+  「descriptorが書き戻されていない」を区別できない値なので、`act`をそのまま
+  「全量転送済み」と読んではいけません。
+- `fifo-timeout`はTX（非periodic）／TX（periodic）／RXのflush timeout回数と、
+  periodic channelがarm中でflushを省略した回数（`skipped`）です。省略は失敗ではありませんが、
+  「全cleanup成功」とは別の状態です。
+- `packet-cleanup out-nptx`はreported OUT packet error後にnon-periodic TX FIFOだけをflushした
+  回数です。`usbcheck`では`delta pkt-retry err`のうちOUT方向だった回数と対応します。
+
+`MSC:`で始まる行は接続中デバイスの現在のBOT sessionのもので、session再構築で0へ戻ります。
+`proactive`はREAD前／WRITE前の予防cleanup回数、`cmd-retry`はBOT Reset Recovery後の
+READ(10)再送、`pkt-retry`はpacket error／timeout別の再送回数です。`resubmit`は
+転送長の契約が拒否した再送回数（`refused`）、そのうちdescriptorが実際にbyteを報告して
+いたもの（`progressed`）、そして**要求長より大きい残量**を書き戻されたdescriptorの数
+（`impossible-len`）です。最後のものは0になりません——このcoreはpacket error時に
+64 byteのOUTへ100,489という残量を返すことがあります。異常ではなく、
+**そのbyte数を信用しない**ことがこのdriverの契約です。拒否されるのはchannelが
+haltしなかったpacketだけで、coreがpacket errorを報告したpacketは残量に関係なく
+1 packet QTDなら再送します（[`USB.md`](USB.md)の「実転送長とretry安全性の契約」）。
+拒否は転送が失敗に終わることを意味しますが、**同じbyteを
+busへ二度出すよりは失敗させるほうが正しい**という判断の結果です。拒否の根拠にした
+`reap HCINT=`と`reap QTD control=`はUARTログに出ます。`recovery`は実失敗後のBOT Reset Recovery回数と
+その失敗数、`csw`は13 byte以外（`short`。名前はbaseline互換）、signature不一致（`sig`）、
+tag不一致（`tag`）の回数です。次の`MSC: csw`行はPhase Error（`phase`）、未定義status、
+host実転送長とresidueの矛盾、data INにCSWが先着した回数（`early`）です。`early`自体は
+current commandの正当なFAILED応答になり得ますが、他の3つはtransport errorです。
+CSWが期待と合わなかった場合はUARTへ受信byte数、期待tag、signature、tag、residue、statusを
+出します。13 byteに満たない分は0埋めなので、`signature=0x53425355`は`USBS`が実際に届いた
+ことを意味します。`usbcheck`はこれらを`delta csw`／`delta csw-detail`で差分表示し、invalid
+CSWが1件でもあれば`BOT CSW contract (stage 3)`をFAILにします。
+
+reported packet errorを再送するときは、reap値に続けてcleanup前のchannel 0を
+`channel HCCHAR=`／`HCTSIZ=`／`HCDMA=`で表示します。channelがhaltしないtimeoutでは、強制haltで
+状態を変える前の同じ3 registerを`before halt`として表示します。HCCHARのChEna／ChDis、HCTSIZの
+PID／schedule情報、descriptor list addressが、直前の失敗から次のpacketへ持ち越されていないかを
+比較するためのStage 3診断です。
+
+転送が失敗したときのHCDログには`USB:   failure=`（原因とphase）、`requested bytes=`、
+`actual bytes=`、`QTD final=`が続きます。従来のログは失敗したことと`HCINT`しか言わず、
+要求byteのうち何byteが既に動いたのかを言いませんでした。
+
+`usbcachefail`はHCDの契約が守られていることを、正常なhardwareでは起こせない3つの故障を
+注入して確認します。1回の実行で3つとも試し、各段階でsessionが引退したら自動で
+再列挙してから次へ進みます。ドライバ自身の論理の試験なので接続構成ごとに繰り返す必要は
+なく、全体で1回で足ります。
+
+- **[1/3] cache同期拒否**（Stage 1）: DMA cache同期の拒否を**data IN phaseへ**注入し、その転送がchannelをarmする
+**前に**失敗すること、および宛先bufferへ1 byteも公開されないことを確認します。宛先は事前に
+`0x5A`で埋めます——deviceのdataでも、0埋めstagingでもない値なので、そのまま残っていれば
+何も上書きされていない証拠になります。正常なhardwareは拒否しないため、注入以外に
+この経路へ到達する方法はありません。ドライバ自身の論理の試験なので、接続構成ごとに
+繰り返す必要はなく1回で足ります。
+
+- **[2/3] 古い世代の完了**（Stage 2）: slotがもう持っていない世代でcompletionを渡し、
+  それが新しいpacketの結果として回収されないことを確認します。同期APIでは1つの
+  `Channel0Transfer`が1回の`run_packet`内で生成・submit・reapされるので、この状態は
+  構造上起こりません。検査はこれを置き換えるqueue型schedulerのためにあり、
+  **一度も発火を観測していない検査は、動くかどうか誰も知らない検査**です。
+- **[3/3] 短いOUT**（Stage 2）: OUT packetを要求より1 byte少なく報告させ、それが
+  要求長分の成功として上位へ返らないことを確認します。READ(10)を使うので、
+  注入が当たるのはcommand blockのOUT packetで、媒体には何も書きません。
+
+[1/3]の注入は**操作回数ではなくphaseで狙います**。commandのdata phaseへ到達するまでのcache呼び出し
+回数は実装詳細で、間にReset Recoveryのcontrol転送も入るためです。phase指定なら回数に
+関係なく目的のpacketへ当たり、`Control`とlabelされたrecoveryは動けます。`msc.rs`は
+Reset Recovery後にREAD(10)を1回だけ再送するので、注入は再送を上回る回数armします——
+1回だけだと再送（完全に同期された転送）が成功して治ってしまい、retry方針が働いた
+だけの結果を契約違反と取り違えます。残った分は終了時に必ず解除します。
+
+2回連続の失敗はBOT層が「recoveryが効いていない」と判定する形なので、**MSC sessionは
+設計どおり使用不能になります**。その旨を表示するので`usbrescan`してください。
 
 `usbhw`はSplit Transactionのレジスタに加え、USB割り込みのsource、global enable、
 総ISR回数、channel 0／periodic channel 1〜4／root-port／spurious回数、`GINTMSK`／`HAINTMSK`／`HCINTMSK0..4`、
@@ -306,10 +426,10 @@ control／bulkを使った後はsleepとWFIが増え、periodicへ昇格でき�
 なので、後者が前者より多くても異常ではありません。HIDでもキー報告を受信してchannelが
 haltした時はchannel IRQが増えます。常設periodic HIDのidle NAKはcontrollerが処理するため、
 前景のpoll／submit／cancelは増えません。
-`IRQ slots`は原則として`submit = reap + cancel`です。直結HIDのidle NAK timeoutはcancelへ
+`IRQ slots`はdescriptor-DMA transferについて原則として`submit = reap + cancel`です。Splitは
+別集計で、ここには含みません。直結HIDのidle NAK timeoutはcancelへ
 入るため、キーを押さずに待つほどreapよりcancelが多くなります。観測瞬間に1件実行中なら
-submitが右辺より1だけ多い場合があります。`stale-token`は常に0が正常です。Splitは別の
-buffer DMA経路なのでこのslot集計には含みません。
+submitが右辺より1だけ多い場合があります。`stale-token`は常に0が正常です。
 Stage 1の設定値は
 source 93、`GINTMSK=0x23000000`、`HAINTMSK=0x00000001`です。
 `HCINTMSK0`へは`0x00003FFF`を書き込みますが、descriptor DMA中の実機read-backは

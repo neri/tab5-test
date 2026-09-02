@@ -1,7 +1,7 @@
 //! USB Mass Storage class driver for the SCSI Transparent Command Set over
 //! Bulk-Only Transport. The BOT envelope lives in `bot.rs`.
 
-use super::bot::{self, BotInterface, BulkOnlyTransport, CommandResult};
+use super::bot::{self, BotInterface, BulkOnlyTransport, CommandResult, TransportObservation};
 use super::protocol::EnumeratedDevice;
 use crate::delay::delay_ms;
 use crate::{tick, uart};
@@ -259,7 +259,7 @@ impl UsbMassStorage {
             );
             return None;
         }
-        if result.transferred < data.len() {
+        if !result.has_exact_data() {
             uart::log(b"USB MSC: short INQUIRY response\r\n");
             return None;
         }
@@ -540,7 +540,7 @@ impl UsbMassStorage {
             );
             return None;
         }
-        if result.transferred < data.len() {
+        if !result.has_exact_data() {
             uart::log(b"USB MSC: short REQUEST SENSE response\r\n");
             return None;
         }
@@ -561,7 +561,7 @@ impl UsbMassStorage {
             );
             return None;
         }
-        if result.transferred < data.len() {
+        if !result.has_exact_data() {
             uart::log(b"USB MSC: short READ CAPACITY(10) response\r\n");
             return None;
         }
@@ -666,7 +666,7 @@ impl UsbMassStorage {
             let _ = self.collect_sense(b"USB MSC: READ(10)");
             return false;
         }
-        if result.transferred < buffer.len() {
+        if !result.has_exact_data() {
             uart::log(b"USB MSC: short READ(10) response\r\n");
             log_read_extent(lba, block_count, flags);
             self.log_maintenance_resync_counts();
@@ -752,6 +752,15 @@ impl UsbMassStorage {
                 uart::log(b"USB MSC: medium is write protected\r\n");
                 return WriteOutcome::WriteProtected;
             }
+            return WriteOutcome::Failed;
+        }
+        if !result.has_exact_data() {
+            uart::log_u32(
+                b"USB MSC: WRITE(10) completed with nonzero residue=",
+                result.residue,
+            );
+            log_write_extent(lba, block_count);
+            self.log_maintenance_resync_counts();
             return WriteOutcome::Failed;
         }
         WriteOutcome::Written
@@ -906,6 +915,23 @@ impl UsbMassStorage {
     /// Successful proactive BOT boundary resets in this attachment.
     pub fn maintenance_resync_count(&self) -> u32 {
         self.maintenance_resyncs
+    }
+
+    /// The same count split by which command asked for it.
+    ///
+    /// READ and WRITE cleanups are removed by separate go/no-go decisions
+    /// (`docs/USB_BOT_HCD_REFACTOR_PLAN.md` stages 5 and 6), so a single
+    /// total cannot say which of the two a run actually exercised.
+    pub fn maintenance_resync_counts(&self) -> (u32, u32) {
+        (
+            self.read_maintenance_resyncs,
+            self.write_maintenance_resyncs,
+        )
+    }
+
+    /// The Stage 0 baseline counters of the BOT session under this device.
+    pub fn transport_observation(&self) -> TransportObservation {
+        self.bot.observation()
     }
 
     /// Monotonic count of lower-level QTD suffix resubmissions.

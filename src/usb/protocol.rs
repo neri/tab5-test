@@ -710,6 +710,7 @@ fn run_control_packet(
         is_in,
         route: pipe.route,
     };
+    hcd::set_transfer_label(hcd::TransferLabel::Control);
     match hcd::run_packet(
         &endpoint,
         is_setup,
@@ -722,7 +723,10 @@ fn run_control_packet(
         buffer,
     ) {
         PacketOutcome::Ok(n) => Some(n),
-        PacketOutcome::Timeout(_) | PacketOutcome::PacketError(_) | PacketOutcome::Error => None,
+        PacketOutcome::Timeout(_)
+        | PacketOutcome::PacketError(_)
+        | PacketOutcome::CacheSyncFailed
+        | PacketOutcome::Error => None,
     }
 }
 

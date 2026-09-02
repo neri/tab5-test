@@ -44,12 +44,16 @@ mod msc;
 mod protocol;
 mod registry;
 
+pub use bot::TransportObservation;
 pub(crate) use hcd::handle_interrupt;
 pub use hcd::{
-    Speed, cache_refusal_count, fs_ls_only_host_forced, interrupt_diagnostics, pi4ioe2_register,
-    port_drop_seen, port_event_history, port_over_current_seen, probe_split_support,
-    set_connect_wait_ms, set_fs_ls_only_host_forced, set_pi4ioe2_output_bit, set_vbus_bit,
-    set_vbus_power,
+    HostObservation, PACKET_FAILURE_KIND_COUNT, PacketFailureKind, Speed, TransferLabel,
+    cache_direction_names, cache_refusal_count, cache_site_names, fifo_configuration,
+    force_cache_refusals, force_short_outs, force_stale_completions, fs_ls_only_host_forced,
+    host_observation, interrupt_diagnostics, packet_failure_kind_index, packet_failure_kind_names,
+    pi4ioe2_register, port_drop_seen, port_event_history, port_over_current_seen,
+    probe_split_support, set_connect_wait_ms, set_fs_ls_only_host_forced, set_pi4ioe2_output_bit,
+    set_vbus_bit, set_vbus_power, transfer_label_names,
 };
 pub use hid::{DESCRIPTOR_TYPE_HID, HidDescriptor};
 pub use hid_mouse::{MOUSE_BUTTON_LEFT, MouseUpdate};

@@ -642,6 +642,16 @@ impl UsbHost {
     /// does not: it addresses storage by number through
     /// [`Self::mass_storage_at`], because "the first one found" is not a
     /// name a mount can be recorded against.
+    /// The same device, read-only. Diagnostics that only report counters
+    /// (`usbhw`) must not have to take a `&mut` on the whole registry to
+    /// read them.
+    pub fn mass_storage(&self) -> Option<&UsbMassStorage> {
+        self.slots.iter().flatten().find_map(|slot| match slot {
+            DeviceKind::MassStorage(storage) => Some(storage),
+            DeviceKind::Keyboard(_) | DeviceKind::Mouse(_) => None,
+        })
+    }
+
     pub fn mass_storage_mut(&mut self) -> Option<&mut UsbMassStorage> {
         self.slots.iter_mut().flatten().find_map(|slot| match slot {
             DeviceKind::MassStorage(storage) => Some(storage),

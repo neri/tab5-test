@@ -73,7 +73,7 @@ pub enum InitialRoute {
 
 pub fn draw_initial(framebuffer: &mut Framebuffer) -> bool {
     framebuffer.fill(WHITE);
-    centred(framebuffer, TITLE_Y, "パソコンへようこそ", 2, BLACK);
+    centred(framebuffer, TITLE_Y, "パソコンを起動しています…", 2, BLACK);
     draw_cell(framebuffer, USB_CELL_LEFT, Visual::pending(), true);
     draw_cell(framebuffer, WIFI_CELL_LEFT, Visual::pending(), false);
     framebuffer.flush()

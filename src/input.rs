@@ -187,7 +187,7 @@ impl InputManager {
 
         let usb_host = usb::UsbHost::new();
         uart::log(b"USB ENUM: bounded retry v9\r\n");
-        uart::log(b"USB STABILITY: phase-aligned split HID v24\r\n");
+        uart::log(b"USB STABILITY: fault-rescan retry v42\r\n");
 
         Self {
             cardkb,

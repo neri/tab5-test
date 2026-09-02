@@ -208,17 +208,23 @@ def validate(elf: Path, readelf: str) -> None:
             f"stack is {stack.size} byte, below the {MIN_STACK_BYTES}-byte minimum"
         )
 
-    periodic_dma: dict[str, int] = {}
+    # Every DMA-shared object must start on a cache line: the ROM cache
+    # routine refuses a span that begins mid-line rather than rounding down,
+    # and rounding down would drag another owner's dirty lines in. The frame
+    # list and the QTD bank need the stronger 512 the hardware asks for.
+    # See docs/USB_BOT_HCD_REFACTOR_PLAN.md stage 1.
+    usb_dma: dict[str, int] = {}
     for suffix, alignment in (
+        ("CHANNEL0_QTD_BANK", 512),
         ("PERIODIC_HID_FRAME_LIST", 512),
         ("PERIODIC_HID_QTD", 512),
-        ("PERIODIC_HID_BUFFER", 4),
+        ("PERIODIC_HID_BUFFER", 64),
     ):
         symbol = symbol_ending_with(symbols, suffix)
         if symbol is None:
-            errors.append(f"required periodic DMA symbol *{suffix} is missing or ambiguous")
+            errors.append(f"required USB DMA symbol *{suffix} is missing or ambiguous")
             continue
-        periodic_dma[suffix] = symbol.value
+        usb_dma[suffix] = symbol.value
         if symbol.value % alignment != 0:
             errors.append(
                 f"{suffix} at 0x{symbol.value:08x} is not {alignment}-byte aligned"
@@ -235,6 +241,12 @@ def validate(elf: Path, readelf: str) -> None:
     if periodic_qtd is not None and periodic_qtd.size != 4 * 512:
         errors.append(
             f"PERIODIC_HID_QTD is {periodic_qtd.size} byte; expected four "
+            "512-byte-stride QTD slots"
+        )
+    channel0_qtd = symbol_ending_with(symbols, "CHANNEL0_QTD_BANK")
+    if channel0_qtd is not None and channel0_qtd.size != 2 * 512:
+        errors.append(
+            f"CHANNEL0_QTD_BANK is {channel0_qtd.size} byte; expected two "
             "512-byte-stride QTD slots"
         )
     periodic_buffer = symbol_ending_with(symbols, "PERIODIC_HID_BUFFER")
@@ -356,12 +368,13 @@ def validate(elf: Path, readelf: str) -> None:
         f"  flash-critical=0x{critical_start:08x}..0x{critical_end:08x} "
         f"relocations={len(critical_relocations)}"
     )
-    if len(periodic_dma) == 3:
+    if len(usb_dma) == 4:
         print(
-            "  USB periodic DMA: "
-            f"frame-list=0x{periodic_dma['PERIODIC_HID_FRAME_LIST']:08x} "
-            f"QTD=0x{periodic_dma['PERIODIC_HID_QTD']:08x} "
-            f"buffer=0x{periodic_dma['PERIODIC_HID_BUFFER']:08x}"
+            "  USB DMA: "
+            f"channel0-QTD=0x{usb_dma['CHANNEL0_QTD_BANK']:08x} "
+            f"frame-list=0x{usb_dma['PERIODIC_HID_FRAME_LIST']:08x} "
+            f"periodic-QTD=0x{usb_dma['PERIODIC_HID_QTD']:08x} "
+            f"buffer=0x{usb_dma['PERIODIC_HID_BUFFER']:08x}"
         )
 
     if errors:

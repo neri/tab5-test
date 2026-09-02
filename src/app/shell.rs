@@ -149,6 +149,9 @@ enum Cmd {
     Usbvbus,
     Shutdown,
     Usbhub,
+    Usbcachefail,
+    Usbcheck,
+    Usbrawcheck,
     Usbhw,
     Usbperiodic,
     Usbmsc,
@@ -1050,6 +1053,47 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         ],
     },
     HelpEntry {
+        name: "usbcheck",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbcheck,
+        usage: "usbcheck [reads] [lba]",
+        lines: &[
+            "USB BOT/HCD acceptance run for one configuration: read soak, then",
+            "ten write rounds when an LBA is given, with counter deltas and a",
+            "PASS/FAIL per gate. no LBA means read-only. use 'usbrawcheck'",
+            "for write bursts without touching filesystem structures.",
+        ],
+    },
+    HelpEntry {
+        name: "usbrawcheck",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbrawcheck,
+        usage: "usbrawcheck <lba> [writes] [span] [gap_ms]",
+        lines: &[
+            "USB MSC raw write burst over a sacrificial LBA range, followed",
+            "by read-back and best-effort restore. defaults: 32 writes over",
+            "one block; span 1..8, gap_ms 0..2000 (default 0). no file or",
+            "directory is created. gap waits only between successful writes.",
+            "THE RANGE MUST BE OUTSIDE EVERY FILESYSTEM YOU CARE ABOUT: a",
+            "transport failure can prevent restore, but needs only usbrescan",
+            "to retry when the named range is deliberately disposable.",
+        ],
+    },
+    HelpEntry {
+        name: "usbcachefail",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Usbcachefail,
+        usage: "usbcachefail",
+        lines: &[
+            "USB: inject one refused DMA cache sync and check the transfer fails",
+            "before the channel is armed, publishing nothing. tests driver logic,",
+            "so one run covers every topology. may end the MSC session.",
+        ],
+    },
+    HelpEntry {
         name: "usbwritetest",
         aliases: &[],
         group: Group::Scaffold,
@@ -1688,6 +1732,9 @@ pub fn execute(
         Cmd::Usbfs => cmd_usbfs(console, framebuffer, argument, usb_host),
         Cmd::Usbvbus => cmd_usbvbus(console, framebuffer, argument),
         Cmd::Usbhub => cmd_usbhub(console, framebuffer, usb_host),
+        Cmd::Usbcheck => cmd_usbcheck(console, framebuffer, argument, usb_host),
+        Cmd::Usbrawcheck => cmd_usbrawcheck(console, framebuffer, argument, usb_host),
+        Cmd::Usbcachefail => cmd_usbcachefail(console, framebuffer, usb_host),
         Cmd::Usbhw => cmd_usbhw(console, framebuffer, usb_host),
         Cmd::Usbperiodic => cmd_usbperiodic(console, framebuffer, usb_host),
         Cmd::Usbmsc => cmd_usbmsc(console, framebuffer, usb_host),
@@ -3263,14 +3310,30 @@ fn cmd_usb_margin(
 /// It keeps the same persistent BOT session and repeats the same 4 KiB
 /// READ(10), so a timeout, recovery retry, or silent data mismatch is visible
 /// without requiring the user to type a long command matrix.
+/// What one read soak established.
+#[derive(Clone, Copy, Default)]
+struct ReadSoakOutcome {
+    requested: u32,
+    completed: u32,
+    transport_failures: u32,
+    mismatches: u32,
+}
+
+impl ReadSoakOutcome {
+    fn passed(&self) -> bool {
+        self.requested > 0
+            && self.completed == self.requested
+            && self.transport_failures == 0
+            && self.mismatches == 0
+    }
+}
+
 fn cmd_usb_read_test(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
     usb_host: &mut usb::UsbHost,
 ) {
-    const STORAGE_BYTES: usize = 8 * 512;
-    uart::log(b"USB TEST: phase-aligned split HID v24\r\n");
     let count = if trim(argument).is_empty() {
         100
     } else {
@@ -3282,18 +3345,39 @@ fn cmd_usb_read_test(
             }
         }
     };
+    let _ = run_usb_read_soak(console, framebuffer, count, "ut", usb_host);
+}
+
+/// Reads and compares the same 4 KiB `count` times.
+///
+/// Split from the command so `usbcheck` can run it as one step of a longer
+/// acceptance run. `label` prefixes the output lines so a soak run inside
+/// another command is not mistaken for a bare `ut`.
+fn run_usb_read_soak(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    count: u32,
+    label: &str,
+    usb_host: &mut usb::UsbHost,
+) -> ReadSoakOutcome {
+    const STORAGE_BYTES: usize = 8 * 512;
+    uart::log(b"USB TEST: fault-rescan retry v42\r\n");
+    let aborted = ReadSoakOutcome::default();
 
     let Some(mass_storage) = usb_host.mass_storage_mut() else {
-        console.write_output_line(
-            framebuffer,
-            "ut: no USB Mass Storage; attach one and run usbrescan",
-        );
-        return;
+        let mut line = Line::new();
+        line.push_str(label);
+        line.push_str(": no USB Mass Storage; attach one and run usbrescan");
+        console.write_output_line(framebuffer, line.as_str());
+        return aborted;
     };
-    write_usb_msc_mode(console, framebuffer, "ut", mass_storage);
+    write_usb_msc_mode(console, framebuffer, label, mass_storage);
     if !mass_storage.wait_until_ready(10) {
-        console.write_output_line(framebuffer, "ut: USB Mass Storage is not ready");
-        return;
+        let mut line = Line::new();
+        line.push_str(label);
+        line.push_str(": USB Mass Storage is not ready");
+        console.write_output_line(framebuffer, line.as_str());
+        return aborted;
     }
 
     let mut reference = [0u8; STORAGE_BYTES];
@@ -3302,8 +3386,11 @@ fn cmd_usb_read_test(
     let resyncs_before = mass_storage.maintenance_resync_count();
     let packet_retries_before = mass_storage.packet_retry_count();
     if !mass_storage.read_blocks(0, &mut reference) {
-        console.write_output_line(framebuffer, "ut: initial USB read failed");
-        return;
+        let mut line = Line::new();
+        line.push_str(label);
+        line.push_str(": initial USB read failed");
+        console.write_output_line(framebuffer, line.as_str());
+        return aborted;
     }
 
     let mut completed = 0u32;
@@ -3329,7 +3416,8 @@ fn cmd_usb_read_test(
         .packet_retry_count()
         .wrapping_sub(packet_retries_before);
     let mut line = Line::new();
-    line.push_str("ut: completed=");
+    line.push_str(label);
+    line.push_str(": completed=");
     line.push_u32(completed);
     line.push_str("/");
     line.push_u32(count);
@@ -3340,7 +3428,8 @@ fn cmd_usb_read_test(
     console.write_output_line(framebuffer, line.as_str());
 
     let mut line = Line::new();
-    line.push_str("ut: packet_retries=");
+    line.push_str(label);
+    line.push_str(": packet_retries=");
     line.push_u32(packet_retries);
     line.push_str(" command_retries=");
     line.push_u32(retries);
@@ -3348,18 +3437,25 @@ fn cmd_usb_read_test(
     line.push_u32(resyncs);
     console.write_output_line(framebuffer, line.as_str());
 
-    if completed == count && transport_failures == 0 && mismatches == 0 {
-        console.write_output_line(
-            framebuffer,
-            if retries == 0 {
-                "ut: PASS"
-            } else {
-                "ut: PASS (BOT recovery was used)"
-            },
-        );
+    let outcome = ReadSoakOutcome {
+        requested: count,
+        completed,
+        transport_failures,
+        mismatches,
+    };
+    let mut line = Line::new();
+    line.push_str(label);
+    line.push_str(if outcome.passed() {
+        if retries == 0 {
+            ": PASS"
+        } else {
+            ": PASS (BOT recovery was used)"
+        }
     } else {
-        console.write_output_line(framebuffer, "ut: FAIL");
-    }
+        ": FAIL"
+    });
+    console.write_output_line(framebuffer, line.as_str());
+    outcome
 }
 
 fn write_usb_msc_mode(
@@ -3378,6 +3474,13 @@ fn write_usb_msc_mode(
     });
     line.push_str(" bulk-in-mps=");
     line.push_u32(mass_storage.bulk_in_mps() as u32);
+    let fifo = usb::fifo_configuration();
+    line.push_str(" fifo=");
+    line.push_u32(fifo.rx_lines);
+    line.push_str("/");
+    line.push_u32(fifo.non_periodic_tx_lines);
+    line.push_str("/");
+    line.push_u32(fifo.periodic_tx_lines);
     console.write_output_line(framebuffer, line.as_str());
 }
 
@@ -8368,22 +8471,55 @@ fn cmd_usbread(
 /// succeeds has reached the device, not the medium, and the read-back may be
 /// answered from the same cache -- so without SYNCHRONIZE CACHE(10) a test
 /// can report "restored" for data that never left the cache.
+/// What one `usbwritetest` round established, for a caller that runs
+/// several and reports the tally rather than the rounds.
+#[derive(Clone, Copy, Default)]
+struct WriteRoundOutcome {
+    /// The pattern write was actually attempted. False means the round
+    /// stopped at a precondition and says nothing about the write path.
+    attempted: bool,
+    /// The pattern was written and read back identical.
+    pattern_ok: bool,
+    /// Every block in the window holds its original contents again.
+    restored: bool,
+    /// Blocks nobody named that changed anyway.
+    collateral: u32,
+    /// The BOT session needs re-enumeration before another command.
+    session_lost: bool,
+}
+
 fn cmd_usb_write_test(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
     argument: &[u8],
     usb_host: &mut usb::UsbHost,
 ) {
+    let Some(lba) = parse_u32(trim(argument)) else {
+        console.write_output_line(framebuffer, "usage: usbwritetest <lba>");
+        return;
+    };
+    let _ = run_usb_write_test(console, framebuffer, lba, usb_host);
+}
+
+/// One write/read-back/restore round against `lba`.
+///
+/// Split from the command so `usbcheck` can run several and report the
+/// tally. Every diagnostic line it used to print, it still prints: a run
+/// that fails is read line by line, and a summary is only useful when the
+/// detail behind it is still there.
+fn run_usb_write_test(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    lba: u32,
+    usb_host: &mut usb::UsbHost,
+) -> WriteRoundOutcome {
     const BLOCK: usize = 512;
     /// Blocks either side of the target that are checked for collateral
     /// damage. One before and two after covers an off-by-one in any
     /// direction and a write that ran long.
     const WINDOW: usize = 4;
 
-    let Some(lba) = parse_u32(trim(argument)) else {
-        console.write_output_line(framebuffer, "usage: usbwritetest <lba>");
-        return;
-    };
+    let aborted = WriteRoundOutcome::default();
 
     console.write_output_line(
         framebuffer,
@@ -8394,16 +8530,16 @@ fn cmd_usb_write_test(
             framebuffer,
             "no Mass Storage device attached; plug one in and run 'usbrescan'",
         );
-        return;
+        return aborted;
     };
     if !require_live_usb_msc(console, framebuffer, mass_storage) {
-        return;
+        return aborted;
     }
 
     console.write_output_line(framebuffer, "waiting for media ready (TEST UNIT READY)...");
     if !mass_storage.wait_until_ready(10) {
         console.write_output_line(framebuffer, "media not ready; aborting (nothing written)");
-        return;
+        return aborted;
     }
 
     // Every block index below assumes 512-byte logical blocks. A device with
@@ -8412,7 +8548,7 @@ fn cmd_usb_write_test(
     // affecting blocks nobody named.
     let Some(capacity) = mass_storage.read_capacity() else {
         console.write_output_line(framebuffer, "READ CAPACITY(10) failed; aborting");
-        return;
+        return aborted;
     };
     if capacity.block_length != BLOCK as u32 {
         let mut line = Line::new();
@@ -8420,7 +8556,7 @@ fn cmd_usb_write_test(
         line.push_u32(capacity.block_length);
         line.push_str(" bytes, not 512; aborting");
         console.write_output_line(framebuffer, line.as_str());
-        return;
+        return aborted;
     }
     if lba > capacity.last_lba {
         let mut line = Line::new();
@@ -8428,7 +8564,7 @@ fn cmd_usb_write_test(
         line.push_u32(capacity.last_lba);
         line.push_str("); aborting");
         console.write_output_line(framebuffer, line.as_str());
-        return;
+        return aborted;
     }
 
     // The window starts one block before the target where there is room, so
@@ -8445,7 +8581,7 @@ fn cmd_usb_write_test(
                 framebuffer,
                 "could not read the block window, aborting (nothing written)",
             );
-            return;
+            return aborted;
         }
     }
 
@@ -8472,10 +8608,17 @@ fn cmd_usb_write_test(
                 framebuffer,
                 "MSC session unusable; run 'usbrescan' before another storage command",
             );
-            return;
+            return WriteRoundOutcome {
+                attempted: true,
+                session_lost: true,
+                ..aborted
+            };
         }
         write_usb_sense_line(console, framebuffer, mass_storage);
-        return;
+        return WriteRoundOutcome {
+            attempted: true,
+            ..aborted
+        };
     }
     let flushed = mass_storage.synchronize_cache();
     match flushed {
@@ -8628,6 +8771,1120 @@ fn cmd_usb_write_test(
             "a block nobody named changed: the write did not land where asked",
         );
     }
+
+    WriteRoundOutcome {
+        attempted: true,
+        pattern_ok: target_ok && window_readable,
+        restored: restore_ok,
+        collateral: damaged,
+        session_lost: mass_storage.needs_reinit(),
+    }
+}
+
+/// Everything one acceptance run compares, gathered before and after so the
+/// run reports its own deltas.
+///
+/// Reading a run used to mean capturing two ten-line `usbhw` blocks and
+/// diffing them by eye, once per topology and per medium. That is the
+/// expensive part of the matrix in `docs/USB_BOT_HCD_REFACTOR_PLAN.md`, and
+/// it is the part a person gets wrong.
+#[derive(Clone, Copy, Default)]
+struct UsbCheckCounters {
+    host: usb::HostObservation,
+    transport: usb::TransportObservation,
+    read_cleanups: u32,
+    write_cleanups: u32,
+    command_retries: u32,
+}
+
+fn usb_check_counters(usb_host: &usb::UsbHost) -> UsbCheckCounters {
+    let host = usb::host_observation();
+    let Some(storage) = usb_host.mass_storage() else {
+        return UsbCheckCounters {
+            host,
+            ..Default::default()
+        };
+    };
+    let (read_cleanups, write_cleanups) = storage.maintenance_resync_counts();
+    UsbCheckCounters {
+        host,
+        transport: storage.transport_observation(),
+        read_cleanups,
+        write_cleanups,
+        command_retries: storage.read_retry_count(),
+    }
+}
+
+/// The change in the counters of several failure kinds, added together.
+fn usb_check_kind_sum(
+    after: &UsbCheckCounters,
+    before: &UsbCheckCounters,
+    kinds: &[usb::PacketFailureKind],
+) -> u32 {
+    kinds
+        .iter()
+        .map(|kind| {
+            let index = usb::packet_failure_kind_index(*kind);
+            after.host.packet_failures_by_kind[index]
+                .wrapping_sub(before.host.packet_failures_by_kind[index])
+        })
+        .sum()
+}
+
+/// One `label+N` field of a delta line.
+fn push_delta(line: &mut Line, label: &str, after: u32, before: u32) {
+    line.push_str(label);
+    line.push_str("+");
+    line.push_u32(after.wrapping_sub(before));
+}
+
+/// Prints one gate as `PASS`/`FAIL` with the reason attached.
+///
+/// A run that only prints numbers still has to be interpreted against the
+/// plan's Go conditions every time. Naming each gate and its verdict is what
+/// makes an acceptance run readable without the plan open beside it.
+fn write_gate(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    passed: bool,
+    name: &str,
+) -> bool {
+    write_gate_named(console, framebuffer, "usbcheck", passed, name)
+}
+
+fn write_gate_named(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    command: &str,
+    passed: bool,
+    name: &str,
+) -> bool {
+    let mut line = Line::new();
+    line.push_str(command);
+    line.push_str(if passed { ": PASS " } else { ": FAIL " });
+    line.push_str(name);
+    console.write_output_line(framebuffer, line.as_str());
+    passed
+}
+
+/// Exercises the raw USB WRITE(10) path without creating filesystem objects.
+///
+/// `fswritetest` is the wrong first gate while transport writes are unstable:
+/// its first failed metadata update can leave a directory entry which only a
+/// different machine can repair. This command instead confines every write
+/// to an explicitly sacrificial raw range. It snapshots that range and tries
+/// to restore it, but correctness never depends on restore succeeding -- the
+/// caller chose blocks whose contents may be discarded.
+fn cmd_usbrawcheck(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    const BLOCK: usize = 512;
+    const MAX_SPAN: usize = 8;
+    const DEFAULT_WRITES: u32 = 32;
+    const MAX_WRITES: u32 = 256;
+
+    const MAX_GAP_MS: u32 = 2_000;
+    const USAGE: &str = "usage: usbrawcheck <lba> [writes] [span] [gap_ms]";
+    let (lba_text, rest) = split_first_word(trim(argument));
+    let Some(first_lba) = parse_u32(lba_text) else {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    };
+    let (writes_text, rest) = split_first_word(trim(rest));
+    let writes = if writes_text.is_empty() {
+        DEFAULT_WRITES
+    } else {
+        match parse_u32(writes_text) {
+            Some(value) if value > 0 && value <= MAX_WRITES => value,
+            _ => {
+                console.write_output_line(framebuffer, "writes must be 1..=256");
+                return;
+            }
+        }
+    };
+    let (span_text, rest) = split_first_word(trim(rest));
+    let span = if span_text.is_empty() {
+        1usize
+    } else {
+        match parse_u32(span_text) {
+            Some(value) if value > 0 && value <= MAX_SPAN as u32 => value as usize,
+            _ => {
+                console.write_output_line(framebuffer, "span must be 1..=8 blocks");
+                return;
+            }
+        }
+    };
+    let (gap_text, rest) = split_first_word(trim(rest));
+    let gap_ms = if gap_text.is_empty() {
+        0
+    } else {
+        match parse_u32(gap_text) {
+            Some(value) if value <= MAX_GAP_MS => value,
+            _ => {
+                console.write_output_line(framebuffer, "gap_ms must be 0..=2000");
+                return;
+            }
+        }
+    };
+    if !trim(rest).is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+    let Some(last_lba) = first_lba.checked_add(span as u32 - 1) else {
+        console.write_output_line(framebuffer, "raw range overflows the LBA address space");
+        return;
+    };
+
+    console.write_output_line(
+        framebuffer,
+        "WARNING: raw sacrificial range; it MUST be outside every filesystem you care about",
+    );
+    console.write_output_line(
+        framebuffer,
+        "no files or directories are created; failed restore does not require filesystem repair",
+    );
+    let mut line = Line::new();
+    line.push_str("usbrawcheck: LBA ");
+    line.push_u32(first_lba);
+    line.push_str("-");
+    line.push_u32(last_lba);
+    line.push_str(" writes=");
+    line.push_u32(writes);
+    line.push_str(" span=");
+    line.push_u32(span as u32);
+    line.push_str(" gap-ms=");
+    line.push_u32(gap_ms);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let Some(mass_storage) = usb_host.mass_storage_mut() else {
+        console.write_output_line(
+            framebuffer,
+            "no Mass Storage device attached; plug one in and run 'usbrescan'",
+        );
+        return;
+    };
+    if !require_live_usb_msc(console, framebuffer, mass_storage) {
+        return;
+    }
+    if !mass_storage.wait_until_ready(10) {
+        console.write_output_line(framebuffer, "media not ready; aborting (nothing written)");
+        return;
+    }
+    let Some(capacity) = mass_storage.read_capacity() else {
+        console.write_output_line(framebuffer, "READ CAPACITY(10) failed; aborting");
+        return;
+    };
+    if capacity.block_length != BLOCK as u32 {
+        console.write_output_line(framebuffer, "device block length is not 512; aborting");
+        return;
+    }
+    if last_lba > capacity.last_lba {
+        console.write_output_line(framebuffer, "raw range extends beyond the medium; aborting");
+        return;
+    }
+
+    let mut snapshot = [[0u8; BLOCK]; MAX_SPAN];
+    for (slot, block) in snapshot.iter_mut().take(span).enumerate() {
+        if !mass_storage.read_blocks(first_lba + slot as u32, block) {
+            console.write_output_line(
+                framebuffer,
+                "could not snapshot the raw range; aborting (nothing written)",
+            );
+            return;
+        }
+    }
+    let mut last_sequence = [u32::MAX; MAX_SPAN];
+    let mut completed = 0u32;
+    let mut pattern = [0u8; BLOCK];
+    for sequence in 0..writes {
+        let slot = sequence as usize % span;
+        fill_usb_raw_pattern(&mut pattern, first_lba + slot as u32, sequence);
+        // Once WRITE starts, its outcome cannot prove the block stayed
+        // untouched. Mark it before issuing the command so a live session
+        // attempts restoration even when the command reports failure.
+        last_sequence[slot] = sequence;
+        if mass_storage.write_blocks(first_lba + slot as u32, &mut pattern)
+            != usb::WriteOutcome::Written
+        {
+            console.write_output_line(framebuffer, "raw burst WRITE failed, see UART log");
+            break;
+        }
+        completed += 1;
+        if gap_ms != 0 && sequence + 1 < writes {
+            delay::delay_ms(gap_ms);
+        }
+    }
+
+    // No read, flush, or ready poll occurs inside the burst above. That is
+    // the command shape filesystem metadata exposed and usbwritetest hid by
+    // verifying every individual write before issuing the next one.
+    let mut pattern_ok = completed == writes && !mass_storage.needs_reinit();
+    if pattern_ok {
+        let _ = mass_storage.synchronize_cache();
+        let _ = mass_storage.wait_until_ready(10);
+        for (slot, sequence) in last_sequence.iter().take(span).enumerate() {
+            if *sequence == u32::MAX {
+                continue;
+            }
+            fill_usb_raw_pattern(&mut pattern, first_lba + slot as u32, *sequence);
+            let mut current = [0u8; BLOCK];
+            let read = mass_storage.read_blocks_from_medium(first_lba + slot as u32, &mut current)
+                || mass_storage.read_blocks(first_lba + slot as u32, &mut current);
+            pattern_ok &= read && current == pattern;
+        }
+    }
+
+    let mut restored = !mass_storage.needs_reinit();
+    if restored {
+        for (slot, original) in snapshot.iter().take(span).enumerate() {
+            if last_sequence[slot] == u32::MAX {
+                continue;
+            }
+            let mut block = *original;
+            if mass_storage.write_blocks(first_lba + slot as u32, &mut block)
+                != usb::WriteOutcome::Written
+            {
+                restored = false;
+                break;
+            }
+        }
+    }
+    if restored {
+        let _ = mass_storage.synchronize_cache();
+        let _ = mass_storage.wait_until_ready(10);
+        for (slot, original) in snapshot.iter().take(span).enumerate() {
+            if last_sequence[slot] == u32::MAX {
+                continue;
+            }
+            let mut current = [0u8; BLOCK];
+            let read = mass_storage.read_blocks_from_medium(first_lba + slot as u32, &mut current)
+                || mass_storage.read_blocks(first_lba + slot as u32, &mut current);
+            restored &= read && current == *original;
+        }
+    }
+
+    let mut line = Line::new();
+    line.push_str("usbrawcheck: writes completed=");
+    line.push_u32(completed);
+    line.push_str("/");
+    line.push_u32(writes);
+    line.push_str(" pattern=");
+    line.push_str(if pattern_ok { "match" } else { "FAIL" });
+    line.push_str(" restored=");
+    line.push_str(if restored { "yes" } else { "NO" });
+    console.write_output_line(framebuffer, line.as_str());
+
+    if mass_storage.needs_reinit() {
+        console.write_output_line(
+            framebuffer,
+            "MSC session unusable; run usbrescan and reuse the same sacrificial range",
+        );
+    }
+    if !restored {
+        console.write_output_line(
+            framebuffer,
+            "sacrificial range may contain test data; no filesystem repair is needed if it is outside every partition",
+        );
+    }
+    console.write_output_line(
+        framebuffer,
+        if completed == writes && pattern_ok && restored {
+            "usbrawcheck: RESULT PASS"
+        } else {
+            "usbrawcheck: RESULT FAIL"
+        },
+    );
+}
+
+fn fill_usb_raw_pattern(block: &mut [u8; 512], lba: u32, sequence: u32) {
+    for (index, byte) in block.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(29).wrapping_add(sequence as u8)
+            ^ (lba as u8).rotate_left(sequence & 7);
+    }
+    block[0..4].copy_from_slice(b"URAW");
+    block[4..8].copy_from_slice(&lba.to_le_bytes());
+    block[8..12].copy_from_slice(&sequence.to_le_bytes());
+}
+
+/// Runs one configuration's acceptance sequence and reports its own verdict.
+///
+/// This is the whole per-topology, per-medium round of
+/// `docs/USB_BOT_HCD_REFACTOR_PLAN.md` in one command: counters before, the
+/// read soak, the write rounds, counters after, the deltas, and a gate for
+/// each Go condition. [`cmd_usbrawcheck`] supplies the no-filesystem burst
+/// gate while raw WRITE remains unstable.
+fn cmd_usbcheck(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    argument: &[u8],
+    usb_host: &mut usb::UsbHost,
+) {
+    /// Write rounds per run when an LBA is given. Stage 0's matrix asked for
+    /// ten, and ten is what caught the restore failing eight times out of
+    /// ten on the Full-Speed hub path.
+    const WRITE_ROUNDS: u32 = 10;
+
+    const USAGE: &str = "usage: usbcheck [reads] [lba]";
+    let (reads_text, rest) = split_first_word(trim(argument));
+    let reads = if reads_text.is_empty() {
+        100
+    } else {
+        match parse_u32(reads_text) {
+            Some(value) if value > 0 && value <= 1_000 => value,
+            _ => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    let (lba_text, rest) = split_first_word(trim(rest));
+    let lba = if lba_text.is_empty() {
+        None
+    } else {
+        match parse_u32(lba_text) {
+            Some(value) => Some(value),
+            None => {
+                console.write_output_line(framebuffer, USAGE);
+                return;
+            }
+        }
+    };
+    if !trim(rest).is_empty() {
+        console.write_output_line(framebuffer, USAGE);
+        return;
+    }
+
+    if usb_host.mass_storage().is_none() {
+        console.write_output_line(
+            framebuffer,
+            "usbcheck: no USB Mass Storage; attach one and run usbrescan",
+        );
+        return;
+    }
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: reads=");
+    line.push_u32(reads);
+    match lba {
+        Some(value) => {
+            line.push_str(" writes=");
+            line.push_u32(WRITE_ROUNDS);
+            line.push_str(" lba=");
+            line.push_u32(value);
+        }
+        None => line.push_str(" writes=0 (read-only; pass an LBA to test writes)"),
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let before = usb_check_counters(usb_host);
+    let soak = run_usb_read_soak(console, framebuffer, reads, "usbcheck", usb_host);
+
+    let mut rounds = 0u32;
+    let mut pattern_ok = 0u32;
+    let mut restored = 0u32;
+    let mut collateral = 0u32;
+    let mut session_lost = false;
+    if let Some(target) = lba {
+        for _ in 0..WRITE_ROUNDS {
+            // A session that has to be re-enumerated fails every remaining
+            // round the same way and takes seconds each to do it. Stop and
+            // report the rounds that actually ran.
+            if session_lost {
+                break;
+            }
+            let outcome = run_usb_write_test(console, framebuffer, target, usb_host);
+            if !outcome.attempted {
+                break;
+            }
+            rounds += 1;
+            pattern_ok += u32::from(outcome.pattern_ok);
+            restored += u32::from(outcome.restored);
+            collateral += outcome.collateral;
+            session_lost = outcome.session_lost;
+        }
+    }
+
+    let after = usb_check_counters(usb_host);
+    write_usbcheck_deltas(console, framebuffer, &before, &after);
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: writes ok=");
+    line.push_u32(pattern_ok);
+    line.push_str("/");
+    line.push_u32(rounds);
+    line.push_str(" restored=");
+    line.push_u32(restored);
+    line.push_str("/");
+    line.push_u32(rounds);
+    line.push_str(" collateral=");
+    line.push_u32(collateral);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let cache_refusals = after
+        .host
+        .cache_refusals
+        .wrapping_sub(before.host.cache_refusals);
+    let refused = after
+        .transport
+        .retries_refused
+        .wrapping_sub(before.transport.retries_refused);
+    let progressed = after
+        .transport
+        .retries_after_progress
+        .wrapping_sub(before.transport.retries_after_progress);
+    // A packet failure the bus produced and a retry then recovered from is
+    // not a failed run: the plan's Go conditions allow packet retries whose
+    // HCINT and actual length are explained, and whether one actually broke
+    // anything is what the read and write gates answer. The kinds below are
+    // different -- none of them can be produced by a device or a cable, so
+    // every one is this driver breaking its own contract.
+    let contract_failures = usb_check_kind_sum(
+        &after,
+        &before,
+        &[
+            usb::PacketFailureKind::ShortOut,
+            usb::PacketFailureKind::CacheSyncRefused,
+            usb::PacketFailureKind::QtdInvalidStatus,
+            usb::PacketFailureKind::NotTransferComplete,
+            usb::PacketFailureKind::StaleCompletion,
+            usb::PacketFailureKind::SplitRejected,
+        ],
+    );
+    let transport_failures = usb_check_kind_sum(
+        &after,
+        &before,
+        &[
+            usb::PacketFailureKind::HaltTimeout,
+            usb::PacketFailureKind::Stall,
+            usb::PacketFailureKind::TransactionError,
+            usb::PacketFailureKind::QtdPacketError,
+        ],
+    );
+    let csw_contract_failures = after
+        .transport
+        .csw_short
+        .wrapping_sub(before.transport.csw_short)
+        .saturating_add(
+            after
+                .transport
+                .csw_bad_signature
+                .wrapping_sub(before.transport.csw_bad_signature),
+        )
+        .saturating_add(
+            after
+                .transport
+                .csw_tag_mismatch
+                .wrapping_sub(before.transport.csw_tag_mismatch),
+        )
+        .saturating_add(
+            after
+                .transport
+                .csw_phase_error
+                .wrapping_sub(before.transport.csw_phase_error),
+        )
+        .saturating_add(
+            after
+                .transport
+                .csw_invalid_status
+                .wrapping_sub(before.transport.csw_invalid_status),
+        )
+        .saturating_add(
+            after
+                .transport
+                .csw_residue_mismatch
+                .wrapping_sub(before.transport.csw_residue_mismatch),
+        );
+
+    let mut all = write_gate(
+        console,
+        framebuffer,
+        cache_refusals == 0,
+        "cache sync (stage 1)",
+    );
+    all &= write_gate(
+        console,
+        framebuffer,
+        contract_failures == 0,
+        "driver contract (no impossible completions)",
+    );
+    all &= write_gate(
+        console,
+        framebuffer,
+        csw_contract_failures == 0,
+        "BOT CSW contract (stage 3)",
+    );
+    all &= write_gate(console, framebuffer, soak.passed(), "read soak");
+    if lba.is_some() {
+        all &= write_gate(
+            console,
+            framebuffer,
+            rounds == WRITE_ROUNDS
+                && pattern_ok == WRITE_ROUNDS
+                && restored == WRITE_ROUNDS
+                && collateral == 0,
+            "write rounds",
+        );
+    }
+
+    // Reported, not gated: the bus produced these and a retry dealt with
+    // them. They still belong in the record, because "the run passed" and
+    // "the run passed without the transport stumbling" are different
+    // results and the second is the one that gets quieter as the refactor
+    // lands.
+    if transport_failures != 0 {
+        let mut line = Line::new();
+        line.push_str("usbcheck: NOTE transport events=");
+        line.push_u32(transport_failures);
+        line.push_str(" retried err+");
+        line.push_u32(
+            after
+                .transport
+                .packet_error_retries
+                .wrapping_sub(before.transport.packet_error_retries),
+        );
+        line.push_str(" timeout+");
+        line.push_u32(
+            after
+                .transport
+                .timeout_retries
+                .wrapping_sub(before.transport.timeout_retries),
+        );
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    // Reported, not gated. A retry of a packet that had already moved bytes
+    // is what stages 2 and 3 exist to make impossible; until they land it is
+    // an expected observation on the Full-Speed hub path, and failing the
+    // run on it would hide whether anything else regressed.
+    if refused != 0 {
+        let mut line = Line::new();
+        line.push_str("usbcheck: NOTE refused=");
+        line.push_u32(refused);
+        line.push_str(" progressed=");
+        line.push_u32(progressed);
+        line.push_str(" bytes=");
+        line.push_u32(
+            after
+                .transport
+                .retry_progress_bytes
+                .wrapping_sub(before.transport.retry_progress_bytes),
+        );
+        console.write_output_line(framebuffer, line.as_str());
+        console.write_output_line(
+            framebuffer,
+            "usbcheck:   resending them could have put the same bytes on the bus twice",
+        );
+    }
+    if session_lost {
+        console.write_output_line(
+            framebuffer,
+            "usbcheck: MSC session was lost; run 'usbrescan' before the next command",
+        );
+    }
+
+    console.write_output_line(
+        framebuffer,
+        if all {
+            "usbcheck: RESULT PASS"
+        } else {
+            "usbcheck: RESULT FAIL"
+        },
+    );
+}
+
+/// The counter deltas across one acceptance run, one field per line group.
+///
+/// Only deltas: an absolute count carries every boot-time enumeration and
+/// every idle keyboard poll since power-on, which is what made two `usbhw`
+/// captures necessary in the first place.
+fn write_usbcheck_deltas(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    before: &UsbCheckCounters,
+    after: &UsbCheckCounters,
+) {
+    let kinds = usb::packet_failure_kind_names();
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta ");
+    push_delta(
+        &mut line,
+        "cache-refusals",
+        after.host.cache_refusals,
+        before.host.cache_refusals,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "pkt-fail",
+        after.host.packet_failures,
+        before.host.packet_failures,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "idle-poll",
+        after.host.idle_poll_timeouts,
+        before.host.idle_poll_timeouts,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    // Position 0 of the kind table is the "no failure" placeholder. The
+    // groups are sized so that five-digit counts still fit one 80-column
+    // line, the same constraint the `usbhw` block is built around.
+    for group in [1usize..5, 5..8, 8..kinds.len()] {
+        let mut line = Line::new();
+        line.push_str("usbcheck: delta pkt-fail");
+        for index in group {
+            line.push_str(" ");
+            push_delta(
+                &mut line,
+                kinds[index],
+                after.host.packet_failures_by_kind[index],
+                before.host.packet_failures_by_kind[index],
+            );
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta fifo-timeout");
+    for (index, name) in ["nptx", "ptx", "rx"].iter().enumerate() {
+        line.push_str(" ");
+        push_delta(
+            &mut line,
+            name,
+            after.host.fifo_flush_timeouts[index],
+            before.host.fifo_flush_timeouts[index],
+        );
+    }
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "skipped",
+        after.host.fifo_flushes_skipped_for_periodic,
+        before.host.fifo_flushes_skipped_for_periodic,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta packet-cleanup ");
+    push_delta(
+        &mut line,
+        "out-nptx",
+        after.host.out_packet_error_nptx_cleanups,
+        before.host.out_packet_error_nptx_cleanups,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta proactive ");
+    push_delta(&mut line, "read", after.read_cleanups, before.read_cleanups);
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "write",
+        after.write_cleanups,
+        before.write_cleanups,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "cmd-retry",
+        after.command_retries,
+        before.command_retries,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta pkt-retry ");
+    push_delta(
+        &mut line,
+        "err",
+        after.transport.packet_error_retries,
+        before.transport.packet_error_retries,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "timeout",
+        after.transport.timeout_retries,
+        before.transport.timeout_retries,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta resubmit ");
+    push_delta(
+        &mut line,
+        "refused",
+        after.transport.retries_refused,
+        before.transport.retries_refused,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "progressed",
+        after.transport.retries_after_progress,
+        before.transport.retries_after_progress,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "impossible-len",
+        after.host.impossible_remainders,
+        before.host.impossible_remainders,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta recovery ");
+    push_delta(
+        &mut line,
+        "ok",
+        after.transport.reset_recoveries,
+        before.transport.reset_recoveries,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "failed",
+        after.transport.reset_recovery_failures,
+        before.transport.reset_recovery_failures,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta csw ");
+    push_delta(
+        &mut line,
+        "short",
+        after.transport.csw_short,
+        before.transport.csw_short,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "sig",
+        after.transport.csw_bad_signature,
+        before.transport.csw_bad_signature,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "tag",
+        after.transport.csw_tag_mismatch,
+        before.transport.csw_tag_mismatch,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("usbcheck: delta csw-detail ");
+    push_delta(
+        &mut line,
+        "phase",
+        after.transport.csw_phase_error,
+        before.transport.csw_phase_error,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "status",
+        after.transport.csw_invalid_status,
+        before.transport.csw_invalid_status,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "residue",
+        after.transport.csw_residue_mismatch,
+        before.transport.csw_residue_mismatch,
+    );
+    line.push_str(" ");
+    push_delta(
+        &mut line,
+        "early",
+        after.transport.csw_early,
+        before.transport.csw_early,
+    );
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// Proves that the three faults the HCD contract exists to catch are
+/// detected rather than absorbed.
+///
+/// Stages 1 and 2 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` add rules that
+/// working hardware never exercises: a refused DMA cache synchronization
+/// must stop the packet before the channel is armed and publish nothing; a
+/// completion arriving under a generation the slot no longer holds must not
+/// be accepted; an OUT that moved fewer bytes than it was given must not
+/// reach the layer above as a success. None of the three can be produced on
+/// demand by a device, so each is injected here. A rule that has never been
+/// seen to fire is a rule nobody knows works.
+///
+/// Topology-independent: this tests the driver's own logic, so one run
+/// covers every configuration in the matrix.
+fn cmd_usbcachefail(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) {
+    let mut all = usb_fault_cache_sync(console, framebuffer, usb_host);
+    all &= usb_fault_stale_completion(console, framebuffer, usb_host);
+    all &= usb_fault_short_out(console, framebuffer, usb_host);
+
+    console.write_output_line(
+        framebuffer,
+        if all {
+            "usbcachefail: RESULT PASS"
+        } else {
+            "usbcachefail: RESULT FAIL"
+        },
+    );
+    console.write_output_line(
+        framebuffer,
+        "usbcachefail: MSC sessions were retired as designed; run 'usbrescan'",
+    );
+}
+
+/// Re-enumerates when the previous injection retired the session, so the
+/// next one starts against a device that can still answer.
+///
+/// Each injection deliberately fails a command twice over, which is exactly
+/// what the BOT layer treats as recovery that is not holding. Without this
+/// the second and third checks would report the first one's wreckage. A
+/// failed command can also leave a downstream device unable to answer the
+/// first descriptor request immediately after reset. Retry the whole bounded
+/// rescan here instead of turning that transient reacquisition failure into
+/// two skipped contract checks.
+fn usb_fault_reset(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    const RESCAN_ATTEMPTS: u32 = 3;
+    const RESCAN_RETRY_DELAY_MS: u32 = 500;
+
+    let storage_ready = |host: &usb::UsbHost| {
+        host.mass_storage()
+            .is_some_and(|storage| !storage.needs_reinit())
+    };
+    if storage_ready(usb_host) {
+        return true;
+    }
+
+    for attempt in 0..RESCAN_ATTEMPTS {
+        if attempt != 0 {
+            console.write_output_line(
+                framebuffer,
+                "usbcachefail: retrying USB rescan after 500 ms",
+            );
+            delay::delay_ms(RESCAN_RETRY_DELAY_MS);
+        }
+        usb_host.rescan(usb::RescanReason::Recovery);
+        if storage_ready(usb_host) {
+            return true;
+        }
+    }
+
+    if usb_host
+        .mass_storage()
+        .is_some_and(usb::UsbMassStorage::needs_reinit)
+    {
+        console.write_output_line(
+            framebuffer,
+            "usbcachefail: USB Mass Storage did not recover; run usbrescan",
+        );
+    } else {
+        console.write_output_line(
+            framebuffer,
+            "usbcachefail: no USB Mass Storage after 3 rescans; check attachment",
+        );
+    }
+    false
+}
+
+/// Neither a plausible block of data nor the zero a freshly staged buffer
+/// holds, so finding it intact afterwards proves nothing was published
+/// over it.
+const USB_FAULT_SENTINEL: u8 = 0x5A;
+const USB_FAULT_BLOCK: usize = 512;
+/// Comfortably more than the one replay `msc.rs` performs after Reset
+/// Recovery, so a check does not have to track that policy. Whatever is
+/// left over is disarmed afterwards.
+const USB_FAULT_ARMED: u32 = 4;
+
+/// Stage 1: a refused cache synchronization fails the packet before the
+/// channel is armed, and publishes nothing.
+///
+/// The injection is aimed at the **data IN** phase and armed several times
+/// over, for two reasons the first version of this check got wrong. A
+/// single untargeted refusal lands on the command block, which is an OUT
+/// packet and so says nothing about what gets published to the caller; and
+/// one refusal is healed by the READ(10) replay `msc.rs` performs after
+/// Reset Recovery, which is the retry policy working rather than a fault.
+fn usb_fault_cache_sync(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    if !usb_fault_reset(console, framebuffer, usb_host) {
+        return false;
+    }
+    console.write_output_line(
+        framebuffer,
+        "usbcachefail: [1/3] refusing every data-IN cache sync of the next read",
+    );
+
+    let refusals_before = usb::cache_refusal_count();
+    let before = usb::host_observation().packet_failures_by_kind;
+    let mut buffer = [USB_FAULT_SENTINEL; USB_FAULT_BLOCK];
+
+    let _ = usb::force_cache_refusals(USB_FAULT_ARMED, Some(usb::TransferLabel::DataIn));
+    let read_ok = usb_host
+        .mass_storage_mut()
+        .is_some_and(|storage| storage.read_blocks(0, &mut buffer));
+    // Nothing stays armed for an unrelated later transfer, whether or not
+    // the read consumed the whole allowance.
+    let _ = usb::force_cache_refusals(0, None);
+
+    let refusals = usb::cache_refusal_count().wrapping_sub(refusals_before);
+    let counted = usb_fault_kind_delta(&before, usb::PacketFailureKind::CacheSyncRefused);
+
+    let mut all = write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        refusals >= 1 && counted >= 1,
+        "[1/3] the refusal failed the packet as a cache-sync failure",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        !read_ok,
+        "[1/3] the read failed rather than succeeding",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        buffer.iter().all(|byte| *byte == USB_FAULT_SENTINEL),
+        "[1/3] no bytes were published over the destination",
+    );
+    all
+}
+
+/// Stage 2: a completion delivered under a generation the slot no longer
+/// holds is rejected instead of being reaped as this packet's result.
+fn usb_fault_stale_completion(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    if !usb_fault_reset(console, framebuffer, usb_host) {
+        return false;
+    }
+    console.write_output_line(
+        framebuffer,
+        "usbcachefail: [2/3] delivering the next completions under a stale generation",
+    );
+
+    let before = usb::host_observation().packet_failures_by_kind;
+    let stale_before = usb::interrupt_diagnostics().stale_tokens;
+    let mut buffer = [USB_FAULT_SENTINEL; USB_FAULT_BLOCK];
+
+    let _ = usb::force_stale_completions(USB_FAULT_ARMED);
+    let read_ok = usb_host
+        .mass_storage_mut()
+        .is_some_and(|storage| storage.read_blocks(0, &mut buffer));
+    let _ = usb::force_stale_completions(0);
+
+    let counted = usb_fault_kind_delta(&before, usb::PacketFailureKind::StaleCompletion);
+    let stale_tokens = usb::interrupt_diagnostics()
+        .stale_tokens
+        .wrapping_sub(stale_before);
+
+    let mut all = write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        counted >= 1 && stale_tokens >= 1,
+        "[2/3] the stale completion was rejected and counted",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        !read_ok,
+        "[2/3] the read failed rather than succeeding",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        buffer.iter().all(|byte| *byte == USB_FAULT_SENTINEL),
+        "[2/3] no bytes were published over the destination",
+    );
+    all
+}
+
+/// Stage 2: an OUT reported short does not reach the layer above as a
+/// success for the length that was asked for.
+fn usb_fault_short_out(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    if !usb_fault_reset(console, framebuffer, usb_host) {
+        return false;
+    }
+    console.write_output_line(
+        framebuffer,
+        "usbcachefail: [3/3] reporting the next OUT packets one byte short",
+    );
+
+    let before = usb::host_observation().packet_failures_by_kind;
+    let mut buffer = [USB_FAULT_SENTINEL; USB_FAULT_BLOCK];
+
+    let _ = usb::force_short_outs(USB_FAULT_ARMED);
+    // A read is used rather than a write: its command block is an OUT
+    // packet, so the injection lands without putting anything on the
+    // medium.
+    let read_ok = usb_host
+        .mass_storage_mut()
+        .is_some_and(|storage| storage.read_blocks(0, &mut buffer));
+    let _ = usb::force_short_outs(0);
+
+    let counted = usb_fault_kind_delta(&before, usb::PacketFailureKind::ShortOut);
+
+    let mut all = write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        counted >= 1,
+        "[3/3] the short OUT was rejected and counted",
+    );
+    all &= write_gate_named(
+        console,
+        framebuffer,
+        "usbcachefail",
+        !read_ok,
+        "[3/3] the command failed rather than succeeding",
+    );
+    all
+}
+
+/// How many failures of `kind` have been counted since `before`.
+fn usb_fault_kind_delta(
+    before: &[u32; usb::PACKET_FAILURE_KIND_COUNT],
+    kind: usb::PacketFailureKind,
+) -> u32 {
+    let index = usb::packet_failure_kind_index(kind);
+    usb::host_observation().packet_failures_by_kind[index].wrapping_sub(before[index])
 }
 
 /// Overwrites blocks on USB Mass Storage with zeros, the USB counterpart of
@@ -8910,6 +10167,8 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
         "  -> not zero means the controller read stale RAM for that many transfers",
     );
 
+    write_bot_baseline(console, framebuffer, usb_host);
+
     let irq = usb::interrupt_diagnostics();
     let mut line = Line::new();
     line.push_str("USB IRQ source=");
@@ -9110,6 +10369,254 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
         b"USB IRQ: unknown count=",
         interrupts::unknown_external_count(),
     );
+}
+
+/// The Stage 0 baseline counters of `docs/USB_BOT_HCD_REFACTOR_PLAN.md`, in
+/// a fixed line format so two runs can be diffed rather than read.
+///
+/// Every field is printed even when zero. A block that hides its zeroes
+/// cannot be compared line by line, and "the counter is missing" and "the
+/// counter is zero" are exactly the two states this has to keep apart.
+///
+/// The `BOT:` lines are controller-wide and survive re-enumeration; the
+/// `MSC:` lines belong to the attached device's current session and start
+/// again when that session is rebuilt.
+fn write_bot_baseline(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    usb_host: &usb::UsbHost,
+) {
+    write_bot_host_baseline(console, framebuffer, &usb::host_observation());
+    let Some(storage) = usb_host.mass_storage() else {
+        let mut line = Line::new();
+        line.push_str("MSC: no mass storage attached, session counters unavailable");
+        console.write_output_line(framebuffer, line.as_str());
+        return;
+    };
+    let (read_cleanups, write_cleanups) = storage.maintenance_resync_counts();
+    write_bot_session_baseline(
+        console,
+        framebuffer,
+        &storage.transport_observation(),
+        read_cleanups,
+        write_cleanups,
+        storage.read_retry_count(),
+    );
+}
+
+/// The controller-wide half: these counters survive re-enumeration.
+///
+/// Every line is kept short enough that four-digit counts still fit the
+/// console's 80-column line. The first baseline run lost the last column of
+/// three lines off the end, which is the one failure mode a fixed-format
+/// counter block must not have -- so the breakdowns use short column codes
+/// (`TransferLabel::short_name`) and are split across two lines rather than
+/// packed into one.
+fn write_bot_host_baseline(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    host: &usb::HostObservation,
+) {
+    let labels = usb::transfer_label_names();
+    let sites = usb::cache_site_names();
+    let directions = usb::cache_direction_names();
+    let kinds = usb::packet_failure_kind_names();
+
+    // `Line` holds 80 bytes and truncates past that, so each breakdown is
+    // split into groups that still fit when every count is five digits.
+    // The positions are the order of the name tables above: none, control,
+    // CBW, data IN, data OUT, CSW, interrupt IN for the phases; channel-0
+    // QTD, channel-0 payload, split staging, periodic, frame list, probe
+    // for the sites. Grouping is by what the counts mean, so a nonzero one
+    // is read beside the counters it should be compared against.
+    const ENVELOPE_PHASES: [usize; 4] = [0, 1, 2, 5];
+    const DATA_PHASES: [usize; 3] = [3, 4, 6];
+    const CHANNEL0_SITES: [usize; 3] = [0, 1, 2];
+    const PERIODIC_SITES: [usize; 3] = [3, 4, 5];
+
+    let mut line = Line::new();
+    line.push_str("BOT: cache-refusals=");
+    line.push_u32(host.cache_refusals);
+    for (index, name) in directions.iter().enumerate() {
+        line.push_str(" ");
+        line.push_str(name);
+        line.push_str("=");
+        line.push_u32(host.cache_refusals_by_direction[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: refusal envelope");
+    for index in ENVELOPE_PHASES {
+        line.push_str(" ");
+        line.push_str(labels[index]);
+        line.push_str("=");
+        line.push_u32(host.cache_refusals_by_label[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: refusal data");
+    for index in DATA_PHASES {
+        line.push_str(" ");
+        line.push_str(labels[index]);
+        line.push_str("=");
+        line.push_u32(host.cache_refusals_by_label[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: refusal ch0");
+    for index in CHANNEL0_SITES {
+        line.push_str(" ");
+        line.push_str(sites[index]);
+        line.push_str("=");
+        line.push_u32(host.cache_refusals_by_site[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: refusal periodic");
+    for index in PERIODIC_SITES {
+        line.push_str(" ");
+        line.push_str(sites[index]);
+        line.push_str("=");
+        line.push_u32(host.cache_refusals_by_site[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: refusal last=0x");
+    line.push_hex(host.last_cache_refusal_address, 8);
+    line.push_str("/");
+    line.push_u32(host.last_cache_refusal_length);
+    line.push_str(" phase=");
+    line.push_str(host.last_cache_refusal_label.name());
+    console.write_output_line(framebuffer, line.as_str());
+
+    // Position 0 of the kind table is the "no failure" placeholder, which
+    // is never counted.
+    let mut line = Line::new();
+    line.push_str("BOT: pkt-fail=");
+    line.push_u32(host.packet_failures);
+    for (index, name) in kinds.iter().enumerate().take(4).skip(1) {
+        line.push_str(" ");
+        line.push_str(name);
+        line.push_str("=");
+        line.push_u32(host.packet_failures_by_kind[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: pkt-fail");
+    for (index, name) in kinds.iter().enumerate().skip(4) {
+        line.push_str(" ");
+        line.push_str(name);
+        line.push_str("=");
+        line.push_u32(host.packet_failures_by_kind[index]);
+    }
+    console.write_output_line(framebuffer, line.as_str());
+
+    // On its own line, and never added to the failure total: an idle
+    // keyboard produces thousands of expired polls on a bus where nothing
+    // is wrong, and the first baseline run buried two real failures under
+    // 1131 of them.
+    let mut line = Line::new();
+    line.push_str("BOT: idle-poll=");
+    line.push_u32(host.idle_poll_timeouts);
+    line.push_str(" (idle Interrupt IN, not failures)");
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: last-fail=");
+    line.push_str(host.last_packet_failure_kind.name());
+    line.push_str(" phase=");
+    line.push_str(host.last_packet_failure_label.name());
+    line.push_str(" in=");
+    line.push_u32(u32::from(host.last_packet_failure_is_in));
+    line.push_str(" req=");
+    line.push_u32(host.last_packet_failure_requested);
+    line.push_str(" act=");
+    line.push_u32(host.last_packet_failure_actual);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: last-fail HCINT=0x");
+    line.push_hex(host.last_packet_failure_hcint, 8);
+    line.push_str(" QTD=0x");
+    line.push_hex(host.last_packet_failure_qtd, 8);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: fifo-timeout nptx=");
+    line.push_u32(host.fifo_flush_timeouts[0]);
+    line.push_str(" ptx=");
+    line.push_u32(host.fifo_flush_timeouts[1]);
+    line.push_str(" rx=");
+    line.push_u32(host.fifo_flush_timeouts[2]);
+    line.push_str(" skipped=");
+    line.push_u32(host.fifo_flushes_skipped_for_periodic);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("BOT: packet-cleanup out-nptx=");
+    line.push_u32(host.out_packet_error_nptx_cleanups);
+    console.write_output_line(framebuffer, line.as_str());
+}
+
+/// The session half: these belong to the attached device's current BOT
+/// session and start again when that session is rebuilt.
+fn write_bot_session_baseline(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    transport: &usb::TransportObservation,
+    read_cleanups: u32,
+    write_cleanups: u32,
+    command_retries: u32,
+) {
+    let mut line = Line::new();
+    line.push_str("MSC: proactive read=");
+    line.push_u32(read_cleanups);
+    line.push_str(" write=");
+    line.push_u32(write_cleanups);
+    line.push_str(" cmd-retry=");
+    line.push_u32(command_retries);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("MSC: pkt-retry err=");
+    line.push_u32(transport.packet_error_retries);
+    line.push_str(" timeout=");
+    line.push_u32(transport.timeout_retries);
+    line.push_str(" progressed=");
+    line.push_u32(transport.retries_after_progress);
+    line.push_str(" bytes=");
+    line.push_u32(transport.retry_progress_bytes);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("MSC: recovery=");
+    line.push_u32(transport.reset_recoveries);
+    line.push_str(" failed=");
+    line.push_u32(transport.reset_recovery_failures);
+    line.push_str(" csw short=");
+    line.push_u32(transport.csw_short);
+    line.push_str(" sig=");
+    line.push_u32(transport.csw_bad_signature);
+    line.push_str(" tag=");
+    line.push_u32(transport.csw_tag_mismatch);
+    console.write_output_line(framebuffer, line.as_str());
+
+    let mut line = Line::new();
+    line.push_str("MSC: csw phase=");
+    line.push_u32(transport.csw_phase_error);
+    line.push_str(" status=");
+    line.push_u32(transport.csw_invalid_status);
+    line.push_str(" residue=");
+    line.push_u32(transport.csw_residue_mismatch);
+    line.push_str(" early=");
+    line.push_u32(transport.csw_early);
+    console.write_output_line(framebuffer, line.as_str());
 }
 
 fn cmd_usbperiodic(

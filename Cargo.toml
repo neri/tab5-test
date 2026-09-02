@@ -1,9 +1,8 @@
-# `browser/` is a workspace member rather than a module of this binary so
-# that its pure byte-in/value-out code can be built for the host and tested
-# with `cargo test`. This package cannot: `main.rs` and everything under it
-# is RISC-V. See `browser/src/lib.rs`.
+# Pure byte-in/value-out components are workspace members rather than modules
+# of this binary so they can be built for the host and tested with `cargo
+# test`. This package cannot: `main.rs` and everything under it is RISC-V.
 [workspace]
-members = ["browser", "font", "spki", "time"]
+members = ["bot-protocol", "browser", "font", "spki", "time"]
 
 [package]
 name = "tab5-hello-world"
@@ -126,6 +125,10 @@ rsa = { version = "0.9", default-features = false, features = ["sha2"] }
 # because it is the one part of the TLS path that parses input an attacker
 # chooses, and `cargo test` builds it for the host.
 tab5-spki = { path = "spki" }
+# USB Mass Storage BOT's CSW parser and length/residue consistency rules are
+# pure byte-in/value-out code. Keeping them in a no_std workspace member makes
+# malformed status wrappers host-testable without compiling the RISC-V HCD.
+tab5-bot-protocol = { path = "bot-protocol" }
 
 [profile.release]
 debug = 2

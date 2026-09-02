@@ -406,6 +406,7 @@ impl InterruptIn {
         // once, not ~`POLL_FAILURE_GIVE_UP_THRESHOLD` times before
         // `needs_reinit` finally gives up.
         let quiet_errors = self.consecutive_hard_errors > 0;
+        hcd::set_transfer_label(hcd::TransferLabel::InterruptIn);
         let outcome = hcd::run_packet(
             &self.endpoint,
             false,
@@ -430,7 +431,9 @@ impl InterruptIn {
                 self.consecutive_hard_errors = 0;
                 return None;
             }
-            PacketOutcome::PacketError(_) | PacketOutcome::Error => {
+            PacketOutcome::PacketError(_)
+            | PacketOutcome::CacheSyncFailed
+            | PacketOutcome::Error => {
                 // `hcd::run_packet` already logged the specific HCINT/QTD
                 // status (unless this streak already has). A real
                 // transaction error (as opposed to a NAK timeout) usually

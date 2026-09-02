@@ -40,7 +40,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [RTC.md](docs/RTC.md) | RX8130CEのカレンダー読み書き、UTCという決めごとと既定JST表示、`rtc test`の検査内容 |
 | [FILE_LAYOUT.md](docs/FILE_LAYOUT.md) | モジュールごとの責務一覧、コーディング方針（コメントの言語、`unsafe`の粒度） |
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
-| [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかったDW-GDMA／SDHOSTの制約 |
+| [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかった制約（DW-GDMA／SDHOST、USB、ファイルシステム） |
 
 作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）:
 [COMMAND_RETIREMENT_PLAN.md](docs/COMMAND_RETIREMENT_PLAN.md)、
@@ -57,6 +57,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [SD_CARD_PLAN.md](docs/SD_CARD_PLAN.md)、
 [SOFT_I2C_REFACTOR_PLAN.md](docs/SOFT_I2C_REFACTOR_PLAN.md)、
 [STARTUP_SCREEN_REFACTOR_PLAN.md](docs/STARTUP_SCREEN_REFACTOR_PLAN.md)、
+[SYSTEM_BAR_PLAN.md](docs/SYSTEM_BAR_PLAN.md)、
+[USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
 [USB_FLOPPY_PLAN.md](docs/USB_FLOPPY_PLAN.md)、
 [USB_HOST_PLAN.md](docs/USB_HOST_PLAN.md)、
 [USB_INTERRUPT_REFACTOR_PLAN.md](docs/USB_INTERRUPT_REFACTOR_PLAN.md)、

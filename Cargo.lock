@@ -938,6 +938,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tab5-bot-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "tab5-browser"
 version = "0.1.0"
 dependencies = [
@@ -966,6 +970,7 @@ dependencies = [
  "rsa",
  "sha2",
  "smoltcp",
+ "tab5-bot-protocol",
  "tab5-browser",
  "tab5-font",
  "tab5-spki",

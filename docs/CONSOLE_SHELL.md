@@ -288,11 +288,38 @@ power-cycleが必要になった場合は不安定と判定してFAILにしま�
 
 USBだけを先に短く確認するときは`ut [count]`を使います。省略時は100回で、LBA 0の同じ
 4 KiBを初回内容と比較します。外部mediaへは書き込みません。`packet_retries`はstatus 1または
-約1秒のtimeout後に、同一packetまたは複数packet QTDの未受信suffixを再投入した回数、
+約1秒のtimeout後に、安全な1 packet QTDを同一DATA PIDで再投入した回数、
 `command_retries`はBOT Reset Recovery後に
 READ(10)を再送した回数です。`failures`は再送しても失敗した回数、`mismatch`は読出し自体は完了したが
-内容が変わった回数です。4 KiBのデータフェーズ自体は1 QTDへまとめて実行します。開始時の
-`host=... bulk-in-mps=...`で、速度切替後に実際のendpoint MPSで再列挙されたことも確認できます。
+内容が変わった回数です。4 KiBのREAD data phaseはendpoint MPS単位のQTDへ分割します。開始時の
+`host=... bulk-in-mps=... fifo=RX/NPTX/PTX`で、速度切替後に実際のendpoint MPSで再列挙された
+ことと、root-port reset後に再適用されたDWC FIFOの実レジスタ値を確認できます。
+ESP32-P4のESP-IDF balanced値は`fifo=512/256/128`です。
+
+USB BOT/HCDの受入試験は接続構成ごとに`usbcheck [reads] [lba]`を1回実行します
+（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。前後のcounterを自分で
+採り、read soakと、LBAを指定した場合は同じLBAへのwrite roundを10回実行し、最後に
+**差分**とGo条件ごとのPASS/FAILを出します。LBAを省略するとread専用で、mediaへは
+書き込みません。10回なのはStage 0のmatrixがその回数で、Full-Speedハブ経路の復元WRITEが
+10回中8回失敗したのを捕らえた回数だからです。USB raw WRITEが不安定な間はfilesystem側の
+`fswritetest`を受入に使いません。`usbrawcheck <lba> [writes] [span] [gap_ms]`がfilesystem外の犠牲範囲へ
+READを挟まず単一block WRITEを発行し、最後にまとめて照合・復元します。既定は1 blockへ
+32 WRITE、spanは1〜8、gapは成功したWRITE間の0〜2000 ms（既定0）です。失敗で復元できなくてもfile／directoryは残らず、`usbrescan`後に
+同じ犠牲範囲で次の試験を続けられます。
+
+以前はこれを`usbhw`→`ut 100`→`usbwritetest`×10→`usbhw`と打ち、2つの10行blockを目視で
+突き合わせていました。counterの絶対値には起動時の列挙とidle HIDのpollが全部乗っているので、
+差分にしないと比較になりません。構成と媒体の組み合わせだけ繰り返す作業なので、
+差分と判定をコマンド側に持たせています。
+
+`usbcachefail`はDMA cache同期の拒否をdata IN phaseへ注入し、その転送がchannelをarmする前に
+失敗すること、宛先bufferへ1 byteも公開されないことを確認します。正常なhardwareは拒否しない
+ので、注入以外にこの経路へ到達する方法がありません。ドライバ自身の論理の試験なので接続構成
+ごとに繰り返す必要はなく、全体で1回実行すれば足ります。注入は自分で減るcounterで、1回の拒否
+ごとに1消費され、終了時に残りを解除します——armされたまま残る状態は作れません。2回連続の
+失敗になるためMSC sessionは設計どおり使用不能になります。各注入の間は最大3回のfull rescanで
+MSCを再取得し、最初のdescriptor要求だけが失敗しても残りの検査を飛ばしません。全注入の終了後は
+`usbrescan`してください。
 
 `pf`は次の1 bootだけ、200 MHzの有効なDQS選定後に診断用失敗を注入します。200 MHzで
 mode registerとDQSまで設定した状態から、MSPI resetと80 MHz profileの再設定で復旧できる

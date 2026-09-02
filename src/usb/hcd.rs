@@ -3,7 +3,9 @@
 //! everything above this layer (`protocol.rs`, `hid_keyboard.rs`) is built
 //! on. This layer knows about registers, channels, and packets -- it does
 //! not know what a USB device, descriptor, or endpoint means; `run_packet`
-//! just runs one packet on channel 0 and reports what happened.
+//! runs one single-packet QTD on channel 0 and reports what happened. Failed
+//! multi-packet and multi-QTD-list experiments remain isolated below but are
+//! not part of the active transfer path.
 //!
 //! Tab5's USB-A connector is wired to this controller (internal UTMI PHY,
 //! dedicated DM/DP pins); the Full-Speed OTG controller on GPIO26/27
@@ -194,6 +196,541 @@ static SPLIT_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SPLIT_PACKET_COUNT: AtomicU32 = AtomicU32::new(0);
 static SPLIT_ROUND_COUNT: AtomicU32 = AtomicU32::new(0);
 static SPLIT_MODE_CONFLICT_COUNT: AtomicU32 = AtomicU32::new(0);
+static DIRECT_BUFFER_PACKET_COUNT: AtomicU32 = AtomicU32::new(0);
+static DIRECT_BUFFER_NAK_COUNT: AtomicU32 = AtomicU32::new(0);
+static CHANNEL0_QTD_NEXT: AtomicU32 = AtomicU32::new(0);
+
+// ------------------------------------------------------------------------
+// Stage 0 observation contract (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`)
+//
+// Nothing below changes what a transfer does. It exists so that the
+// proactive host cleanup this driver still performs at healthy Bulk-Only
+// Transport command boundaries can eventually be removed against measured
+// numbers rather than against the impression that a run felt stable: every
+// later stage is compared against a baseline taken with these counters and
+// the current cleanup in place. A counter that is only maintained once the
+// behaviour has already changed cannot produce that comparison.
+// ------------------------------------------------------------------------
+
+/// Which transfer a DMA buffer belongs to, published by the layer that owns
+/// that transfer.
+///
+/// The HCD never interprets this and never branches on it. It stores the
+/// label and reports it back, so that a refused cache maintenance call or a
+/// failed packet names the transfer that was running instead of only an
+/// address. An address on its own does not say whether the controller was
+/// about to read a command block or publish a status wrapper, and that is
+/// exactly the distinction the cleanup removal has to be judged on.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransferLabel {
+    /// Nothing has claimed the channel since boot or since the last owner
+    /// released it. Refusals counted here mean an unattributed transfer.
+    #[default]
+    Unlabelled,
+    /// EP0, any stage of a control transfer.
+    Control,
+    /// The 31-byte command block a transport sends first.
+    CommandBlock,
+    /// A command's data phase, device to host.
+    DataIn,
+    /// A command's data phase, host to device.
+    DataOut,
+    /// The 13-byte status wrapper a transport reads last.
+    CommandStatus,
+    /// An Interrupt IN report, whether persistent-periodic or the
+    /// channel-0 fallback poll.
+    InterruptIn,
+}
+
+const TRANSFER_LABEL_COUNT: usize = 7;
+
+impl TransferLabel {
+    fn index(self) -> usize {
+        match self {
+            Self::Unlabelled => 0,
+            Self::Control => 1,
+            Self::CommandBlock => 2,
+            Self::DataIn => 3,
+            Self::DataOut => 4,
+            Self::CommandStatus => 5,
+            Self::InterruptIn => 6,
+        }
+    }
+
+    fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Control,
+            2 => Self::CommandBlock,
+            3 => Self::DataIn,
+            4 => Self::DataOut,
+            5 => Self::CommandStatus,
+            6 => Self::InterruptIn,
+            _ => Self::Unlabelled,
+        }
+    }
+
+    /// A short, stable name for prose: log lines and the `phase=` field.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unlabelled => "none",
+            Self::Control => "control",
+            Self::CommandBlock => "CBW",
+            Self::DataIn => "data-IN",
+            Self::DataOut => "data-OUT",
+            Self::CommandStatus => "CSW",
+            Self::InterruptIn => "intr-IN",
+        }
+    }
+
+    /// The column heading for the `usbhw` breakdown, where seven of these
+    /// share one 80-column line. The first baseline run lost the last
+    /// column off the end of the line, which is the one failure mode a
+    /// fixed-format counter block must not have.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Unlabelled => "none",
+            Self::Control => "ctl",
+            Self::CommandBlock => "cbw",
+            Self::DataIn => "din",
+            Self::DataOut => "dout",
+            Self::CommandStatus => "csw",
+            Self::InterruptIn => "int",
+        }
+    }
+}
+
+static TRANSFER_LABEL: AtomicU32 = AtomicU32::new(0);
+
+/// Names the transfer the next packets belong to. Purely a diagnostic
+/// label: see [`TransferLabel`].
+pub fn set_transfer_label(label: TransferLabel) {
+    TRANSFER_LABEL.store(label.index() as u32, Ordering::Relaxed);
+}
+
+fn transfer_label() -> TransferLabel {
+    TransferLabel::from_index(TRANSFER_LABEL.load(Ordering::Relaxed))
+}
+
+/// Which DMA-shared object a cache maintenance call covers.
+///
+/// A refusal leaves the CPU holding its own copy of the span, so the
+/// consequence differs per object: a refused QTD writeback means the
+/// controller may fetch a stale descriptor, while a refused payload
+/// invalidate means this driver publishes pre-DMA bytes upwards. Counting
+/// them apart is what tells those two failures apart after the fact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheSite {
+    /// The channel-0 queue transfer descriptor.
+    Channel0Qtd,
+    /// A channel-0 payload span.
+    Channel0Payload,
+    /// The buffer-DMA staging buffer used for split packets.
+    SplitStaging,
+    /// A persistent periodic HID descriptor or its report buffer.
+    Periodic,
+    /// The periodic frame list.
+    PeriodicFrameList,
+    /// The one-shot periodic probe's stack-owned descriptor or buffer.
+    PeriodicProbe,
+}
+
+const CACHE_SITE_COUNT: usize = 6;
+
+impl CacheSite {
+    fn index(self) -> usize {
+        match self {
+            Self::Channel0Qtd => 0,
+            Self::Channel0Payload => 1,
+            Self::SplitStaging => 2,
+            Self::Periodic => 3,
+            Self::PeriodicFrameList => 4,
+            Self::PeriodicProbe => 5,
+        }
+    }
+}
+
+/// Which way the bytes a cache maintenance call covers are about to move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheDirection {
+    /// Bytes the controller is about to read out of memory.
+    HostToDevice,
+    /// Bytes the controller has just written into memory.
+    DeviceToHost,
+    /// A descriptor or frame list, which the controller both reads and
+    /// writes back within one transfer.
+    Descriptor,
+}
+
+const CACHE_DIRECTION_COUNT: usize = 3;
+
+impl CacheDirection {
+    fn index(self) -> usize {
+        match self {
+            Self::HostToDevice => 0,
+            Self::DeviceToHost => 1,
+            Self::Descriptor => 2,
+        }
+    }
+}
+
+static CACHE_REFUSALS_BY_SITE: [AtomicU32; CACHE_SITE_COUNT] =
+    [const { AtomicU32::new(0) }; CACHE_SITE_COUNT];
+static CACHE_REFUSALS_BY_LABEL: [AtomicU32; TRANSFER_LABEL_COUNT] =
+    [const { AtomicU32::new(0) }; TRANSFER_LABEL_COUNT];
+static CACHE_REFUSALS_BY_DIRECTION: [AtomicU32; CACHE_DIRECTION_COUNT] =
+    [const { AtomicU32::new(0) }; CACHE_DIRECTION_COUNT];
+static LAST_CACHE_REFUSAL_ADDRESS: AtomicU32 = AtomicU32::new(0);
+static LAST_CACHE_REFUSAL_LENGTH: AtomicU32 = AtomicU32::new(0);
+static LAST_CACHE_REFUSAL_LABEL: AtomicU32 = AtomicU32::new(0);
+
+/// Why one packet did not complete.
+///
+/// The three transport-level causes (timeout, STALL, transaction error) are
+/// the ones a device or a cable can produce. The rest are contract
+/// violations inside this driver's own completion accounting, and are the
+/// ones the later stages of the refactor exist to remove; keeping them in
+/// separate counters is what makes "the cleanup was hiding a real defect"
+/// distinguishable from "the bus is noisy".
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PacketFailureKind {
+    #[default]
+    None,
+    /// The channel never halted within the caller's budget.
+    HaltTimeout,
+    Stall,
+    /// `HCINT` reported CRC/babble/transaction error.
+    TransactionError,
+    /// QTD status 1: a packet-level failure, excessive NAK included.
+    QtdPacketError,
+    /// QTD status 2 or 3: a buffer or reserved status this driver has no
+    /// meaning for.
+    QtdInvalidStatus,
+    /// The channel halted without `XferCompl`, or with the descriptor still
+    /// owned by hardware.
+    NotTransferComplete,
+    /// A completion arrived for a generation this slot no longer holds.
+    StaleCompletion,
+    /// An OUT packet completed with fewer bytes than it was given.
+    ShortOut,
+    /// A DMA buffer or descriptor could not be cache-synchronized.
+    CacheSyncRefused,
+    /// A split packet could not start, or its scheduler saw no frame
+    /// progress, or its length exceeded the staging buffer.
+    SplitRejected,
+}
+
+pub const PACKET_FAILURE_KIND_COUNT: usize = 11;
+
+impl PacketFailureKind {
+    fn index(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::HaltTimeout => 1,
+            Self::Stall => 2,
+            Self::TransactionError => 3,
+            Self::ShortOut => 4,
+            Self::CacheSyncRefused => 5,
+            Self::QtdPacketError => 6,
+            Self::QtdInvalidStatus => 7,
+            Self::NotTransferComplete => 8,
+            Self::StaleCompletion => 9,
+            Self::SplitRejected => 10,
+        }
+    }
+
+    fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::HaltTimeout,
+            2 => Self::Stall,
+            3 => Self::TransactionError,
+            4 => Self::ShortOut,
+            5 => Self::CacheSyncRefused,
+            6 => Self::QtdPacketError,
+            7 => Self::QtdInvalidStatus,
+            8 => Self::NotTransferComplete,
+            9 => Self::StaleCompletion,
+            10 => Self::SplitRejected,
+            _ => Self::None,
+        }
+    }
+
+    /// A short, stable name for prose: log lines and the `last-fail=` field.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HaltTimeout => "halt-timeout",
+            Self::Stall => "STALL",
+            Self::TransactionError => "xact-error",
+            Self::ShortOut => "short-OUT",
+            Self::CacheSyncRefused => "cache-sync-refused",
+            Self::QtdPacketError => "QTD-packet-error",
+            Self::QtdInvalidStatus => "QTD-bad-status",
+            Self::NotTransferComplete => "not-XferCompl",
+            Self::StaleCompletion => "stale-completion",
+            Self::SplitRejected => "split-rejected",
+        }
+    }
+
+    /// The column heading for the `usbhw` breakdown. See
+    /// [`TransferLabel::short_name`] for why these are separate.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HaltTimeout => "timeout",
+            Self::Stall => "stall",
+            Self::TransactionError => "xact",
+            Self::ShortOut => "shortout",
+            Self::CacheSyncRefused => "cache",
+            Self::QtdPacketError => "qtderr",
+            Self::QtdInvalidStatus => "qtdbad",
+            Self::NotTransferComplete => "nocpl",
+            Self::StaleCompletion => "stale",
+            Self::SplitRejected => "splitrej",
+        }
+    }
+}
+
+static PACKET_FAILURES_BY_KIND: [AtomicU32; PACKET_FAILURE_KIND_COUNT] =
+    [const { AtomicU32::new(0) }; PACKET_FAILURE_KIND_COUNT];
+/// Interrupt IN polls that ran out their budget with nothing to report.
+///
+/// Counted apart from every failure kind, and deliberately not added to the
+/// failure total. `SET_IDLE(0)` means an idle keyboard NAKs until a key
+/// moves, so this is what a working idle HID looks like -- the first
+/// baseline run counted 1131 of them as packet failures on a bus where
+/// nothing was wrong, which buries the two real failures beside them.
+static IDLE_POLL_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+/// Descriptor readbacks whose remainder exceeded the requested length.
+///
+/// Not a failure on its own -- it is how this core reports some packet
+/// errors -- but it is the reason no byte count may be taken on trust.
+static IMPOSSIBLE_REMAINDERS: AtomicU32 = AtomicU32::new(0);
+static PACKET_FAILURE_TOTAL: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_KIND: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_LABEL: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_REQUESTED: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_ACTUAL: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_HCINT: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_QTD: AtomicU32 = AtomicU32::new(0);
+static LAST_FAILED_PACKET_IS_IN: AtomicBool = AtomicBool::new(false);
+
+/// Records one failed packet with the numbers a later stage needs to say
+/// what the hardware actually did: what was asked for, what moved, the
+/// `HCINT` that ended the packet, and the descriptor's final control word.
+///
+/// Called only on the failure path, so the cost never lands on a healthy
+/// transfer. `qtd_final` is 0 where the failure happened before any
+/// descriptor was written back (a split packet uses buffer DMA and has
+/// none at all).
+fn note_packet_failure(
+    kind: PacketFailureKind,
+    is_in: bool,
+    requested: usize,
+    actual: usize,
+    hcint: u32,
+    qtd_final: u32,
+) {
+    let label = transfer_label();
+    PACKET_FAILURES_BY_KIND[kind.index()].fetch_add(1, Ordering::Relaxed);
+    PACKET_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    LAST_FAILED_PACKET_LABEL.store(label.index() as u32, Ordering::Relaxed);
+    LAST_FAILED_PACKET_REQUESTED.store(requested as u32, Ordering::Relaxed);
+    LAST_FAILED_PACKET_ACTUAL.store(actual as u32, Ordering::Relaxed);
+    LAST_FAILED_PACKET_HCINT.store(hcint, Ordering::Relaxed);
+    LAST_FAILED_PACKET_QTD.store(qtd_final, Ordering::Relaxed);
+    LAST_FAILED_PACKET_IS_IN.store(is_in, Ordering::Relaxed);
+    // Published last, so a reader never sees a new kind beside stale fields.
+    LAST_FAILED_PACKET_KIND.store(kind.index() as u32, Ordering::Release);
+}
+
+/// Counts one Interrupt IN poll that expired with no report.
+fn note_idle_poll_timeout() {
+    IDLE_POLL_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Writes the requested/actual pair and the raw hardware words for a packet
+/// that has just failed.
+///
+/// The existing failure logs say *that* a packet failed and which HCINT
+/// ended it. What they never said is how many of the requested bytes had
+/// already moved, which is the number that decides whether a retry can
+/// resend the packet without publishing the same bytes twice.
+fn log_packet_failure(kind: PacketFailureKind, requested: usize, actual: usize, qtd_final: u32) {
+    uart::log(b"USB:   failure=");
+    uart::log(kind.name().as_bytes());
+    uart::log(b" phase=");
+    uart::log(transfer_label().name().as_bytes());
+    uart::log(b"\r\n");
+    uart::log_u32(b"USB:   requested bytes=", requested as u32);
+    uart::log_u32(b"USB:   actual bytes=", actual as u32);
+    uart::log_hex(b"USB:   QTD final=", qtd_final);
+}
+
+/// Which FIFO a flush timed out on. The three are shared very differently:
+/// the non-periodic TX FIFO belongs to channel 0 alone, while the periodic
+/// TX and RX FIFOs are shared with every armed Interrupt endpoint.
+const FIFO_NON_PERIODIC_TX: usize = 0;
+const FIFO_PERIODIC_TX: usize = 1;
+const FIFO_RX: usize = 2;
+const FIFO_COUNT: usize = 3;
+
+static FIFO_FLUSH_TIMEOUTS: [AtomicU32; FIFO_COUNT] = [const { AtomicU32::new(0) }; FIFO_COUNT];
+static FIFO_FLUSHES_SKIPPED_FOR_PERIODIC: AtomicU32 = AtomicU32::new(0);
+/// Reported channel-0 Bulk OUT packet errors recovered by flushing only the
+/// FIFO that can contain that packet's transmit residue.
+///
+/// This counter distinguishes the directional Stage 3 experiment from both
+/// the old all-FIFO recovery and the rejected no-cleanup experiment.
+static OUT_PACKET_ERROR_NPTX_CLEANUPS: AtomicU32 = AtomicU32::new(0);
+
+fn note_fifo_flush_timeout(fifo: usize) {
+    FIFO_FLUSH_TIMEOUTS[fifo].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Everything the Stage 0 baseline is compared on, in one snapshot so that
+/// a `usbhw` taken before and after an acceptance run describes the same
+/// instant for every counter.
+#[derive(Clone, Copy, Default)]
+pub struct HostObservation {
+    pub cache_refusals: u32,
+    pub cache_refusals_by_label: [u32; TRANSFER_LABEL_COUNT],
+    pub cache_refusals_by_site: [u32; CACHE_SITE_COUNT],
+    pub cache_refusals_by_direction: [u32; CACHE_DIRECTION_COUNT],
+    pub last_cache_refusal_address: u32,
+    pub last_cache_refusal_length: u32,
+    pub last_cache_refusal_label: TransferLabel,
+    pub packet_failures: u32,
+    pub packet_failures_by_kind: [u32; PACKET_FAILURE_KIND_COUNT],
+    /// Expired Interrupt IN polls, which are not failures. See
+    /// [`IDLE_POLL_TIMEOUTS`].
+    pub idle_poll_timeouts: u32,
+    /// Descriptor readbacks whose remainder exceeded the request.
+    pub impossible_remainders: u32,
+    pub last_packet_failure_kind: PacketFailureKind,
+    pub last_packet_failure_label: TransferLabel,
+    pub last_packet_failure_is_in: bool,
+    pub last_packet_failure_requested: u32,
+    pub last_packet_failure_actual: u32,
+    pub last_packet_failure_hcint: u32,
+    pub last_packet_failure_qtd: u32,
+    pub fifo_flush_timeouts: [u32; FIFO_COUNT],
+    pub fifo_flushes_skipped_for_periodic: u32,
+    pub out_packet_error_nptx_cleanups: u32,
+}
+
+/// Live host FIFO partition in 32-bit lines.
+#[derive(Clone, Copy)]
+pub struct FifoConfiguration {
+    pub rx_lines: u32,
+    pub non_periodic_tx_lines: u32,
+    pub periodic_tx_lines: u32,
+}
+
+pub fn fifo_configuration() -> FifoConfiguration {
+    FifoConfiguration {
+        rx_lines: unsafe { read(GRXFSIZ) } & 0xFFFF,
+        non_periodic_tx_lines: unsafe { read(GNPTXFSIZ) } >> 16,
+        periodic_tx_lines: unsafe { read(HPTXFSIZ) } >> 16,
+    }
+}
+
+/// The Stage 0 baseline counters. Names for the array positions are
+/// [`cache_site_names`], [`cache_direction_names`], [`transfer_label_names`]
+/// and [`packet_failure_kind_names`], so a caller printing them does not
+/// have to keep its own copy of this driver's ordering.
+pub fn host_observation() -> HostObservation {
+    let mut observation = HostObservation {
+        cache_refusals: CACHE_REFUSALS.load(Ordering::Relaxed),
+        last_cache_refusal_address: LAST_CACHE_REFUSAL_ADDRESS.load(Ordering::Relaxed),
+        last_cache_refusal_length: LAST_CACHE_REFUSAL_LENGTH.load(Ordering::Relaxed),
+        last_cache_refusal_label: TransferLabel::from_index(
+            LAST_CACHE_REFUSAL_LABEL.load(Ordering::Relaxed),
+        ),
+        packet_failures: PACKET_FAILURE_TOTAL.load(Ordering::Relaxed),
+        idle_poll_timeouts: IDLE_POLL_TIMEOUTS.load(Ordering::Relaxed),
+        impossible_remainders: IMPOSSIBLE_REMAINDERS.load(Ordering::Relaxed),
+        last_packet_failure_kind: PacketFailureKind::from_index(
+            LAST_FAILED_PACKET_KIND.load(Ordering::Acquire),
+        ),
+        last_packet_failure_label: TransferLabel::from_index(
+            LAST_FAILED_PACKET_LABEL.load(Ordering::Relaxed),
+        ),
+        last_packet_failure_is_in: LAST_FAILED_PACKET_IS_IN.load(Ordering::Relaxed),
+        last_packet_failure_requested: LAST_FAILED_PACKET_REQUESTED.load(Ordering::Relaxed),
+        last_packet_failure_actual: LAST_FAILED_PACKET_ACTUAL.load(Ordering::Relaxed),
+        last_packet_failure_hcint: LAST_FAILED_PACKET_HCINT.load(Ordering::Relaxed),
+        last_packet_failure_qtd: LAST_FAILED_PACKET_QTD.load(Ordering::Relaxed),
+        fifo_flushes_skipped_for_periodic: FIFO_FLUSHES_SKIPPED_FOR_PERIODIC
+            .load(Ordering::Relaxed),
+        out_packet_error_nptx_cleanups: OUT_PACKET_ERROR_NPTX_CLEANUPS.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    for (index, counter) in CACHE_REFUSALS_BY_LABEL.iter().enumerate() {
+        observation.cache_refusals_by_label[index] = counter.load(Ordering::Relaxed);
+    }
+    for (index, counter) in CACHE_REFUSALS_BY_SITE.iter().enumerate() {
+        observation.cache_refusals_by_site[index] = counter.load(Ordering::Relaxed);
+    }
+    for (index, counter) in CACHE_REFUSALS_BY_DIRECTION.iter().enumerate() {
+        observation.cache_refusals_by_direction[index] = counter.load(Ordering::Relaxed);
+    }
+    for (index, counter) in PACKET_FAILURES_BY_KIND.iter().enumerate() {
+        observation.packet_failures_by_kind[index] = counter.load(Ordering::Relaxed);
+    }
+    for (index, counter) in FIFO_FLUSH_TIMEOUTS.iter().enumerate() {
+        observation.fifo_flush_timeouts[index] = counter.load(Ordering::Relaxed);
+    }
+    observation
+}
+
+/// Names for [`HostObservation::cache_refusals_by_site`], in order.
+pub fn cache_site_names() -> [&'static str; CACHE_SITE_COUNT] {
+    ["qtd", "buf", "split", "per", "flist", "probe"]
+}
+
+/// Names for [`HostObservation::cache_refusals_by_direction`], in order.
+pub fn cache_direction_names() -> [&'static str; CACHE_DIRECTION_COUNT] {
+    ["out", "in", "desc"]
+}
+
+/// Column headings for [`HostObservation::cache_refusals_by_label`].
+pub fn transfer_label_names() -> [&'static str; TRANSFER_LABEL_COUNT] {
+    [
+        TransferLabel::Unlabelled.short_name(),
+        TransferLabel::Control.short_name(),
+        TransferLabel::CommandBlock.short_name(),
+        TransferLabel::DataIn.short_name(),
+        TransferLabel::DataOut.short_name(),
+        TransferLabel::CommandStatus.short_name(),
+        TransferLabel::InterruptIn.short_name(),
+    ]
+}
+
+/// The position of one kind in [`HostObservation::packet_failures_by_kind`].
+///
+/// Exported so a caller checking one specific kind names it rather than
+/// searching the heading table for a string: a renamed heading would then
+/// silently select the "no failure" placeholder, whose count is always zero.
+pub fn packet_failure_kind_index(kind: PacketFailureKind) -> usize {
+    kind.index()
+}
+
+/// Column headings for [`HostObservation::packet_failures_by_kind`].
+pub fn packet_failure_kind_names() -> [&'static str; PACKET_FAILURE_KIND_COUNT] {
+    [
+        PacketFailureKind::None.short_name(),
+        PacketFailureKind::HaltTimeout.short_name(),
+        PacketFailureKind::Stall.short_name(),
+        PacketFailureKind::TransactionError.short_name(),
+        PacketFailureKind::ShortOut.short_name(),
+        PacketFailureKind::CacheSyncRefused.short_name(),
+        PacketFailureKind::QtdPacketError.short_name(),
+        PacketFailureKind::QtdInvalidStatus.short_name(),
+        PacketFailureKind::NotTransferComplete.short_name(),
+        PacketFailureKind::StaleCompletion.short_name(),
+        PacketFailureKind::SplitRejected.short_name(),
+    ]
+}
 
 fn note_root_device_connected() {
     // A later disconnect is a new state transition and deserves one timeout
@@ -692,11 +1229,14 @@ pub const HCCHAR_EPTYPE_BULK: u32 = 2 << 18;
 pub const HCCHAR_EPTYPE_INTR: u32 = 3 << 18;
 
 /// HCCHAR bits[21:20], the field the databook calls MC/EC. With
-/// `HCSPLT.SpltEna` clear it is a periodic multi-count and 0 is harmless
-/// (every unsplit transfer in this driver leaves it there). With SpltEna
-/// set it becomes the split transaction's retry count, which the databook
-/// requires to be at least 1 -- and Linux's dwc2 initializes to 1 for every
-/// channel it allocates, split or not.
+/// `HCSPLT.SpltEna` clear it is a periodic multi-count. Direct descriptor-DMA
+/// transfers leave it at 0, including a multi-entry Bulk QTD list: ESP-IDF
+/// v5.5.3's `usb_dwc_ll_hcchar_init` does not set this field. Setting it to 1
+/// on every descriptor transfer made a Full-Speed Bulk IN session fail after
+/// four reads, and limiting it to a 512-byte WRITE QTD did not improve that
+/// transfer either. Direct buffer DMA needs 1 to launch its one programmed
+/// transaction. With SpltEna set it becomes the split transaction's retry
+/// count, which the databook requires to be at least 1.
 const HCCHAR_MC_ONE: u32 = 1 << 20;
 
 // Bounds `force_halt_channel`'s wait for the halt it explicitly requested;
@@ -829,10 +1369,11 @@ const SPLIT_FRAME_WAIT_ITERATIONS: u32 = 1_000_000;
 // HCTSIZi in Scatter/Gather DMA mode repurposes the low byte as SCHED_INFO
 // (bits[7:0], must be 0xFF for non-periodic channels or the channel can
 // freeze -- ESP-IDF's `usb_dwc_ll_hctsiz_init` comment) and bits[15:8] as
-// NTD (number of transfer descriptors - 1). `run_packet` always runs one
-// QTD, which may describe one packet or a larger MPS-multiple transfer, so
-// NTD is always 0.
+// NTD (number of transfer descriptors - 1). The normal `run_packet` path
+// uses one QTD. The Full-Speed WRITE packet-list experiment uses up to eight.
 const HCTSIZ_SCHED_INFO_ALL: u32 = 0xFF;
+#[allow(dead_code)] // rejected v38/v39 QTD-list experiment retained for its exact diagnostics
+const HCTSIZ_NTD_SHIFT: u32 = 8;
 const HCTSIZ_PID_DATA1: u32 = 2 << 29; // 2'b10; DATA0 is 2'b00
 
 // The same register's *buffer* DMA meaning, used only by `run_split_packet`
@@ -847,8 +1388,8 @@ const HCTSIZ_PID_SETUP: u32 = 3 << 29;
 
 // QTD (Queue Transfer Descriptor), 8 bytes: control word + buffer pointer.
 // The list this points into must be 512-byte aligned (`HCDMAi.dmaaddr`
-// packs the list base into bits[31:9]); `run_packet` only ever uses a
-// single-entry list, so a single over-aligned local is enough.
+// packs the list base into bits[31:9]). Channel 0 uses two 512-byte list
+// slots; each periodic `QtdSlot` is independently padded to one list base.
 const QTD_XFER_SIZE_MASK: u32 = 0x1_FFFF; // bits[16:0]
 const QTD_IS_SETUP: u32 = 1 << 24;
 const QTD_INTR_CPLT: u32 = 1 << 25;
@@ -859,11 +1400,189 @@ const QTD_STATUS_SUCCESS: u32 = 0;
 const QTD_STATUS_PACKET_ERROR: u32 = 1 << QTD_STATUS_SHIFT;
 const QTD_ACTIVE: u32 = 1 << 31;
 
+/// Cache line size at both ESP32-P4 levels, and therefore the granularity
+/// every DMA-shared object in this driver is aligned and sized to. Cache
+/// maintenance cannot address anything finer, so an object that shares a
+/// line with another owner cannot be synchronized without also writing back
+/// -- or discarding -- that owner's data.
+const DMA_ALIGN: usize = crate::psram::CACHE_LINE_BYTES;
+
+/// The largest channel-0 QTD list payload. This equals the High-Speed Bulk
+/// maximum packet size; direct Full-Speed BOT WRITE data can describe it as
+/// eight 64-byte QTDs, while other callers remain MPS-bounded.
+const PACKET_STAGING_BYTES: usize = 512;
+
+/// Channel 0's DMA payload buffer.
+///
+/// The controller reads and writes this, never a caller's slice. A caller
+/// hands `run_packet` any `&mut [u8]` it likes -- a 13-byte status wrapper,
+/// an 8-byte SETUP packet, a slice starting part-way through a 4 KiB read --
+/// and none of those can be given a cache-line start address by anything
+/// the caller does. Propagating an alignment requirement outward does not
+/// work either: a sub-slice at any MPS offset breaks it again at the next
+/// packet. So the alignment lives here, once, on an object this module
+/// owns, and each QTD list costs one copy of at most 512 bytes.
+///
+/// The whole buffer is synchronized, not just the bytes in use, which is
+/// exactly `PACKET_STAGING_BYTES / DMA_ALIGN` whole lines belonging to
+/// nothing else.
+#[repr(C, align(64))]
+struct PacketStaging {
+    bytes: [u8; PACKET_STAGING_BYTES],
+}
+
+impl PacketStaging {
+    const fn zeroed() -> Self {
+        Self {
+            bytes: [0; PACKET_STAGING_BYTES],
+        }
+    }
+}
+
+/// How many upcoming cache maintenance calls must refuse regardless of what
+/// the hardware would have done.
+///
+/// Fault injection for the Stage 1 contract of
+/// `docs/USB_BOT_HCD_REFACTOR_PLAN.md`: a refused synchronization has to
+/// fail its transfer *before* the channel is armed, so that no packet
+/// succeeds and no IN buffer is published from a staging area DMA never
+/// wrote. There is no other way to reach that path on working hardware.
+///
+/// This is a self-draining count rather than a mode: each forced refusal
+/// consumes one, so an armed injection cannot outlive the transfers it was
+/// armed for, and there is no state a person can leave the bus in. A bus
+/// that permanently cannot synchronize its DMA buffers is still not
+/// something anyone should be able to select at a prompt.
+static FORCED_CACHE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+/// Which transfer phase the armed refusals apply to, or
+/// `TRANSFER_LABEL_COUNT` for any phase.
+///
+/// Counting operations to reach a particular phase does not work: the number
+/// of cache calls before a command's data phase is an implementation detail
+/// that every later stage of the refactor changes, and BOT Reset Recovery
+/// runs its own control transfers in between. Naming the phase reaches the
+/// intended packet whatever the count is, and leaves recovery -- which is
+/// labelled `Control` -- able to run.
+static FORCED_CACHE_REFUSAL_PHASE: AtomicU32 = AtomicU32::new(TRANSFER_LABEL_COUNT as u32);
+
+/// Arms `count` forced cache refusals on transfers labelled `phase`, or on
+/// any transfer when `phase` is `None`. Returns the count that was already
+/// armed. See [`FORCED_CACHE_REFUSALS`].
+pub fn force_cache_refusals(count: u32, phase: Option<TransferLabel>) -> u32 {
+    FORCED_CACHE_REFUSAL_PHASE.store(
+        phase.map_or(TRANSFER_LABEL_COUNT as u32, |label| label.index() as u32),
+        Ordering::Relaxed,
+    );
+    FORCED_CACHE_REFUSALS.swap(count, Ordering::Relaxed)
+}
+
+/// Completions to hand to the slot under a generation it no longer holds.
+///
+/// The synchronous packet API cannot produce a stale generation on its own:
+/// one `Channel0Transfer` is created, submitted and reaped inside a single
+/// `run_packet`, so the token it checks is always the token it issued. The
+/// check exists for the queued scheduler that replaces it, and a check that
+/// has never been observed to fire is a check nobody knows works.
+static FORCED_STALE_COMPLETIONS: AtomicU32 = AtomicU32::new(0);
+
+/// Arms `count` completions delivered under the wrong generation.
+pub fn force_stale_completions(count: u32) -> u32 {
+    FORCED_STALE_COMPLETIONS.swap(count, Ordering::Relaxed)
+}
+
+fn take_forced_stale_completion() -> bool {
+    FORCED_STALE_COMPLETIONS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
+            armed.checked_sub(1)
+        })
+        .is_ok()
+}
+
+/// OUT packets to report one byte short of what was asked for.
+///
+/// A device that takes part of a packet is the fault this models. It cannot
+/// be produced on demand from a healthy device, and the consequence of
+/// mishandling it -- the data toggle and the caller's offset advancing over
+/// bytes that were never delivered -- is silent.
+static FORCED_SHORT_OUTS: AtomicU32 = AtomicU32::new(0);
+
+/// Arms `count` OUT completions reported one byte short.
+pub fn force_short_outs(count: u32) -> u32 {
+    FORCED_SHORT_OUTS.swap(count, Ordering::Relaxed)
+}
+
+fn take_forced_short_out() -> bool {
+    FORCED_SHORT_OUTS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
+            armed.checked_sub(1)
+        })
+        .is_ok()
+}
+
+/// Consumes one armed forced refusal if `label` is the phase it was armed
+/// for.
+fn take_forced_cache_refusal(label: TransferLabel) -> bool {
+    let armed_phase = FORCED_CACHE_REFUSAL_PHASE.load(Ordering::Relaxed);
+    if armed_phase != TRANSFER_LABEL_COUNT as u32 && armed_phase != label.index() as u32 {
+        return false;
+    }
+    FORCED_CACHE_REFUSALS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
+            armed.checked_sub(1)
+        })
+        .is_ok()
+}
+
 #[repr(C, align(512))]
 struct QtdSlot {
     control: u32,
     buffer: u32,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RawQtd {
+    control: u32,
+    buffer: u32,
+}
+
+impl RawQtd {
+    const fn zeroed() -> Self {
+        Self {
+            control: 0,
+            buffer: 0,
+        }
+    }
+}
+
+const CHANNEL0_QTD_LIST_CAPACITY: usize = 8;
+const CHANNEL0_QTD_LIST_PADDING: usize =
+    512 - CHANNEL0_QTD_LIST_CAPACITY * core::mem::size_of::<RawQtd>();
+const _: () = assert!(core::mem::size_of::<RawQtd>() == 8);
+
+/// One 512-byte descriptor-list base for synchronous channel 0.
+///
+/// The first eight entries are real 8-byte QTDs. The padding keeps the next
+/// ping-pong slot on another HCDMA list base while allowing a WRITE data phase
+/// to chain eight Full-Speed packets under one channel activation.
+#[derive(Clone, Copy)]
+#[repr(C, align(512))]
+struct Channel0QtdListSlot {
+    qtds: [RawQtd; CHANNEL0_QTD_LIST_CAPACITY],
+    padding: [u8; CHANNEL0_QTD_LIST_PADDING],
+}
+
+impl Channel0QtdListSlot {
+    const fn zeroed() -> Self {
+        Self {
+            qtds: [RawQtd::zeroed(); CHANNEL0_QTD_LIST_CAPACITY],
+            padding: [0; CHANNEL0_QTD_LIST_PADDING],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Channel0QtdListSlot>() == 512);
+const _: () = assert!(core::mem::align_of::<Channel0QtdListSlot>() == 512);
 
 impl QtdSlot {
     const fn zeroed() -> Self {
@@ -871,6 +1590,75 @@ impl QtdSlot {
             control: 0,
             buffer: 0,
         }
+    }
+}
+
+const CHANNEL0_QTD_SLOT_COUNT: usize = 2;
+
+/// Descriptor storage for synchronous channel 0.
+///
+/// Each list slot occupies one 512-byte descriptor-list base. Alternating the
+/// slots prevents a retry from re-arming the exact address the DWC descriptor
+/// engine just wrote back as failed.
+#[repr(C, align(512))]
+struct Channel0QtdBank {
+    slots: [Channel0QtdListSlot; CHANNEL0_QTD_SLOT_COUNT],
+}
+
+/// What one descriptor readback established about a finished packet.
+///
+/// A `QTD_XFER_SIZE_MASK` remainder is only a byte count if the descriptor
+/// it came from was actually written back by hardware. Real hardware left a
+/// control word of `0x00000000` behind on a Full-Speed hub timeout, whose
+/// remainder of zero says "every requested byte moved" -- and the same
+/// zero is what an unfetched, never-written-back or stale-cache descriptor
+/// reads as. Software writes `QTD_EOL` and `QTD_INTR_CPLT` at submit and
+/// hardware preserves them (`0x16000200` on a real packet error), so their
+/// absence is the difference between the two readings.
+///
+/// Everything downstream of this decision has to treat `Unknown` as "the
+/// bytes on the wire cannot be accounted for" rather than as zero: a
+/// resubmitted OUT that had in fact completed puts the same bytes on the
+/// bus twice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransferProgress {
+    /// The descriptor was written back and its remainder is within the
+    /// requested length. The payload is the byte count that moved.
+    Known(usize),
+    /// The descriptor cannot be trusted, so no byte count exists.
+    Unknown,
+}
+
+impl TransferProgress {
+    /// The count for logs and counters, where an unknown length is reported
+    /// as zero *and named as unknown beside it* -- never silently.
+    pub fn count(self) -> usize {
+        match self {
+            Self::Known(bytes) => bytes,
+            Self::Unknown => 0,
+        }
+    }
+
+    pub fn is_known(self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+
+    /// Whether an **abandoned** packet may be put on the bus again.
+    ///
+    /// Only one that provably moved nothing. A packet the channel never
+    /// halted for is genuinely ambiguous: the core may have been part-way
+    /// through it, and there is no completion status to say otherwise. Real
+    /// hardware produced exactly that shape -- a 64-byte OUT whose
+    /// descriptor read `0x06000000`, a success status with zero remaining,
+    /// while `HCINT` was `0x00000000` and the channel had to be force
+    /// halted. Read as a byte count that says all 64 bytes went out, and it
+    /// was resubmitted four times.
+    ///
+    /// This does **not** apply to a packet the core reported as failed. See
+    /// `bot::run_bulk_packet` for why a reported packet error is safe to
+    /// resend where an abandoned packet is not.
+    pub fn safe_to_retry(self) -> bool {
+        self == Self::Known(0)
     }
 }
 
@@ -890,13 +1678,16 @@ enum TransferSlotState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TransferToken(u32);
 
-/// One caller-owned, fixed-capacity descriptor slot for an unsplit packet.
+/// One caller-owned transfer generation for an unsplit packet.
 ///
-/// Keeping the QTD inside the object preserves its 512-byte alignment and its
-/// lifetime from `submit` through `reap`. `run_packet` owns exactly one of
-/// these today; Stage 3 can place the same object in a fixed channel array.
+/// The payload staging remains inside this object for its full
+/// submit-to-reap lifetime. The QTD itself comes from the fixed channel-0
+/// bank so consecutive generations do not reuse one physical descriptor.
 struct Channel0Transfer<'a> {
-    qtd: QtdSlot,
+    qtd_slot: usize,
+    /// The bytes the controller actually moves. `buffer` is the caller's
+    /// slice, which DMA never touches; see [`PacketStaging`].
+    staging: PacketStaging,
     endpoint: Endpoint,
     is_setup: bool,
     pid_data1: bool,
@@ -909,7 +1700,15 @@ struct Channel0Transfer<'a> {
 impl<'a> Channel0Transfer<'a> {
     fn new(endpoint: &Endpoint, is_setup: bool, pid_data1: bool, buffer: &'a mut [u8]) -> Self {
         Self {
-            qtd: QtdSlot::zeroed(),
+            // Do not immediately re-arm the physical descriptor which just
+            // completed or failed. Real FS hardware repeatedly reported a
+            // status-1 QTD when every synchronous call reused one stack
+            // address (0x4FF77C00), then stopped servicing the following
+            // channel. A fixed two-slot bank gives descriptor ownership a
+            // real generation boundary while channel 0 remains synchronous.
+            qtd_slot: CHANNEL0_QTD_NEXT.fetch_add(1, Ordering::Relaxed) as usize
+                % CHANNEL0_QTD_SLOT_COUNT,
+            staging: PacketStaging::zeroed(),
             endpoint: *endpoint,
             is_setup,
             pid_data1,
@@ -920,13 +1719,31 @@ impl<'a> Channel0Transfer<'a> {
         }
     }
 
-    /// Publishes the QTD and starts channel 0, returning this slot generation.
-    fn submit(&mut self) -> TransferToken {
+    /// Publishes the QTD and starts channel 0, returning this slot
+    /// generation, or `None` when the DMA buffers could not be
+    /// synchronized. A refusal must stop the transfer here: arming the
+    /// channel anyway would send whatever was in RAM, or fill a buffer the
+    /// CPU then reads its own stale copy of.
+    fn submit(&mut self) -> Option<TransferToken> {
         debug_assert!(self.state == TransferSlotState::Idle);
         let xfer_len = self.buffer.len();
-        let data_ptr = self.buffer.as_mut_ptr();
-        if xfer_len > 0 {
-            cache_writeback_invalidate(data_ptr as usize, xfer_len);
+        debug_assert!(xfer_len <= PACKET_STAGING_BYTES);
+        if !self.endpoint.is_in {
+            self.staging.bytes[..xfer_len].copy_from_slice(self.buffer);
+        }
+        let data_ptr = self.staging.bytes.as_mut_ptr();
+        if !cache_writeback_invalidate(
+            CacheSite::Channel0Payload,
+            if self.endpoint.is_in {
+                CacheDirection::DeviceToHost
+            } else {
+                CacheDirection::HostToDevice
+            },
+            data_ptr as usize,
+            PACKET_STAGING_BYTES,
+        ) {
+            self.note_failure(PacketFailureKind::CacheSyncRefused, 0, 0);
+            return None;
         }
 
         let mut qtd_control = xfer_len as u32 & QTD_XFER_SIZE_MASK;
@@ -935,12 +1752,15 @@ impl<'a> Channel0Transfer<'a> {
         }
         qtd_control |= QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
 
-        let qtd_address = &raw mut self.qtd as usize;
+        let qtd_address = self.qtd_address();
         unsafe {
             write(qtd_address, qtd_control);
             write(qtd_address + 4, data_ptr as u32);
         }
-        cache_writeback_invalidate(qtd_address, 8);
+        if !self.sync_qtd() {
+            self.note_failure(PacketFailureKind::CacheSyncRefused, 0, 0);
+            return None;
+        }
 
         let endpoint = self.endpoint;
         let hcchar = (endpoint.mps as u32 & 0x7FF)
@@ -976,7 +1796,95 @@ impl<'a> Channel0Transfer<'a> {
             write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
             modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
         }
-        self.token
+        Some(self.token)
+    }
+
+    /// Judges one descriptor readback and returns how many bytes it proves
+    /// moved.
+    ///
+    /// This is the only place `actual` is derived. Three ways a remainder
+    /// can be meaningless are rejected here rather than at each caller:
+    /// hardware still owning the descriptor, a remainder larger than what
+    /// was asked for, and -- when the channel never reported the transfer
+    /// complete -- a descriptor that does not look written back at all.
+    ///
+    /// `completed` is whether `HCINT.XferCompl` ended this packet. When it
+    /// did not, an **all-zero** control word is rejected: real hardware left
+    /// exactly `0x00000000` behind after a Full-Speed hub timeout, and the
+    /// remainder of zero read out of it says "every requested byte moved" --
+    /// the same thing an unfetched or stale-cached descriptor says. A word
+    /// of zero is also self-contradictory on its own terms, claiming a full
+    /// transfer while carrying none of the `QTD_EOL`/`QTD_INTR_CPLT` bits
+    /// this driver set at submit and hardware preserves (`0x07000000` on a
+    /// completed SETUP, `0x16000200` on a packet error).
+    ///
+    /// The test is deliberately this narrow. Requiring `QTD_EOL` on every
+    /// uncompleted packet was tried first and was wrong: a Full-Speed hub
+    /// path whose packet errors had always retried successfully with a
+    /// descriptor reporting zero progress started reporting that progress
+    /// as unknown, and ten write rounds out of ten failed where ten out of
+    /// ten had passed. A rule that fails safe still has to be right about
+    /// which readings are impossible.
+    fn progress_from(&self, control_after: u32, completed: bool) -> TransferProgress {
+        let requested = self.buffer.len();
+        let hardware_owns = control_after & QTD_ACTIVE != 0;
+        let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
+        let never_written_back = !completed && control_after == 0 && requested > 0;
+        if remaining > requested {
+            // Counted rather than only rejected: this core really does
+            // write one back. A 64-byte OUT that failed came back with
+            // `0x16018889` -- a genuine writeback (`Active` clear, status
+            // 1, `EOL`/`IOC` preserved) carrying a remainder of 100,489,
+            // and a 31-byte command block came back with a remainder of
+            // 128. The old arithmetic saturated both to "nothing
+            // transferred"; naming them is what makes the acceptance
+            // criterion "an impossible length is never used as a byte
+            // count" rather than "impossible lengths do not occur".
+            IMPOSSIBLE_REMAINDERS.fetch_add(1, Ordering::Relaxed);
+        }
+        if hardware_owns || remaining > requested || never_written_back {
+            return TransferProgress::Unknown;
+        }
+        TransferProgress::Known(requested - remaining)
+    }
+
+    /// Synchronizes this slot's descriptor. The QTD is over-aligned to 512
+    /// bytes for `HCDMA`, which makes its whole allocation a run of cache
+    /// lines nothing else shares.
+    fn sync_qtd(&mut self) -> bool {
+        cache_writeback_invalidate(
+            CacheSite::Channel0Qtd,
+            CacheDirection::Descriptor,
+            self.qtd_address(),
+            core::mem::size_of::<Channel0QtdListSlot>(),
+        )
+    }
+
+    fn qtd_address(&self) -> usize {
+        channel0_qtd_address(self.qtd_slot)
+    }
+
+    /// Invalidates the staging buffer and copies `transferred` received
+    /// bytes out to the caller. Returns false if the buffer could not be
+    /// synchronized, in which case nothing is published: the alternative is
+    /// handing the caller the CPU's pre-DMA copy, which for a freshly
+    /// zeroed staging area is a buffer full of zeroes that looks like a
+    /// successful short packet.
+    fn publish_in_bytes(&mut self, transferred: usize) -> bool {
+        if !self.endpoint.is_in || transferred == 0 {
+            return true;
+        }
+        if !cache_writeback_invalidate(
+            CacheSite::Channel0Payload,
+            CacheDirection::DeviceToHost,
+            self.staging.bytes.as_mut_ptr() as usize,
+            PACKET_STAGING_BYTES,
+        ) {
+            return false;
+        }
+        let published = transferred.min(self.buffer.len());
+        self.buffer[..published].copy_from_slice(&self.staging.bytes[..published]);
+        true
     }
 
     fn note_completion(&mut self, token: TransferToken, hcint: u32) -> bool {
@@ -993,36 +1901,83 @@ impl<'a> Channel0Transfer<'a> {
     fn reap(&mut self, token: TransferToken, quiet_errors: bool) -> PacketOutcome {
         if self.state != TransferSlotState::CompletionPending || token != self.token {
             USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+            note_packet_failure(
+                PacketFailureKind::StaleCompletion,
+                self.endpoint.is_in,
+                self.buffer.len(),
+                0,
+                self.completion,
+                0,
+            );
             return PacketOutcome::Error;
         }
 
-        let qtd_address = &raw mut self.qtd as usize;
-        cache_writeback_invalidate(qtd_address, 8);
+        let qtd_address = self.qtd_address();
+        if !self.sync_qtd() {
+            self.note_failure(PacketFailureKind::CacheSyncRefused, 0, 0);
+            return PacketOutcome::CacheSyncFailed;
+        }
         let control_after = unsafe { read(qtd_address) };
         USB_LAST_REAP_HCINT.store(self.completion, Ordering::Release);
         USB_LAST_REAP_QTD_CONTROL.store(control_after, Ordering::Release);
-        let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
         let status = control_after & QTD_STATUS_MASK;
-        let transferred = self.buffer.len().saturating_sub(remaining);
+        let mut progress =
+            self.progress_from(control_after, self.completion & HCINT_XFERCOMPL != 0);
+        if !self.endpoint.is_in
+            && !self.buffer.is_empty()
+            && progress.is_known()
+            && take_forced_short_out()
+        {
+            progress = TransferProgress::Known(progress.count().saturating_sub(1));
+        }
+        let transferred = progress.count();
         self.state = TransferSlotState::Reaped;
         USB_REAP_COUNT.fetch_add(1, Ordering::Relaxed);
 
         if self.completion & HCINT_STALL != 0 {
+            self.note_failure(PacketFailureKind::Stall, transferred, control_after);
             if !quiet_errors {
                 uart::log(b"USB: transfer STALL\r\n");
+                log_packet_failure(
+                    PacketFailureKind::Stall,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
+                );
             }
             return PacketOutcome::Error;
         }
         if self.completion & HCINT_ERROR_MASK != 0 {
+            self.note_failure(
+                PacketFailureKind::TransactionError,
+                transferred,
+                control_after,
+            );
             if !quiet_errors {
                 uart::log_hex(b"USB: transfer transaction error, HCINT=", self.completion);
+                log_packet_failure(
+                    PacketFailureKind::TransactionError,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
+                );
                 log_port_state();
             }
             return PacketOutcome::Error;
         }
         if status == QTD_STATUS_PACKET_ERROR {
-            if self.endpoint.is_in && transferred > 0 {
-                cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+            self.note_failure(
+                PacketFailureKind::QtdPacketError,
+                transferred,
+                control_after,
+            );
+            if !self.publish_in_bytes(transferred) {
+                self.note_failure(
+                    PacketFailureKind::CacheSyncRefused,
+                    transferred,
+                    control_after,
+                );
+                return PacketOutcome::CacheSyncFailed;
             }
             if !quiet_errors {
                 uart::log_hex(
@@ -1040,16 +1995,33 @@ impl<'a> Channel0Transfer<'a> {
                 uart::log_hex(b"USB:   HCINT=", self.completion);
                 uart::log_hex(b"USB:   HCCHAR=", unsafe { read(CHAN0_HCCHAR) });
                 uart::log_hex(b"USB:   HCTSIZ=", unsafe { read(CHAN0_HCTSIZ) });
-                uart::log_hex(b"USB:   bytes transferred=", transferred as u32);
+                uart::log_hex(b"USB:   HCDMA=", unsafe { read(CHAN0_HCDMA) });
+                log_packet_failure(
+                    PacketFailureKind::QtdPacketError,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
+                );
                 log_port_state();
             }
-            return PacketOutcome::PacketError(transferred);
+            return PacketOutcome::PacketError(progress);
         }
         if status != QTD_STATUS_SUCCESS {
+            self.note_failure(
+                PacketFailureKind::QtdInvalidStatus,
+                transferred,
+                control_after,
+            );
             if !quiet_errors {
                 uart::log_hex(
                     b"USB: transfer QTD buffer/reserved error, status=",
                     status >> QTD_STATUS_SHIFT,
+                );
+                log_packet_failure(
+                    PacketFailureKind::QtdInvalidStatus,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
                 );
             }
             return PacketOutcome::Error;
@@ -1061,7 +2033,20 @@ impl<'a> Channel0Transfer<'a> {
         // a stale ChHltd snapshot/reused descriptor be accepted as a fresh
         // short packet, observed as the previous command's 13-byte CSW in
         // the next READ CAPACITY data phase.
-        if self.completion & HCINT_XFERCOMPL == 0 || control_after & QTD_ACTIVE != 0 {
+        // A halted channel with an untrustworthy descriptor is not a
+        // completed transfer either: `progress_from` rejects a descriptor
+        // hardware never wrote back, one it still owns, and a remainder
+        // larger than the request, and none of those can be reported as a
+        // successful packet of any length.
+        if self.completion & HCINT_XFERCOMPL == 0
+            || control_after & QTD_ACTIVE != 0
+            || !progress.is_known()
+        {
+            self.note_failure(
+                PacketFailureKind::NotTransferComplete,
+                transferred,
+                control_after,
+            );
             if !quiet_errors {
                 uart::log(b"USB: halted QTD was not transfer-complete\r\n");
                 uart::log_hex(b"USB:   HCINT=", self.completion);
@@ -1074,31 +2059,98 @@ impl<'a> Channel0Transfer<'a> {
                     b"USB:   QTD active=",
                     u32::from(control_after & QTD_ACTIVE != 0),
                 );
+                log_packet_failure(
+                    PacketFailureKind::NotTransferComplete,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
+                );
             }
             return PacketOutcome::Error;
         }
-        if self.endpoint.is_in && transferred > 0 {
-            cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+        // An OUT that completed with fewer bytes than it was given never
+        // reaches the layer above. There is no useful partial OUT here: the
+        // caller chunked by MPS, so a short one means the device took part
+        // of a packet, and calling that success advances the data toggle
+        // and the caller's offset over bytes that were never delivered.
+        if !self.endpoint.is_in && transferred != self.buffer.len() {
+            self.note_failure(PacketFailureKind::ShortOut, transferred, control_after);
+            if !quiet_errors {
+                uart::log(b"USB: OUT packet completed short\r\n");
+                log_packet_failure(
+                    PacketFailureKind::ShortOut,
+                    self.buffer.len(),
+                    transferred,
+                    control_after,
+                );
+            }
+            return PacketOutcome::Error;
+        }
+        if !self.publish_in_bytes(transferred) {
+            self.note_failure(
+                PacketFailureKind::CacheSyncRefused,
+                transferred,
+                control_after,
+            );
+            return PacketOutcome::CacheSyncFailed;
         }
         PacketOutcome::Ok(transferred)
     }
 
-    fn cancel(&mut self, token: TransferToken) -> usize {
+    /// Records one failed packet against this slot's own requested length,
+    /// direction and completion cause, so every failure carries the same
+    /// four numbers regardless of which check rejected it.
+    fn note_failure(&self, kind: PacketFailureKind, actual: usize, qtd_final: u32) {
+        note_packet_failure(
+            kind,
+            self.endpoint.is_in,
+            self.buffer.len(),
+            actual,
+            self.completion,
+            qtd_final,
+        );
+    }
+
+    /// Retires an abandoned packet and reports what its descriptor proves
+    /// about it -- which, after a timeout, is very often nothing at all.
+    fn cancel(&mut self, token: TransferToken) -> TransferProgress {
         if token == self.token {
-            let qtd_address = &raw mut self.qtd as usize;
-            cache_writeback_invalidate(qtd_address, 8);
-            let control_after = unsafe { read(qtd_address) };
-            let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
-            let transferred = self.buffer.len().saturating_sub(remaining);
-            if self.endpoint.is_in && transferred > 0 {
-                cache_writeback_invalidate(self.buffer.as_mut_ptr() as usize, transferred);
+            let qtd_address = self.qtd_address();
+            if !self.sync_qtd() {
+                self.note_failure(PacketFailureKind::CacheSyncRefused, 0, 0);
+                self.state = TransferSlotState::Reaped;
+                USB_CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
+                return TransferProgress::Unknown;
             }
+            let control_after = unsafe { read(qtd_address) };
+            // Published for the same reason `reap` publishes it: a refusal
+            // to resubmit has to be explainable from the descriptor it was
+            // based on.
+            USB_LAST_REAP_HCINT.store(self.completion, Ordering::Release);
+            USB_LAST_REAP_QTD_CONTROL.store(control_after, Ordering::Release);
+            // A cancelled packet never reported completion by definition.
+            let progress = self.progress_from(control_after, false);
+            // A refusal here means the received bytes cannot be published,
+            // so as far as the caller is concerned none arrived -- and how
+            // many there were is then unknown, not zero. Reporting them as
+            // transferred would let a retry skip a prefix that was never
+            // handed over.
+            let progress = if self.publish_in_bytes(progress.count()) {
+                progress
+            } else {
+                self.note_failure(
+                    PacketFailureKind::CacheSyncRefused,
+                    progress.count(),
+                    control_after,
+                );
+                TransferProgress::Unknown
+            };
             self.state = TransferSlotState::Reaped;
             USB_CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
-            transferred
+            progress
         } else {
             USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-            0
+            TransferProgress::Unknown
         }
     }
 }
@@ -1482,7 +2534,6 @@ pub fn probe_port() -> HostPort {
     let channel_count = ((hwcfg2 & GHWCFG2_NUMHSTCHNL_MASK) >> 14) + 1;
     let fifo_depth_words = hwcfg3 >> GHWCFG3_DFIFODEPTH_SHIFT;
 
-    configure_fifos(fifo_depth_words);
     delay_ms(FORCE_HOST_MODE_DELAY_MS);
 
     configure_host_speed_support();
@@ -1541,7 +2592,7 @@ pub fn probe_port() -> HostPort {
         _ => Speed::Unknown,
     };
     if enabled {
-        finish_port_enable();
+        finish_port_enable(fifo_depth_words);
         // Only now is the history worth keeping: this driver's own reset
         // pulse sets `prtenchng` (and can set `prtconndet`), so clearing it
         // any earlier would leave every later log claiming the device had
@@ -1755,13 +2806,27 @@ fn configure_host_speed_support() {
 }
 
 fn configure_fifos(fifo_depth_words: u32) {
-    // No channels are allocated yet at core init, so the exact split does
-    // not matter functionally. An even three-way split just needs to fit
-    // within the core's total FIFO depth (from GHWCFG3).
-    let rx_lines = fifo_depth_words / 2;
-    let remaining = fifo_depth_words - rx_lines;
-    let nptx_lines = remaining / 2;
-    let ptx_lines = remaining - nptx_lines;
+    // Match ESP-IDF v5.5.3's default balanced partition for a High-Speed
+    // DWC instance. It derives TX sizes from the 1024-line OTG data FIFO
+    // synthesis depth, then gives the remaining implemented lines to RX.
+    // ESP32-P4 reports 896 usable lines, producing RX/NPTX/PTX=512/256/128.
+    // The former 448/224/224 split was locally invented and was the largest
+    // remaining global-controller difference in the BOT path. Apply this
+    // only after a successful root-port reset: that reset restores the FIFO
+    // registers to their hardware defaults. ESP-IDF likewise reapplies its
+    // saved FIFO configuration at this point.
+    const HS_OTG_DFIFO_DEPTH: u32 = 1024;
+    let nptx_lines = HS_OTG_DFIFO_DEPTH / 4;
+    let ptx_lines = HS_OTG_DFIFO_DEPTH / 8;
+    let tx_lines = nptx_lines + ptx_lines;
+    let (rx_lines, nptx_lines, ptx_lines) = if fifo_depth_words > tx_lines {
+        (fifo_depth_words - tx_lines, nptx_lines, ptx_lines)
+    } else {
+        // Defensive fallback for an unexpected smaller DWC configuration.
+        let rx = fifo_depth_words / 2;
+        let remaining = fifo_depth_words - rx;
+        (rx, remaining / 2, remaining - remaining / 2)
+    };
 
     unsafe {
         write(GRXFSIZ, rx_lines);
@@ -1801,6 +2866,11 @@ fn periodic_channels_armed() -> bool {
 fn flush_channel0_fifos() {
     if periodic_channels_armed() {
         flush_non_periodic_tx_fifo();
+        // Counted, not just logged: "all cleanups succeeded" and "two of
+        // the three cleanups were skipped" are different states, and a
+        // baseline that reports them as the same one cannot tell whether a
+        // later run kept the residue this cleanup exists to remove.
+        FIFO_FLUSHES_SKIPPED_FOR_PERIODIC.fetch_add(1, Ordering::Relaxed);
         uart::log(b"USB: periodic channels armed, flushed only the non-periodic FIFO\r\n");
         return;
     }
@@ -1813,6 +2883,7 @@ fn flush_non_periodic_tx_fifo() {
         modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
     }
     if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
+        note_fifo_flush_timeout(FIFO_NON_PERIODIC_TX);
         uart::log(b"USB: non-periodic TX FIFO flush timed out\r\n");
     }
 }
@@ -1824,19 +2895,22 @@ fn flush_fifos() {
         modify(GRSTCTL, GRSTCTL_TXFFLSH, GRSTCTL_TXFFLSH);
     }
     if !poll_until(GRSTCTL, GRSTCTL_TXFFLSH, false, 100_000) {
+        note_fifo_flush_timeout(FIFO_PERIODIC_TX);
         uart::log(b"USB: periodic TX FIFO flush timed out\r\n");
     }
     unsafe {
         modify(GRSTCTL, GRSTCTL_RXFFLSH, GRSTCTL_RXFFLSH);
     }
     if !poll_until(GRSTCTL, GRSTCTL_RXFFLSH, false, 100_000) {
+        note_fifo_flush_timeout(FIFO_RX);
         uart::log(b"USB: RX FIFO flush timed out\r\n");
     }
 }
 
 /// Restores channel 0 to the baseline used by descriptor-DMA transfers after
-/// a packet failure.  The driver is synchronous and uses no other channel,
-/// so flushing the FIFOs here cannot discard another in-flight transfer.
+/// an abandoned transfer or before a proactive BOT boundary. Periodic HID
+/// channels may be active concurrently, so [`flush_channel0_fifos`] limits
+/// the flush scope when their shared FIFOs cannot safely be discarded.
 ///
 /// This is intentionally lighter than a root-port reset: devices keep their
 /// address/configuration and a retry can resume without re-enumerating live
@@ -1851,6 +2925,31 @@ pub fn recover_channel_after_packet_failure() {
     }
     prepare_channel0_interrupt();
     flush_channel0_fifos();
+}
+
+/// Restores channel 0 after hardware has reported a completed packet error.
+///
+/// Unlike a timeout, the channel has already halted and the descriptor has
+/// been reaped. An OUT failure can only leave payload residue in the
+/// non-periodic TX FIFO; flushing the RX and periodic TX FIFOs as well is
+/// unrelated to that packet and used to happen only because the generic
+/// recovery API had no direction. IN failures keep the conservative existing
+/// cleanup because receive residue can remain in the shared RX FIFO.
+pub fn recover_reported_packet_error(is_in: bool) {
+    if unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0 {
+        force_halt_channel();
+    }
+    unsafe {
+        write(CHAN0_HCSPLT, 0);
+        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+    }
+    prepare_channel0_interrupt();
+    if is_in {
+        flush_channel0_fifos();
+    } else {
+        OUT_PACKET_ERROR_NPTX_CLEANUPS.fetch_add(1, Ordering::Relaxed);
+        flush_non_periodic_tx_fifo();
+    }
 }
 
 /// Waits for HPRT to report a connected device, returning the milliseconds
@@ -1877,7 +2976,8 @@ fn reset_pulse() {
     delay_ms(RESET_RECOVERY_MS);
 }
 
-fn finish_port_enable() {
+fn finish_port_enable(fifo_depth_words: u32) {
+    configure_fifos(fifo_depth_words);
     unsafe {
         modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
         modify(HCFG, HCFG_PERSCHEDENA, 0); // periodic scheduler stays off; see HCCHAR_EPTYPE_BULK's doc comment
@@ -1921,11 +3021,19 @@ fn poll_until(address: usize, mask: u32, want_set: bool, timeout_iterations: u32
 /// stale (see `UsbKeyboard::needs_reinit`).
 pub enum PacketOutcome {
     Ok(usize),
-    /// Channel did not halt within the budget; payload is QTD byte progress.
-    Timeout(usize),
+    /// Channel did not halt within the budget. The payload is what the
+    /// descriptor proves about the bytes that moved, which after an
+    /// abandoned packet is frequently [`TransferProgress::Unknown`].
+    Timeout(TransferProgress),
     /// QTD status 1: CRC/transaction timeout/stuff/false-EOP/excessive-NAK.
-    /// The payload is the number of bytes completed before the failed packet.
-    PacketError(usize),
+    /// The payload is what the descriptor proves about the bytes completed
+    /// before the failed packet.
+    PacketError(TransferProgress),
+    /// A DMA buffer or descriptor could not be cache-synchronized, so the
+    /// packet was never started -- or its received bytes were never
+    /// published. Distinct from `Error` because retrying is pointless: the
+    /// same buffer will be refused again. See `cache_writeback_invalidate`.
+    CacheSyncFailed,
     Error,
 }
 
@@ -2024,9 +3132,17 @@ struct PeriodicFrameList {
     entries: [u32; PERIODIC_FRAME_LIST_ENTRIES],
 }
 
-#[repr(C, align(4))]
+/// One persistent periodic slot's DMA report buffer.
+///
+/// Aligned and sized to exactly one cache line. It was `align(4)` and the
+/// release image placed it at `0x4FF515D8`, which is 0x18 past a line
+/// boundary -- so every synchronization of it started mid-line. The ROM
+/// routine did not refuse that in the Stage 0 baseline, but "was not
+/// refused" is not the contract; `psram::writeback_invalidate` requires a
+/// line-aligned start and does not round down.
+#[repr(C, align(64))]
 struct PeriodicReportBuffer {
-    bytes: [u8; 64],
+    bytes: [u8; DMA_ALIGN],
 }
 
 #[repr(C, align(512))]
@@ -2034,7 +3150,10 @@ struct PeriodicQtdBank {
     slots: [QtdSlot; PERIODIC_HID_SLOT_COUNT],
 }
 
-#[repr(C, align(4))]
+/// The four slots' report buffers. Declared at `DMA_ALIGN` rather than
+/// inheriting it from the element type, so that weakening
+/// `PeriodicReportBuffer` cannot silently un-align the bank.
+#[repr(C, align(64))]
 struct PeriodicBufferBank {
     slots: [PeriodicReportBuffer; PERIODIC_HID_SLOT_COUNT],
 }
@@ -2059,6 +3178,9 @@ impl<T> DmaCell<T> {
 static PERIODIC_HID_FRAME_LIST: DmaCell<PeriodicFrameList> = DmaCell::new(PeriodicFrameList {
     entries: [0; PERIODIC_FRAME_LIST_ENTRIES],
 });
+static CHANNEL0_QTD_BANK: DmaCell<Channel0QtdBank> = DmaCell::new(Channel0QtdBank {
+    slots: [Channel0QtdListSlot::zeroed(), Channel0QtdListSlot::zeroed()],
+});
 static PERIODIC_HID_QTD: DmaCell<PeriodicQtdBank> = DmaCell::new(PeriodicQtdBank {
     slots: [
         QtdSlot::zeroed(),
@@ -2067,12 +3189,25 @@ static PERIODIC_HID_QTD: DmaCell<PeriodicQtdBank> = DmaCell::new(PeriodicQtdBank
         QtdSlot::zeroed(),
     ],
 });
+
+fn channel0_qtd_address(slot: usize) -> usize {
+    debug_assert!(slot < CHANNEL0_QTD_SLOT_COUNT);
+    CHANNEL0_QTD_BANK.get() as usize + slot * core::mem::size_of::<Channel0QtdListSlot>()
+}
 static PERIODIC_HID_BUFFER: DmaCell<PeriodicBufferBank> = DmaCell::new(PeriodicBufferBank {
     slots: [
-        PeriodicReportBuffer { bytes: [0; 64] },
-        PeriodicReportBuffer { bytes: [0; 64] },
-        PeriodicReportBuffer { bytes: [0; 64] },
-        PeriodicReportBuffer { bytes: [0; 64] },
+        PeriodicReportBuffer {
+            bytes: [0; DMA_ALIGN],
+        },
+        PeriodicReportBuffer {
+            bytes: [0; DMA_ALIGN],
+        },
+        PeriodicReportBuffer {
+            bytes: [0; DMA_ALIGN],
+        },
+        PeriodicReportBuffer {
+            bytes: [0; DMA_ALIGN],
+        },
     ],
 });
 
@@ -2133,7 +3268,14 @@ pub fn enable_periodic_hid(endpoint: &Endpoint, interval: u8) -> Option<Periodic
     PERIODIC_HID_INTERVAL[slot].store(scheduled_interval as u32, Ordering::Release);
     PERIODIC_HID_PID_DATA1[slot].store(false, Ordering::Release);
     USB_PERIODIC_PENDING[slot].store(0, Ordering::Release);
-    rebuild_periodic_frame_list();
+    if !rebuild_periodic_frame_list() {
+        // The controller would walk a frame list the CPU still holds a
+        // dirty copy of. Give the slot back and let the caller fall back to
+        // channel-0 polling, which stages its own DMA buffer.
+        uart::log(b"USB HID: periodic frame list cache sync refused, staying on channel 0\r\n");
+        PERIODIC_HID_ACTIVE_MASK.fetch_and(!(1 << slot), Ordering::AcqRel);
+        return None;
+    }
 
     let frame_list_address = PERIODIC_HID_FRAME_LIST.get() as usize;
     let generation = PERIODIC_HID_GENERATION[slot]
@@ -2179,6 +3321,10 @@ pub fn enable_periodic_hid(endpoint: &Endpoint, interval: u8) -> Option<Periodic
 /// rearmed before returning the bytes, so idle CPU polling is eliminated and
 /// the controller resumes polling at the descriptor's interval immediately.
 pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> PeriodicRead {
+    // The persistent periodic path does not go through `run_packet`, so it
+    // claims the diagnostic label itself; otherwise its cache work would be
+    // attributed to whichever bulk phase happened to run last.
+    set_transfer_label(TransferLabel::InterruptIn);
     let slot = handle.slot as usize;
     if slot >= PERIODIC_HID_SLOT_COUNT
         || PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire) & (1 << slot) == 0
@@ -2228,7 +3374,9 @@ pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> Pe
     }
 
     let qtd_address = periodic_qtd_address(slot);
-    cache_writeback_invalidate(qtd_address, 8);
+    if !sync_periodic_qtd(slot) {
+        return fail_periodic_slot(slot);
+    }
     let control_after = unsafe { read(qtd_address) };
     let status = control_after & QTD_STATUS_MASK;
     let mps = PERIODIC_HID_MPS[slot].load(Ordering::Acquire) as usize;
@@ -2247,7 +3395,13 @@ pub fn take_periodic_hid_report(handle: PeriodicHandle, report: &mut [u8]) -> Pe
 
     let buffer_address = periodic_buffer_address(slot);
     if transferred > 0 {
-        cache_writeback_invalidate(buffer_address, transferred);
+        // Publishing without a successful invalidate would hand the caller
+        // the CPU's pre-DMA copy of this slot's buffer, which is the report
+        // before the device wrote it -- a keystroke that never happened, or
+        // the previous one repeated.
+        if !sync_periodic_buffer(slot, CacheDirection::DeviceToHost) {
+            return fail_periodic_slot(slot);
+        }
         let source =
             unsafe { core::slice::from_raw_parts(buffer_address as *const u8, transferred) };
         let copied = transferred.min(report.len());
@@ -2283,6 +3437,7 @@ fn report_stalled_periodic_channel(slot: usize) {
 }
 
 fn arm_periodic_hid(slot: usize) {
+    set_transfer_label(TransferLabel::InterruptIn);
     let channel = slot + 1;
     let mps = PERIODIC_HID_MPS[slot].load(Ordering::Acquire) as usize;
     let qtd_address = periodic_qtd_address(slot);
@@ -2295,8 +3450,19 @@ fn arm_periodic_hid(slot: usize) {
         );
         write(qtd_address + 4, buffer_address as u32);
     }
-    cache_writeback_invalidate(buffer_address, mps);
-    cache_writeback_invalidate(qtd_address, 8);
+    if !sync_periodic_buffer(slot, CacheDirection::DeviceToHost) || !sync_periodic_qtd(slot) {
+        // Arming anyway would point the controller at a descriptor the CPU
+        // still holds a dirty copy of. Invalidating this slot's generation
+        // makes every later foreground read report an error, which is what
+        // drives the HID driver to re-enumerate.
+        uart::log_u32(
+            b"USB HID: cache sync refused, channel not armed=",
+            channel as u32,
+        );
+        PERIODIC_HID_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+        PERIODIC_HID_GENERATION[slot].fetch_add(1, Ordering::AcqRel);
+        return;
+    }
 
     unsafe {
         write(channel_register(channel, HCINTMSK_OFFSET), 0);
@@ -2330,6 +3496,38 @@ fn arm_periodic_hid(slot: usize) {
     PERIODIC_HID_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Synchronizes one persistent periodic slot's descriptor. The bank is
+/// 512-byte aligned and each `QtdSlot` occupies a whole 512-byte
+/// allocation, so a slot's cache lines belong to nothing else.
+fn sync_periodic_qtd(slot: usize) -> bool {
+    cache_writeback_invalidate(
+        CacheSite::Periodic,
+        CacheDirection::Descriptor,
+        periodic_qtd_address(slot),
+        core::mem::size_of::<QtdSlot>(),
+    )
+}
+
+/// Synchronizes one persistent periodic slot's report buffer, which is
+/// exactly one cache line (`PeriodicReportBuffer`).
+fn sync_periodic_buffer(slot: usize, direction: CacheDirection) -> bool {
+    cache_writeback_invalidate(
+        CacheSite::Periodic,
+        direction,
+        periodic_buffer_address(slot),
+        core::mem::size_of::<PeriodicReportBuffer>(),
+    )
+}
+
+/// Retires one periodic slot after a refused cache operation, the same way
+/// a failed completion is retired: the generation is invalidated so every
+/// later read reports an error and the HID driver re-enumerates.
+fn fail_periodic_slot(slot: usize) -> PeriodicRead {
+    PERIODIC_HID_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+    PERIODIC_HID_GENERATION[slot].fetch_add(1, Ordering::AcqRel);
+    PeriodicRead::Error
+}
+
 fn periodic_qtd_address(slot: usize) -> usize {
     PERIODIC_HID_QTD.get() as usize + slot * core::mem::size_of::<QtdSlot>()
 }
@@ -2338,7 +3536,9 @@ fn periodic_buffer_address(slot: usize) -> usize {
     PERIODIC_HID_BUFFER.get() as usize + slot * core::mem::size_of::<PeriodicReportBuffer>()
 }
 
-fn rebuild_periodic_frame_list() {
+#[must_use]
+fn rebuild_periodic_frame_list() -> bool {
+    set_transfer_label(TransferLabel::InterruptIn);
     let active = PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire);
     let frame_list = unsafe { &mut *PERIODIC_HID_FRAME_LIST.get() };
     frame_list.entries.fill(0);
@@ -2352,9 +3552,11 @@ fn rebuild_periodic_frame_list() {
         }
     }
     cache_writeback_invalidate(
+        CacheSite::PeriodicFrameList,
+        CacheDirection::Descriptor,
         PERIODIC_HID_FRAME_LIST.get() as usize,
         core::mem::size_of::<PeriodicFrameList>(),
-    );
+    )
 }
 
 /// Stops the persistent periodic HID channel before a registry teardown or
@@ -2362,6 +3564,7 @@ fn rebuild_periodic_frame_list() {
 /// delayed, but periodic scheduling and both DMA addresses are cleared before
 /// returning.
 pub fn disable_periodic_hid() -> bool {
+    set_transfer_label(TransferLabel::InterruptIn);
     let active = PERIODIC_HID_ACTIVE_MASK.load(Ordering::Acquire);
     if active == 0 {
         return true;
@@ -2397,9 +3600,13 @@ pub fn disable_periodic_hid() -> bool {
         // just before the halt consumed the programmed PID even if foreground
         // had not reaped it yet; account for that dropped report here.
         let qtd_address = periodic_qtd_address(slot);
-        cache_writeback_invalidate(qtd_address, 8);
+        // A refusal here only costs the toggle bookkeeping below: the
+        // channel is already being torn down, and a stale descriptor read
+        // must not be treated as a completed report.
+        let qtd_synced = sync_periodic_qtd(slot);
         let qtd_status = unsafe { read(qtd_address) } & QTD_STATUS_MASK;
-        if completion & HCINT_XFERCOMPL != 0
+        if qtd_synced
+            && completion & HCINT_XFERCOMPL != 0
             && completion & (HCINT_STALL | HCINT_ERROR_MASK) == 0
             && qtd_status == QTD_STATUS_SUCCESS
         {
@@ -2424,7 +3631,13 @@ pub fn disable_periodic_hid() -> bool {
         write(HFLBADDR, 0);
     }
     PERIODIC_HID_ACTIVE_MASK.store(0, Ordering::Release);
-    rebuild_periodic_frame_list();
+    // Deliberately not folded into the return value. `HCFG.PerSchedEna` and
+    // both DMA addresses have already been cleared, so nothing walks this
+    // list any more and a refused writeback of it cannot start anything.
+    // The caller treats `false` as "a periodic channel is wedged, the bus
+    // needs re-enumeration", which this is not; the refusal is counted and
+    // named by `cache_writeback_invalidate` on its own.
+    let _ = rebuild_periodic_frame_list();
     all_halted
 }
 
@@ -2503,6 +3716,7 @@ pub fn probe_periodic_interrupt_in(
     {
         return PeriodicProbeResult::unsupported(interval);
     }
+    set_transfer_label(TransferLabel::InterruptIn);
 
     let scheduled_interval = periodic_interval_frames(interval);
     let mut frame_list = PeriodicFrameList {
@@ -2514,22 +3728,42 @@ pub fn probe_periodic_interrupt_in(
         scheduled_entries += 1;
     }
     let frame_list_address = &raw mut frame_list as usize;
-    cache_writeback_invalidate(
-        frame_list_address,
-        core::mem::size_of::<PeriodicFrameList>(),
-    );
-
     let mut qtd = QtdSlot::zeroed();
     let qtd_address = &raw mut qtd as usize;
-    let data_address = buffer.as_mut_ptr() as usize;
-    cache_writeback_invalidate(data_address, buffer.len());
+    // The probe stages its own payload for the same reason `run_packet`
+    // does: the caller's `&mut [u8]` has no cache-line alignment to offer.
+    let mut staging = PacketStaging::zeroed();
+    if buffer.len() > PACKET_STAGING_BYTES {
+        return PeriodicProbeResult::unsupported(interval);
+    }
+    let data_address = staging.bytes.as_mut_ptr() as usize;
+    if !cache_writeback_invalidate(
+        CacheSite::PeriodicFrameList,
+        CacheDirection::Descriptor,
+        frame_list_address,
+        core::mem::size_of::<PeriodicFrameList>(),
+    ) || !cache_writeback_invalidate(
+        CacheSite::PeriodicProbe,
+        CacheDirection::DeviceToHost,
+        data_address,
+        PACKET_STAGING_BYTES,
+    ) {
+        return PeriodicProbeResult::unsupported(interval);
+    }
     let qtd_control =
         (buffer.len() as u32 & QTD_XFER_SIZE_MASK) | QTD_INTR_CPLT | QTD_EOL | QTD_ACTIVE;
     unsafe {
         write(qtd_address, qtd_control);
         write(qtd_address + 4, data_address as u32);
     }
-    cache_writeback_invalidate(qtd_address, 8);
+    if !cache_writeback_invalidate(
+        CacheSite::PeriodicProbe,
+        CacheDirection::Descriptor,
+        qtd_address,
+        core::mem::size_of::<QtdSlot>(),
+    ) {
+        return PeriodicProbeResult::unsupported(interval);
+    }
 
     let saved_hcfg = unsafe { read(HCFG) };
     let saved_hflbaddr = unsafe { read(HFLBADDR) };
@@ -2605,17 +3839,33 @@ pub fn probe_periodic_interrupt_in(
     }
     USB_PERIODIC_PENDING[0].store(0, Ordering::Release);
 
-    cache_writeback_invalidate(qtd_address, 8);
+    let qtd_synced = cache_writeback_invalidate(
+        CacheSite::PeriodicProbe,
+        CacheDirection::Descriptor,
+        qtd_address,
+        core::mem::size_of::<QtdSlot>(),
+    );
     let control_after = unsafe { read(qtd_address) };
     let remaining = (control_after & QTD_XFER_SIZE_MASK) as usize;
     let status = control_after & QTD_STATUS_MASK;
     let transferred = buffer.len().saturating_sub(remaining.min(buffer.len()));
-    if transferred > 0 {
-        cache_writeback_invalidate(data_address, transferred);
+    let payload_synced = transferred == 0
+        || cache_writeback_invalidate(
+            CacheSite::PeriodicProbe,
+            CacheDirection::DeviceToHost,
+            data_address,
+            PACKET_STAGING_BYTES,
+        );
+    if payload_synced && transferred > 0 {
+        let published = transferred.min(buffer.len());
+        buffer[..published].copy_from_slice(&staging.bytes[..published]);
     }
     let hcint = completion.unwrap_or(0);
-    let completed =
-        completion.is_some() && hcint & HCINT_XFERCOMPL != 0 && status == QTD_STATUS_SUCCESS;
+    let completed = completion.is_some()
+        && qtd_synced
+        && payload_synced
+        && hcint & HCINT_XFERCOMPL != 0
+        && status == QTD_STATUS_SUCCESS;
 
     PeriodicProbeResult {
         attempted: true,
@@ -2736,8 +3986,21 @@ pub fn run_packet(
         );
     }
 
+    let buffer_len = buffer.len();
+    if buffer_len > PACKET_STAGING_BYTES {
+        // Unreachable through the current callers, which all chunk by an
+        // endpoint MPS of at most 512. Truncating a transfer to fit the
+        // staging buffer would be far worse than refusing it.
+        uart::log_u32(
+            b"USB: packet larger than the DMA staging buffer, len=",
+            buffer_len as u32,
+        );
+        return PacketOutcome::Error;
+    }
     let mut transfer = Channel0Transfer::new(endpoint, is_setup, pid_data1, buffer);
-    let token = transfer.submit();
+    let Some(token) = transfer.submit() else {
+        return PacketOutcome::CacheSyncFailed;
+    };
     let sleep_on_interrupt = completion_wait == CompletionWait::Interrupt;
     let hcint = match await_packet(
         0,
@@ -2751,23 +4014,664 @@ pub fn run_packet(
         None => {
             if !quiet_timeout {
                 uart::log(b"USB: packet timed out waiting for channel halt\r\n");
+                let (hcchar, hctsiz, hcdma) = channel0_diagnostic_registers();
+                uart::log_hex(b"USB:   before halt HCCHAR=", hcchar);
+                uart::log_hex(b"USB:   before halt HCTSIZ=", hctsiz);
+                uart::log_hex(b"USB:   before halt HCDMA=", hcdma);
                 log_port_state();
             }
             // Leave the channel in a known-idle state regardless of why we
             // gave up, so the next call's fresh HCCHAR/HCTSIZ/HCDMA write is
             // not racing whatever the core was still doing.
             force_halt_channel();
-            let transferred = transfer.cancel(token);
-            return PacketOutcome::Timeout(transferred);
+            let progress = transfer.cancel(token);
+            let transferred = progress.count();
+            // `PollIdleNak` is the manually scheduled Interrupt IN poll,
+            // whose caller treats a timeout as "no new report" rather than
+            // an error (`hid.rs`). Counting it as a packet failure makes
+            // the failure total a measure of how long a keyboard sat idle.
+            if completion_wait == CompletionWait::PollIdleNak {
+                note_idle_poll_timeout();
+            } else {
+                transfer.note_failure(PacketFailureKind::HaltTimeout, transferred, 0);
+                if !quiet_timeout {
+                    log_packet_failure(PacketFailureKind::HaltTimeout, buffer_len, transferred, 0);
+                    if !progress.is_known() {
+                        uart::log(b"USB:   actual bytes are UNKNOWN, not zero\r\n");
+                    }
+                }
+            }
+            return PacketOutcome::Timeout(progress);
         }
     };
-    if !transfer.note_completion(token, hcint) {
+    // Fault injection: deliver this completion under a generation the slot
+    // never issued, which is what a queued scheduler could do with a
+    // completion left over from an earlier packet.
+    let completion_token = if take_forced_stale_completion() {
+        TransferToken(token.0.wrapping_add(1))
+    } else {
+        token
+    };
+    if !transfer.note_completion(completion_token, hcint) {
+        note_packet_failure(
+            PacketFailureKind::StaleCompletion,
+            endpoint.is_in,
+            buffer_len,
+            0,
+            hcint,
+            0,
+        );
         if !quiet_errors {
             uart::log(b"USB: stale channel completion token\r\n");
         }
         return PacketOutcome::Error;
     }
     transfer.reap(token, quiet_errors)
+}
+
+#[allow(dead_code)]
+fn log_out_qtd_list_failure(message: &[u8], index: usize, control: u32, hcint: u32) {
+    uart::log(message);
+    uart::log_u32(b"USB:   QTD index=", index as u32);
+    uart::log_hex(b"USB:   QTD control=", control);
+    uart::log_hex(b"USB:   HCINT=", hcint);
+    uart::log_hex(b"USB:   HCCHAR=", unsafe { read(CHAN0_HCCHAR) });
+    uart::log_hex(b"USB:   HCTSIZ=", unsafe { read(CHAN0_HCTSIZ) });
+    uart::log_hex(b"USB:   HCDMA=", unsafe { read(CHAN0_HCDMA) });
+    log_port_state();
+}
+
+/// Rejected v38/v39 experiment: runs one Bulk OUT train as one-packet QTDs.
+///
+/// The active BOT path halts and rearms channel 0 after every Full-Speed
+/// packet. A single 512-byte QTD avoids that boundary but is unreliable on
+/// the forced-FS hub topology. This variant keeps each descriptor at one MPS
+/// while setting HCTSIZ.NTD so hardware walks all eight descriptors under one
+/// activation. After a reported packet error, BOT may rebuild the uncompleted
+/// suffix only when this function proves the QTD boundary; an ambiguous list
+/// is never replayed.
+#[allow(dead_code)]
+fn run_out_packet_list(
+    endpoint: &Endpoint,
+    pid_data1: bool,
+    timeout_iterations: u32,
+    quiet_errors: bool,
+    buffer: &mut [u8],
+) -> PacketOutcome {
+    let mps = endpoint.mps.max(1) as usize;
+    let qtd_count = buffer.len().div_ceil(mps);
+    if endpoint.is_in
+        || endpoint.route.split.is_some()
+        || endpoint.endpoint_type != HCCHAR_EPTYPE_BULK
+        || buffer.len() <= mps
+        || buffer.len() > PACKET_STAGING_BYTES
+        || qtd_count > CHANNEL0_QTD_LIST_CAPACITY
+    {
+        uart::log(b"USB: invalid direct Bulk OUT QTD-list request\r\n");
+        return PacketOutcome::Error;
+    }
+
+    let mut staging = PacketStaging::zeroed();
+    staging.bytes[..buffer.len()].copy_from_slice(buffer);
+    let data_address = staging.bytes.as_mut_ptr() as usize;
+    if !cache_writeback_invalidate(
+        CacheSite::Channel0Payload,
+        CacheDirection::HostToDevice,
+        data_address,
+        PACKET_STAGING_BYTES,
+    ) {
+        note_packet_failure(
+            PacketFailureKind::CacheSyncRefused,
+            false,
+            buffer.len(),
+            0,
+            0,
+            0,
+        );
+        return PacketOutcome::CacheSyncFailed;
+    }
+
+    let slot = CHANNEL0_QTD_NEXT.fetch_add(1, Ordering::Relaxed) as usize % CHANNEL0_QTD_SLOT_COUNT;
+    let qtd_address = channel0_qtd_address(slot);
+    for index in 0..CHANNEL0_QTD_LIST_CAPACITY {
+        let descriptor = qtd_address + index * core::mem::size_of::<RawQtd>();
+        unsafe {
+            write(descriptor, 0);
+            write(descriptor + 4, 0);
+        }
+    }
+    let mut submitted_controls = [0u32; CHANNEL0_QTD_LIST_CAPACITY];
+    let mut submitted_buffers = [0u32; CHANNEL0_QTD_LIST_CAPACITY];
+    for (index, submitted_control) in submitted_controls.iter_mut().take(qtd_count).enumerate() {
+        let offset = index * mps;
+        let length = (buffer.len() - offset).min(mps);
+        let is_last = index + 1 == qtd_count;
+        let mut control = length as u32 | QTD_ACTIVE;
+        if is_last {
+            control |= QTD_INTR_CPLT | QTD_EOL;
+        }
+        *submitted_control = control;
+        submitted_buffers[index] = (data_address + offset) as u32;
+        let descriptor = qtd_address + index * core::mem::size_of::<RawQtd>();
+        unsafe {
+            write(descriptor, control);
+            write(descriptor + 4, submitted_buffers[index]);
+        }
+    }
+    if !cache_writeback_invalidate(
+        CacheSite::Channel0Qtd,
+        CacheDirection::Descriptor,
+        qtd_address,
+        core::mem::size_of::<Channel0QtdListSlot>(),
+    ) {
+        note_packet_failure(
+            PacketFailureKind::CacheSyncRefused,
+            false,
+            buffer.len(),
+            0,
+            0,
+            0,
+        );
+        return PacketOutcome::CacheSyncFailed;
+    }
+
+    let hcchar = (endpoint.mps as u32 & 0x7FF)
+        | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+        | (if endpoint.route.low_speed_via_hub {
+            HCCHAR_LSPDDEV
+        } else {
+            0
+        })
+        | endpoint.endpoint_type
+        | ((endpoint.device_address as u32 & 0x7F) << 22);
+    let hctsiz = HCTSIZ_SCHED_INFO_ALL
+        | (((qtd_count - 1) as u32) << HCTSIZ_NTD_SHIFT)
+        | if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 };
+
+    USB_TRANSFER_GENERATION.fetch_add(1, Ordering::Relaxed);
+    USB_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    prepare_channel0_interrupt();
+    unsafe {
+        write(CHAN0_HCSPLT, 0);
+        write(CHAN0_HCCHAR, hcchar);
+        write(CHAN0_HCTSIZ, hctsiz);
+        write(CHAN0_HCDMA, (qtd_address as u32) & 0xFFFF_FE00);
+        modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+    }
+
+    let Some(halt) = await_packet(0, 0, timeout_iterations, 0, true, false) else {
+        uart::log(b"USB: QTD list timed out waiting for channel halt\r\n");
+        let (hcchar, hctsiz, hcdma) = channel0_diagnostic_registers();
+        uart::log_hex(b"USB:   before halt HCCHAR=", hcchar);
+        uart::log_hex(b"USB:   before halt HCTSIZ=", hctsiz);
+        uart::log_hex(b"USB:   before halt HCDMA=", hcdma);
+        log_port_state();
+        force_halt_channel();
+        USB_CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
+        note_packet_failure(PacketFailureKind::HaltTimeout, false, buffer.len(), 0, 0, 0);
+        return PacketOutcome::Timeout(TransferProgress::Unknown);
+    };
+    let hcint = halt.hcint;
+    if !cache_writeback_invalidate(
+        CacheSite::Channel0Qtd,
+        CacheDirection::Descriptor,
+        qtd_address,
+        core::mem::size_of::<Channel0QtdListSlot>(),
+    ) {
+        note_packet_failure(
+            PacketFailureKind::CacheSyncRefused,
+            false,
+            buffer.len(),
+            0,
+            hcint,
+            0,
+        );
+        return PacketOutcome::CacheSyncFailed;
+    }
+    USB_REAP_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let mut controls = [0u32; CHANNEL0_QTD_LIST_CAPACITY];
+    let mut buffers_after = [0u32; CHANNEL0_QTD_LIST_CAPACITY];
+    for (index, control) in controls.iter_mut().take(qtd_count).enumerate() {
+        let descriptor = qtd_address + index * core::mem::size_of::<RawQtd>();
+        *control = unsafe { read(descriptor) };
+        buffers_after[index] = unsafe { read(descriptor + 4) };
+    }
+    let failed_index = controls[..qtd_count]
+        .iter()
+        .position(|control| *control & QTD_STATUS_MASK != QTD_STATUS_SUCCESS);
+    let active_index = controls[..qtd_count]
+        .iter()
+        .position(|control| *control & QTD_ACTIVE != 0);
+    let incomplete_index = controls[..qtd_count]
+        .iter()
+        .position(|control| *control & QTD_XFER_SIZE_MASK != 0);
+    for (index, control) in controls[..qtd_count].iter().enumerate() {
+        let requested = (buffer.len() - index * mps).min(mps);
+        if (*control & QTD_XFER_SIZE_MASK) as usize > requested {
+            IMPOSSIBLE_REMAINDERS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let diagnostic_index = failed_index
+        .or(active_index)
+        .or(incomplete_index)
+        .unwrap_or(qtd_count - 1);
+    let diagnostic_control = controls[diagnostic_index];
+    USB_LAST_REAP_HCINT.store(hcint, Ordering::Release);
+    USB_LAST_REAP_QTD_CONTROL.store(diagnostic_control, Ordering::Release);
+
+    if hcint & HCINT_STALL != 0 {
+        note_packet_failure(
+            PacketFailureKind::Stall,
+            false,
+            buffer.len(),
+            0,
+            hcint,
+            diagnostic_control,
+        );
+        if !quiet_errors {
+            log_out_qtd_list_failure(
+                b"USB: WRITE packet-list stalled\r\n",
+                diagnostic_index,
+                diagnostic_control,
+                hcint,
+            );
+        }
+        return PacketOutcome::Error;
+    }
+    if hcint & HCINT_ERROR_MASK != 0 {
+        note_packet_failure(
+            PacketFailureKind::TransactionError,
+            false,
+            buffer.len(),
+            0,
+            hcint,
+            diagnostic_control,
+        );
+        if !quiet_errors {
+            log_out_qtd_list_failure(
+                b"USB: WRITE packet-list transaction error\r\n",
+                diagnostic_index,
+                diagnostic_control,
+                hcint,
+            );
+        }
+        return PacketOutcome::Error;
+    }
+    if let Some(index) = failed_index {
+        let status = controls[index] & QTD_STATUS_MASK;
+        let kind = if status == QTD_STATUS_PACKET_ERROR {
+            PacketFailureKind::QtdPacketError
+        } else {
+            PacketFailureKind::QtdInvalidStatus
+        };
+        note_packet_failure(kind, false, buffer.len(), 0, hcint, controls[index]);
+        if !quiet_errors {
+            log_out_qtd_list_failure(
+                b"USB: WRITE packet-list QTD failed\r\n",
+                index,
+                controls[index],
+                hcint,
+            );
+        }
+        if status != QTD_STATUS_PACKET_ERROR {
+            return PacketOutcome::Error;
+        }
+
+        // A status-1 QTD is one atomic USB packet that may be retried with
+        // the same DATA PID. Earlier descriptors form a reusable prefix only
+        // when hardware completed every one, and later descriptors must be
+        // bit-for-bit untouched. This is stronger than trusting the failed
+        // descriptor's remainder (which is frequently impossible on this
+        // core) and lets BOT rebuild a list beginning at the failed packet
+        // without replaying an accepted prefix.
+        let prefix_complete = controls[..index]
+            .iter()
+            .all(|control| control & (QTD_ACTIVE | QTD_STATUS_MASK | QTD_XFER_SIZE_MASK) == 0);
+        let suffix_untouched = controls[index + 1..qtd_count]
+            == submitted_controls[index + 1..qtd_count]
+            && buffers_after[index + 1..qtd_count] == submitted_buffers[index + 1..qtd_count];
+        if prefix_complete && suffix_untouched {
+            let completed_prefix = index * mps;
+            if !quiet_errors {
+                uart::log_u32(
+                    b"USB:   completed QTD-list prefix bytes=",
+                    completed_prefix as u32,
+                );
+            }
+            return PacketOutcome::PacketError(TransferProgress::Known(completed_prefix));
+        }
+        if !quiet_errors {
+            uart::log(b"USB: QTD-list boundary is ambiguous; refusing resume\r\n");
+        }
+        return PacketOutcome::PacketError(TransferProgress::Unknown);
+    }
+
+    let every_qtd_complete = controls[..qtd_count]
+        .iter()
+        .enumerate()
+        .all(|(index, control)| {
+            let requested = (buffer.len() - index * mps).min(mps);
+            control & QTD_ACTIVE == 0
+                && (*control & QTD_XFER_SIZE_MASK) as usize == 0
+                && requested > 0
+        });
+    if hcint & HCINT_XFERCOMPL == 0 || !every_qtd_complete {
+        note_packet_failure(
+            PacketFailureKind::NotTransferComplete,
+            false,
+            buffer.len(),
+            0,
+            hcint,
+            diagnostic_control,
+        );
+        if !quiet_errors {
+            log_out_qtd_list_failure(
+                b"USB: WRITE packet-list did not complete every QTD\r\n",
+                diagnostic_index,
+                diagnostic_control,
+                hcint,
+            );
+        }
+        return PacketOutcome::Error;
+    }
+    if take_forced_short_out() {
+        note_packet_failure(
+            PacketFailureKind::ShortOut,
+            false,
+            buffer.len(),
+            buffer.len().saturating_sub(1),
+            hcint,
+            controls[qtd_count - 1],
+        );
+        return PacketOutcome::Error;
+    }
+    PacketOutcome::Ok(buffer.len())
+}
+
+/// Failed v30/v31 experiment for directly addressed Full-Speed buffer DMA.
+///
+/// This is deliberately not called by BOT. Both MC/EC=0 and MC/EC=1 made the
+/// first CBW fail on real FS hardware; descriptor DMA with the fixed QTD bank
+/// is the active non-Split path. The helper remains temporarily as the exact
+/// measured rejected implementation while Stage 3 continues, rather than
+/// being mistaken later for an untried fallback.
+///
+/// `HCFG.DescDMA` belongs to the whole controller. The registry already
+/// moves HID to serialized channel-0 polling whenever MSC and HID coexist;
+/// this function still refuses to switch modes if a periodic channel is
+/// armed, making that topology rule an HCD invariant.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn run_direct_fs_bulk_packet(
+    endpoint: &Endpoint,
+    pid_data1: bool,
+    timeout_iterations: u32,
+    max_nak_rounds: u32,
+    quiet_timeout: bool,
+    quiet_errors: bool,
+    buffer: &mut [u8],
+) -> PacketOutcome {
+    let xfer_len = buffer.len();
+    if endpoint.route.split.is_some()
+        || endpoint.endpoint_type != HCCHAR_EPTYPE_BULK
+        || endpoint.mps > 64
+        || xfer_len > endpoint.mps as usize
+        || xfer_len > PACKET_STAGING_BYTES
+    {
+        if !quiet_errors {
+            uart::log(b"USB: direct buffer-DMA request is not FS Bulk\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+    if periodic_channels_armed()
+        || SPLIT_MODE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        SPLIT_MODE_CONFLICT_COUNT.fetch_add(1, Ordering::Relaxed);
+        if !quiet_errors {
+            uart::log(b"USB: direct buffer-DMA blocked by another DMA-mode owner\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+
+    let mut staging = PacketStaging::zeroed();
+    if !endpoint.is_in {
+        staging.bytes[..xfer_len].copy_from_slice(buffer);
+    }
+    let data_address = staging.bytes.as_mut_ptr() as usize;
+    if !cache_writeback_invalidate(
+        CacheSite::Channel0Payload,
+        if endpoint.is_in {
+            CacheDirection::DeviceToHost
+        } else {
+            CacheDirection::HostToDevice
+        },
+        data_address,
+        PACKET_STAGING_BYTES,
+    ) {
+        SPLIT_MODE_ACTIVE.store(false, Ordering::Release);
+        note_packet_failure(
+            PacketFailureKind::CacheSyncRefused,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
+        return PacketOutcome::CacheSyncFailed;
+    }
+
+    let hcchar = (endpoint.mps as u32 & 0x7FF)
+        | ((endpoint.endpoint_number as u32 & 0xF) << 11)
+        | (if endpoint.is_in { HCCHAR_EPDIR_IN } else { 0 })
+        | (if endpoint.route.low_speed_via_hub {
+            HCCHAR_LSPDDEV
+        } else {
+            0
+        })
+        | HCCHAR_EPTYPE_BULK
+        // In buffer-DMA mode the DWC host channel expects one transaction
+        // in MC/EC. Leaving the field at descriptor-DMA's working value 0
+        // made the first 31-byte CBW halt immediately with
+        // ChHltd|NAK|XactErr (HCINT=0x92) and HCTSIZ unchanged. Keep this
+        // confined to the buffer-DMA path: setting it on direct descriptor
+        // DMA was the v26 regression which stopped B2 after four reads.
+        | HCCHAR_MC_ONE
+        | ((endpoint.device_address as u32 & 0x7F) << 22);
+    let hctsiz = (xfer_len as u32 & HCTSIZ_XFERSIZE_MASK)
+        | (1 << HCTSIZ_PKTCNT_SHIFT)
+        | if pid_data1 { HCTSIZ_PID_DATA1 } else { 0 };
+
+    USB_LAST_REAP_HCINT.store(0, Ordering::Release);
+    // There is deliberately no QTD on this path. Clearing the old snapshot
+    // prevents BOT retry diagnostics from attributing the preceding
+    // descriptor to this packet.
+    USB_LAST_REAP_QTD_CONTROL.store(0, Ordering::Release);
+    prepare_channel0_interrupt();
+    unsafe {
+        modify(HCFG, HCFG_DESCDMA, 0);
+        write(CHAN0_HCSPLT, 0);
+        write(CHAN0_HCCHAR, hcchar);
+        write(CHAN0_HCTSIZ, hctsiz);
+        write(CHAN0_HCDMA, data_address as u32);
+        modify(CHAN0_HCCHAR, HCCHAR_CHENA, HCCHAR_CHENA);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+    DIRECT_BUFFER_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let outcome =
+        await_direct_buffer_packet(hctsiz, data_address, timeout_iterations, max_nak_rounds);
+    let channel_active = unsafe { read(CHAN0_HCCHAR) } & HCCHAR_CHENA != 0;
+    if outcome.is_none() && channel_active {
+        force_halt_channel();
+    }
+    let hctsiz_after = unsafe { read(CHAN0_HCTSIZ) };
+    unsafe {
+        write(CHAN0_HCSPLT, 0);
+        modify(HCFG, HCFG_DESCDMA, HCFG_DESCDMA);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
+    SPLIT_MODE_ACTIVE.store(false, Ordering::Release);
+
+    let Some(halt) = outcome else {
+        note_packet_failure(
+            PacketFailureKind::HaltTimeout,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
+        if !quiet_timeout {
+            uart::log(b"USB: direct buffer-DMA packet timed out\r\n");
+            log_port_state();
+        }
+        // An abandoned buffer-DMA OUT has no completion proving whether a
+        // packet reached the device, so BOT must not resubmit it.
+        return PacketOutcome::Timeout(TransferProgress::Unknown);
+    };
+    let hcint = halt.hcint;
+    USB_LAST_REAP_HCINT.store(hcint, Ordering::Release);
+
+    if take_forced_stale_completion() {
+        USB_STALE_TOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
+        note_packet_failure(
+            PacketFailureKind::StaleCompletion,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            hcint,
+            0,
+        );
+        if !quiet_errors {
+            uart::log(b"USB: stale direct buffer-DMA completion token\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+
+    let remaining = (hctsiz_after & HCTSIZ_XFERSIZE_MASK) as usize;
+    let mut progress = if remaining <= xfer_len {
+        TransferProgress::Known(xfer_len - remaining)
+    } else {
+        TransferProgress::Unknown
+    };
+    if !endpoint.is_in && xfer_len > 0 && progress.is_known() && take_forced_short_out() {
+        progress = TransferProgress::Known(progress.count().saturating_sub(1));
+    }
+    let transferred = progress.count();
+
+    if hcint & HCINT_STALL != 0 {
+        note_packet_failure(
+            PacketFailureKind::Stall,
+            endpoint.is_in,
+            xfer_len,
+            transferred,
+            hcint,
+            0,
+        );
+        if !quiet_errors {
+            uart::log(b"USB: direct buffer-DMA transfer STALL\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+    if hcint & HCINT_ERROR_MASK != 0 || hcint & HCINT_XFERCOMPL == 0 || !progress.is_known() {
+        note_packet_failure(
+            PacketFailureKind::TransactionError,
+            endpoint.is_in,
+            xfer_len,
+            transferred,
+            hcint,
+            0,
+        );
+        if !quiet_errors {
+            uart::log_hex(b"USB: direct buffer-DMA packet error, HCINT=", hcint);
+            uart::log_hex(b"USB:   HCTSIZ=", hctsiz_after);
+            log_port_state();
+        }
+        return PacketOutcome::PacketError(progress);
+    }
+    if !endpoint.is_in && transferred != xfer_len {
+        note_packet_failure(
+            PacketFailureKind::ShortOut,
+            false,
+            xfer_len,
+            transferred,
+            hcint,
+            0,
+        );
+        if !quiet_errors {
+            uart::log(b"USB: direct buffer-DMA short OUT\r\n");
+        }
+        return PacketOutcome::Error;
+    }
+    if endpoint.is_in && transferred > 0 {
+        if !cache_writeback_invalidate(
+            CacheSite::Channel0Payload,
+            CacheDirection::DeviceToHost,
+            data_address,
+            PACKET_STAGING_BYTES,
+        ) {
+            note_packet_failure(
+                PacketFailureKind::CacheSyncRefused,
+                true,
+                xfer_len,
+                transferred,
+                hcint,
+                0,
+            );
+            return PacketOutcome::CacheSyncFailed;
+        }
+        buffer[..transferred].copy_from_slice(&staging.bytes[..transferred]);
+    }
+    PacketOutcome::Ok(transferred)
+}
+
+/// Buffer DMA halts a non-periodic channel on NAK instead of letting a QTD
+/// absorb the retries. Re-arm the identical one-packet transfer in software,
+/// under one cumulative timeout and the caller's bounded round budget.
+fn await_direct_buffer_packet(
+    hctsiz: u32,
+    data_address: usize,
+    timeout_iterations: u32,
+    max_nak_rounds: u32,
+) -> Option<PacketHalt> {
+    let start = cycle_count();
+    let cycle_budget = timeout_iterations
+        .saturating_mul(WAIT_TIMEOUT_CYCLES_PER_ITERATION)
+        .max(1);
+    let mut rounds = 0u32;
+    loop {
+        let elapsed = cycle_count().wrapping_sub(start);
+        if elapsed >= cycle_budget {
+            return None;
+        }
+        let remaining_iterations = cycle_budget
+            .saturating_sub(elapsed)
+            .div_ceil(WAIT_TIMEOUT_CYCLES_PER_ITERATION)
+            .max(1);
+        let hcint = wait_for_channel0_halt(remaining_iterations, WaitStrategy::Interrupt)?;
+        if hcint & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_ERROR_MASK) != 0 {
+            return Some(PacketHalt {
+                hcint,
+                complete_split: false,
+            });
+        }
+        if hcint & (HCINT_NAK | HCINT_NYET) == 0 || rounds >= max_nak_rounds {
+            return Some(PacketHalt {
+                hcint,
+                complete_split: false,
+            });
+        }
+        rounds += 1;
+        DIRECT_BUFFER_NAK_COUNT.fetch_add(1, Ordering::Relaxed);
+        prepare_channel0_interrupt();
+        unsafe {
+            write(CHAN0_HCTSIZ, hctsiz);
+            write(CHAN0_HCDMA, data_address as u32);
+            modify(CHAN0_HCCHAR, HCCHAR_CHENA | HCCHAR_CHDIS, HCCHAR_CHENA);
+        }
+    }
 }
 
 /// Largest split packet `run_split_packet` will stage. A device reached
@@ -2782,14 +4686,19 @@ const SPLIT_STAGING_MAX: usize = 64;
 /// last resort rather than the normal path.
 const SPLIT_HARD_ROUND_CAP: u32 = 5_000;
 
-/// A word-aligned staging buffer for split packets. Buffer DMA hands
+/// A cache-line-aligned staging buffer for split packets. Buffer DMA hands
 /// `HCDMA` the data pointer itself (Scatter/Gather DMA pointed it at a
 /// descriptor instead), and the core requires that pointer to be word
 /// aligned -- which an arbitrary `&mut [u8]` sub-slice from a caller is
 /// not. Copying through a fixed aligned buffer is cheaper than propagating
 /// an alignment requirement up through every caller, at
 /// `SPLIT_STAGING_MAX` bytes a packet.
-#[repr(C, align(4))]
+///
+/// The alignment is `DMA_ALIGN` rather than the core's word requirement
+/// because the buffer also has to be cache-synchronized, and that operation
+/// cannot address anything finer than a line. At exactly `SPLIT_STAGING_MAX`
+/// = one line, the span this driver writes back belongs to nothing else.
+#[repr(C, align(64))]
 struct SplitStaging {
     bytes: [u8; SPLIT_STAGING_MAX],
 }
@@ -2830,6 +4739,14 @@ fn run_split_packet(
         // Unreachable via the current callers (all chunk by MPS, which is
         // at most 64 on a Full/Low-Speed endpoint), but silently truncating
         // a transfer would be far worse than refusing it.
+        note_packet_failure(
+            PacketFailureKind::SplitRejected,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
         uart::log_hex(
             b"USB: split packet larger than the staging buffer, len=",
             xfer_len as u32,
@@ -2837,6 +4754,14 @@ fn run_split_packet(
         return PacketOutcome::Error;
     }
     if !enter_split_mode() {
+        note_packet_failure(
+            PacketFailureKind::SplitRejected,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
         if !quiet_errors {
             uart::log(b"USB: split transfer blocked by active periodic channels\r\n");
         }
@@ -2850,7 +4775,29 @@ fn run_split_packet(
         staging.bytes[..xfer_len].copy_from_slice(buffer);
     }
     let data_address = staging.bytes.as_mut_ptr() as usize;
-    cache_writeback_invalidate(data_address, SPLIT_STAGING_MAX);
+    if !cache_writeback_invalidate(
+        CacheSite::SplitStaging,
+        if endpoint.is_in {
+            CacheDirection::DeviceToHost
+        } else {
+            CacheDirection::HostToDevice
+        },
+        data_address,
+        SPLIT_STAGING_MAX,
+    ) {
+        // Nothing has been programmed yet, but split mode has been entered
+        // and has to be given back before returning.
+        leave_split_mode();
+        note_packet_failure(
+            PacketFailureKind::CacheSyncRefused,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
+        return PacketOutcome::CacheSyncFailed;
+    }
 
     let hcchar = (endpoint.mps as u32 & 0x7FF)
         | ((endpoint.endpoint_number as u32 & 0xF) << 11)
@@ -2886,6 +4833,14 @@ fn run_split_packet(
     };
     if !start_slot_ready {
         leave_split_mode();
+        note_packet_failure(
+            PacketFailureKind::SplitRejected,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            0,
+            0,
+        );
         if !quiet_errors {
             uart::log(b"USB: split scheduler saw no High-Speed frame progress\r\n");
         }
@@ -2949,21 +4904,59 @@ fn run_split_packet(
     leave_split_mode();
 
     let Some(halt) = outcome else {
+        // Buffer DMA leaves no descriptor to read back, so the only honest
+        // actual length after an abandoned split is 0 -- which is also why
+        // an OUT that gets here must never be resent as if nothing moved.
+        // A periodic Interrupt split whose CSPLIT window ends in NYET
+        // expires at the next full-frame boundary by design, and the next
+        // rendered frame starts a fresh SSPLIT. That is an idle HID, not a
+        // failed packet -- see `await_packet`.
+        if periodic_split {
+            note_idle_poll_timeout();
+        } else {
+            note_packet_failure(
+                PacketFailureKind::HaltTimeout,
+                endpoint.is_in,
+                xfer_len,
+                0,
+                0,
+                0,
+            );
+        }
         if !quiet_timeout {
             uart::log(b"USB: split transfer timed out waiting for the hub's TT\r\n");
+            log_packet_failure(PacketFailureKind::HaltTimeout, xfer_len, 0, 0);
             log_port_state();
         }
-        return PacketOutcome::Timeout(0);
+        // Buffer DMA leaves no descriptor behind, so an abandoned split
+        // has no accounting for what reached the wire.
+        return PacketOutcome::Timeout(TransferProgress::Unknown);
     };
     let hcint = halt.hcint;
 
     if hcint & HCINT_STALL != 0 {
+        note_packet_failure(
+            PacketFailureKind::Stall,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            hcint,
+            0,
+        );
         if !quiet_errors {
             uart::log(b"USB: split transfer STALL\r\n");
         }
         return PacketOutcome::Error;
     }
     if hcint & HCINT_ERROR_MASK != 0 {
+        note_packet_failure(
+            PacketFailureKind::TransactionError,
+            endpoint.is_in,
+            xfer_len,
+            0,
+            hcint,
+            0,
+        );
         if !quiet_errors {
             uart::log(if halt.complete_split {
                 b"USB: split failed during CSPLIT\r\n"
@@ -2982,7 +4975,22 @@ fn run_split_packet(
     let remaining = (unsafe { read(CHAN0_HCTSIZ) } & HCTSIZ_XFERSIZE_MASK) as usize;
     let transferred = xfer_len.saturating_sub(remaining.min(xfer_len));
     if endpoint.is_in && transferred > 0 {
-        cache_writeback_invalidate(data_address, SPLIT_STAGING_MAX);
+        if !cache_writeback_invalidate(
+            CacheSite::SplitStaging,
+            CacheDirection::DeviceToHost,
+            data_address,
+            SPLIT_STAGING_MAX,
+        ) {
+            note_packet_failure(
+                PacketFailureKind::CacheSyncRefused,
+                true,
+                xfer_len,
+                transferred,
+                hcint,
+                0,
+            );
+            return PacketOutcome::CacheSyncFailed;
+        }
         buffer[..transferred].copy_from_slice(&staging.bytes[..transferred]);
     }
     PacketOutcome::Ok(transferred)
@@ -3467,12 +5475,45 @@ fn cycle_count() -> u32 {
 /// alignment where DMA touches them, and this path has been through the
 /// acceptance testing in `docs/USB_WRITE_STABILITY_PLAN.md` as it stands;
 /// turning refusals into failures here is a change to a verified transport
-/// that belongs with its own bus testing, not with an SD card fix.
-fn cache_writeback_invalidate(address: usize, length: usize) {
-    if crate::psram::writeback_invalidate(address, length) {
-        return;
+/// that belongs with its own bus testing, not with an SD card fix. Stage 1
+/// of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` is that testing; until then this
+/// records what a refusal would have cost instead of acting on it.
+///
+/// `site` and `direction` say which DMA-shared object this covers, and the
+/// transfer label the owning layer published says which transfer it belongs
+/// to. A refusal counted only as a total cannot be told apart from an
+/// unrelated one on the periodic HID path, and the two have nothing to do
+/// with each other.
+#[must_use]
+fn cache_writeback_invalidate(
+    site: CacheSite,
+    direction: CacheDirection,
+    address: usize,
+    length: usize,
+) -> bool {
+    // The start address is this driver's own responsibility, not the ROM
+    // routine's: it refuses a span that begins mid-line rather than rounding
+    // down, and rounding down here would drag another owner's dirty lines
+    // into the operation. Every DMA-shared object below is declared with at
+    // least `DMA_ALIGN`, so a failure here is a declaration that was
+    // weakened, not a runtime condition -- which is why it is checked
+    // rather than assumed.
+    let aligned = address.is_multiple_of(DMA_ALIGN);
+    // Whole cache lines, upward only. Each object's allocated size is a
+    // multiple of its own alignment, so the rounded span stays inside it.
+    let lines = length.div_ceil(DMA_ALIGN) * DMA_ALIGN;
+    let label = transfer_label();
+    let forced = take_forced_cache_refusal(label);
+    if aligned && !forced && crate::psram::writeback_invalidate(address, lines) {
+        return true;
     }
     CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    CACHE_REFUSALS_BY_SITE[site.index()].fetch_add(1, Ordering::Relaxed);
+    CACHE_REFUSALS_BY_DIRECTION[direction.index()].fetch_add(1, Ordering::Relaxed);
+    CACHE_REFUSALS_BY_LABEL[label.index()].fetch_add(1, Ordering::Relaxed);
+    LAST_CACHE_REFUSAL_ADDRESS.store(address as u32, Ordering::Relaxed);
+    LAST_CACHE_REFUSAL_LENGTH.store(length as u32, Ordering::Relaxed);
+    LAST_CACHE_REFUSAL_LABEL.store(label.index() as u32, Ordering::Relaxed);
     // Described once. A refusal repeats for every transfer that uses the
     // same buffer, and the address and length are what identify which one:
     // a 31-byte span is a CBW, 13 is a CSW, a whole number of blocks is
@@ -3481,8 +5522,19 @@ fn cache_writeback_invalidate(address: usize, length: usize) {
         uart::log(b"USB: cache writeback REFUSED over a DMA buffer\r\n");
         uart::log_hex(b"USB:   address=", address as u32);
         uart::log_u32(b"USB:   length=", length as u32);
-        uart::log(b"USB:   the controller will read stale RAM for this transfer\r\n");
+        uart::log(b"USB:   phase=");
+        uart::log(label.name().as_bytes());
+        uart::log(b"\r\n");
+        uart::log(if forced {
+            b"USB:   refusal injected on purpose by 'usbcachefail'\r\n" as &[u8]
+        } else if aligned {
+            b"USB:   the cache controller refused the span\r\n"
+        } else {
+            b"USB:   the span does not start on a cache-line boundary\r\n"
+        });
+        uart::log(b"USB:   the transfer is failed rather than started\r\n");
     }
+    false
 }
 
 /// How many cache writebacks have been refused since boot.
@@ -3497,6 +5549,13 @@ pub fn last_channel0_reap() -> (u32, u32) {
         USB_LAST_REAP_HCINT.load(Ordering::Acquire),
         USB_LAST_REAP_QTD_CONTROL.load(Ordering::Acquire),
     )
+}
+
+/// Channel-0 registers at a rare upper-layer diagnostic point. Callers use
+/// this immediately after a failed descriptor has been reaped and before its
+/// recovery cleanup, so the values describe the channel that actually failed.
+pub fn channel0_diagnostic_registers() -> (u32, u32, u32) {
+    unsafe { (read(CHAN0_HCCHAR), read(CHAN0_HCTSIZ), read(CHAN0_HCDMA)) }
 }
 
 /// # Safety

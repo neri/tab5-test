@@ -71,7 +71,10 @@ Bulk QTDはCPU周波数から約1秒で一度区切り、同じBOT phaseのま�
 合計待ち時間は約5秒です。BOT Reset Recoveryでも使うcontrol packetは約1秒です。CBW送信後に
 Bulk転送がtimeout／transaction error、またはCSW不正になった場合は、BOT Reset
 Recovery（Mass Storage Reset class request、Bulk IN／OUTそれぞれの
-`CLEAR_FEATURE(ENDPOINT_HALT)`、host toggleのDATA0復帰）を実行します。
+`CLEAR_FEATURE(ENDPOINT_HALT)`、host toggleのDATA0復帰）を実行します。Mass Storage Reset
+の直後は150 ms待ってから最初のhalt解除を送ります。Full-Speed媒体がreset requestを処理中の
+まま即時のSETUPを取りこぼす頻度を下げるためです。実機では同じ媒体でもRecoveryが完了する
+runとCLEAR_FEATUREで失敗するrunがあり、この待機だけで回復を保証するものではありません。
 読み出し専用のREAD(10)と、媒体確認に使うTEST UNIT READY、READ CAPACITY(10)、
 INQUIRY／INQUIRY(EVPD)はRecovery後に1回再送します。**WRITE(10)は自動再送しません。**
 途中で失敗した書き込みはメディアへ
@@ -101,6 +104,14 @@ High-Speed直結の`usbwritetest 2`は10/10回、pattern照合、原本復元、
 成功しています。pattern書き込みと復元を合わせて計20回のWRITEを連続成功しました。
 FS-onlyハブ＋HID併用でも10/10回成功しました。給電中のHID事前接続ハブも上流再接続を
 5/5回認識し、初回列挙修正を含む実機受入を完了しています。
+
+BOTのcommand resultはhost実転送長に加えて、期待data長とCSW residueを保持します。
+READ(10)／WRITE(10)の固定長I/Oは、CSW PASSEDだけでなく全量転送かつresidue 0でなければ
+成功にしません。特にWRITE(10)はhostが全dataを送れていてもdeviceが非zero residueを返した
+場合があり得るため、これを成功へ丸めません。一方、INQUIRY VPDは可変長応答なので、host
+実転送長とresidueが矛盾しないことをBOT層で確認した後、response headerが宣言する長さまでを
+使います。data INの代わりにCSWが先着した場合はdata bufferへ混ぜず、current commandの
+FAILED応答またはstale tagとして処理します。
 
 `usbwritetest <lba>`は`sdwritetest`より検査が厚くなっています。対象LBAだけでなく
 **前1・後2ブロックの窓**を事前に読んで保持し、パターン書き込み後に窓全体を読み直します。
@@ -135,13 +146,48 @@ sense keyを表示します。**成否は読み戻しで判定し、フラッシ
 出します**——デバイスが実行しないフラッシュは、直前の書き込みについて何も語らないため
 です（`usbwritetest`も同じ）。
 
-descriptor DMAのQTD status 1はESP-IDF 5.5.3と同じくpacket error
+`usbrawcheck <lba> [writes] [span] [gap_ms]`はUSB transportのfilesystem非依存raw burst試験です。
+filesystem APIを通さず、指定した犠牲範囲（既定1 block、最大8 blocks）へ単一block WRITE(10)を
+READ／flush／ready pollなしで連続発行します（既定32回、最大256回）。最後にだけ媒体から
+最終patternを読み戻し、開始時snapshotの復元と再照合を試みます。**指定範囲は必ず、保持したい
+filesystemの全partition外に置きます。**transport failureで復元できなくてもfilesystem objectは
+残らず、sessionを`usbrescan`して同じ犠牲範囲を再利用できます。Stage 3では全6構成で安定を
+確認し、`fswritetest`の代わりにtransport受入として採用しました。filesystem層の受入は
+別段階で行います。
+
+descriptor DMAを使うHigh-Speed／Split以外の既存経路では、QTD status 1をESP-IDF 5.5.3と同じくpacket error
 （CRC、transaction timeout、stuff、false EOP、excessive NAK）として扱います。
-すべてのBulk QTDをendpoint MPS以下の1 packetに限定し、endpoint toggleを進めず
-同一packet／同一DATA PIDを50 ms間隔で最大20回まで再送します。ACKを失ったOUTでもdevice側は
-同じPIDのduplicateを再消費しないため安全です。4 KiB READ(10)もMPS単位へ分割し、各QTDの
-完了後にsoftwareがDATA PIDを1回進めます。複数packet QTDのdescriptor残量から進捗を推定する
-経路は使用しません。QTDのIN byte数はMPSの倍数にする必要があるため、
+各descriptorはendpoint MPS以下の1 packet QTDに限定し、非Split BOT Bulk OUTも1 packetごとに
+channelをarmします。v36〜v39で試した複数packet QTD／複数QTD listはFull-Speed WRITEを悪化
+させたため撤回しており、現行経路では使いません。HCCHAR MC/ECはCBW／CSW／Bulk INと同じ0を
+維持します。
+
+**再送の可否は、packetが「失敗を報告された」のか「放棄された」のかで分かれます**
+（[`USB.md`](USB.md)の「実転送長とretry安全性の契約」）。
+
+- **coreがpacket errorを報告したpacket**は、endpoint toggleを進めず同一packet／同一
+  DATA PIDを50 ms間隔で最大20回まで再送します。USB packetは不可分で、ここでのQTDは
+  1 packetしか運ばないため、失敗の報告は「deviceが受け取らなかった」か「受け取ったが
+  handshakeが失われた」を意味します。ACKを失ったOUTでもdevice側は同じPIDのduplicateを
+  再消費しないため安全です。
+- **channelがhaltせず放棄したpacket**は、descriptorが「1 byteも動いていない」と
+  証明できるときだけ再送します。completionが無いのでcoreがpacket途中だった可能性を
+  否定できません。証明できない場合はtransport errorとして上げ、
+  `USB BOT: refusing to resubmit after ...`を出します。実機では64 byteのOUTが
+  `requested=64 actual=64`のまま4回再送されていました。
+
+**このcoreはpacket error時に不可能な残量を書き戻すことがあります**（64 byte要求に対して
+100,489や84,041を実測）。いずれも正規のwritebackでbyte欄だけが成立していないため、
+残量として使わず`usbcheck`の`impossible-len`で数えます。非Split BOT Bulkはdescriptor DMAを使い、
+channel-0の固定2-slot QTD bankをpacketごとに交互使用します。retryと次packetが直前の物理QTD
+addressを即時再利用しないための所有境界です。4 KiB READ(10)もMPS単位へ分割し、各packetの
+完了後にsoftwareがDATA PIDを1回進めます。
+reported Bulk OUT packet errorはnon-periodic TX FIFOをcleanupし、同じDATA PIDでretryします。
+descriptor-DMA mode再始動はB1の停止packetで反復しても結果を変えなかったため使用しません。
+複数QTDのWRITE listはB2で正常WRITEを後退させたため使用せず、非Split BOT OUTも1 packet
+QTDずつ実行します。reported packet errorだけを同じDATA PIDで再送し、haltしなかったpacketは
+descriptorが0 byte進行を証明できる場合以外再送しません。
+QTDのIN byte数はMPSの倍数にする必要があるため、
 13 byte CSW、36 byte INQUIRY、8 byte READ CAPACITYはMPSサイズの内蔵SRAM stagingへ受け、
 実受信byteだけを呼び出し側へコピーします。
 短い応答が要求長を超えた場合は、要求長、HCDが報告した実受信長、先頭16 byteを4つの
@@ -302,9 +348,12 @@ DATA PROTECT）を`BlockError::WriteProtected`へ写します。転送は何も�
 | `usbmsc` | INQUIRY／TEST UNIT READY／READ CAPACITY(10)の結果を表示 |
 | `usbread <lba>` | SCSI READ(10)で1ブロック読み出してUARTへダンプ |
 | `usbwritetest <lba>` | SCSI WRITE(10)で1ブロックの書き込み・照合・復元（`sdwritetest`のUSB版） |
+| `usbrawcheck <lba> [writes] [span] [gap_ms]` | filesystem外の犠牲範囲へ単一block WRITEを発行し、最後に照合・復元するraw試験。gapは成功したWRITE command間の0〜2000 ms、既定0 |
 | `usbzero <lba> [count]` | 1〜8ブロックをゼロで上書きし、媒体から読み直して照合（破壊的） |
 | `usbmbr` | LBA 0のMBRを`sdmbr`と同じ書式で表示 |
 | `ut [count]` | 同じ4 KiBを反復read・比較するread-only試験（既定100回、Recovery再送数・予防再同期数も表示） |
+| `usbcheck [reads] [lba]` | 1構成ぶんの受入試験。read soakと、LBA指定時はwrite 10回を実行し、counterの**差分**とGo条件ごとのPASS/FAILを表示（LBA省略でread-only） |
+| `usbcachefail` | DMA cache同期拒否・古い世代の完了・短いOUTの3つを注入し、いずれも吸収されず失敗になることを確認（接続構成に依存せず全体で1回。実行後は`usbrescan`） |
 | `usbmargin [rounds]` | VBUS offから再投入し、LBA 0が読めるまでの各段階を計測（read-only、既定5回、最大20回） |
 | `devices` | ブロックデバイス（`ram`／`sd0`／`usb0`…）の容量と、LBA 0の判定結果（MBRの各entry、superfloppy、ambiguous、判定不能）を表示。USBは接続中の台数ぶん列挙し、接続位置とVID:PIDも出す |
 | `blkread <dev> [pN] <lba>` | ブロック層経由で1ブロック読み出してUARTへダンプ。`pN`を付けるとLBAはそのパーティション相対になり、末尾を越える指定は媒体へ届く前に拒否される |
