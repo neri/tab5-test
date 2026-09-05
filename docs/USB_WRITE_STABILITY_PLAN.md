@@ -5,7 +5,18 @@
 > （[`STORAGE.md`](STORAGE.md)、[`USB.md`](USB.md)）とコードを優先してください。
 > 読み出しまでの実装計画は[`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)です。
 
-## 状態: **単一ブロックは安定化完了／複数ブロックWRITE(10)は未解決**
+## 状態: **完了**（機能受入。根本原因は未特定のまま緩和策で封じ込め）
+
+単一ブロックは第24版までに、複数ブロックWRITE(10)とFull-Speed固定ハブ経路の故障は
+[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md) Stage 7で解消した。
+`src/fs/usb_msc.rs`の`MAX_WRITE_BLOCKS`は回避策の`1`から`8`になり、2媒体×2 topologyで
+2／4／8 blockが各10回PASS、A／B／Cの`usbcheck`／`fswritetest`／HID／PC媒体検査も
+上限変更後のbinaryでPASSしている。受入時のcounterは`recovery ok+0 failed+0`、
+`proactive read+0`で、下の「症状」にある頻繁な回復は再現しない。
+
+**根本原因は未特定である。** 下の「まだ分かっていないこと」と「根本原因を追う場合の
+次の手」は、緩和策を外して原因まで特定したい場合の入口として残す。同節が書いている
+とおり、これらは機能受入の残作業ではない。
 
 MSCとHIDの単一ブロック経路は第24版のHigh-Speedハブ複合回帰まで実機確認済みである。
 一方、第25版で判明した複数ブロックのWRITE(10)は決定論的に失敗するため、`src/fs/usb_msc.rs`の

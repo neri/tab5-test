@@ -6,10 +6,21 @@
 > 元の段階計画: [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)、
 > USB書き込みの実機記録: [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)
 
-## 状態
+## 状態: 完了（Stage 0〜5、実機確認済み）
 
-**Stage 0〜5を実装済み。RAMディスク、SD、USBの1-round実機受入は合格。USBの頻発する
-transport recoveryは継続調査中。**
+RAMディスク、SD、USBの受入がすべて合格し、
+コマンドで代替できない2項目——PCでの`fsck.fat -n`と、再起動を挟んだ読み直し——も
+実施済みである。完了条件「実機で書いた媒体をPCと再起動後のTab5の両方から読める」は
+これで満たした。
+
+USBの頻発するtransport recoveryは、[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)
+Stage 0〜8で解消した。同計画の受入では`recovery ok+0 failed+0`、`proactive read+0`で、
+A／B／Cの3構成すべてが`fswritetest` 12検査PASS、試験後に媒体をunmountして別PCで
+全ファイル読み出しと`fsck.fat -n`もPASSしている。下の「中断理由」と
+「回復の頻度は正常なUSB MSCとして受け入れる水準ではない」はその作業より前の記録である。
+
+`README.md`の不一致3箇所（下記）は人間管理のため未変更で、この計画の完了後も
+判断待ちとして残る。
 
 RAMディスクだけに限定していたFAT書き込み経路を、SDカードとUSB Mass Storage上の
 FAT12/16/32へ広げる計画である。実装の現状は[`FILESYSTEM.md`](FILESYSTEM.md)と
@@ -33,10 +44,12 @@ FAT12/16/32へ広げる計画である。実装の現状は[`FILESYSTEM.md`](FIL
 USBの検査2は64 KiBを1ブロックずつ、**WRITE(10) 128本の連続成功**である。検査3
 （短縮置換）まで通っているので、**Stage 0のtruncate修正はUSB上でも検証済み**。
 
-コマンドで代替できない受入項目が2つ残っている。PCでの`fsck.fat -n`と、再起動を
-挟んだ読み直しである。SDについては未実施。
+コマンドで代替できない受入項目は2つとも実施済み。PCでの`fsck.fat -n`は
+[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md) Stage 7に記録がある
+（「試験後に媒体をunmountし、別PCで全ファイルの読み出しと`fsck.fat -n`もPASSした」）。
+再起動を挟んだ読み直しも実施済み。
 
-### 中断理由
+### 中断理由（解消済みの記録）
 
 1回目、短縮ログ版の3回目、opcode追加後の4回目はUSBの検査4で
 `bulk IN timed out during CSW`。明示的な
@@ -64,7 +77,7 @@ TEST UNIT READY、READ CAPACITY(10)、INQUIRY／INQUIRY(EVPD)を再送安全な�
 いずれもRecovery後に1回だけ再送する。WRITE(10)を再送しない方針は変更しない。
 この修正版で`fswritetest /vol/usb0p1 1 1`は12検査を45,383 msで完走した。
 
-ただし回復の頻度は正常なUSB MSCとして受け入れる水準ではない。失敗はREAD(10)のdata IN、
+（以下はBOT/HCD Stage 0〜8より前の記録である。）ただし回復の頻度は正常なUSB MSCとして受け入れる水準ではない。失敗はREAD(10)のdata IN、
 TEST UNIT READYのCSW、READ CAPACITY(10)のdata INと、媒体上の特定sectorでは説明できない
 commandにまたがる。別runでも最初のREAD障害は同じtag `0x14F`、検査4のTEST UNIT READYは
 同じtag `0x9E4`で再現した一方、READのLBAは`0x7DF0`、`0x7E20`、`0x7E50`と動いた。
@@ -99,7 +112,7 @@ controller silicon単独よりMSC device firmwareと独自BOT/HCD実装の相互
 説は外れだった。`usbhw`が拒否回数を表示するようにしてあり、実機で0である。同プランの
 未解明候補3（OUT側のcache同期）のうち、この部分は消えた。
 
-### 再開するときの入口
+### 再開するときの入口（当時の記録）
 
 1. `fswritetest /vol/usb0pN 1 1`を実行し、検査4または5でREAD data IN／CSWが失敗するか。
    成功した予防再同期ログは初回と64回ごとだけ出し、失敗時はLBA、block数、FUA、方向別の

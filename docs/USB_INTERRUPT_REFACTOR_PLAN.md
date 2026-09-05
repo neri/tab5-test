@@ -5,7 +5,12 @@
 > この文書は作業計画と実機での判断記録です。現在の実装仕様は現状文書とコードを
 > 優先します。
 
-## 状態: Stage 0〜5とroot接続event完了、hub statusは低頻度fallbackを維持
+## 状態: 完了（Stage 0〜5とroot接続event。hub statusは低頻度fallbackのまま運用）
+
+**hub statusを割り込み駆動へ移す残りは、この計画では実施しない**（利用者判断、
+2026-09-04）。現行の低頻度fallbackで実機に大きな問題が出ていないためである。
+問題が出た時点で新しい計画を起票する。以下は当時の作業記録として残す。
+
 
 2026-08-20時点で、ESP-IDF v5.5.3のローカル参照実装からHigh-Speed DWCの割り込み
 ソースが`ETS_USB_OTG_INTR_SOURCE = 93`であること、DWC側のmask／ack手順を確認した。

@@ -10,7 +10,7 @@
 > [`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)で既定
 > read-writeにしています。
 
-## 状態
+## 状態: 完了（機能1〜3、2026-08-25実機確認済み）
 
 **機能1（カレントディレクトリ）完了（2026-08-25、実機確認済み）。**
 Stage 1-1・1-2に加えて、実装中に決めた`/tmp`への改名と`ls`の作り替えまでを
