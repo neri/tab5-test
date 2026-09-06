@@ -12,9 +12,9 @@
 | 0 | 現状確認、用語、画面契約、段階分けの固定（この文書） | 完了 |
 | 1 | 4つのアプリ区分と、座標・表示状態・hit testだけを持つ上部バー部品 | 未着手 |
 | 2 | 時計・Wi-Fi・バッテリーの共有状態と部分更新 | 未着手 |
-| 3 | 通常GUIアプリのhost、coordinator、ランチャー | 未着手 |
+| 3 | system barのイベントループ、フォーカス、タイマー、coordinator、ランチャー | 未着手 |
 | 4 | Browserを通常GUIアプリとして上部バーへ統合 | 未着手 |
-| 5 | Wi-Fi設定とバッテリー画面をミニアプリへ移行 | 未着手 |
+| 5 | Wi-Fi画面のイベント駆動化、Wi-Fi操作の段階実行、バッテリーのミニアプリ化 | 未着手 |
 | 6 | 専有GUIアプリとコンソールアプリの境界を固定 | 未着手 |
 | 7 | 入力、ミニアプリ往復、画面遷移の回帰 | 未着手 |
 | 8 | 実機受入、現状文書と本書の状態更新 | 未着手 |
@@ -44,6 +44,7 @@ Stage 4〜6で区分ごとに移す。Browserは自前toolbarの上へ別の帯�
 - 左端をランチャー、右端をWi-Fi、バッテリー、将来の音量、時計に固定する
 - 中央を現在のアプリが使うapp areaとし、Browserの操作を同じ一段へ収める
 - system領域とapp領域の描画、hit test、dirty矩形の所有者を分ける
+- system bar動作中のイベントループ、フォーカス、timer、USB／Wi-Fi処理をsystem barへ統合する
 - Browser、Console、専有GUIの前景遷移を`src/app.rs`の1つのcoordinatorへ集め、
   Wi-Fi設定とバッテリー画面は通常GUI host内のミニアプリとして往復させる
 - 通常GUI、ミニ、専有GUI、コンソールの4区分をコードと現状文書で明示する
@@ -79,8 +80,9 @@ system barの有無、画面の所有者、ミニアプリと協調できるか�
 
 ### 通常GUIアプリ
 
-通常GUIアプリは`NormalGuiHost`としてsystem bar、共有indicator、launcher、active appの
-状態をまとめて所有する。初版ではBrowserだけである。Browserのpage、scroll、履歴、
+system barの実行主体が共有indicator、launcher、active appの状態とイベントループを
+所有する。本書の`NormalGuiHost`はこの実行主体を指し、別のイベントループやフォーカス
+管理器を設けるものではない。通常GUIアプリは初版ではBrowserだけである。Browserのpage、scroll、履歴、
 編集中address、進行中の取得はBrowserの状態であり、ミニアプリへ渡さない。
 
 ミニアプリを開く前に、Browserは進行中resourceを一時停止または安全な待機状態へ移す。
@@ -89,9 +91,9 @@ system barの有無、画面の所有者、ミニアプリと協調できるか�
 
 ### ミニアプリ
 
-ミニアプリは独立したtaskでも通常GUI routeでもない。`NormalGuiHost`から同期的に呼ばれ、
-画面と必要な共有管理器を一時的に借りる。呼出元の通常GUIアプリは裏でpollされず、停止した
-値としてcall stack上に残る。
+ミニアプリは独立したtaskでも通常GUI routeでもない。system barが画面状態を保持し、
+イベントの配信先とフォーカスをミニアプリへ切り替える。呼出元の通常GUIアプリは
+裏でpollされず、停止した値としてhostに残る。画面ごとの入力待ちループは持たない。
 
 ミニアプリ自身もsystem barを表示するが、呼出元のapp固有buttonは消し、app areaには
 ミニアプリのtitle、戻る操作、必要なら短い状態だけを描く。ミニアプリ内でlauncherが押された
@@ -156,7 +158,7 @@ Wi-Fiメニューを同期呼出しし、戻るとBrowserを全面再描画す�
 このまま各画面がランチャーから互いを直接呼ぶと、`Browser → Launcher → Battery →
 Launcher → Browser`のたびにcall stackが深くなり、resourceを誰が返すかも画面ごとに
 変わる。Stage 3でConsole、通常GUI、専有GUIの前景route選択を`src/app.rs`へ戻す。
-ミニアプリだけは通常GUI hostの内側で常に同じ深さへ同期呼出しし、ミニアプリ同士や
+ミニアプリはsystem barのイベントループ内で状態と配信先を切り替え、ミニアプリ同士や
 別の通常GUIアプリを直接起動しない形にする。
 
 ### indicatorに必要な能力は揃っていない
@@ -206,9 +208,11 @@ BrowserではApp領域を、戻る52、進む52、再読込／中止52、12 pixe
 全消去buttonと内側余白を除いても90半角cell前後を表示できる。現在より短くなるが、
 既存の編集欄はcaretが見える位置へ横方向に追従するため、URL長の上限は変えない。
 
-### 2. system barはhardwareを直接所有しない
+### 2. system barがイベント処理を所有し、描画部品とhardware管理を分ける
 
-`src/app/system_bar.rs`を追加し、次だけを担当させる。
+`src/app/system_bar.rs`を入口として、実行部分と描画部品を分ける。system barの実行部分は
+イベントループ、フォーカス、タイマー、画面への配信、USB／Wi-Fiのserviceとイベント処理を
+統合する。Stage 1で先に作る描画部品は次を担当する。
 
 - system領域の背景、icon、時計文字の描画
 - appが中央へ描くための`AppRect`の提供
@@ -234,12 +238,12 @@ enum SystemAction {
     Battery,
 }
 
-struct SystemBar {
+struct SystemBarView {
     painted: Option<SystemSnapshot>,
 }
 ```
 
-active appは初回描画時にbar背景と自分のapp areaを描く。状態更新時は`SystemBar`が変更された
+active appは初回描画時にbar背景と自分のapp areaを描く。状態更新時は描画部品が変更された
 system slotだけを描き、active appの中央を塗り直さない。逆にBrowserがaddressを変えても
 時計やbatteryを塗り直さない。
 
@@ -259,7 +263,7 @@ coordinator loop
 
 NormalGuiHost(Browser)
   └─ Launcher choice
-       ├─ Mini(Network／Battery) ─→ 同期実行してBrowserへ戻る
+       ├─ Mini(Network／Battery) ─→ 配信先を切替、終了時Browserへ戻す
        ├─ Normal(other) ─────────→ FrontRouteをcoordinatorへ返す
        ├─ Console ───────────────→ FrontRouteをcoordinatorへ返す
        └─ Cancel ────────────────→ Browserを同じ状態で再描画
@@ -276,9 +280,9 @@ pointerの退避画素など、その画面だけのresourceをreturn前に閉�
 backgroundで継続しない。`wifi_manager`、`InputManager`、VFS、automountのような
 現在も画面間で共有している管理器だけをcoordinatorが保持する。
 
-ミニアプリへ入る場合はBrowserのframe loopから同期呼出しし、Browser固有resourceを閉じない。
-ただしBrowser loopはミニアプリ中にpollされず、ミニアプリが明示的に借りた共有管理器だけが
-進む。Consoleのセル内容を保持して再描画することは許すが、Console loopを裏で回すことではない。
+ミニアプリへ入る場合はsystem barがBrowserへの配信を停止し、Browserの画面状態を保持する。
+Browserの処理は進めず、共有管理器の保守はsystem barが継続する。進行中の通信resourceは
+安全な待機状態へ移し、保持不能なsocketは閉じて復帰時に再開する。Consoleのセル内容を保持して再描画することは許すが、Console loopを裏で回すことではない。
 初版のBrowserは別の`FrontRoute`への変更でpage、scroll、履歴を破棄する。将来状態を保持する場合も、
 実行中taskではなく停止した値として明示的に設計する。
 
@@ -303,8 +307,8 @@ launcher自体も同じsystem barを表示し、左端は選択中として描�
 
 launcherは選択した対象を自分で起動せず、`LaunchChoice::Mini(MiniId)`、
 `LaunchChoice::Front(FrontRoute)`、`Cancelled`のいずれかを通常GUI hostへ返す。
-CancelならhostがBrowserを全面再描画して同じframe loopを続けるため、page、scroll、履歴を
-失わない。Miniならhostが同じ深さで同期実行し、FrontならBrowserが固有resourceを閉じて
+Cancelならhostが呼出元画面を全面再描画して配信を再開するため、page、scroll、履歴を
+失わない。Miniならhostが配信先を切り替え、FrontならBrowserが固有resourceを閉じて
 coordinatorへreturnする。launcher内からappや別launcherを直接callしない。
 
 ### 5. indicatorは実際に分かる状態だけを表示する
@@ -361,10 +365,13 @@ appへ渡さない。逆にcontentで始まったdragがbarへ入ってもlaunch
 現在の`pointer.rs`の「cursorを外す→下を描く→cursorを載せる→和集合をflush」を維持する。
 
 keyboardの既存割当ては変えない。初版のlauncherには矢印、Page Up／Down、Enter、Escapeを
-与える。全画面共通shortcutはCardKBにCtrlが無いこととBrowserの既存キーとの衝突を解決する
-まで追加せず、launcherへの確実な入口はbar左端のtap／clickとする。
+与える。keyboardからbarへフォーカスを移す操作は、CardKBにCtrlが無いこととBrowserの既存キーとの
+衝突を考慮してStage 3で決める。tap／clickに加えkeyboardだけでもlauncherへ到達できるようにする。
 
 ### 7. full-width barを毎回flushしない
+
+イベントhandlerは状態とdirtyを更新し、描画とflushはsystem barがframe境界でまとめる。
+イベントごとに全画面描画を行わず、pointerの退避・復元も同じ描画経路へ集める。
 
 CW回転ではlogical x幅がwritebackするnative連続範囲の大きさを決める。高さ48 pixelでも
 `flush_rect(0, 0, WIDTH, 48)`を時計更新のたびに行えば、全幅分の高いcostを払う。
@@ -405,6 +412,48 @@ C6受信やUSB HID Splitのように停止すると低層状態を壊すservice�
 
 ## 画面別の移行
 
+### 共通イベント契約
+
+system barが動作している通常GUI、launcher、ミニアプリでは、キー、touch、mouse、
+タイマー、USB／Wi-Fiのイベントをsystem bar経由で処理する。system操作として消費した
+入力を画面へ二重配信しない。画面は必要な定期処理をタイマーとして登録し、独自の待機loopを
+持たず、handlerから短時間で戻る。通信やI/Oをタイマーhandlerへ移すだけで長い同期待ちが
+解消するわけではないため、処理自体も段階実行できるようにする。
+
+USBの`service_fast`やC6受信など、イベント生成に必要な低層保守もsystem barが進める。
+画面イベントの消費や描画frameだけを待たず、現在必要な非描画wakeでの保守頻度を維持する。
+driver、`InputManager`、`wifi_manager`のhardware所有と接続policyは再利用する。
+表示用の状態通知を最新値へまとめる場合でも、切断によるsocketやdevice handleの無効化と
+resource解放を省略しない。停止中画面へ通知するために、その画面のhandlerを裏で回さない。
+
+Consoleと専有GUIでは既存loopと既存のUSB／Wi-Fi保守経路を使う。system barを非表示の
+常駐実行基盤にはせず、coordinatorで共有管理器を引き渡す。前後のloopによる二重pollを
+防ぎ、古い画面宛ての保留イベントと押下状態を次のrouteへ持ち越さない。
+
+#### フォーカスと遷移
+
+keyboardの配信先はsystem barが管理し、launcher表示中は背後のBrowserへ配信しない。
+Escapeは現在の画面・フォーカスに応じてlauncherを閉じる、miniから戻る、Browser内の
+取消操作へ振り分け、複数の操作へ同時に使わない。keyboardフォーカスとpointerのgesture
+所有は別に保持し、contentで始まったdragはbarへ移動してもcontentへ送り続ける。
+
+handlerは画面を直接呼ばず遷移要求を返す。system barはhandlerが戻った後に旧画面への
+配信を止め、押下をcancelし、必要なtimer解除とresource解放を行ってから次画面を有効にする。
+遷移を起こした入力のreleaseや取得済み入力が新画面を操作しないよう境界を設ける。
+mini→miniは状態の入替えとし、call stackを深くしない。
+
+#### タイマー
+
+- タイマーごとに未消費イベントは最大1件とし、消費されるまで次のイベントを発火しない。
+  消費はhandlerが処理を完了して戻った時点とする。
+- 停止中画面のtimerイベントは配信せず、保留は最大1件に留める。画面終了時は登録と
+  保留イベントを破棄し、終了済み画面や同じIDを再利用した別画面へ届けない。
+- 復帰時、定時性が重要なtimerは元の周期を基準に期限を調整する。経過した周期の回数分を
+  まとめて発火しない。定時性が不要なtimerは遅れを調整せず、復帰後の処理から通常間隔で再開する。
+- 定時性の要否はtimerごとに指定する。共有サービスのtimerは停止中画面のtimerと区別し、
+  miniやlauncher表示中も必要な保守を継続する。
+- 通信timeoutなどの実時間の期限は画面停止で延長せず、復帰時に現在時刻で判定する。
+
 ### Consoleとコンソールアプリ
 
 `Console`の`TOP=8`、列数156、行数44を変えない。system barのgeometryをConsoleへ持ち込まず、
@@ -418,7 +467,8 @@ system barなしでConsole全体を再描画する。
 ### Browser
 
 `TOOLBAR_HEIGHT=48`、`VIEWPORT_TOP=56`、`VIEWPORT_BOTTOM=688`、status 32 pixelは維持する。
-変えるのはtoolbar内部の横配置と所有者だけで、縦の本文行数を減らさない。
+画面配置の変更はtoolbar内部の横配置と所有者に限り、縦の本文行数を減らさない。
+実行構造は共通イベント契約へ移し、独自の入力pollとWi-Fi menu同期呼出しを除く。
 
 - 左端へlauncher slotを追加する
 - 戻る／進む／再読込をapp area左へ移す
@@ -433,12 +483,33 @@ launcherで別の`FrontRoute`を選んだ場合はBrowserを終了し、socket�
 
 ### Network settingsミニアプリ
 
+既存Wi-Fi menuの待機loopを流用せず、一覧、パスワード入力、接続中、結果、確認・エラーを
+画面状態として持つUIへ作り直す。入力・フォーカス・定期処理はsystem barから受け取り、
+スキャンや接続は開始要求を出して戻り、Wi-Fiイベントで状態と表示を更新する。
+閉じる／別miniへの切替も遷移要求として返す。接続管理と資格情報の管理は既存managerを活かす。
+
+現状の移行対象は`wifi_menu.rs`の`edit_password`、`choose_profile`、`wait_*`、
+`confirm_forget`、`connect_and_configure`の内部待機と、Browserの`open_wifi_menu`による
+同期呼出しである。`choose_profile`は下記の仕様変更により削除する。
+さらに`wifi::station::scan`は`block=true`で要求し、`Rpc::call`は応答待ちに15秒の設定を
+持つ（実測停止時間ではない）。スキャン、初期化、ON/OFF、接続開始等の同期RPC経路を
+点検し、system barから使う操作は開始と完了／失敗を分離する。Console用の同期APIは残せる。
+
 現在のheader 78 pixelのうち上48 pixelをsystem barに置き換える。残る30 pixelと
 `y=78..94`を列見出し／余白に使い、`LIST_TOP=94`、row高32、footer位置は初版で維持する。
 タイトルまたは現在状態はapp areaへ置き、右のWi-Fi slotは選択中の詳細先として描く。
 自分自身を開くtapは無視し、ON/OFFや再scanは画面内の既存操作だけで行う。
 
+システムバー移行時に、接続時の「保存して自動接続／今回だけ接続」の選択画面を廃止する。
+メニューから選択した接続は常に`ProfileChoice::SaveAndAutoConnect`相当とし、必要な
+パスワード入力後は保存方式を再確認せず接続へ進む。メニューには一時接続の選択肢を置かない。
+保存の実行タイミングと失敗時の扱いは既存の保存接続経路を引き継ぐ。
+これはStage 5で変更する仕様であり、移行前のWi-Fi menuには適用済みではない。
+
 ### Battery detailsミニアプリ
+
+現状の`battery::run`にある測定loopと、初期化失敗時の`wait_for_key`を廃止し、
+共有monitorの更新とtimer／入力イベントで表示を進める。エラー表示中もbarを操作できる。
 
 共有`BatteryMonitor`のsampleを表示し、自分で別のINA226 instanceを初期化しない。
 contentの幾何学中心は`y=48..720`の中央から求め、固定値を単純に48 pixel足して下端を
@@ -482,12 +553,16 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 ### Stage 3: 通常GUI host、coordinator、ランチャー
 
 - 初回route後の`src/app.rs`を`FrontRoute`のcoordinator loopへ分ける
+- system barの実行主体へイベントループ、フォーカス、USB／Wi-Fiのserviceと配信を統合する
+- timerの未消費1件制限、停止／復帰／終了、定時性に応じた期限調整を実装する
+- handler終了後の遷移適用、入力の消費、gesture cancel、旧画面イベントの破棄を一元化する
+- keyboardだけでbarとlauncherへ到達する操作を決め、既存Browser操作との衝突を検査する
 - `NormalGuiHost`、`MiniId`、`MiniOutcome`と、各区分が借りる共有contextを定義する
 - appからappを直接起動する経路を増やさない
 - launcherを通常GUI host内のmodal system componentとして追加する
 - Network、Battery、条件付きVolume、Console、Cancelを区分付きで返す
 - CancelではBrowserの状態を保って再描画し、`FrontRoute`選択時だけBrowserがreturnする
-- Mini選択ではhostが同期実行し、mini自身は選択先を直接起動しない
+- Mini選択ではsystem barが状態と配信先を切り替え、mini自身は選択先を直接起動しない
 - route終了時にBrowser socket、VFS handle、pointer下地が残らない検査点を置く
 - reboot／shutdownとBrowser終了後Consoleを維持する
 - Startup完了後はOnlineでなくてもBrowserへ進み、ミニアプリを直接開かない
@@ -497,7 +572,7 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 - Browser toolbarをsystem barのapp areaへ移す
 - 既存Wi-Fi icon、描画、hit testをsystem側へ一本化する
 - system/app dirtyを分離する
-- Browserの状態を保持したままlauncherとミニアプリを同期実行するhost loopを追加する
+- Browserの独自loopをsystem barからイベントを受け取る形へ移し、launcher／mini中は状態を保持して配信を止める
 - URL本文64 cell以上、全消去、caret、3button、南京錠の非重なりassertを置く
 - touch／mouseでlauncherとBrowser buttonを境界まで押し分ける
 - Network settings往復、取得中cancel、再接続待ち、local file handleのcleanupを回帰する
@@ -505,8 +580,14 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 
 ### Stage 5: ミニアプリ
 
-- Wi-Fi menuをNetwork settingsミニアプリへ変え、headerをbar＋既存listへ分ける
+- Wi-Fi menuをイベント駆動のNetwork settingsとして作り直し、headerをbar＋一覧へ分ける
+- パスワード入力、接続待ち、結果、確認、エラーを状態化し、内部入力待ちloopを除く
+- スキャン・初期化・ON/OFF・接続開始等を点検し、GUI経路の同期RPC待ちを段階実行へ移す
+- 接続管理は既存managerを再利用し、Console用の同期APIと挙動を維持する
+- batteryの測定をtimerへ移し、初期化失敗時も入力待ち関数を直接呼ばない
 - Wi-Fi状態変化をbarと一覧へ同じmanagerから反映する
+- 保存／一時接続の選択画面を削除し、メニューからの接続は常に保存して自動接続する経路へ送る
+- 暗号化APとopen APの両方で保存方式の選択画面を経由せず、既存の保存接続経路へ進むことを確認する
 - battery UIをBattery detailsミニアプリへ変え、共有monitorから表示する
 - ミニアプリ終了で`Dismissed`、別ミニ選択で`Open(MiniId)`を返す
 - Wi-Fi／batteryの自分自身を開くsystem actionを無視する
@@ -530,6 +611,10 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 
 ### Stage 7: 入力と画面遷移の回帰
 
+- timerが未消費中に再発火しないこと、復帰時の定時性別の期限、終了後の配信禁止をtestする
+- modal中のkeyboard配信先、入力の二重配信禁止、遷移時のrelease漏れ防止をtestする
+- Console／専有GUIとの往復でUSB／Wi-Fiの二重pollや保守の引継ぎ漏れがないことを確認する
+- Wi-Fiのスキャン・接続待ち・RPC timeout中もbarが応答し、handler所要時間が許容内か実測する
 - 通常GUI、launcher、ミニアプリのbar gesture所有を回帰する
 - mini→miniの入替えでcall stackが深くならないことをtestする
 - launcher Cancel、mini Dismiss、Normal／Console切替を区別する
@@ -547,8 +632,10 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 - [`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)へ44行維持、bar非表示、`wifi`／`battery`の
   Console上の挙動を記録する
 - [`INPUT.md`](INPUT.md)へbar gestureの所有規則を記録する
+- イベント配信、フォーカス、timerの契約を[`APPS.md`](APPS.md)へ記録する
 - [`RTC.md`](RTC.md)へsystem clockの表示元とinvalid表示を記録する
 - [`WIFI.md`](WIFI.md)へNetwork settingsの入口と通常GUI hostとの協調を記録する
+- [`WIFI.md`](WIFI.md)へGUI操作の段階実行、保存方式選択の廃止、常時保存の仕様を記録する
 - [`FILE_LAYOUT.md`](FILE_LAYOUT.md)へ`system_bar.rs`、launcher、battery monitor、
   coordinatorの責務を記録する
 - `DESIGN.md`の起動分岐とsystem barの現状説明を実装へ同期する
@@ -572,6 +659,11 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 | Browser | launcherからConsoleへ | Browserを終了し、socketとfile handleを保持せずConsoleへ移る |
 | Mini | NetworkからBatteryへ切替 | 一度hostへ戻して同じ深さで入れ替え、Browser状態を保つ |
 | Wi-Fi | OFF→ON→association→DHCP | 同じslotが0→1→2→3段階へ進む |
+| Wi-Fi | スキャン／接続待ち／RPC無応答 | bar操作と必要なUSB／Wi-Fi保守を継続し、失敗をイベントで処理する |
+| Wi-Fi | 暗号化AP／open APを選択 | 保存方式選択を出さず保存接続へ進み、保存失敗は既存規則で扱う |
+| Timer | 未消費のまま複数周期経過 | 未処理は1件だけで、追加発火しない |
+| Timer | miniから復帰／画面終了 | 定時性に応じて再開し、終了済み画面へ配信しない |
+| Focus | keyboardでlauncherを開閉 | 背後の画面へ入力が漏れず、閉じた後に適切なフォーカスへ戻る |
 | Wi-Fi | 認証停止／C6 link loss | error markerまたは再接続段階になり、古いOnlineを残さない |
 | Battery | INA226あり | 約1秒周期のsampleでicon段階と詳細値が同じになる |
 | Battery | INA226なし／一時I2C失敗 | 不明表示になり、0%を捏造せず、他入力が止まらない |
@@ -609,6 +701,11 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 
 次は計画時点で数値を断定せず、Stageごとの実機比較で決める。
 
+Stage 3の実装前には、barへのkeyboardフォーカス移動キー、touchとmouseの同時操作時の
+優先順位、clock／空白slot上のwheelの扱い、drag-out後に元のtargetへ戻った場合の取消規則も
+決める。イベント種別ごとのqueue上限と過負荷時の扱い、handlerの許容実行時間は低層serviceの
+期限と実測から決める。これらは議論で挙がった未決事項であり、以下の画面寸法の判断とは分ける。
+
 1. launcherの52 pixel幅で、左端とBrowserの戻るを指で押し分けられるか
 2. Wi-Fi／battery各48 pixelと時計80 pixelが、bitmap fontとiconの見た目に足りるか
 3. 音量reserveの空白が不自然なら、slot境界を描かず単なる余白として見せるか
@@ -621,6 +718,22 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 
 ## 判断記録
 
+### 2026-09-06: system barへイベント処理を統合
+
+- system bar動作中はイベントループ、フォーカス、timer、USB／Wi-Fiイベントを統合する
+- 各画面は短時間で戻るhandlerと状態を持ち、定期処理はtimerイベントで進める
+- timerは消費まで再発火しない。復帰時は定時性が必要な処理だけ周期に合わせて時間調整する
+- Consoleと専有GUIは既存loopを維持する。system barを非表示の常駐基盤にする案は採用しない
+- miniの同期呼出し・call stack保持案を、hostによる停止状態保持とイベント配信先切替へ変更する
+- Wi-Fi画面は移行時に作り直し、待機loopとGUIからの長い同期RPC待ちを除く
+- 入力の所有、遷移境界、timerの寿命、frame単位の描画を共通契約として扱う
+
+### 2026-09-06: Wi-Fiメニューの保存方式を統一
+
+- システムバー移行に合わせ、保存して接続するか一時接続するかを選ぶ画面を廃止する
+- メニューからの接続は常に保存して自動接続する扱いにする
+- 実装変更はStage 5で行い、保存タイミングと保存失敗時の扱いは既存の保存接続経路を引き継ぐ
+
 ### 2026-08-31: plan作成時
 
 - 上端へsystem barを追加するのではなく、Browserが既に使う48 pixelのtoolbarを
@@ -631,7 +744,8 @@ contentの幾何学中心は`y=48..720`の中央から求め、固定値を単�
 - Consoleはsystem bar対象にせず、上端8 pixelと156列×44行を維持する
 - task、window manager、background appを導入せず、coordinatorが1つの前景routeだけを実行する
 - launcherは初版でoverlay popupにせず、bar下のcontentを一時的に使うmodal画面にする。
-  Cancelなら通常GUIアプリを状態ごと継続し、ミニアプリ選択なら同期実行する
+  Cancelなら通常GUIアプリを状態ごと継続する。当初のミニアプリ同期実行案は
+  2026-09-06のイベント配信先切替方式で置き換える
 - Network settings、Battery details、将来のVolumeをミニアプリとし、Browserの状態を保って往復する
 - 専有GUIアプリとコンソールアプリはsystem barもミニアプリ入口も持たない
 - Startupは区分外のsystem screenとし、完了後はofflineでもBrowserへ進む
