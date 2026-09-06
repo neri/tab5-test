@@ -1,107 +1,8 @@
-//! Full-screen live battery monitor entered through the `battery` command.
+//! Battery details rendering.
 
-use crate::framebuffer::{BLACK, CYAN, Framebuffer, GREEN, RED, WHITE, WIDTH, YELLOW};
-use crate::ina226::{BatterySample, Ina226, InitError};
-use crate::input::InputManager;
-use crate::{interrupts, uart};
-
-const UPDATE_INTERVAL_FRAMES: u32 = 57;
-const PACK_EMPTY_MV: u32 = 6_000;
-const PACK_FULL_MV: u32 = 8_230;
-
-/// Opens the battery monitor.  Any managed keyboard key returns to the shell.
-pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
-    let monitor = match Ina226::init() {
-        Ok(monitor) => monitor,
-        Err(error) => {
-            show_unavailable(framebuffer, error);
-            input.wait_for_key();
-            return;
-        }
-    };
-    uart::log(b"Battery: INA226 monitor ready\r\n");
-
-    let mut sample = monitor.read_sample();
-    draw_all(framebuffer, sample, monitor.address());
-    let mut sequence = interrupts::frame_sequence();
-    let mut last_update = sequence;
-    let mut read_failure_reported = false;
-
-    loop {
-        if interrupts::dma_error() != 0 {
-            uart::log(b"Battery: DMA interrupt error\r\n");
-            return;
-        }
-        interrupts::wait_for_interrupt();
-        let next_sequence = interrupts::frame_sequence();
-        if next_sequence == sequence {
-            input.service_fast();
-            continue;
-        }
-        sequence = next_sequence;
-        // As in the axis diagnostic, do not service an empty USB root port
-        // here: its debounce/reset work would make a live reading stutter.
-        if input.poll_key().is_some() {
-            return;
-        }
-        if sequence.wrapping_sub(last_update) < UPDATE_INTERVAL_FRAMES {
-            continue;
-        }
-        last_update = sequence;
-        match monitor.read_sample() {
-            Some(next) => {
-                sample = Some(next);
-                read_failure_reported = false;
-            }
-            None if !read_failure_reported => {
-                uart::log(b"Battery: INA226 read failed; retaining last reading\r\n");
-                read_failure_reported = true;
-            }
-            None => {}
-        }
-        draw_all(framebuffer, sample, monitor.address());
-    }
-}
-
-fn draw_all(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, address: u8) {
-    draw_scene(framebuffer, sample, address);
-    if !framebuffer.flush() {
-        uart::log(b"Battery: framebuffer flush failed\r\n");
-        return;
-    }
-}
-
-fn draw_scene(framebuffer: &mut Framebuffer, sample: Option<BatterySample>, address: u8) {
-    framebuffer.fill(BLACK);
-    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 2, CYAN, None);
-    let mut device_text = Text::new();
-    device_text.push_str("TAB5 / INA226 / I2C 0X");
-    device_text.push_hex_byte(address);
-    device_text.push_str(" / 5 MOHM");
-    framebuffer.draw_text(34, 70, device_text.as_str(), 1, WHITE, None);
-    framebuffer.draw_line(32, 100, WIDTH - 32, 100, CYAN);
-
-    match sample {
-        Some(sample) => draw_reading(framebuffer, sample),
-        None => {
-            let waiting = "WAITING FOR INA226 DATA";
-            // Centred from the text's own width: at scale 2 the drawn width
-            // is twice the measured one, so half of it is that measurement.
-            let x = WIDTH / 2 - crate::font::text_width(waiting);
-            framebuffer.draw_text(x, 300, waiting, 2, YELLOW, None);
-            draw_battery(framebuffer, 0, RED);
-        }
-    }
-    framebuffer.draw_text(
-        32,
-        674,
-        "LIVE UPDATE: 1 S       PRESS ANY KEY TO EXIT",
-        1,
-        WHITE,
-        None,
-    );
-}
-
+use super::theme;
+use crate::framebuffer::{Framebuffer, WIDTH};
+use crate::ina226::BatterySample;
 fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     let percent = voltage_percent(sample.bus_voltage_mv);
     let level_color = level_color(percent);
@@ -112,7 +13,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     text.push_u32(percent);
     text.push_str("%");
     framebuffer.draw_text(68, 530, text.as_str(), 1, level_color, None);
-    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, WHITE, None);
+    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, theme::TEXT, None);
 
     draw_value(
         framebuffer,
@@ -120,7 +21,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
         148,
         "PACK VOLTAGE",
         voltage_text(sample.bus_voltage_mv).as_str(),
-        CYAN,
+        theme::ACCENT,
     );
     draw_value(
         framebuffer,
@@ -144,7 +45,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
         514,
         "SHUNT VOLTAGE",
         shunt_text(sample.shunt_voltage_uv).as_str(),
-        WHITE,
+        theme::TEXT,
     );
 }
 
@@ -157,13 +58,13 @@ fn draw_battery(framebuffer: &mut Framebuffer, percent: u32, color: u16) {
     const CAP_HEIGHT: usize = 100;
     const INNER: usize = 16;
 
-    framebuffer.stroke_rect(LEFT, TOP, BODY_WIDTH, BODY_HEIGHT, WHITE);
+    framebuffer.stroke_rect(LEFT, TOP, BODY_WIDTH, BODY_HEIGHT, theme::TEXT);
     framebuffer.stroke_rect(
         LEFT + BODY_WIDTH,
         TOP + (BODY_HEIGHT - CAP_HEIGHT) / 2,
         CAP_WIDTH,
         CAP_HEIGHT,
-        WHITE,
+        theme::TEXT,
     );
     let available_height = BODY_HEIGHT - INNER * 2;
     let filled = available_height * percent as usize / 100;
@@ -188,8 +89,8 @@ fn draw_battery(framebuffer: &mut Framebuffer, percent: u32, color: u16) {
         TOP + (BODY_HEIGHT - crate::font::HEIGHT * 2) / 2,
         text.as_str(),
         2,
-        WHITE,
-        Some(BLACK),
+        theme::TEXT,
+        Some(theme::BACKGROUND),
     );
 }
 
@@ -201,40 +102,23 @@ fn draw_value(
     value: &str,
     value_color: u16,
 ) {
-    framebuffer.draw_text(x, y, label, 1, WHITE, None);
+    framebuffer.draw_text(x, y, label, 1, theme::TEXT, None);
     framebuffer.draw_text(x, y + 34, value, 2, value_color, None);
-    framebuffer.draw_line(x, y + 102, WIDTH - 54, y + 102, 0x39E7);
+    framebuffer.draw_line(x, y + 102, WIDTH - 54, y + 102, theme::BORDER);
 }
 
-fn voltage_percent(voltage_mv: u32) -> u32 {
-    voltage_mv
-        .saturating_sub(PACK_EMPTY_MV)
-        .saturating_mul(100)
-        .checked_div(PACK_FULL_MV - PACK_EMPTY_MV)
-        .unwrap_or(0)
-        .min(100)
+fn voltage_percent(mv: u32) -> u32 {
+    tab5_system_ui::voltage_percent(mv)
 }
 
 fn level_color(percent: u32) -> u16 {
     if percent <= 15 {
-        RED
+        theme::ERROR
     } else if percent <= 45 {
-        YELLOW
+        theme::WARNING
     } else {
-        GREEN
+        theme::SUCCESS
     }
-}
-
-fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
-    framebuffer.fill(BLACK);
-    framebuffer.draw_text(32, 26, "BATTERY MONITOR", 2, CYAN, None);
-    framebuffer.draw_text(32, 160, error.message(), 2, RED, None);
-    framebuffer.draw_text(32, 220, "PRESS ANY KEY TO EXIT", 1, YELLOW, None);
-    if !framebuffer.flush() {
-        uart::log(b"Battery: unavailable-screen flush failed\r\n");
-        return;
-    }
-    uart::log(error.log_message());
 }
 
 struct Text {
@@ -284,12 +168,6 @@ impl Text {
     fn push_signed(&mut self, value: i32) {
         self.push_byte(if value < 0 { b'-' } else { b'+' });
         self.push_u32(value.unsigned_abs());
-    }
-
-    fn push_hex_byte(&mut self, value: u8) {
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        self.push_byte(HEX[(value >> 4) as usize]);
-        self.push_byte(HEX[(value & 0x0F) as usize]);
     }
 
     fn as_str(&self) -> &str {
@@ -348,4 +226,29 @@ fn push_fraction(text: &mut Text, remainder: u32, digits: u32) {
         let digit = (scaled / 10u32.pow(position)) % 10;
         text.push_byte(b'0' + digit as u8);
     }
+}
+
+/// Draws only content. The host owns the bar and the writeback boundary.
+pub fn draw_details(fb: &mut Framebuffer, monitor: &super::battery_monitor::BatteryMonitor) {
+    fb.fill_rect(0, 48, WIDTH, 672, theme::BACKGROUND);
+    if let Some(sample) = monitor.sample {
+        draw_reading(fb, sample);
+    } else {
+        fb.draw_text(
+            32,
+            300,
+            monitor.error.unwrap_or("WAITING FOR INA226 DATA"),
+            2,
+            theme::TEXT,
+            None,
+        );
+    }
+    fb.draw_text(
+        32,
+        674,
+        "VOLTAGE ESTIMATE ONLY / ESC BACK / F3 LAUNCHER",
+        1,
+        theme::TEXT,
+        None,
+    );
 }

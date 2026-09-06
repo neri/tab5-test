@@ -67,7 +67,7 @@ impl Visual {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum InitialRoute {
     Browser,
-    WifiMenu,
+    Desktop,
     Console,
 }
 
@@ -146,10 +146,14 @@ pub fn run(
 
         if usb_app.is_done() && wifi_app.is_done() {
             wifi.finish_startup_retry_policy();
-            return if wifi_app.is_online() {
+            // Use the current link state: USB setup can outlast the first
+            // successful Wi-Fi verdict, and the link may have dropped since.
+            return if matches!(wifi.state(), WifiState::Online(_))
+                && wifi.stack().is_some_and(crate::net::Stack::has_address)
+            {
                 InitialRoute::Browser
             } else {
-                InitialRoute::WifiMenu
+                InitialRoute::Desktop
             };
         }
     }
@@ -471,10 +475,6 @@ impl WifiStartup {
 
     const fn is_done(&self) -> bool {
         self.done
-    }
-
-    const fn is_online(&self) -> bool {
-        self.online
     }
 }
 

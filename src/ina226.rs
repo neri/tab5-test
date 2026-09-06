@@ -57,13 +57,6 @@ impl InitError {
             Self::Configure => "INA226 CONFIGURATION FAILED",
         }
     }
-
-    pub fn log_message(self) -> &'static [u8] {
-        match self {
-            Self::NotFound => b"Battery: INA226 identity read failed\r\n",
-            Self::Configure => b"Battery: INA226 configuration write failed\r\n",
-        }
-    }
 }
 
 /// The Tab5 battery power monitor on the board I2C bus.
@@ -86,11 +79,6 @@ impl Ina226 {
         }
         crate::uart::log_hex(b"Battery: INA226 found at I2C address=0x", address as u32);
         Ok(Self { bus, address })
-    }
-
-    /// The verified 7-bit I2C address of this monitor.
-    pub fn address(&self) -> u8 {
-        self.address
     }
 
     /// Reads shunt voltage, pack voltage, and calibrated current.

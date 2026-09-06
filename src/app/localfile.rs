@@ -229,6 +229,11 @@ fn build_listing(
     let mut overflowed = false;
     let mut failed: Option<Error> = None;
     let outcome = vfs.list(devices, path, |entry| {
+        // The page already provides its own parent link. Skip filesystem
+        // dot entries before counting visible entries toward the limit.
+        if matches!(entry.name, "." | "..") {
+            return;
+        }
         if failed.is_some() {
             return;
         }

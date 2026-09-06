@@ -186,6 +186,7 @@ struct TxBuffer([u8; MAX_FRAME_BYTES]);
 /// in step with the slave, so there is exactly one of these per activated
 /// C6.
 pub struct Transport {
+    bounded_send: bool,
     /// The activated card. Held because dropping it would not stop the
     /// transport working, but keeping it makes the ownership obvious and
     /// gives callers the bus details.
@@ -217,6 +218,7 @@ pub fn bring_up() -> Option<(Transport, SlaveInfo)> {
     let card = sdio::init()?;
 
     let mut transport = Transport {
+        bounded_send: false,
         card,
         rx_byte_count: 0,
         tx_buffer_count: 0,
@@ -260,6 +262,9 @@ pub fn bring_up() -> Option<(Transport, SlaveInfo)> {
 }
 
 impl Transport {
+    pub fn set_bounded_send(&mut self, bounded: bool) {
+        self.bounded_send = bounded;
+    }
     /// Whether the link is still usable. Once the C6 stops answering there
     /// is nothing to be done about it from here -- the card has to be
     /// activated again from scratch -- so callers should drop the transport
@@ -531,7 +536,11 @@ impl Transport {
 
     /// Waits until the slave has at least `needed` receive buffers free.
     fn wait_for_slave_buffers(&mut self, needed: u32) -> bool {
-        for _ in 0..TX_BUFFER_ATTEMPTS {
+        for _ in 0..if self.bounded_send {
+            1
+        } else {
+            TX_BUFFER_ATTEMPTS
+        } {
             let Some(raw) = self.read_slave_register32(REG_TOKEN_READ_DATA) else {
                 return false;
             };
@@ -540,7 +549,9 @@ impl Transport {
             if available >= needed {
                 return true;
             }
-            delay_ms(TX_BUFFER_POLL_MS);
+            if !self.bounded_send {
+                delay_ms(TX_BUFFER_POLL_MS);
+            }
         }
         false
     }
@@ -746,4 +757,77 @@ fn parse_init_event(payload: &[u8]) -> Option<SlaveInfo> {
     }
 
     Some(info)
+}
+
+/// GUI bring-up keeps the long reset and private init-event waits outside
+/// handlers. The synchronous boot/console entry point remains unchanged.
+pub struct BringUp {
+    activation: sdio::Activation,
+    transport: Option<alloc::boxed::Box<Transport>>,
+    deadline: u64,
+}
+impl BringUp {
+    pub fn new() -> Self {
+        Self {
+            activation: sdio::Activation::new(),
+            transport: None,
+            deadline: 0,
+        }
+    }
+    pub fn poll(&mut self, now: u64) -> Option<Result<Transport, ()>> {
+        if self.transport.is_none() {
+            let card = match self.activation.poll(now)? {
+                Ok(card) => card,
+                Err(()) => return Some(Err(())),
+            };
+            let transport = Transport {
+                bounded_send: true,
+                card,
+                rx_byte_count: 0,
+                tx_buffer_count: 0,
+                sequence: 0,
+                // Until the slave says otherwise, fill the checksum in: a slave that
+                // ignores it does not mind, one that checks it would drop the frame.
+                checksum_enabled: true,
+                throttled: false,
+                buffer: DmaBuffer([0; STAGING_BYTES]),
+                tx_buffer: TxBuffer([0; MAX_FRAME_BYTES]),
+                parsed: 0,
+                unparsed: 0,
+                register_failures: 0,
+                link_lost: false,
+            };
+
+            if !transport
+                .write_slave_register(REG_HOST_TO_SLAVE_INTERRUPT, HOST_INTERRUPT_OPEN_DATA_PATH)
+            {
+                return Some(Err(()));
+            }
+            self.transport = Some(alloc::boxed::Box::new(transport));
+            self.deadline =
+                now.saturating_add(INIT_EVENT_ATTEMPTS as u64 * INIT_EVENT_POLL_MS as u64);
+            return None;
+        }
+        let transport = self.transport.as_mut()?;
+        let mut payload = [0u8; MAX_PAYLOAD_BYTES];
+        if let Some(frame) = transport.receive(&mut payload) {
+            if frame.if_type == IF_PRIV {
+                if let Some(info) = parse_init_event(&payload[..frame.length]) {
+                    if info.streaming_mode {
+                        return Some(Err(()));
+                    }
+                    transport.checksum_enabled = info.capabilities & CAPABILITY_CHECKSUM != 0;
+                    if !transport.send_host_configuration(info.chip_id) {
+                        return Some(Err(()));
+                    }
+                    return Some(Ok(*self.transport.take().expect("initialized transport")));
+                }
+            }
+        }
+        if now >= self.deadline {
+            Some(Err(()))
+        } else {
+            None
+        }
+    }
 }

@@ -78,6 +78,7 @@ enum Group {
 /// than something the console discovers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cmd {
+    Win,
     Help,
     Clear,
     Echo,
@@ -108,8 +109,6 @@ enum Cmd {
     Coordtest,
     Fonttest,
     Axistest,
-    Battery,
-    Win,
     Tls,
     Entropy,
     Rtc,
@@ -161,6 +160,8 @@ enum Cmd {
     Usbwritetest,
     Usbmbr,
     Wifi,
+    Wifion,
+    Wifioff,
     Wifiinfo,
     Wifiup,
     Wifimac,
@@ -336,7 +337,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         usage: "ui",
         lines: &[
             "run 100 real console scrolls, then visit the coordinate, paint,",
-            "touch, axis, and desktop screens. interact with each screen and",
+            "touch and axis screens. interact with each screen and",
             "press any key to advance; the final screen reports underruns.",
         ],
     },
@@ -510,29 +511,6 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         id: Cmd::Axistest,
         usage: "axistest",
         lines: &["tilt-controlled BMI270 ball test; any key exits"],
-    },
-    HelpEntry {
-        name: "battery",
-        aliases: &["batinfo"],
-        group: Group::Product,
-        id: Cmd::Battery,
-        usage: "battery",
-        lines: &[
-            "live INA226 battery monitor: pack voltage, current, power, and",
-            "a voltage-based estimate; any key exits",
-        ],
-    },
-    HelpEntry {
-        name: "win",
-        aliases: &[],
-        group: Group::Scaffold,
-        id: Cmd::Win,
-        usage: "win",
-        lines: &[
-            "Windows 95 desktop mock-up: a USB HID Boot Mouse moves the",
-            "pointer and drags the window by its title bar, and the taskbar",
-            "shows the RTC clock; any key exits",
-        ],
     },
     HelpEntry {
         name: "tls",
@@ -1137,109 +1115,126 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wifi,
-        usage: "wifi [on|off|status|forget]",
+        usage: "wifi <subcommand> [arguments]",
         lines: &[
-            "without an argument, open the Wi-Fi setup screen; on/off is",
-            "persistent, status reports manager state, and forget deletes",
-            "the saved profile. menu connections request DHCP automatically",
+            "on / off: persist the radio setting; status: manager, IPv4 and AP",
+            "scan / connect <ssid> [password] / disconnect / forget",
+            "info / up / mac / saved / log: diagnostics",
+            "help wifi <subcommand> shows details. GUI settings are in the system bar.",
         ],
     },
     HelpEntry {
-        name: "wifiinfo",
+        name: "wifi on",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifion,
+        usage: "wifi on",
+        lines: &["enable Wi-Fi and save the setting for next boot"],
+    },
+    HelpEntry {
+        name: "wifi off",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Wifioff,
+        usage: "wifi off",
+        lines: &["disable Wi-Fi and save the setting for next boot"],
+    },
+    HelpEntry {
+        name: "wifi info",
         aliases: &[],
         group: Group::Scaffold,
         id: Cmd::Wifiinfo,
-        usage: "wifiinfo",
+        usage: "wifi info",
         lines: &[
             "power and activate the ESP32-C6 as an SDIO card, show its",
             "CIS identifiers and bus setup",
         ],
     },
     HelpEntry {
-        name: "wifiup",
+        name: "wifi up",
         aliases: &[],
         group: Group::Scaffold,
         id: Cmd::Wifiup,
-        usage: "wifiup",
+        usage: "wifi up",
         lines: &[
             "bring up the ESP-Hosted link to the ESP32-C6 and show what the",
             "slave firmware reports about itself",
         ],
     },
     HelpEntry {
-        name: "wifimac",
+        name: "wifi mac",
         aliases: &[],
         group: Group::Scaffold,
         id: Cmd::Wifimac,
-        usage: "wifimac",
+        usage: "wifi mac",
         lines: &[
             "bring up the link and ask the C6 for its station MAC address",
             "over RPC (one request/response round trip)",
         ],
     },
     HelpEntry {
-        name: "wifiscan",
+        name: "wifi scan",
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wifiscan,
-        usage: "wifiscan",
+        usage: "wifi scan",
         lines: &[
             "bring up the C6, start Wi-Fi in station mode and list the",
             "access points it can see",
         ],
     },
     HelpEntry {
-        name: "wificonnect",
+        name: "wifi connect",
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wificonnect,
-        usage: "wificonnect <ssid> [password]",
+        usage: "wifi connect <ssid> [password]",
         lines: &[
             "join an access point and report the result. this associates",
             "only; run 'ipconfig dhcp' afterwards to get an address",
         ],
     },
     HelpEntry {
-        name: "wifistatus",
+        name: "wifi status",
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wifistatus,
-        usage: "wifistatus",
-        lines: &["show the access point the C6 is associated with"],
+        usage: "wifi status",
+        lines: &["show manager state, saved-profile presence, IPv4 and the associated AP"],
     },
     HelpEntry {
-        name: "wifisaved",
+        name: "wifi saved",
         aliases: &[],
         group: Group::Scaffold,
         id: Cmd::Wifisaved,
-        usage: "wifisaved",
+        usage: "wifi saved",
         lines: &[
             "show whether the C6 currently has a station configuration;",
             "never prints the password or its length",
         ],
     },
     HelpEntry {
-        name: "wififorget",
+        name: "wifi forget",
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wififorget,
-        usage: "wififorget",
+        usage: "wifi forget",
         lines: &["delete the station profile saved in C6 flash"],
     },
     HelpEntry {
-        name: "wifilog",
+        name: "wifi log",
         aliases: &[],
         group: Group::Scaffold,
         id: Cmd::Wifilog,
-        usage: "wifilog",
+        usage: "wifi log",
         lines: &["show the last 16 Wi-Fi manager transitions and retry decisions"],
     },
     HelpEntry {
-        name: "wifidisconnect",
+        name: "wifi disconnect",
         aliases: &[],
         group: Group::Product,
         id: Cmd::Wifidisconnect,
-        usage: "wifidisconnect",
+        usage: "wifi disconnect",
         lines: &[
             "leave the current access point for this boot; unlike 'wifi off',",
             "Wi-Fi remains enabled and a saved profile remains in C6 flash",
@@ -1337,6 +1332,14 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "  own to encrypt or not to. an https fetch is UNAUTHENTICATED:",
             "  it stops passive eavesdropping and nothing else (see 'tls')",
         ],
+    },
+    HelpEntry {
+        name: "win",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Win,
+        usage: "win",
+        lines: &["open the desktop with the shared system bar"],
     },
     HelpEntry {
         name: "browser",
@@ -1464,6 +1467,8 @@ impl State {
 /// `app::run`, is all anything does with it.
 #[derive(Clone, Eq, PartialEq)]
 pub enum Outcome {
+    /// Open the normal GUI desktop.
+    Desktop,
     /// Keep running the console; write a fresh prompt.
     Continue,
     /// Reboot once this frame's output has reached the panel.
@@ -1480,12 +1485,6 @@ pub enum Outcome {
     FontTest,
     /// Hand the display over to the BMI270 tilt diagnostic screen.
     AxisTest,
-    /// Hand the display over to the INA226 battery monitor.
-    Battery,
-    /// Hand the display over to the Windows 95 desktop mock-up.
-    Win,
-    /// Hand the display over to the keyboard-driven Wi-Fi setup screen.
-    WifiMenu,
     /// Hand the display over to the hypertext viewer, on the address
     /// given or on its built-in home page.
     Browser(Option<Url>),
@@ -1524,7 +1523,17 @@ pub fn execute(
     uart::log(b"\r\n");
 
     let (command, rest) = split_first_word(line);
-    let argument = trim(rest);
+    let mut argument = trim(rest);
+    let mut qualified = String::new();
+    let command = if command == b"wifi" && !argument.is_empty() {
+        let (subcommand, rest) = split_first_word(argument);
+        qualified.push_str("wifi ");
+        qualified.push_str(as_str(subcommand));
+        argument = trim(rest);
+        qualified.as_bytes()
+    } else {
+        command
+    };
     // A name becomes a command in exactly one place, and it is the same
     // table `help` reads. Nothing below can dispatch a command the listing
     // does not know about, and nothing listed can be missing a body: the
@@ -1534,6 +1543,44 @@ pub fn execute(
         console.write_output_line(framebuffer, "unknown command (try 'help')");
         return Outcome::Continue;
     };
+    if entry.name.starts_with("wifi ")
+        && !matches!(entry.id, Cmd::Wificonnect)
+        && !argument.is_empty()
+    {
+        console.write_output_line(framebuffer, entry.usage);
+        return Outcome::Continue;
+    }
+    // GUI radio jobs retain their one RPC slot across a return to Console.
+    // Commands that need that slot are rejected before borrowing any handle.
+    if wifi_manager.gui_busy()
+        && matches!(
+            entry.id,
+            Cmd::Wifion
+                | Cmd::Wifioff
+                | Cmd::Wifiinfo
+                | Cmd::Wifistatus
+                | Cmd::Wifiup
+                | Cmd::Wifimac
+                | Cmd::Wifiscan
+                | Cmd::Wificonnect
+                | Cmd::Wifisaved
+                | Cmd::Wififorget
+                | Cmd::Wifidisconnect
+                | Cmd::Ipconfig
+                | Cmd::Tls
+                | Cmd::Nslookup
+                | Cmd::Ping
+                | Cmd::Tftpget
+                | Cmd::Httpget
+                | Cmd::Bt
+        )
+    {
+        console.write_output_line(
+            framebuffer,
+            "Wi-Fi operation pending; retry after completion.",
+        );
+        return Outcome::Continue;
+    }
     match entry.id {
         Cmd::Help => cmd_help(console, framebuffer, argument),
         Cmd::Clear => console.clear(framebuffer),
@@ -1762,11 +1809,18 @@ pub fn execute(
         Cmd::Usbwritetest => cmd_usb_write_test(console, framebuffer, argument, usb_host),
         Cmd::Usbzero => cmd_usbzero(console, framebuffer, argument, usb_host),
         Cmd::Usbmbr => cmd_usbmbr(console, framebuffer, usb_host),
-        Cmd::Wifi => {
-            if argument.is_empty() {
-                return Outcome::WifiMenu;
-            }
-            cmd_wifi_control(console, framebuffer, argument, wifi_manager);
+        Cmd::Wifi => cmd_help(console, framebuffer, b"wifi"),
+        Cmd::Wifion | Cmd::Wifioff => {
+            cmd_wifi_control(
+                console,
+                framebuffer,
+                if matches!(entry.id, Cmd::Wifion) {
+                    b"on"
+                } else {
+                    b"off"
+                },
+                wifi_manager,
+            );
             drop_dead_session(console, framebuffer, wifi_manager);
         }
         Cmd::Wifiinfo => {
@@ -1813,7 +1867,9 @@ pub fn execute(
             }
         }
         Cmd::Wifistatus => {
-            if wifi_command_allowed(console, framebuffer, wifi_manager) {
+            cmd_wifi_control(console, framebuffer, b"status", wifi_manager);
+            if wifi_manager.is_enabled() && wifi_command_allowed(console, framebuffer, wifi_manager)
+            {
                 let (wifi_session, _) = wifi_manager.options_mut();
                 cmd_wifistatus(console, framebuffer, wifi_session);
                 drop_dead_session(console, framebuffer, wifi_manager);
@@ -1952,8 +2008,12 @@ pub fn execute(
         Cmd::Coordtest => return Outcome::CoordTest,
         Cmd::Fonttest => return Outcome::FontTest,
         Cmd::Axistest => return Outcome::AxisTest,
-        Cmd::Battery => return Outcome::Battery,
-        Cmd::Win => return Outcome::Win,
+        Cmd::Win => {
+            if argument.is_empty() {
+                return Outcome::Desktop;
+            }
+            console.write_output_line(framebuffer, "usage: win");
+        }
         Cmd::Browser => {
             let argument = trim(argument);
             // Not refused without a network: the built-in pages are in
@@ -1999,7 +2059,7 @@ pub fn reboot(session: Option<&mut wifi::Rpc>) -> ! {
     // next `sdio::init` pulses its reset line. The access point is left
     // holding an entry for a station that stopped answering, and its
     // inactivity timeout for that entry lands on the *next* association --
-    // which is why the first `wificonnect` after a reboot fails with
+    // which is why the first `wifi connect` after a reboot fails with
     // reason 4 while the second succeeds. Leaving properly costs one frame.
     if let Some(rpc) = session
         && let Some(0) = wifi::station::disconnect(rpc)
@@ -2051,7 +2111,10 @@ fn lookup(name: &[u8]) -> Option<&'static HelpEntry> {
 /// its own width, so this stays one call however long the group gets.
 fn list_group(console: &mut Console, framebuffer: &mut Framebuffer, group: Group) {
     let mut names = String::new();
-    for entry in HELP_ENTRIES.iter().filter(|entry| entry.group == group) {
+    for entry in HELP_ENTRIES
+        .iter()
+        .filter(|entry| entry.group == group && !entry.name.contains(' '))
+    {
         if !names.is_empty() {
             names.push(' ');
         }
@@ -4799,8 +4862,7 @@ fn cmd_wifi_control(
                 console.write_output_line(framebuffer, line.as_str());
             }
         }
-        b"forget" => cmd_wififorget(console, framebuffer, manager),
-        _ => console.write_output_line(framebuffer, "usage: wifi [on|off|status|forget]"),
+        _ => console.write_output_line(framebuffer, "usage: wifi <subcommand> [arguments]"),
     }
 }
 
@@ -5056,8 +5118,8 @@ pub(super) fn drop_dead_session(
 /// Returns the open C6 session, establishing it first if there is none.
 ///
 /// Bringing the link up resets the co-processor, so it is done once and then
-/// reused: a connection made by `wificonnect` has to survive until
-/// `wifistatus` asks about it.
+/// reused: a connection made by `wifi connect` has to survive until
+/// `wifi status` asks about it.
 fn wifi_session<'a>(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -5166,7 +5228,7 @@ fn cmd_wificonnect(
     let (ssid, password) = split_first_word(trim(argument));
     let password = trim(password);
     if ssid.is_empty() {
-        console.write_output_line(framebuffer, "usage: wificonnect <ssid> [password]");
+        console.write_output_line(framebuffer, "usage: wifi connect <ssid> [password]");
         return ShellConnect::NotStarted;
     }
     if ssid.len() > wifi::station::SSID_MAX_BYTES
@@ -5306,7 +5368,7 @@ fn cmd_wifistatus(
     let Some(rpc) = session.as_mut() else {
         console.write_output_line(
             framebuffer,
-            "no C6 link (run wifiscan or wificonnect first)",
+            "no C6 link (run wifi scan or wifi connect first)",
         );
         return;
     };
@@ -5587,7 +5649,7 @@ fn write_slave_status(
 /// stack the first time round.
 ///
 /// The stack is kept beside the session rather than inside it because the
-/// two have different lifetimes: `wifiinfo` and `wifiup` deliberately throw
+/// two have different lifetimes: `wifi info` and `wifi up` deliberately throw
 /// the session away, and an interface holding an address obtained over a
 /// link that no longer exists would be a lie.
 fn net_session<'a>(
@@ -5746,7 +5808,7 @@ fn write_association(console: &mut Console, framebuffer: &mut Framebuffer, rpc: 
                 "NOT associated, so nothing can be sent",
                 status,
             );
-            console.write_output_line(framebuffer, "run wificonnect before expecting traffic");
+            console.write_output_line(framebuffer, "run wifi connect before expecting traffic");
         }
         None => console.write_output_line(framebuffer, "association: RPC failed, see UART log"),
     }
@@ -6716,7 +6778,7 @@ fn cmd_browsertest(
 /// Says what the browser will not be able to do, before it opens.
 ///
 /// The plan asks for the preparation steps to appear in the shell rather
-/// than on the viewer's screen, and this is why: `wificonnect` and
+/// than on the viewer's screen, and this is why: `wifi connect` and
 /// `ipconfig dhcp` are shell commands, and a message about them belongs
 /// where they can be typed.
 fn browser_readiness(
@@ -6733,7 +6795,7 @@ fn browser_readiness(
     }
     console.write_output_line(
         framebuffer,
-        "no address: fetching will fail until 'wificonnect <ssid> <key>' and",
+        "no address: fetching will fail until 'wifi connect <ssid> <key>' and",
     );
     console.write_output_line(
         framebuffer,

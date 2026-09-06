@@ -5,19 +5,28 @@
 > [`BROWSER.md`](BROWSER.md)、[`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)とコードを
 > 優先してください。
 
-## 状態: **未実装**（Stage 0のみ完了）
+
+## 旧UI削除後の構成
+
+`legacy-ui` feature、`browser_legacy.rs`、`wifi_menu.rs`と旧UI専用の接続・入力helperを削除した。
+以下の旧UI build記録は移行時点の履歴。現行buildは通常GUI hostへ一本化している。
+起動完了時にWi-FiがOnlineかつIPv4取得済みならBrowser、それ以外はデスクトップへ進む。
+明示EscapeはConsoleへ進む。今回の削除・起動分岐は実機未確認。
+
+
+## 状態: **統合実装済み・実機未確認**（Stage 8の受入待ち）
 
 | Stage | 内容 | 状態 |
 | --- | --- | --- |
 | 0 | 現状確認、用語、画面契約、段階分けの固定（この文書） | 完了 |
-| 1 | 4つのアプリ区分と、座標・表示状態・hit testだけを持つ上部バー部品 | 未着手 |
-| 2 | 時計・Wi-Fi・バッテリーの共有状態と部分更新 | 未着手 |
-| 3 | system barのイベントループ、フォーカス、タイマー、coordinator、ランチャー | 未着手 |
-| 4 | Browserを通常GUIアプリとして上部バーへ統合 | 未着手 |
-| 5 | Wi-Fi画面のイベント駆動化、Wi-Fi操作の段階実行、バッテリーのミニアプリ化 | 未着手 |
-| 6 | 専有GUIアプリとコンソールアプリの境界を固定 | 未着手 |
-| 7 | 入力、ミニアプリ往復、画面遷移の回帰 | 未着手 |
-| 8 | 実機受入、現状文書と本書の状態更新 | 未着手 |
+| 1 | 4つのアプリ区分と、座標・表示状態・hit testだけを持つ上部バー部品 | 実装済み・実機未確認 |
+| 2 | 時計・Wi-Fi・バッテリーの共有状態と部分更新 | 実装済み・実機未確認 |
+| 3 | system barのイベントループ、フォーカス、タイマー、coordinator、ランチャー | 実装済み・実機未確認 |
+| 4 | Browserを通常GUIアプリとして上部バーへ統合 | 実装済み・実機未確認 |
+| 5 | Wi-Fi画面のイベント駆動化、Wi-Fi操作の段階実行、バッテリーのミニアプリ化 | 実装済み・実機未確認 |
+| 6 | 専有GUIアプリとコンソールアプリの境界を固定 | 実装済み・実機未確認 |
+| 7 | 入力、ミニアプリ往復、画面遷移の回帰 | host回帰追加、実機回帰待ち |
+| 8 | 実機受入、現状文書と本書の状態更新 | 未完了（実機受入・image／soak待ち） |
 
 Stageは原則として番号順に進める。Stage 1と2は既存画面へ接続せずにhost testと
 診断用の静止表示で確認できる。Stage 3で通常GUIアプリとミニアプリの所有関係を作り、
@@ -302,8 +311,9 @@ Browserの処理は進めず、共有管理器の保守はsystem barが継続す
 - Cancel
 
 専有GUIアプリは引き続きConsoleの入口commandから開く。項目はkeyboard、touch、USB mouseで選べる。
-launcher自体も同じsystem barを表示し、左端は選択中として描く。launcherからlauncherを
-再度開くactionは無視する。
+launcher自体も同じsystem barを表示し、左端は選択中として描く。barの背景はbutton faceの
+グレー（RGB565 `0xC618`）とする。表示中のハンバーガーアイコンの再クリック／tapは
+Cancelと同じ動作で呼出元へ戻る。
 
 launcherは選択した対象を自分で起動せず、`LaunchChoice::Mini(MiniId)`、
 `LaunchChoice::Front(FrontRoute)`、`Cancelled`のいずれかを通常GUI hostへ返す。
@@ -504,7 +514,7 @@ launcherで別の`FrontRoute`を選んだ場合はBrowserを終了し、socket�
 メニューから選択した接続は常に`ProfileChoice::SaveAndAutoConnect`相当とし、必要な
 パスワード入力後は保存方式を再確認せず接続へ進む。メニューには一時接続の選択肢を置かない。
 保存の実行タイミングと失敗時の扱いは既存の保存接続経路を引き継ぐ。
-これはStage 5で変更する仕様であり、移行前のWi-Fi menuには適用済みではない。
+通常buildのStage 5経路へ実装した。`legacy-ui` featureだけは移行前のWi-Fi menuを保持する。
 
 ### Battery detailsミニアプリ
 
@@ -718,6 +728,18 @@ Stage 3の実装前には、barへのkeyboardフォーカス移動キー、touch
 
 ## 判断記録
 
+### 2026-09-06: 統合実装（実機結果は未記入）
+
+- 通常buildを共有barへ接続。現状仕様は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)へ集約した
+- M（文字編集中以外）／F3をLauncher入口とした。CardKBの既存正規化にはFunctionキーがないためMを用意した
+- touch優先、bar上のwheelは無視、drag-outは復帰しても取消。取得済みキーqueueを遷移時に破棄する
+- Network settingsは要求token付きの完了通知を使う。破棄済み画面や共有policy処理の完了で新画面を変更しない
+- GUI RPCとSDIO／Hosted初期化待ちは段階実行にした。低層の単一transaction期限は維持し、実機で最長handler時間を測る
+- Timerは未消費1件、停止／復帰と固定周期調整を実装。Browserは非定時17 ms、shared indicatorは別deadlineを持つ
+- `legacy-ui`と静止診断`system-bar-static`を残した。実機受入後にfallback削除を判断する
+- host testとrelease buildはエージェントの確認範囲。image生成・書き込み・display soak・受入matrixは人間による実機確認待ち
+
+
 ### 2026-09-06: system barへイベント処理を統合
 
 - system bar動作中はイベントループ、フォーカス、timer、USB／Wi-Fiイベントを統合する
@@ -751,3 +773,40 @@ Stage 3の実装前には、barへのkeyboardフォーカス移動キー、touch
 - Startupは区分外のsystem screenとし、完了後はofflineでもBrowserへ進む
 - 音量状態は未実装なので表示を捏造せず、将来の横幅だけを予約する
 - indicator更新はslot単位のdirty／flushとし、48 pixel高を理由に全幅更新しない
+
+
+## ホストでの検証結果（2026-09-06）
+
+- `cargo build --release`: 成功。`legacy-ui`と`system-bar-static`のfeature buildも確認した
+- `mise run test`にsystem UI crateを追加。同じcargo test指定で284件成功、既存1件ignored
+- `wifi_retry.rs`の独立host test: 6件成功。上記と合わせて290件成功
+- `tools/check_elf_layout.py`: 成功。IRAM 10,336、DROM 589,528、IROM 1,270,990、stack 188,928 byte
+- `git diff --check`: 成功。READMEの作業差分なし
+- image検査、書き込み、実行、シリアル確認、display soak、下記matrixは未実施
+
+## 実装後の実機確認手順（未実施）
+
+1. Tab5、USB Serial/JTAG接続、CardKBまたはUSBキーボード、USBマウス（併用時はhub）、
+   電池pack、管理できる2.4 GHz APを用意する。通常buildを書き込む操作は人間が行う。
+   エージェントは`cargo run --release`／`espflash`を実行しない。
+2. 起動後のBrowserで左Launcher、戻る／進む、Wi-Fi、Batteryの隣接境界をtap／clickする。
+   M／F3、矢印、Enter、EscapeでもLauncher→Battery→Browserを往復する。
+   短い組み込みhomeへ戻った際もミニの絵が下半分に残らず、URL編集中なら編集内容が残ること。
+3. Network settingsでR／Rescan、O／On-Off、暗号化APのpassword入力、OPEN AP接続を試す。
+   保存方法の選択画面が出ず、association→DHCP→OnlineとIPv4表示へ進むこと。
+   scan中、接続待ち、接続失敗時にもbarからBatteryへ移れること。保存後の再起動で自動接続を確認する。
+4. 長いURL、本文scroll、戻る／進むを操作後、Network／Battery／Launcher Cancelを往復する。
+   取得中にミニへ移るとGETのsocketを返し、復帰時に安全に再取得すること。
+   `browser file:/`やSD上のfileでも往復し、抜去済み媒体はエラーとなり古いhandleを使わないこと。
+5. LauncherのConsoleへ進み、`wifi`、`battery`、`batinfo`を実行する。
+   wifiは入口案内だけ、battery類は1回の測定文字列またはINA226エラーだけで、GUIを開かないこと。
+   `coordtest`、`paint`、`win`でbarが出ず、終了後Consoleの44行表示へ戻ること。
+6. barを押してcontentへdrag、targetへ戻ってrelease、contentからbarへのdrag、mouse抜去を試す。
+   誤ったsystem actionが出ず、cursorの古い下地や押下が次画面へ残らないこと。
+7. 分境界、VLF／STOP、battery読出し失敗の条件を安全に用意できる範囲で確認する。
+   時計はHH:MMまたは--:--、batteryはsampleまたは不明を出し、古い正常値を保持しないこと。
+
+失敗の兆候はbarの無応答、別buttonの誤発火、復帰後の下地残り、page／編集状態の消失、
+古いOnline、DMA errorや意図しないunderrun増加、UARTの`SYSTEM BAR: ... flush failed`。
+`SYSTEM BAR: max service/handler ms=`とBrowser repaint最大値も記録して報告する。
+image検査と既存display soakを含む受入matrixの結果が届くまでStage 8は完了にしない。

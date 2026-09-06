@@ -38,7 +38,7 @@ HTTP GETができるところまでです。受け取ったファイルはRAMル
 `src/app/wifi_manager.rs`の接続管理器が両方の`Option`と接続元、IP設定方針、接続状態を
 1つの所有者として保持します。リンク喪失とSTA切断時はstackも同時に捨てるため、存在しない
 リンクで取得したアドレスが残りません。Wi-Fi OFFではstack、アドレス、route、resolverを
-まとめて破棄し、ネットワークコマンドから下層sessionを暗黙に作りません。`wifiinfo`・`wifiup`も
+まとめて破棄し、ネットワークコマンドから下層sessionを暗黙に作りません。`wifi info`・`wifi up`も
 セッションを張り直すので管理器を通してstackまで破棄し、診断後に元のON/OFF状態へ戻します。
 
 メニューから始めたassociationでは、接続管理器がreason／timeout／RPC結果を分類して最大30秒の
@@ -53,7 +53,7 @@ C6 NVSに保存profileがある起動も同じ`MenuManaged`／`Dhcp`方針へ入
 associationとDHCPを開始します。メニューの`Connect once`とCLIはC6 RAM設定を使うため、
 保存済みprofileを上書きしません。
 
-この処理はCLIの契約を変えません。`wificonnect`は1回のassociationだけで資格情報を管理器へ
+この処理はCLIの契約を変えません。`wifi connect`は1回のassociationだけで資格情報を管理器へ
 保持せず、IPv4設定は利用者が`ipconfig dhcp`またはstatic設定を実行するまで
 `Unconfigured`のままです。したがってCLI接続は自動再接続しません。
 
@@ -101,13 +101,13 @@ C6は受信したフレームをホストが読むまで保持し、**溜まっ�
 - `Rpc::service`はキューが満杯になったら**トランスポートを読むのをやめます**。
   読んでいないフレームはステージングバッファに残るので失われません
   （一度読んだフレームは戻せないため、これが唯一の非破壊な止め方です）
-- RPC応答を待つ経路（`wifiscan`・`wificonnect`など）は止まれません。誰も
+- RPC応答を待つ経路（`wifi scan`・`wifi connect`など）は止まれません。誰も
   キューを捌いていない状況で止まると応答を永久に待つことになるので、
   こちらは**最も古いフレームを捨てます**。捨てた数は`ipconfig`の
   `dropped`に出ます
 - `Stack::poll`は「キューを埋める→インタフェースに捌かせる」を最大4回
   繰り返します
-- **スタックがまだ無い状態**（CLIの`wificonnect`は済んだが`ipconfig`を実行して
+- **スタックがまだ無い状態**（CLIの`wifi connect`は済んだが`ipconfig`を実行して
   いない、という一番長く居る状態）では、フレームループが
   `Rpc::discard_station_frames`で読んでは捨てます。行き先が無くても、
   読まないことが最終的にリンクを殺すためです。捨てた数は同じ`dropped`に
@@ -196,8 +196,8 @@ transmitコールバックで、Wi-Fiステーション用netifが渡すのは14
 | `httpget <host\|a.b.c.d>[:port] [path]` | HTTP/1.0 GET。ヘッダの先頭数行を表示し、本文をカレントディレクトリへ保存 |
 | `hs <url> [r <n>\|p [n]\|c <n>]` | `Transaction`を直接回して結果を数値で報告。schemeを省くと`http://`を補う（[`BROWSER.md`](BROWSER.md)） |
 
-Wi-FiがONなら、いずれも必要に応じてC6のリンクとstation modeを用意します（`wifiscan`以降と
-同じ`wifi_session`を通ります）。OFF中はC6を起動せず`wifi on`を案内します。APへのアソシエートは別で、`wificonnect`が
+Wi-FiがONなら、いずれも必要に応じてC6のリンクとstation modeを用意します（`wifi scan`以降と
+同じ`wifi_session`を通ります）。OFF中はC6を起動せず`wifi on`を案内します。APへのアソシエートは別で、`wifi connect`が
 済んでいないと`ipconfig dhcp`はリースを取れません。
 
 全画面の`wifi`メニュー、または起動時の保存profileから接続した場合は、管理器がassociationイベントをフレームごとに読み、
@@ -205,7 +205,7 @@ Wi-FiがONなら、いずれも必要に応じてC6のリンクとstation mode�
 場合もDHCP clientを維持し、画面を閉じた後を含め毎フレームのpollで取得を継続します。
 stackがなければ`Rpc::discard_station_frames`を呼び、C6の受信queueを溜めません。
 
-CLIの`wificonnect`はこの自動DHCPを使いません。従来どおりassociationだけで戻り、利用者が
+CLIの`wifi connect`はこの自動DHCPを使いません。従来どおりassociationだけで戻り、利用者が
 `ipconfig dhcp`を実行した時点で初めてDHCPを開始します。管理器のIP方針もこの時点で
 `Dhcp`に変わり、static設定では`Static`、`ipconfig release`では`Unconfigured`になります。
 
@@ -743,5 +743,5 @@ redirect規則、pin tableの生成で、段階分けは[TLS_PLAN.md](TLS_PLAN.m
 - 受信したファイルの保存先はカレントディレクトリです。現状の書き込み可能媒体は
   8 MiBのRAMルートだけで、内容はリセットで消えます（[`FILESYSTEM.md`](FILESYSTEM.md)）
 - リンクが切れると古いアドレスを破棄します。管理対象のメニュー／保存profile接続は
-  自動再接続とDHCPを行い、CLI接続は`wificonnect`と`ipconfig`の手動操作が必要です
+  自動再接続とDHCPを行い、CLI接続は`wifi connect`と`ipconfig`の手動操作が必要です
 - シェルは単一スレッドなので、長いコマンドの実行中は他のことが止まります

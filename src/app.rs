@@ -1,22 +1,17 @@
-//! Foreground application loop for the framebuffer console.
+//! Foreground coordinator for Console, normal GUI and exclusive diagnostics.
 //!
-//! The display supplies frame boundaries; this module owns input sources,
-//! command dispatch, and application-mode transitions.
-//!
-//! Everything below it exists only to serve a shell command: `shell` itself
-//! dispatches them, `membench`, `mbr` and `lsusb` are the ones whose output
-//! is long enough to deserve their own file, and the rest are the full-screen modes
-//! `run` hands the framebuffer to. None of them is reachable from the
-//! hardware-facing modules at the crate root, which is what keeps that
-//! dependency pointing one way.
+//! Hardware and shared managers are initialized once. Each route returns
+//! before another starts; the system bar owns its minis as stopped values.
 
 mod automount;
 mod axis_test;
 mod battery;
+mod battery_monitor;
 mod blockdev;
 mod browser;
 mod browsertest;
 mod coord_test;
+mod desktop;
 mod fetch;
 mod files;
 mod font_test;
@@ -25,15 +20,16 @@ mod localfile;
 mod lsusb;
 mod mbr;
 mod membench;
+mod network_settings;
 mod paint;
 mod pointer;
 mod shell;
 mod startup_screen;
+mod system_bar;
+mod theme;
 mod touch_test;
 mod wifi_manager;
-mod wifi_menu;
 mod wifi_retry;
-mod win;
 
 use alloc::vec::Vec;
 
@@ -157,6 +153,7 @@ pub fn run(psram: Psram) {
     // One owner keeps the C6 link, IP stack and the policy connecting them
     // coherent across shell commands and full-screen modes.
     let mut wifi_manager = wifi_manager::Manager::new();
+    let mut battery_monitor = battery_monitor::BatteryMonitor::new();
     let initial_route = startup_screen::run(
         &mut display,
         &mut input,
@@ -166,193 +163,218 @@ pub fn run(psram: Psram) {
         &mut wifi_manager,
         startup_screen_shown_ms,
     );
-    match initial_route {
-        startup_screen::InitialRoute::Browser => {
-            browser::run(
-                display.framebuffer_mut(),
-                &mut input,
-                &mut wifi_manager,
-                &mut vfs,
-                ram_disk.as_mut(),
-                None,
-            );
-            shell::drop_dead_session(console, display.framebuffer_mut(), &mut wifi_manager);
-        }
-        startup_screen::InitialRoute::WifiMenu => {
-            let outcome = wifi_menu::run(
-                display.framebuffer_mut(),
-                &mut input,
-                &mut wifi_manager,
-                wifi_menu::Entry::Startup,
-            );
-            if outcome == wifi_menu::Outcome::Online {
-                browser::run(
+    let mut route = match initial_route {
+        startup_screen::InitialRoute::Console => FrontRoute::Console,
+        startup_screen::InitialRoute::Browser => FrontRoute::Normal(None),
+        startup_screen::InitialRoute::Desktop => FrontRoute::Desktop,
+    };
+    'coordinator: loop {
+        input.discard_queued_keys();
+        input.cancel_primary_touch();
+        match route {
+            FrontRoute::Desktop | FrontRoute::Normal(_) => {
+                let (start, desktop) = match route {
+                    FrontRoute::Normal(start) => (start, false),
+                    _ => (None, true),
+                };
+                route = run_normal_gui(
                     display.framebuffer_mut(),
                     &mut input,
                     &mut wifi_manager,
                     &mut vfs,
                     ram_disk.as_mut(),
-                    None,
-                );
-            }
-            shell::drop_dead_session(console, display.framebuffer_mut(), &mut wifi_manager);
-        }
-        startup_screen::InitialRoute::Console => {}
-    }
-
-    console.clear(display.framebuffer_mut());
-    console.write_output_line(display.framebuffer_mut(), BOOT_VERSION);
-    for line in &boot_lines {
-        console.write_output_line(display.framebuffer_mut(), line.as_str());
-    }
-    console.write_prompt(display.framebuffer_mut());
-    let mut blink_frames = 0u32;
-    loop {
-        if display
-            .wait_for_frame_with(|| input.service_fast())
-            .is_none()
-        {
-            return;
-        }
-
-        let framebuffer = display.framebuffer_mut();
-
-        input.service();
-        // Reconciling the mount table sits here, beside command dispatch,
-        // rather than inside `input.service`: opening a volume is bus I/O and
-        // FAT parsing, and the input servicing above is what the console's
-        // redraw is waiting on. Nothing happens at all unless the bus moved.
-        auto_mount.service(
-            console,
-            framebuffer,
-            &mut vfs,
-            ram_disk.as_mut(),
-            input.usb_host_mut(),
-        );
-        // Frames the C6 has received are held there until the host reads
-        // them, and a backlog larger than the transport's staging buffer
-        // cannot be resynchronized -- so the link is serviced every frame,
-        // not only while a network command is running.
-        wifi_manager.service();
-
-        let Some(event) = input.poll_key() else {
-            // No key this frame: advance the idle blink timer and, on phase
-            // change, repaint only the cursor's own cell.
-            blink_frames += 1;
-            if blink_frames >= BLINK_INTERVAL_FRAMES {
-                blink_frames = 0;
-                console.blink_cursor(framebuffer);
-            }
-            continue;
-        };
-
-        blink_frames = 0;
-        console.push_key(framebuffer, event.key);
-
-        // Enter completing a command line is an application-level reaction
-        // rather than part of the echo, so it is handled here instead of
-        // inside the console.
-        let Some(submission) = console.take_submission() else {
-            continue;
-        };
-        let outcome = shell::execute(
-            console,
-            framebuffer,
-            submission.as_bytes(),
-            input.usb_host_mut(),
-            ram_disk.as_mut(),
-            &mut vfs,
-            &mut shell_state,
-            &mut auto_mount,
-            &mut wifi_manager,
-        );
-        match outcome {
-            // Each of these blocks until a key is pressed and leaves its own
-            // drawing in the framebuffer; `clear` repaints the console over it.
-            shell::Outcome::Paint => {
-                paint::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::TouchTest => {
-                touch_test::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::CoordTest => {
-                coord_test::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::FontTest => {
-                font_test::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::AxisTest => {
-                axis_test::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::Battery => {
-                battery::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::Win => {
-                win::run(framebuffer, &mut input);
-                console.clear(framebuffer);
-            }
-            shell::Outcome::WifiMenu => {
-                let _ = wifi_menu::run(
-                    framebuffer,
-                    &mut input,
-                    &mut wifi_manager,
-                    wifi_menu::Entry::Shell,
-                );
-                console.clear(framebuffer);
-                shell::drop_dead_session(console, framebuffer, &mut wifi_manager);
-            }
-            shell::Outcome::Browser(start) => {
-                // The viewer keeps borrowing the manager for one fetch step
-                // at a time and services it every frame, because the loop
-                // above is paused while the full-screen mode is running.
-                browser::run(
-                    framebuffer,
-                    &mut input,
-                    &mut wifi_manager,
-                    &mut vfs,
-                    ram_disk.as_mut(),
                     start,
+                    desktop,
+                    &mut battery_monitor,
+                    &mut auto_mount,
                 );
-                console.clear(framebuffer);
-                // A disconnection while the viewer was up is otherwise
-                // invisible: the same check every network command makes.
-                shell::drop_dead_session(console, framebuffer, &mut wifi_manager);
+                continue 'coordinator;
             }
-            shell::Outcome::VisualQa => {
-                run_visual_qa(console, framebuffer, &mut input);
+            FrontRoute::Exclusive(id) => {
+                debug_assert!(!tab5_system_ui::AppClass::Exclusive.has_bar());
+                match id {
+                    ExclusiveApp::Paint => paint::run(display.framebuffer_mut(), &mut input),
+                    ExclusiveApp::Touch => touch_test::run(display.framebuffer_mut(), &mut input),
+                    ExclusiveApp::Coordinates => {
+                        coord_test::run(display.framebuffer_mut(), &mut input)
+                    }
+                    ExclusiveApp::Font => font_test::run(display.framebuffer_mut(), &mut input),
+                    ExclusiveApp::Axis => axis_test::run(display.framebuffer_mut(), &mut input),
+                    ExclusiveApp::Display => {
+                        run_visual_qa(console, display.framebuffer_mut(), &mut input)
+                    }
+                }
+                route = FrontRoute::Desktop;
+                continue 'coordinator;
             }
-            shell::Outcome::Continue => {}
-            shell::Outcome::Reboot => {
-                // The "rebooting..." line is already in PSRAM; give the panel
-                // one scan-out interval to actually show it before the reset.
+            FrontRoute::Power(action) => {
+                let fb = display.framebuffer_mut();
+                console.clear(fb);
+                console.write_output_line(
+                    fb,
+                    match action {
+                        tab5_system_ui::PowerAction::Reboot => "rebooting...",
+                        tab5_system_ui::PowerAction::Shutdown => "shutting down...",
+                    },
+                );
                 delay_ms(300);
-                // An HP-core reset does not physically clear all L2 RAM.
-                // Scrub the retained menu credential before the reboot path
-                // borrows the still-live session for its best-effort deauth.
-                wifi_manager.erase_credentials();
-                shell::reboot(wifi_manager.session_mut());
+                match action {
+                    tab5_system_ui::PowerAction::Reboot => {
+                        wifi_manager.erase_credentials();
+                        shell::reboot(wifi_manager.session_mut());
+                    }
+                    tab5_system_ui::PowerAction::Shutdown => {
+                        let acknowledged = shell::shutdown();
+                        // If power remains, keep the result visible until acknowledged.
+                        console.write_output_line(
+                            fb,
+                            if acknowledged {
+                                "shutdown pulses sent; device is still running"
+                            } else {
+                                "shutdown request failed; device is still running"
+                            },
+                        );
+                        console.write_output_line(fb, "Press any key to return to Console");
+                        input.wait_for_key();
+                    }
+                }
+                route = FrontRoute::Console;
+                continue 'coordinator;
             }
-            shell::Outcome::Shutdown => {
-                // As with reboot, let the acknowledgement reach the panel
-                // before the power controller removes the device rail.
-                delay_ms(300);
-                if !shell::shutdown() {
-                    console.write_output_line(
-                        framebuffer,
-                        "shutdown request failed; device is still running",
-                    );
-                    console.write_prompt(framebuffer);
+            FrontRoute::Console => {
+                debug_assert!(!tab5_system_ui::AppClass::Console.has_bar());
+            }
+        }
+        console.clear(display.framebuffer_mut());
+        console.write_output_line(display.framebuffer_mut(), BOOT_VERSION);
+        for line in &boot_lines {
+            console.write_output_line(display.framebuffer_mut(), line.as_str());
+        }
+        boot_lines.clear();
+        console.write_prompt(display.framebuffer_mut());
+        let mut blink_frames = 0u32;
+        loop {
+            if display
+                .wait_for_frame_with(|| input.service_fast())
+                .is_none()
+            {
+                return;
+            }
+
+            let framebuffer = display.framebuffer_mut();
+
+            input.service();
+            // Reconciling the mount table sits here, beside command dispatch,
+            // rather than inside `input.service`: opening a volume is bus I/O and
+            // FAT parsing, and the input servicing above is what the console's
+            // redraw is waiting on. Nothing happens at all unless the bus moved.
+            auto_mount.service(
+                console,
+                framebuffer,
+                &mut vfs,
+                ram_disk.as_mut(),
+                input.usb_host_mut(),
+            );
+            // Frames the C6 has received are held there until the host reads
+            // them, and a backlog larger than the transport's staging buffer
+            // cannot be resynchronized -- so the link is serviced every frame,
+            // not only while a network command is running.
+            wifi_manager.service();
+
+            let Some(event) = input.poll_key() else {
+                // No key this frame: advance the idle blink timer and, on phase
+                // change, repaint only the cursor's own cell.
+                blink_frames += 1;
+                if blink_frames >= BLINK_INTERVAL_FRAMES {
+                    blink_frames = 0;
+                    console.blink_cursor(framebuffer);
                 }
                 continue;
+            };
+
+            blink_frames = 0;
+            console.push_key(framebuffer, event.key);
+
+            // Enter completing a command line is an application-level reaction
+            // rather than part of the echo, so it is handled here instead of
+            // inside the console.
+            let Some(submission) = console.take_submission() else {
+                continue;
+            };
+            let outcome = shell::execute(
+                console,
+                framebuffer,
+                submission.as_bytes(),
+                input.usb_host_mut(),
+                ram_disk.as_mut(),
+                &mut vfs,
+                &mut shell_state,
+                &mut auto_mount,
+                &mut wifi_manager,
+            );
+            match outcome {
+                // Each of these blocks until a key is pressed and leaves its own
+                // drawing in the framebuffer; `clear` repaints the console over it.
+                shell::Outcome::Paint => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Paint);
+                    continue 'coordinator;
+                }
+                shell::Outcome::TouchTest => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Touch);
+                    continue 'coordinator;
+                }
+                shell::Outcome::CoordTest => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Coordinates);
+                    continue 'coordinator;
+                }
+                shell::Outcome::FontTest => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Font);
+                    continue 'coordinator;
+                }
+                shell::Outcome::AxisTest => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Axis);
+                    continue 'coordinator;
+                }
+                shell::Outcome::Desktop => {
+                    route = FrontRoute::Desktop;
+                    continue 'coordinator;
+                }
+                shell::Outcome::Browser(start) => {
+                    route = FrontRoute::Normal(start);
+                    continue 'coordinator;
+                }
+
+                shell::Outcome::VisualQa => {
+                    route = FrontRoute::Exclusive(ExclusiveApp::Display);
+                    continue 'coordinator;
+                }
+                shell::Outcome::Continue => {}
+                shell::Outcome::Reboot => {
+                    // The "rebooting..." line is already in PSRAM; give the panel
+                    // one scan-out interval to actually show it before the reset.
+                    delay_ms(300);
+                    // An HP-core reset does not physically clear all L2 RAM.
+                    // Scrub the retained menu credential before the reboot path
+                    // borrows the still-live session for its best-effort deauth.
+                    wifi_manager.erase_credentials();
+                    shell::reboot(wifi_manager.session_mut());
+                }
+                shell::Outcome::Shutdown => {
+                    // As with reboot, let the acknowledgement reach the panel
+                    // before the power controller removes the device rail.
+                    delay_ms(300);
+                    if !shell::shutdown() {
+                        console.write_output_line(
+                            framebuffer,
+                            "shutdown request failed; device is still running",
+                        );
+                        console.write_prompt(framebuffer);
+                    }
+                    continue;
+                }
             }
+            console.write_prompt(framebuffer);
         }
-        console.write_prompt(framebuffer);
     }
 }
 
@@ -478,12 +500,7 @@ fn run_visual_qa(
     uart::log(b"UI visual: axis; tilt, then any key advances\r\n");
     axis_test::run(framebuffer, input);
     console.clear(framebuffer);
-    previous_underruns = finish_visual_stage(b"axis", previous_underruns);
-
-    uart::log(b"UI visual: desktop; move/drag, then any key finishes\r\n");
-    win::run(framebuffer, input);
-    console.clear(framebuffer);
-    let final_underruns = finish_visual_stage(b"desktop", previous_underruns);
+    let final_underruns = finish_visual_stage(b"axis", previous_underruns);
 
     let mut line = shell::Line::new();
     line.push_str("ui visual: underruns=");
@@ -503,4 +520,36 @@ fn finish_visual_stage(name: &[u8], before: u32) -> u32 {
     uart::log(name);
     uart::log_hex(b" underruns=", after.wrapping_sub(before));
     after
+}
+
+/// Foreground routes have no mini variants: minis live inside NormalGuiHost.
+pub enum FrontRoute {
+    Console,
+    Desktop,
+    Normal(Option<crate::browser::url::Url>),
+    Exclusive(ExclusiveApp),
+    Power(tab5_system_ui::PowerAction),
+}
+pub enum ExclusiveApp {
+    Paint,
+    Touch,
+    Coordinates,
+    Font,
+    Axis,
+    Display,
+}
+fn run_normal_gui(
+    fb: &mut crate::framebuffer::Framebuffer,
+    input: &mut InputManager,
+    wifi: &mut wifi_manager::Manager,
+    vfs: &mut Vfs,
+    ram: Option<&mut fs::RamBlockDevice>,
+    start: Option<crate::browser::url::Url>,
+    desktop: bool,
+    battery: &mut battery_monitor::BatteryMonitor,
+    automount: &mut automount::AutoMount,
+) -> FrontRoute {
+    system_bar::run(
+        fb, input, wifi, vfs, ram, start, desktop, battery, automount,
+    )
 }

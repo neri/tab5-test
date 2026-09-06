@@ -30,7 +30,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [CONSOLE_SHELL.md](docs/CONSOLE_SHELL.md) | コンソールのセル管理と部分書き戻し、シェル、再起動、全体電源断 |
 | [CONSOLE_COMMAND_REVIEW.md](docs/CONSOLE_COMMAND_REVIEW.md) | シェルコマンド全数の棚卸しと、一般実用／専門家向け／開発検証専用の分類 |
 | [INPUT.md](docs/INPUT.md) | ソフトI2C、CardKB／USBキーボード、`Key`正規化、`InputManager`、ポインタ、タッチコントローラー |
-| [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、`win`デスクトップ |
+| [GUI_THEME.md](docs/GUI_THEME.md) | 通常GUIの共通配色、選択行、状態色、Backの表示 |
+| [SYSTEM_BAR.md](docs/SYSTEM_BAR.md) | 上部48 pixelの共有バー、アプリ区分、coordinator、入力・timer・ミニアプリの所有 |
+| [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、共通ブロックデバイス層、MBR判定、シェルコマンド |
 | [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
@@ -61,6 +63,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
 [USB_FLOPPY_PLAN.md](docs/USB_FLOPPY_PLAN.md)、
 [USB_HOST_PLAN.md](docs/USB_HOST_PLAN.md)、
+[USB_HID_REPORT_PLAN.md](docs/USB_HID_REPORT_PLAN.md)、
 [USB_INTERRUPT_REFACTOR_PLAN.md](docs/USB_INTERRUPT_REFACTOR_PLAN.md)、
 [USB_MSC_PLAN.md](docs/USB_MSC_PLAN.md)、
 [USB_MSC_BOOT_MARGIN_PLAN.md](docs/USB_MSC_BOOT_MARGIN_PLAN.md)、
@@ -76,6 +79,9 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [SCALABLE_PROPORTIONAL_FONT_PLAN.md](docs/SCALABLE_PROPORTIONAL_FONT_PLAN.md)。
 
 ## 制約
+
+- 起動完了時にWi-FiがOnlineかつIPv4取得済みならBrowser、それ以外はデスクトップへ進み、上部48 pixelのsystem barからNetwork settingsと
+  Battery detailsを開きます。Consoleと専有GUIはbarを表示しません。統合経路は実機未確認です（[SYSTEM_BAR.md](docs/SYSTEM_BAR.md)）。
 
 - ECO2で確認したレジスタ値とROM APIアドレスを使用しています。
 - PSRAMは32 MiB全体を固定アドレスへMMU割り当てし、フレームバッファ（1,843,200

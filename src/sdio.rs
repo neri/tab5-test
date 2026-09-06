@@ -632,3 +632,174 @@ fn rw_direct(write: bool, function: u32, address: u32, value: u8) -> Option<u8> 
         Err(_) => None,
     }
 }
+
+/// Incremental power/reset/card activation for foreground GUI operations.
+/// Delays and card-ready retries are deadlines; each poll issues only one
+/// activation step. Individual SD commands retain the driver's deadlines.
+pub struct Activation {
+    stage: u8,
+    next: u64,
+    deadline: u64,
+    probe: u32,
+    rca: u16,
+    width: bool,
+}
+impl Activation {
+    pub fn new() -> Self {
+        Self {
+            stage: 0,
+            next: 0,
+            deadline: 0,
+            probe: 0,
+            rca: 0,
+            width: false,
+        }
+    }
+    pub fn poll(&mut self, now: u64) -> Option<Result<SdioCard, ()>> {
+        if now < self.next {
+            return None;
+        }
+        let result = self.step(now);
+        match result {
+            Ok(card) => card.map(Ok),
+            Err(()) => Some(Err(())),
+        }
+    }
+    fn step(&mut self, now: u64) -> Result<Option<SdioCard>, ()> {
+        self.next = now;
+        match self.stage {
+            0 => {
+                if !usb::set_pi4ioe2_output_bit(C6_POWER_BIT, true) {
+                    return Err(());
+                }
+                self.next = now.saturating_add(50);
+            }
+            1 => {
+                gpio::configure_c6_sdio_pins();
+                gpio::configure_push_pull_output(Pin::C6Reset);
+                self.next = now.saturating_add(10);
+            }
+            2 => {
+                gpio::set_high(Pin::C6Reset);
+                self.next = now.saturating_add(10);
+            }
+            3 => {
+                gpio::set_low(Pin::C6Reset);
+                self.next = now.saturating_add(10);
+            }
+            4 => {
+                gpio::set_high(Pin::C6Reset);
+                self.next = now.saturating_add(RESET_BOOT_DELAY_MS as u64);
+            }
+            5 => {
+                if !sdmmc::init_host(CARD_C6) {
+                    return Err(());
+                }
+            }
+            6 => {
+                let _ = rw_direct(true, 0, CCCR_CONTROL, CCCR_CONTROL_RESET);
+                self.next = now.saturating_add(10);
+            }
+            7 => {
+                sdmmc::send_command_on(CARD_C6, 0, 0, sdmmc::RESPONSE_NONE_WITH_INIT)
+                    .map_err(|_| ())?;
+                self.next = now.saturating_add(1);
+                self.deadline = now.saturating_add(CARD_PROBE_RETRIES as u64 * 100);
+            }
+            8 => {
+                if let Ok(r) = sdmmc::send_command_on(CARD_C6, 5, 0, sdmmc::RESPONSE_SHORT_NO_CRC) {
+                    self.probe = r[0];
+                    if (self.probe >> 28) & 7 == 0 {
+                        return Err(());
+                    }
+                    self.deadline = now.saturating_add(1000);
+                } else {
+                    if now >= self.deadline {
+                        return Err(());
+                    }
+                    self.next = now.saturating_add(100);
+                    return Ok(None);
+                }
+            }
+            9 => {
+                let r = sdmmc::send_command_on(
+                    CARD_C6,
+                    5,
+                    self.probe & OCR_VOLTAGE_WINDOW,
+                    sdmmc::RESPONSE_SHORT_NO_CRC,
+                )
+                .map_err(|_| ())?;
+                if r[0] & OCR_READY == 0 {
+                    if now >= self.deadline {
+                        return Err(());
+                    }
+                    self.next = now.saturating_add(10);
+                    return Ok(None);
+                }
+            }
+            10 => {
+                self.rca = (sdmmc::send_command_on(CARD_C6, 3, 0, sdmmc::RESPONSE_SHORT)
+                    .map_err(|_| ())?[0]
+                    >> 16) as u16;
+            }
+            11 => {
+                sdmmc::send_command_on(CARD_C6, 7, (self.rca as u32) << 16, sdmmc::RESPONSE_SHORT)
+                    .map_err(|_| ())?;
+                self.next = now.saturating_add(1);
+            }
+            12 => {
+                self.width = set_bus_width_4bit();
+            }
+            13 => {
+                if !set_block_size_512() {
+                    return Err(());
+                }
+            }
+            14 => {
+                let enabled = read_byte(0, CCCR_FUNCTION_ENABLE).ok_or(())?;
+                write_byte(
+                    0,
+                    CCCR_FUNCTION_ENABLE,
+                    enabled | (1 << FUNCTION_WIFI) as u8,
+                )
+                .ok_or(())?;
+                self.deadline = now.saturating_add(1000);
+            }
+            15 => {
+                if !read_byte(0, CCCR_FUNCTION_READY)
+                    .is_some_and(|v| v & (1 << FUNCTION_WIFI) as u8 != 0)
+                {
+                    if now >= self.deadline {
+                        return Err(());
+                    }
+                    self.next = now.saturating_add(10);
+                    return Ok(None);
+                }
+            }
+            16 => {
+                enable_card_interrupts();
+            }
+            _ => {
+                let high_speed_supported = read_byte(0, CCCR_HIGH_SPEED)
+                    .is_some_and(|v| v & CCCR_HIGH_SPEED_SUPPORTED != 0);
+                if !sdmmc::set_clock(CARD_C6, 8, 0) {
+                    return Err(());
+                }
+                let (manufacturer, product) = read_manufacturer_id();
+                sdmmc::note_second_card_active();
+                return Ok(Some(SdioCard {
+                    rca: self.rca,
+                    io_functions: ((self.probe >> 28) & 7) as u8,
+                    memory_present: self.probe & OCR_MEMORY_PRESENT != 0,
+                    bus_width_4bit: self.width,
+                    high_speed_supported,
+                    clock_khz: 20_000,
+                    manufacturer,
+                    product,
+                }));
+            }
+        }
+        self.stage += 1;
+        Ok(None)
+    }
+}

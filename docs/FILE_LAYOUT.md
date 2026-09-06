@@ -23,9 +23,15 @@
 - `src/framebuffer.rs`: シングルフレームバッファと描画API
 - `src/console.rs`: キーボード入力エコーとコマンドライン切り出し用コンソール。
   桁数（`COLUMNS`）だけ公開していて、`ls`の桁詰めがそれを使う
-- `src/app.rs`: 起動画面からBrowser／Wi-Fiメニュー／Consoleへの初回遷移と、Consoleの
-  フレームループ、入力、コマンド実行、全画面モードへの出入りを持つ。以下は`app`配下の
-  モジュール群で、クレート直下のハードウェア寄りモジュールからは参照されない
+- `src/app.rs`: 共有resourceを一度初期化し、Startup後の`FrontRoute`を選ぶcoordinator。
+  Console／通常GUI／専有GUIの1つだけを実行する。以下は`app`配下のモジュール群
+    - `src/app/theme.rs`: 通常GUIのRGB565基本色。Browser、バー、Launcher、Network、Batteryで共有
+    - `src/app/system_bar.rs`: 通常GUI hostのイベントloop、フォーカス、timer、Launcher／電源サブメニュー、ミニ配信、
+      system slotのsnapshot描画、I2C indicatorの周期分散、pointerの描画順
+    - `src/app/battery_monitor.rs`: INA226の共有所有、sampleとエラー、測定／再試行期限
+    - `src/app/network_settings.rs`: Network settingsミニの一覧、password、確認、処理待ち状態と短いhandler
+    - `src/app/wifi_manager/gui.rs`: 管理器を借りるGUI操作の段階実行。要求token付き完了通知、
+      scan／ON・OFF／接続置換／association後の保存・DHCP／forget。画面を呼ばない
     - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
     - `src/app/lsusb.rs`: `lsusb`コマンドの表示。ハブを介したツリー（全interfaceを含む）と、
       指定デバイスの主要な記述子。`UsbHost`のデバイスレコードを読むだけで、
@@ -56,18 +62,14 @@
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
     - `src/app/font_test.rs`: `fonttest`コマンドで起動する16pxフォント診断画面。半角と全角、combining mark、未収録文字の枠、背景ありの再描画、太字、2倍、日本語の本文を1画面に並べる
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
-    - `src/app/battery.rs`: `battery`／`batinfo`コマンドで起動するバッテリー電圧・電流・電力のライブ表示画面
-    - `src/app/startup_screen.rs`: 白背景の`Tab5`、USB／Wi-Fi状態アイコン、5秒後のEscape案内を描き、USB初回探索・自動マウントと保存Wi-Fi接続をフレーム駆動で協調実行する。完了時のBrowser／Wi-Fiメニューと、明示キャンセル時のConsoleを選ぶ
+    - `src/app/battery.rs`: Battery detailsのcontent描画。Consoleコマンドは持たない
+    - `src/app/startup_screen.rs`: 白背景の`Tab5`、USB／Wi-Fi状態アイコン、5秒後のEscape案内を描き、USB初回探索・自動マウントと保存Wi-Fi接続をフレーム駆動で協調実行する。完了時はWi-Fi Online＋IPv4ありならBrowser、それ以外はデスクトップ、明示キャンセル時はConsoleを選ぶ
     - `assets/startup/`: 起動画面用USB／Wi-Fiアイコン。確認用の64×64 PNGと、firmwareが`include_bytes!`で直接読む同寸法の8-bit alpha maskを置く
     - `src/app/wifi_manager.rs`: ESP-Hostedの`Rpc`、IPの`Stack`、接続元、IP設定方針、接続状態、永続ON/OFFをまとめる単一所有者。毎フレームC6とsmoltcpをpollし、起動時／メニュー接続のassociation、切断後の再接続、C6リンク再構築、DHCPを状態遷移で進める。資格情報は現在の管理対象接続が有効な間だけ固定長RAMへ保持し、association成功後のC6 NVS保存、OFF時の切断・driver停止・power down、ON、forget、直近16遷移の診断も担当する
     - `src/app/wifi_retry.rs`: association失敗のreason、timeout、RPC結果を、停止または待ち時間へ変換する副作用のないpolicy。reason 4の短い再試行、一般の指数backoff、10分安定後の失敗回数resetをホスト単体testで検査する
-    - `src/app/wifi_menu.rs`: `wifi`コマンド、起動画面、ブラウザのWi-Fi indicatorから開くキーボード／タッチ操作のWi-Fi設定画面。同一SSIDの統合、SSID／信号／CH／SECURITY／BSSID数の固定列表示と接続中SSIDの`✓`＋太字、ページ移動と行tap、ON/OFF、forget確認、マスク付きパスワード入力、保存／一回接続の選択を担当し、association、成功後保存、メニュー専用DHCPは`wifi_manager.rs`へ依頼する
-    - `src/app/browser.rs`: `browser`コマンドで起動するハイパーテキストビューアの画面。
-      toolbar／viewport／status行の3帯、キーボード・タッチ・マウスの入力、履歴8件の
-      戻る・進む・再読込、toolbarのボタンとセキュリティの南京錠、アドレス欄の編集、
-      通信を必要としない組み込みページ（`http://built-in/`）を持つ。Wi-Fi indicator
-      のtapで`wifi_menu.rs`を開き、取得中のページは再接続待ちへ移して戻り際に再開
-      する。文書の取得そのものは持たない（[`BROWSER.md`](BROWSER.md)）
+    - `src/app/browser.rs`: 通常GUIとして停止可能なBrowser状態、app領域・本文・statusの描画、
+      key／click／取得timer handler、履歴8件、URL編集、ミニ遷移時のsocket返却。
+      文書取得そのものは`fetch.rs`／`localfile.rs`へ委譲する（[`BROWSER.md`](BROWSER.md)）
     - `src/app/fetch.rs`: 1ページ分の取得の状態機械。名前解決→接続→応答headの判定
       （redirect追跡・statusの判定・HTMLかどうか・`charset`）→本文→文書。2xx以外でも
       HTMLなら本文を組み立て、statusを添えて返す。`step`は決まった量だけ
@@ -80,10 +82,12 @@
       ファイルハンドルを所有するので`close`が必須（[`BROWSER.md`](BROWSER.md)）
     - `src/app/browsertest.rs`: `hs`（1回の取得を数値で報告）と`bt`（fixture serverの
       `/manifest.txt`を巡回して期待値と突き合わせ）の診断
-    - `src/app/pointer.rs`: `win`と`browser`が共有するマウスカーソル。下地の退避・
+    - `src/app/pointer.rs`: 通常GUI hostが使うマウスカーソル。下地の退避・
       復元と移動量のスケーリング。描画順（cursorを外す→dirty領域を描く→cursorを
       載せる→和集合をflush）はこのモジュールの説明に明記してある
-    - `src/app/win.rs`: `win`コマンドで起動するWindows 95風デスクトップ。USB HID Bootマウスの動作テスト用。マウスカーソル、タスクバーの時計、タイトルバーのドラッグによるウィンドウ移動（内容を表示したまま移動）だけが動く
+    - `src/app/desktop.rs`: 共有バーの下のテーマ指定のティール背景を描く通常GUIアプリ。`win`からも開く
+- `system-ui/src/lib.rs`: hardware非依存のbar寸法、4区分、snapshot差分、gesture、timer、
+  Launcherの遷移。host testを持つ`tab5-system-ui` workspace member
 - `src/font.rs`: 16 pixel bitmapフォントの再export。実体は依存ゼロの別クレート
   `font/`（パッケージ名`tab5-font`）にあり、`browser/`と同じくホストでビルド
   できるので、収録範囲と文字幅を`cargo test`で検査できる。firmware内のパスは
@@ -120,7 +124,7 @@
 - `src/i2c.rs`: `gpio.rs`の上に実装した汎用ソフトウェアI2C（bit-bang）。物理バスごとに一つの`SoftI2c`を持ち、GPIO設定と初回バス復旧は起動時に一度だけ実行する。通常はアドレス付きの読出し・書込み・書込み後読出しをトランザクションとして提供し、可変長プロトコルだけをクロージャ型の逐次APIで扱う。SPI等の別インターフェースを追加する場合も同じ構成（`gpio.rs`の上に載せる独立モジュール）に従う
 - `src/cardkb.rs`: PORT.AのCardKBドライバ（`i2c.rs`のI2Cバスを使用）
 - `src/tab5_keyboard.rs`: Ext.Port1（GPIO0/1）のTab5 KeyboardをHIDモードで読むI2Cドライバ。HID usage IDを`input.rs`の共通変換へ渡す
-- `src/input.rs`: CardKB、Tab5 Keyboard、USBキーボード、USBマウス、タッチを統合する`InputManager`、再接続管理、キーイベント、全画面モードが共通で使うキー待ち（`wait_for_key`）を持つ。USBマウスは`poll_mouse`で生の`usb::MouseUpdate`を渡し、相対移動量を位置にするカーソルは描画側（`app::win`）が持つ。タッチはドライバを隠した論理座標の全接触点と、追加接触を無視して最初の接触を追跡する1本指ポインタ位相を提供する
+- `src/input.rs`: CardKB、Tab5 Keyboard、USBキーボード、USBマウス、タッチを統合する`InputManager`、再接続管理、キーイベント、全画面モードが共通で使うキー待ち（`wait_for_key`）を持つ。USBマウスは`poll_mouse`で生の`usb::MouseUpdate`を渡し、相対移動量を位置にするカーソルは描画側（`app::system_bar`）が持つ。タッチはドライバを隠した論理座標の全接触点と、追加接触を無視して最初の接触を追跡する1本指ポインタ位相を提供する
 - `src/touch.rs`: GT911／ST7121・ST7123タッチコントローラードライバ（`i2c.rs`のI2Cバスを使用、[`INPUT.md`](INPUT.md)）。接触ID・ST7121/ST7123の固定レポートスロットなどのハードウェア差はここに閉じ、初期化・再接続とアプリ向けの抽象化は`InputManager`が行う
 - `src/power.rs`: E2 P4（`PWROFF_PULSE`）を用いたTab5全体の電源断要求
 - `src/bmi270.rs`: Tab5内蔵BMI270のソフトウェアI2C初期化、ファームウェア転送、設定、6軸生データ読出し
@@ -157,7 +161,9 @@
   （スロット）が2つあり、カード0がmicroSD、カード1がESP32-C6。カード番号を取る
   低レベルAPI（`init_host`／`send_command_on`／`set_clock`／
   `set_host_bus_width_4bit`）を`sdio.rs`へ公開する
-- `src/sdio.rs`: SDMMCカード1に載るESP32-C6のSDIOカードとしての活性化
+- `src/sdio.rs`: GUI向けの`Activation`は電源・リセット・card ready待ちをdeadlineで段階実行する。
+  従来の同期初期化も残す。以下は共通SDIO機能。
+  SDMMCカード1に載るESP32-C6のSDIOカードとしての活性化
   （電源E2.P0、GPIO15リセット、CMD52／CMD5／CMD3／CMD7、CCCR設定、CIS読み出し）と、
   CMD52の1バイトアクセス・CMD53のブロック／バイトモード転送。ピンはGPIO Matrix
   経由なので`gpio.rs`の`configure_c6_sdio_pins`を使う。計画と実機での判断は

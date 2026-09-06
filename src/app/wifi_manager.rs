@@ -6,6 +6,9 @@
 //! in RAM while that connection is active, so a lost station or C6 link can be
 //! rebuilt without user input.
 
+mod gui;
+use gui::{GuiJob, GuiKind};
+
 use alloc::vec::Vec;
 
 use crate::{net, sdio, tick, wifi};
@@ -34,12 +37,6 @@ pub enum IpPolicy {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ProfileChoice {
-    ConnectOnce,
-    SaveAndAutoConnect,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSaveState {
     NotRequested,
     Pending,
@@ -47,7 +44,7 @@ pub enum ProfileSaveState {
     Failed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Association {
     pub ssid: [u8; wifi::station::SSID_MAX_BYTES],
     pub ssid_length: usize,
@@ -60,7 +57,7 @@ impl Association {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     Disabled,
     LinkBringUp,
@@ -87,7 +84,7 @@ pub enum Failure {
     StopStatus(i32),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Off,
     LinkDown,
@@ -230,6 +227,15 @@ impl Drop for Credentials {
 }
 
 pub struct Manager {
+    gui_bringup: Option<alloc::boxed::Box<wifi::hosted::BringUp>>,
+    gui_mode: bool,
+    gui_job: Option<GuiJob>,
+    gui_followup: Option<GuiJob>,
+    gui_sequence: u32,
+    gui_reply: Option<(
+        u32,
+        Result<Option<Vec<wifi::station::AccessPoint>>, Failure>,
+    )>,
     enabled: bool,
     saved_profile_exists: bool,
     session: Option<wifi::Rpc>,
@@ -255,6 +261,12 @@ pub struct Manager {
 impl Manager {
     pub const fn new() -> Self {
         Self {
+            gui_bringup: None,
+            gui_mode: false,
+            gui_job: None,
+            gui_followup: None,
+            gui_sequence: 0,
+            gui_reply: None,
             enabled: true,
             saved_profile_exists: false,
             session: None,
@@ -791,31 +803,6 @@ impl Manager {
         Ok(true)
     }
 
-    /// Starts a menu-managed association. The credential remains in RAM while
-    /// this connection is active so Stage 5 can recover a lost station or C6
-    /// link. A save request is committed to C6 NVS only after association.
-    pub fn begin_menu_connect(
-        &mut self,
-        ssid: &[u8],
-        password: &[u8],
-        profile: ProfileChoice,
-    ) -> Result<(), Failure> {
-        self.prepare_connection_replacement()?;
-        self.source = Some(ConnectionSource::MenuManaged);
-        self.ip_policy = IpPolicy::Dhcp;
-        self.credentials = Some(Credentials::new(ssid, password));
-        self.attempt = 1;
-        self.connected_since_ms = None;
-        self.reconnecting = false;
-        self.save_pending = profile == ProfileChoice::SaveAndAutoConnect;
-        self.profile_save_state = if self.save_pending {
-            ProfileSaveState::Pending
-        } else {
-            ProfileSaveState::NotRequested
-        };
-        self.send_pending_connect()
-    }
-
     /// Cancels the currently managed association before a menu or CLI request
     /// installs another station configuration. ESP-IDF rejects or races a
     /// second connect request while the first association is still active,
@@ -973,8 +960,27 @@ impl Manager {
         }
     }
 
+    /// Transport-only maintenance during non-frame wakes and banded drawing.
+    /// Policy events remain queued for the host's single frame dispatch.
+    pub fn service_io(&mut self) {
+        if let Some(rpc) = self.session.as_mut() {
+            if let Some(stack) = self.stack.as_mut() {
+                stack.poll(rpc);
+            } else {
+                rpc.discard_station_frames();
+            }
+        }
+    }
+
     /// Services transport backpressure, station events and DHCP once.
     pub fn service(&mut self) {
+        if self.gui_job.is_none() {
+            self.gui_job = self.gui_followup.take();
+        }
+        if self.gui_job.is_some() {
+            self.service_gui_job();
+            return;
+        }
         if !self.enabled {
             if !matches!(self.state, State::Off) {
                 self.transition(State::Off, Cause::Disabled);
@@ -1049,6 +1055,16 @@ impl Manager {
                         self.push_notice(Notice::Reassociated);
                     }
                     self.transition(State::Associated(association), Cause::Connected);
+                    if self.gui_mode
+                        && self.source == Some(ConnectionSource::MenuManaged)
+                        && self.ip_policy == IpPolicy::Dhcp
+                    {
+                        self.gui_job = Some(GuiJob::new(
+                            GuiKind::Associated(association),
+                            if self.save_pending { 40 } else { 43 },
+                        ));
+                        continue;
+                    }
                     if self.save_pending {
                         self.persist_profile();
                     }
@@ -1102,7 +1118,14 @@ impl Manager {
                 ..
             } if generation == self.generation && tick::now_ms() >= deadline_ms => {
                 self.attempt = next_attempt;
-                let _ = self.send_pending_connect();
+                if self.gui_mode {
+                    self.gui_job = Some(GuiJob::new(
+                        GuiKind::Retry,
+                        if self.session.is_some() { 10 } else { 0 },
+                    ));
+                } else {
+                    let _ = self.send_pending_connect();
+                }
             }
             State::RequestingDhcp {
                 association,
@@ -1186,7 +1209,7 @@ impl Manager {
                 let next_attempt = self.attempt.saturating_add(1);
                 // Keep the originating reason/status as its own history entry.
                 // The following transition records the chosen backoff, so both
-                // halves of the retry decision remain visible in `wifilog`.
+                // halves of the retry decision remain visible in `wifi log`.
                 self.record_only(cause_for_failure(failure));
                 self.transition(
                     State::RetryWaiting {

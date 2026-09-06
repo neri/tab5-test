@@ -43,16 +43,8 @@
 //! them have keys as well (`[`, `]`, `r`, Escape), and the keys are what
 //! CardKB has: the buttons are for the finger, not instead of them.
 //!
-//! At the right end are the Wi-Fi bars, the one thing on this screen that
-//! is about the board rather than about the page. They are here because
-//! this is where the answer matters and where the shell is not running: a
-//! reader whose page will not load cannot type `wifistatus` while a
-//! full-screen mode is up, and without this has no way to tell a dead link
-//! from a dead server. Unlike the lock, they are also a way out of the
-//! problem they report: tapping them opens the Wi-Fi menu, and the state
-//! it leaves behind is the sentence that lands on the status line on the
-//! way back. Reporting alone would have been an indicator that says what is
-//! wrong on the one screen from which nothing can be done about it.
+//! System indicators, launcher and minis belong to `system_bar`.
+//! This module receives only events for the active Browser.
 //!
 //! **A page is only ever shown complete.** While one is arriving the
 //! previous one stays on screen and only the toolbar's byte count moves; the
@@ -60,39 +52,35 @@
 //! been built. Nothing partial is ever displayed, because a page that
 //! stopped halfway looks exactly like a page that ended there.
 //!
-//! **The loop never blocks.** Name resolution and the transfer are both
-//! polled a little at a time from the frame loop (`net::dns::Query` and
-//! `net::http::Transaction`), so Escape is answered within a frame however
-//! slow or dead the other end is. That is most of why those two types
-//! exist.
+//! Name resolution and transfer advance one bounded step per host timer
+//! delivery (`net::dns::Query` and `net::http::Transaction`). The host
+//! stops these deliveries while a mini or launcher owns the screen.
 //!
-//! The pointer comes from `super::pointer`, shared with `win`, and the
+//! The host uses `super::pointer` for all normal GUI screens, and the
 //! drawing order it documents is obeyed exactly: lift the cursor, draw what
 //! changed, put the cursor back, write back the union.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::theme::{self, BACKGROUND as WHITE, TEXT as BLACK};
 use crate::browser::document::{Document, Marker, Parser, STYLE_BOLD, STYLE_CODE, STYLE_ITALIC};
 use crate::browser::error::{self, Error};
 use crate::browser::layout::{Layout, Line, Metrics};
 use crate::browser::limits::{MAX_HISTORY, MAX_URL_BYTES};
 use crate::browser::memory;
 use crate::browser::url::{self, Url};
-use crate::framebuffer::{BLACK, Framebuffer, HEIGHT, WHITE, WIDTH};
-use crate::input::{InputManager, Key, PrimaryTouch};
-use crate::usb::MOUSE_BUTTON_LEFT;
-use crate::{interrupts, tick, uart};
+use crate::framebuffer::{Framebuffer, HEIGHT, WIDTH};
+use crate::input::{InputManager, Key};
+
+use crate::{tick, uart};
 
 use super::fetch::{self, Fetch, Network, Outcome as FetchOutcome};
 use super::localfile::{LocalRead, Started};
 use super::wifi_manager::Manager as WifiManager;
-use super::wifi_menu;
 
 use crate::fs::vfs::Vfs;
 use crate::fs::{Devices, RamBlockDevice, SdSlot};
-
-use super::pointer::{CURSOR_DRAWN_HEIGHT, CURSOR_DRAWN_WIDTH, Cursor, flush_union};
 
 /// One half-width cell of the 16 pixel font: the unit the chrome and the
 /// list markers are laid out in.
@@ -121,7 +109,7 @@ const CELL_HEIGHT: usize = crate::font::HEIGHT;
 /// Everything on the bar is derived from this constant -- `BUTTON_WIDTH`
 /// included -- so changing it is one edit, and the assertions below are
 /// what say whether the derivation still holds.
-const TOOLBAR_HEIGHT: usize = 48;
+const TOOLBAR_HEIGHT: usize = tab5_system_ui::HEIGHT;
 const STATUS_HEIGHT: usize = 32;
 /// Blank space between the toolbar and the first line of the page.
 ///
@@ -156,9 +144,9 @@ const STATUS_TEXT_Y: usize = VIEWPORT_BOTTOM + (STATUS_HEIGHT - CELL_HEIGHT * CH
 /// part of this bar that is never wide enough.
 /// Slightly wider than the bar is tall, which keeps three of them and the
 /// lock inside the space the link and line counts used to hold.
-const BUTTON_WIDTH: usize = TOOLBAR_HEIGHT + 4;
+const BUTTON_WIDTH: usize = tab5_system_ui::BUTTON_WIDTH;
 const BUTTON_COUNT: usize = 3;
-const BUTTONS_LEFT: usize = MARGIN;
+const BUTTONS_LEFT: usize = tab5_system_ui::APP.x;
 /// What the three buttons are drawn with.
 ///
 /// Characters and not bitmaps of their own: the font covers the arrows and
@@ -180,19 +168,9 @@ const ICON_WIDTH: usize = 24;
 /// What the lock says when it is asked while a connection is being made and
 /// has proved nothing. Not a security state: the absence of one.
 const CONNECTING_TEXT: &str = "CONNECTING: nothing has been proved yet";
-const ICON_LEFT: usize = BUTTONS_LEFT + BUTTON_COUNT * BUTTON_WIDTH + 12;
-const ADDRESS_LEFT: usize = ICON_LEFT + ICON_WIDTH + 8;
-/// The Wi-Fi indicator's slot, at the far right of the bar.
-///
-/// The one thing on this screen that is about the board rather than about
-/// the page. It is here because the browser is where the answer matters
-/// and where the shell -- the only other place that could say -- is not
-/// running: `wifistatus` cannot be typed while a full-screen mode is up,
-/// so a reader whose page will not load otherwise has no way to tell a
-/// dead link from a dead server.
-const WIFI_WIDTH: usize = 24;
-const WIFI_LEFT: usize = WIDTH - MARGIN - WIFI_WIDTH;
-const ADDRESS_RIGHT: usize = WIFI_LEFT - 8;
+const ICON_LEFT: usize = tab5_system_ui::ICON_LEFT;
+const ADDRESS_LEFT: usize = tab5_system_ui::ADDRESS_LEFT;
+const ADDRESS_RIGHT: usize = tab5_system_ui::ADDRESS_RIGHT;
 /// The clear button, inside the field's own right edge and present only
 /// while the field is open. `ADDRESS_CELLS` is what the text gets, which is
 /// the field less that button.
@@ -226,7 +204,7 @@ const _: () = {
         "the buttons have eaten the address field"
     );
     assert!(
-        ADDRESS_RIGHT < WIFI_LEFT,
+        ADDRESS_RIGHT + 4 <= tab5_system_ui::WIFI.x,
         "the address field runs into the Wi-Fi icon"
     );
     assert!(
@@ -238,33 +216,33 @@ const _: () = {
 const PAGE_BACKGROUND: u16 = WHITE;
 const TEXT_COLOR: u16 = BLACK;
 /// Pure blue on white, which the panel renders cleanly at this size.
-const LINK_COLOR: u16 = 0x001F;
-const CODE_COLOR: u16 = 0x0320;
+const LINK_COLOR: u16 = theme::ACCENT;
+const CODE_COLOR: u16 = theme::CODE;
 /// Dark red. A grey was tried first and could not be told from black at
 /// this size: two near-blacks in a bitmap font read as a rendering fault
 /// rather than as emphasis. Emphasis has to differ in hue, not in
 /// brightness.
-const ITALIC_COLOR: u16 = 0x9000;
-const RULE_COLOR: u16 = 0x8410;
-const CHROME_BACKGROUND: u16 = 0xC618;
+const ITALIC_COLOR: u16 = theme::EMPHASIS;
+const RULE_COLOR: u16 = theme::BORDER;
+const CHROME_BACKGROUND: u16 = theme::BUTTON_FACE;
 const CHROME_TEXT: u16 = BLACK;
 /// Status-line messages, in the same red as the cleartext badge: almost
 /// every one of them is the viewer refusing to do something.
-const MESSAGE_COLOR: u16 = 0x9000;
+const MESSAGE_COLOR: u16 = theme::EMPHASIS;
 /// The lock when the connection proves nothing about who answered: plain
 /// HTTP, and unauthenticated TLS. Red, because both mean the same thing to
 /// a reader -- what is on screen may not be what the address says.
-const INSECURE_COLOR: u16 = 0xF800;
+const INSECURE_COLOR: u16 = theme::ERROR;
 /// The lock when a pin matched. Dark green: the one case where the peer
 /// was actually identified. Still not the word "secure", which would claim
 /// more than a pin does.
-const AUTHENTICATED_COLOR: u16 = 0x0400;
+const AUTHENTICATED_COLOR: u16 = theme::SUCCESS;
 /// A button whose action is not available: no history to go back to, no
 /// forward entry to return to.
-const DISABLED_COLOR: u16 = 0x8410;
+const DISABLED_COLOR: u16 = theme::BORDER;
 /// The address field while it is being edited.
 const EDIT_BACKGROUND: u16 = WHITE;
-const EDIT_CARET: u16 = 0x001F;
+const EDIT_CARET: u16 = theme::ACCENT;
 
 /// Lines one wheel detent scrolls.
 const WHEEL_LINES: i32 = 3;
@@ -280,137 +258,106 @@ const LINES_PER_SERVICE: usize = 8;
 /// Width of one band of the viewport writeback, in logical pixels.
 const FLUSH_BAND_WIDTH: usize = 128;
 
-/// Runs the viewer until Ctrl+Q (or `q`) is pressed.
-///
-/// The manager remains the owner for the whole screen. Individual fetch
-/// steps borrow its link and stack only for that step, allowing connection
-/// events and DHCP to advance between frames.
-pub fn run(
-    framebuffer: &mut Framebuffer,
-    input: &mut InputManager,
-    wifi: &mut WifiManager,
-    vfs: &mut Vfs,
-    mut ram_disk: Option<&mut RamBlockDevice>,
-    start: Option<Url>,
-) {
-    let mut viewer = match Viewer::new() {
-        Ok(viewer) => viewer,
-        Err(failure) => {
-            uart::log(b"Browser: the built-in home page did not parse: ");
-            uart::log(error::error_name(failure).as_bytes());
-            uart::log(b"\r\n");
-            return;
+/// A stopped value while a launcher or mini owns the screen.
+pub struct Browser {
+    viewer: Viewer,
+    pending: Option<Pending>,
+}
+impl Browser {
+    pub fn new(start: Option<Url>, wifi: &mut WifiManager) -> Option<Self> {
+        let mut viewer = Viewer::new().ok()?;
+        if addressed_network(wifi).is_none() {
+            viewer.say("no network: open Network settings from the system bar");
         }
-    };
-    if addressed_network(wifi).is_none() {
-        viewer.say("no network: tap the Wi-Fi bars to choose one");
+        if let Some(url) = start {
+            viewer.request(Navigation::fresh(url));
+        }
+        Some(Self {
+            viewer,
+            pending: None,
+        })
     }
-    if let Some(url) = start {
-        viewer.request(Navigation::fresh(url));
+    pub fn key(&mut self, key: Key, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
+        let action = self.viewer.handle_key(key, self.pending.is_some());
+        self.answer(action, wifi, vfs)
     }
-
-    framebuffer.fill(PAGE_BACKGROUND);
-    viewer.draw_all(framebuffer, &mut || service_link(wifi));
-    let mut cursor = Cursor::new(WIDTH / 2, HEIGHT / 2);
-    input.reset_primary_touch();
-    cursor.show(framebuffer);
-    if !framebuffer.flush() {
-        uart::log(b"Browser: initial flush failed\r\n");
-        return;
+    pub fn click(&mut self, x: usize, y: usize, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
+        let action = self.viewer.click(x, y);
+        self.answer(action, wifi, vfs)
     }
-
-    let mut pending: Option<Pending> = None;
-    let mut sequence = interrupts::frame_sequence();
-    loop {
-        if interrupts::dma_error() != 0 {
-            uart::log(b"Browser: DMA interrupt error\r\n");
-            break;
+    fn answer(&mut self, action: Action, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
+        match action {
+            Action::Continue => {}
+            Action::Cancel => stop_pending(&mut self.viewer, &mut self.pending, wifi, vfs),
+            Action::Report => report_state(&mut self.viewer, &self.pending, wifi),
+            Action::Leave => return true,
         }
-        interrupts::wait_for_interrupt();
-        let next_sequence = interrupts::frame_sequence();
-        if next_sequence == sequence {
-            // Not a frame boundary: the cheap input maintenance only. This
-            // is the wake that keeps a USB keyboard alive between frames.
-            input.service_fast();
-            continue;
+        false
+    }
+    pub fn wheel(&mut self, amount: i32) {
+        self.viewer.scroll_by(-amount * WHEEL_LINES);
+    }
+    pub fn bar_target(&self, x: usize) -> tab5_system_ui::Rect {
+        tab5_system_ui::browser_target(x, self.editing())
+    }
+    pub fn suspend(&mut self, wifi: &mut WifiManager, vfs: &mut Vfs) {
+        // Network GETs restart on return. Local reads retain their VFS handle;
+        // they are never polled while this screen is suspended.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(Pending::is_network_transfer)
+        {
+            let active = self.pending.take().expect("pending transfer");
+            let navigation = Navigation {
+                url: active.navigation.url.clone(),
+                restore: active.navigation.restore,
+                how: active.navigation.how,
+            };
+            close_pending(active, wifi, vfs);
+            self.pending = Some(Pending {
+                navigation,
+                source: Source::WaitingForNetwork,
+            });
         }
-        sequence = next_sequence;
-        input.service();
-        // Before anything else this frame. The C6 keeps received frames
-        // until the host reads them, and a backlog larger than the
-        // transport's staging buffer cannot be resynchronized -- the link
-        // is gone for good at that point. The window that has to stay
-        // small is "time between two reads", so the read comes first and
-        // the expensive work below is broken up around more of them.
-        service_link(wifi);
-        // Read once per frame and compared inside, so the bar repaints on
-        // the frame the state changes and on no other.
-        viewer.update_wifi(wifi_level(wifi));
-
-        let mut leaving = false;
-        let mut wifi_menu_wanted = false;
-        while let Some(event) = input.poll_key() {
-            match viewer.handle_key(event.key, pending.is_some()) {
-                Action::Continue => {}
-                Action::Cancel => stop_pending(&mut viewer, &mut pending, wifi, vfs),
-                Action::Report => report_state(&mut viewer, &pending, wifi),
-                Action::Wifi => wifi_menu_wanted = true,
-                Action::Leave => leaving = true,
-            }
+    }
+    pub fn close(&mut self, wifi: &mut WifiManager, vfs: &mut Vfs) {
+        if let Some(active) = self.pending.take() {
+            close_pending(active, wifi, vfs);
         }
-        if leaving {
-            break;
+    }
+    pub fn draw(&mut self, fb: &mut Framebuffer, wifi: &mut WifiManager, full: bool) -> bool {
+        if full {
+            self.viewer.draw_all(fb, &mut || service_link(wifi))
+        } else {
+            self.viewer.draw_dirty(fb, &mut || service_link(wifi))
         }
-
-        let touch = input.poll_primary_touch();
-        let motion = input.poll_mouse();
-        let (target_x, target_y) = match touch {
-            PrimaryTouch::Pressed(point) | PrimaryTouch::Moved(point) => (point.x, point.y),
-            PrimaryTouch::Idle | PrimaryTouch::Released => match motion {
-                Some(update) => cursor.moved_to(update.dx, update.dy),
-                None => (cursor.x, cursor.y),
-            },
-        };
-        let pointer_moved = (target_x, target_y) != (cursor.x, cursor.y);
-
-        if let PrimaryTouch::Pressed(point) = touch {
-            let action = viewer.click(point.x, point.y);
-            wifi_menu_wanted |= answer_click(action, &mut viewer, &mut pending, wifi, vfs);
-        }
-        if let Some(update) = motion {
-            if update.pressed & MOUSE_BUTTON_LEFT != 0 {
-                let action = viewer.click(target_x, target_y);
-                wifi_menu_wanted |= answer_click(action, &mut viewer, &mut pending, wifi, vfs);
-            }
-            if update.wheel != 0 {
-                viewer.scroll_by(-update.wheel * WHEEL_LINES);
-            }
-        }
-
-        // The whole screen goes to the menu and comes back repainted, so
-        // this frame ends here: the pointer bookkeeping at the bottom
-        // describes a screen that no longer exists.
-        if wifi_menu_wanted {
-            open_wifi_menu(
-                framebuffer,
-                input,
-                wifi,
-                vfs,
-                &mut viewer,
-                &mut cursor,
-                &mut pending,
-            );
-            continue;
-        }
-
+    }
+    pub fn editing(&self) -> bool {
+        self.viewer.editing.is_some()
+    }
+    pub fn dirty(&self) -> bool {
+        self.viewer.dirty()
+    }
+    pub fn tick(
+        &mut self,
+        input: &mut InputManager,
+        wifi: &mut WifiManager,
+        vfs: &mut Vfs,
+        mut ram_disk: Option<&mut RamBlockDevice>,
+    ) {
         // A managed connection can disappear between two page-fetch steps.
         // Its old socket belongs to the old stack and cannot survive, but a
         // GET can: keep the navigation and restart it once reassociation and
         // DHCP have produced a new addressed stack.
-        if pending.as_ref().is_some_and(Pending::is_network_transfer) && !network_is_addressed(wifi)
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(Pending::is_network_transfer)
+            && !network_is_addressed(wifi)
         {
-            if let Some(active) = pending.take() {
-                suspend_or_fail(active, &mut viewer, &mut pending, wifi, vfs);
+            if let Some(active) = self.pending.take() {
+                suspend_or_fail(active, &mut self.viewer, &mut self.pending, wifi, vfs);
             }
         }
 
@@ -418,12 +365,12 @@ pub fn run(
         // abandoned first: the newest request is the one they meant, and
         // this is also what makes "cancel, then fetch something else"
         // work without a state in between.
-        if let Some(navigation) = viewer.take_request() {
-            if let Some(active) = pending.take() {
+        if let Some(navigation) = self.viewer.take_request() {
+            if let Some(active) = self.pending.take() {
                 close_pending(active, wifi, vfs);
             }
-            pending = begin(
-                &mut viewer,
+            self.pending = begin(
+                &mut self.viewer,
                 navigation,
                 wifi,
                 vfs,
@@ -433,17 +380,18 @@ pub fn run(
         }
 
         // `Source::WaitingForNetwork` owns no socket. It deliberately stays
-        // pending so Escape and a newer navigation still have their ordinary
+        // self.pending so Escape and a newer navigation still have their ordinary
         // meanings while the manager performs reassociation and DHCP.
-        if pending
+        if self
+            .pending
             .as_ref()
             .is_some_and(Pending::is_waiting_for_network)
         {
             if network_is_addressed(wifi) {
-                let active = pending.take().expect("network wait is pending");
+                let active = self.pending.take().expect("network wait is self.pending");
                 let navigation = active.navigation;
-                pending = begin(
-                    &mut viewer,
+                self.pending = begin(
+                    &mut self.viewer,
                     navigation,
                     wifi,
                     vfs,
@@ -451,15 +399,15 @@ pub fn run(
                     input,
                 );
             } else if !network_is_recovering(wifi) {
-                let active = pending.take().expect("network wait is pending");
+                let active = self.pending.take().expect("network wait is self.pending");
                 let url = active.navigation.url.clone();
                 let how = active.navigation.how;
                 close_pending(active, wifi, vfs);
-                viewer.show_failure(&url, fetch::NO_NETWORK, how);
+                self.viewer.show_failure(&url, fetch::NO_NETWORK, how);
             }
         }
 
-        let outcome = match pending.as_mut() {
+        let outcome = match self.pending.as_mut() {
             Some(active) => {
                 let outcome = match &mut active.source {
                     Source::Network(fetch) => addressed_network(wifi)
@@ -479,7 +427,8 @@ pub fn run(
                     Source::WaitingForNetwork => None,
                 };
                 if outcome.is_some() {
-                    viewer.update_loading(active.received(), active.security());
+                    self.viewer
+                        .update_loading(active.received(), active.security());
                 }
                 outcome
             }
@@ -488,7 +437,7 @@ pub fn run(
         match outcome {
             None | Some(FetchOutcome::Working) => {}
             Some(FetchOutcome::Page(document)) => {
-                if let Some(active) = pending.take() {
+                if let Some(active) = self.pending.take() {
                     // The final address, which is the last hop of a
                     // redirect chain rather than the one that was asked
                     // for -- so the toolbar and the base for this page's
@@ -503,11 +452,18 @@ pub fn run(
                         how: active.navigation.how,
                     };
                     close_pending(active, wifi, vfs);
-                    viewer.show_document(document, &navigation, landed, security, status, peak);
+                    self.viewer.show_document(
+                        document,
+                        &navigation,
+                        landed,
+                        security,
+                        status,
+                        peak,
+                    );
                 }
             }
             Some(FetchOutcome::Failed(failure)) => {
-                if let Some(active) = pending.take() {
+                if let Some(active) = self.pending.take() {
                     // A transfer can be the operation that makes a dead C6
                     // link observable. Let the manager consume that evidence
                     // before deciding whether this is a page failure or an
@@ -517,42 +473,16 @@ pub fn run(
                         && !network_is_addressed(wifi)
                         && network_is_recovering(wifi)
                     {
-                        suspend_or_fail(active, &mut viewer, &mut pending, wifi, vfs);
+                        suspend_or_fail(active, &mut self.viewer, &mut self.pending, wifi, vfs);
                     } else {
                         let url = active.landed();
                         let how = active.navigation.how;
                         close_pending(active, wifi, vfs);
-                        viewer.show_failure(&url, failure, how);
+                        self.viewer.show_failure(&url, failure, how);
                     }
                 }
             }
         }
-
-        if !viewer.dirty() && !pointer_moved {
-            continue;
-        }
-
-        // The pointer is topmost, so it comes off before anything repaints
-        // and goes back on last -- see `super::pointer`.
-        let (previous_x, previous_y) = (cursor.x, cursor.y);
-        cursor.hide(framebuffer);
-        viewer.draw_dirty(framebuffer, &mut || service_link(wifi));
-        cursor.move_to(target_x, target_y);
-        cursor.show(framebuffer);
-        flush_union(
-            framebuffer,
-            (previous_x, previous_y),
-            (cursor.x, cursor.y),
-            CURSOR_DRAWN_WIDTH,
-            CURSOR_DRAWN_HEIGHT,
-        );
-    }
-
-    // Leaving with a transfer still running would leak its socket out of
-    // the set for the rest of the run. Every exit from the loop above is a
-    // `break` so that this is the only way out.
-    if let Some(active) = pending.take() {
-        close_pending(active, wifi, vfs);
     }
 }
 
@@ -602,132 +532,6 @@ fn suspend_or_fail(
         let how = navigation.how;
         viewer.show_failure(&url, fetch::NO_NETWORK, how);
     }
-}
-
-/// Acts on what a tap or a click came to, and answers whether the Wi-Fi
-/// menu was asked for.
-///
-/// The two pointer paths -- touch and mouse -- go through here rather than
-/// each handling the actions themselves, so a new action is added in one
-/// place and cannot be answered on one input and ignored on the other. The
-/// menu is the one action this cannot perform itself: it needs the screen
-/// and the pointer, and both belong to the frame loop.
-fn answer_click(
-    action: Action,
-    viewer: &mut Viewer,
-    pending: &mut Option<Pending>,
-    wifi: &mut WifiManager,
-    vfs: &mut Vfs,
-) -> bool {
-    match action {
-        Action::Cancel => stop_pending(viewer, pending, wifi, vfs),
-        Action::Wifi => return true,
-        Action::Report => report_state(viewer, pending, wifi),
-        // Nothing on the toolbar leaves the browser.
-        Action::Continue | Action::Leave => {}
-    }
-    false
-}
-
-/// Hands the whole screen to the Wi-Fi menu and takes it back.
-///
-/// The bars are the way in because this is where the answer matters and
-/// where the shell is not running: a reader whose page will not load cannot
-/// type `wifi` while a full-screen mode is up, and leaving the viewer to do
-/// it loses the address they were on. Coming back, the state the menu left
-/// behind goes on the status line -- which is the sentence the bars used to
-/// say when they were only tappable for a sentence.
-///
-/// A transfer in flight cannot survive the menu: connecting builds a new IP
-/// stack and the socket belongs to the old one. Its socket goes back before
-/// the menu opens, but the navigation is kept as a network wait, so a
-/// connection made in there resumes the page instead of losing it. A local
-/// read owns no socket and nothing in the menu can disturb it, so it stays
-/// exactly as it was.
-fn open_wifi_menu(
-    framebuffer: &mut Framebuffer,
-    input: &mut InputManager,
-    wifi: &mut WifiManager,
-    vfs: &mut Vfs,
-    viewer: &mut Viewer,
-    cursor: &mut Cursor,
-    pending: &mut Option<Pending>,
-) {
-    if pending.as_ref().is_some_and(Pending::is_network_transfer) {
-        let active = pending.take().expect("network transfer is pending");
-        let url = active.navigation.url.clone();
-        let navigation = Navigation {
-            url: url.clone(),
-            restore: active.navigation.restore,
-            how: active.navigation.how,
-        };
-        close_pending(active, wifi, vfs);
-        viewer.wait_for_network(&url);
-        *pending = Some(Pending {
-            source: Source::WaitingForNetwork,
-            navigation,
-        });
-    }
-
-    // Lifted before the menu paints over it: the sprite's saved pixels
-    // describe the viewer's screen, and putting them back afterwards would
-    // stamp a square of the old toolbar onto the new one.
-    cursor.hide(framebuffer);
-    let _ = wifi_menu::run(framebuffer, input, wifi, wifi_menu::Entry::Browser);
-    // The tap that leaves the menu must not also arrive here.
-    input.reset_primary_touch();
-
-    viewer.update_wifi(wifi_level(wifi));
-    report_wifi(viewer, wifi);
-    framebuffer.fill(PAGE_BACKGROUND);
-    viewer.draw_all(framebuffer, &mut || service_link(wifi));
-    cursor.show(framebuffer);
-    if !framebuffer.flush() {
-        uart::log(b"Browser: flush after the Wi-Fi menu failed\r\n");
-    }
-}
-
-/// Says what the Wi-Fi indicator means, in words.
-///
-/// The same bargain the padlock makes: the bar shows a shape, and the shape
-/// says its sentence when it is asked. Where the state is one a reader can
-/// do something about, the sentence says what.
-fn report_wifi(viewer: &mut Viewer, wifi: &mut WifiManager) {
-    use super::wifi_manager::State;
-    let state = wifi.state();
-    let addressed = wifi.stack().is_some_and(crate::net::Stack::has_address);
-    let association = match state {
-        State::Associated(association)
-        | State::RequestingDhcp { association, .. }
-        | State::AssociatedNoLease(association)
-        | State::Online(association) => Some(association),
-        _ => None,
-    };
-    let mut line = Summary::new();
-    line.push(match state {
-        State::Off => "Wi-Fi is off",
-        State::LinkDown => "the link to the C6 is down",
-        State::Idle => "not connected: tap the Wi-Fi bars to choose a network",
-        State::Failed(_) => "the last attempt failed: tap the Wi-Fi bars to try again",
-        State::NeedsPassword(_) => "a password is needed: tap the Wi-Fi bars",
-        State::Associating { .. } => "connecting",
-        State::RetryWaiting { .. } => "waiting to try again",
-        State::Online(_) if addressed => "online",
-        // Associated, and online-without-an-address, which is the same
-        // thing from here: a fetch would fail either way, and the
-        // indicator shows two bars for both.
-        _ => "associated but with no address: leave and run ipconfig dhcp",
-    });
-    // The name, but only when it is text. An SSID is bytes, and one that is
-    // not UTF-8 is left out rather than shown as replacement characters --
-    // the sentence around it already said what happened.
-    if let Some(association) = association
-        && let Ok(name) = core::str::from_utf8(association.ssid())
-    {
-        line.push(" on ");
-        line.push(name);
-    }
-    viewer.say(line.as_str());
 }
 
 /// Puts the numbers a leak would show up in on the status line, and the
@@ -797,7 +601,7 @@ fn stop_pending(
 /// looking at the link -- which is most of a viewport repaint. Cheap when
 /// there is nothing waiting: a couple of SDIO register reads.
 fn service_link(wifi: &mut WifiManager) {
-    wifi.service();
+    wifi.service_io();
 }
 
 fn raw_network(wifi: &mut WifiManager) -> Option<Network<'_>> {
@@ -1048,7 +852,6 @@ enum Action {
     /// Open the Wi-Fi menu. Answered by the loop for the same reason, and
     /// because handing the whole screen to another mode is not something
     /// the viewer can do while it is drawing itself.
-    Wifi,
     Leave,
 }
 
@@ -1236,7 +1039,6 @@ struct Viewer {
     /// Sampled every frame and compared, rather than drawn every frame: the
     /// toolbar only repaints when something on it changed, and the Wi-Fi
     /// state changes a handful of times in a session.
-    wifi: WifiLevel,
     dirty: Dirty,
 }
 
@@ -1254,7 +1056,6 @@ impl Viewer {
             painted_bottom: VIEWPORT_BOTTOM,
             slowest_repaint_ms: 0,
             last_peak: 0,
-            wifi: WifiLevel::Off,
             dirty: Dirty {
                 toolbar: true,
                 viewport: true,
@@ -1302,12 +1103,6 @@ impl Viewer {
     }
 
     /// Takes the current Wi-Fi state, repainting the bar only on a change.
-    fn update_wifi(&mut self, level: WifiLevel) {
-        if self.wifi != level {
-            self.wifi = level;
-            self.dirty.toolbar = true;
-        }
-    }
 
     fn clear_message(&mut self) {
         if self.message.is_some() {
@@ -1805,12 +1600,6 @@ impl Viewer {
             self.explain_security();
             return Action::Continue;
         }
-        // To the right edge rather than to the icon's own edge: there is
-        // nothing beyond it, and a target that stops short of the corner
-        // is one a thumb misses.
-        if x >= WIFI_LEFT {
-            return Action::Wifi;
-        }
         // Only while the field is open, which is the whole of what makes
         // this position mean two things safely: closed, it is part of the
         // address and opens the field like the rest of it.
@@ -1970,13 +1759,17 @@ impl Viewer {
 
     // --- drawing ------------------------------------------------------
 
-    fn draw_all(&mut self, framebuffer: &mut Framebuffer, service: &mut dyn FnMut()) {
+    fn draw_all(&mut self, framebuffer: &mut Framebuffer, service: &mut dyn FnMut()) -> bool {
+        // A modal screen may have painted below this page's previous last line.
+        self.painted_bottom = VIEWPORT_BOTTOM;
+        framebuffer.fill_rect(0, TOOLBAR_HEIGHT, WIDTH, CONTENT_GAP, PAGE_BACKGROUND);
+        let gap_ok = framebuffer.flush_rect(0, TOOLBAR_HEIGHT, WIDTH, CONTENT_GAP);
         self.dirty = Dirty {
             toolbar: true,
             viewport: true,
             status: true,
         };
-        self.draw_dirty(framebuffer, service);
+        self.draw_dirty(framebuffer, service) && gap_ok
     }
 
     /// `service` is called at every point in here where the work between
@@ -1989,17 +1782,23 @@ impl Viewer {
     /// not a slow link -- it is a dead one, permanently. The toolbar and
     /// the status line are small enough not to need this; the viewport is
     /// broken up below.
-    fn draw_dirty(&mut self, framebuffer: &mut Framebuffer, service: &mut dyn FnMut()) {
+    fn draw_dirty(&mut self, framebuffer: &mut Framebuffer, service: &mut dyn FnMut()) -> bool {
+        let mut ok = true;
         let dirty = self.dirty;
         self.dirty = Dirty::default();
         if dirty.toolbar {
             self.draw_toolbar(framebuffer);
-            framebuffer.flush_rect(0, 0, WIDTH, VIEWPORT_TOP);
+            ok &= framebuffer.flush_rect(
+                tab5_system_ui::APP.x,
+                0,
+                tab5_system_ui::APP.width,
+                TOOLBAR_HEIGHT,
+            );
         }
         if dirty.viewport {
             let started = tick::now_ms();
             let height = self.draw_viewport(framebuffer, service);
-            flush_viewport(framebuffer, height, service);
+            ok &= flush_viewport(framebuffer, height, service);
             let elapsed = tick::now_ms().saturating_sub(started);
             if elapsed > self.slowest_repaint_ms {
                 self.slowest_repaint_ms = elapsed;
@@ -2011,17 +1810,24 @@ impl Viewer {
         }
         if dirty.status {
             self.draw_status(framebuffer);
-            framebuffer.flush_rect(0, VIEWPORT_BOTTOM, WIDTH, STATUS_HEIGHT);
+            ok &= framebuffer.flush_rect(0, VIEWPORT_BOTTOM, WIDTH, STATUS_HEIGHT);
         }
+        ok
     }
 
     fn draw_toolbar(&self, framebuffer: &mut Framebuffer) {
-        framebuffer.fill_rect(0, 0, WIDTH, TOOLBAR_HEIGHT, CHROME_BACKGROUND);
+        framebuffer.fill_rect(
+            tab5_system_ui::APP.x,
+            0,
+            tab5_system_ui::APP.width,
+            TOOLBAR_HEIGHT,
+            CHROME_BACKGROUND,
+        );
         // The gap below the bar is painted here rather than by the
         // viewport, so it belongs to the band that is cheapest to repaint
         // and cannot be left behind by a viewport repaint that starts
         // lower down.
-        framebuffer.fill_rect(0, TOOLBAR_HEIGHT, WIDTH, CONTENT_GAP, PAGE_BACKGROUND);
+
         self.draw_buttons(framebuffer);
         // The lock comes next and is never absent. What it says is what the
         // connection actually proved, not what the address asked for: an
@@ -2031,7 +1837,6 @@ impl Viewer {
         // says. The words are one tap away, on the lock itself.
         let (lock, color, _) = self.security_state();
         draw_lock(framebuffer, ICON_LEFT, lock, color);
-        draw_wifi(framebuffer, self.wifi);
 
         match (&self.editing, &self.loading) {
             (Some(editing), _) => self.draw_address_field(framebuffer, editing),
@@ -2409,99 +2214,6 @@ impl Viewer {
 /// what a reader wants to know when a page will not load is whether the
 /// board is on the network at all. The bars fill up as the connection
 /// gets further along, and tapping them says exactly where it stopped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WifiLevel {
-    /// Off, or the link to the C6 is down. Nothing will work.
-    Off,
-    /// Trying: associating, waiting to retry, or waiting for a password.
-    Working,
-    /// Associated, but with no address yet. A fetch would fail.
-    Associated,
-    /// Associated *and* addressed, which is what a fetch needs.
-    Online,
-}
-
-impl WifiLevel {
-    /// How many of the three bars are drawn dark.
-    fn bars(self) -> usize {
-        match self {
-            WifiLevel::Off => 0,
-            WifiLevel::Working => 1,
-            WifiLevel::Associated => 2,
-            WifiLevel::Online => 3,
-        }
-    }
-}
-
-/// What the manager's state means for the indicator.
-///
-/// `Online` is the one that has to agree with something else: the browser
-/// will only fetch when `addressed_network` answers, so the icon says
-/// online exactly when that is true. An icon that reported the association
-/// and left the address out would be full bars over a page that fails with
-/// `no-network`.
-fn wifi_level(wifi: &WifiManager) -> WifiLevel {
-    use super::wifi_manager::State;
-    let addressed = wifi.stack().is_some_and(crate::net::Stack::has_address);
-    match wifi.state() {
-        State::Off | State::LinkDown | State::Failed(_) => WifiLevel::Off,
-        State::Idle
-        | State::NeedsPassword(_)
-        | State::Associating { .. }
-        | State::RetryWaiting { .. } => WifiLevel::Working,
-        State::Associated(_) | State::RequestingDhcp { .. } | State::AssociatedNoLease(_) => {
-            WifiLevel::Associated
-        }
-        State::Online(_) if addressed => WifiLevel::Online,
-        State::Online(_) => WifiLevel::Associated,
-    }
-}
-
-/// Draws the three ascending bars.
-///
-/// Bars and not the fan of arcs everything else uses, because arcs at this
-/// size are three curves two pixels thick and the panel renders them as
-/// mush. Rectangles are exact.
-fn draw_wifi(framebuffer: &mut Framebuffer, level: WifiLevel) {
-    const BAR_WIDTH: usize = 5;
-    const BAR_GAP: usize = 2;
-    const BARS: usize = 3;
-    const TALLEST: usize = 16;
-    let width = BARS * BAR_WIDTH + (BARS - 1) * BAR_GAP;
-    let left = WIFI_LEFT + (WIFI_WIDTH - width) / 2;
-    let baseline = (TOOLBAR_HEIGHT + TALLEST) / 2;
-    let lit = level.bars();
-    for index in 0..BARS {
-        // 6, 11, 16: a step of five, which is the most difference three
-        // bars can carry in sixteen pixels.
-        let height = 6 + index * 5;
-        let color = if index < lit {
-            CHROME_TEXT
-        } else {
-            DISABLED_COLOR
-        };
-        framebuffer.fill_rect(
-            left + index * (BAR_WIDTH + BAR_GAP),
-            baseline - height,
-            BAR_WIDTH,
-            height,
-            color,
-        );
-    }
-    if level == WifiLevel::Off {
-        // Struck through, because "no bars lit" and "one bar lit" are two
-        // pixels apart otherwise. Grey rather than red: red on this bar
-        // means the lock, and it means something else.
-        framebuffer.draw_line(
-            left,
-            baseline - TALLEST,
-            left + width - 1,
-            baseline - 1,
-            DISABLED_COLOR,
-        );
-    }
-}
-
 /// The three states the padlock is drawn in.
 ///
 /// Two of them, not three: plaintext and unauthenticated TLS share the open
@@ -2580,17 +2292,19 @@ const LOCK_SHACKLE_HEIGHT: usize = 8;
 /// bounding span is still almost the whole buffer, and write back the same
 /// 1.6 MB in ten goes instead of one.
 #[inline(never)]
-fn flush_viewport(framebuffer: &Framebuffer, height: usize, service: &mut dyn FnMut()) {
+fn flush_viewport(framebuffer: &Framebuffer, height: usize, service: &mut dyn FnMut()) -> bool {
     if height == 0 {
-        return;
+        return true;
     }
+    let mut ok = true;
     let mut x = 0;
     while x < WIDTH {
         let width = FLUSH_BAND_WIDTH.min(WIDTH - x);
-        framebuffer.flush_rect(x, VIEWPORT_TOP, width, height);
+        ok &= framebuffer.flush_rect(x, VIEWPORT_TOP, width, height);
         service();
         x += width;
     }
+    ok
 }
 
 /// The bullet or number to the left of a list item, right-aligned into the

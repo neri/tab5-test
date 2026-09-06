@@ -143,12 +143,23 @@ upstream切断中も保持された古いaddress/configurationへaddress 0の要
 channel 0のframe pollへ戻します。device resetや再列挙ではないため接続状態は維持されます。
 MSCが無い構成では上記のperiodic経路をそのまま使用します。
 
+## system barの入力所有
+
+通常GUI hostはbarのpress位置をreleaseまで所有し、targetを一度でも外れると取り消す。
+contentから始まったgestureをsystem actionへ変えない。touchがmouseより優先し、wheelは
+Browser contentだけで処理する。M（文字編集中以外）／F3でLauncherへ移り、modal中は背後へ配信しない。
+遷移時の`discard_queued_keys`はInputManagerと各USBキーボードの取得済みqueueだけを捨て、
+held keyの履歴を保つ。`cancel_primary_touch`は全指が離れるまで新しいpressを抑止する。
+旧UIだけで使用していた`reset_primary_touch`は削除した。
+USB topology変化でもhostのbar押下を取り消す。統合後の実機挿抜・同時入力は未確認。
+詳細は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)。
+
 ## ポインタ（USBマウス）
 
 `poll_mouse`は`usb::MouseUpdate`をそのまま返し、キーのようには正規化しません。
 キーはそれ単体で意味を持ちますが、マウスの移動量は相対値であり、「何の上を
 動くか」を決めた側で初めて位置になるためです。カーソル位置と利得は描画側
-（`src/app/win.rs`）が持つため、USBマウス部分はフレームバッファの寸法に依存しません。
+（`src/app/system_bar.rs`）が持つため、USBマウス部分はフレームバッファの寸法に依存しません。
 利得と端数の持ち越しは[`APPS.md`](APPS.md)の
 「Windows 95風デスクトップ」にあります。
 
@@ -192,5 +203,5 @@ ST7123は「設定されたタッチ点数ぶんのレポートテーブル全�
 （1280×720 Landscape）に変換します。パネルの物理解像度やDSI側の設定を
 変更しない点は描画APIの座標変換と同じです（[`GRAPHICS.md`](GRAPHICS.md)）。
 
-タッチを使う画面（`paint`／`touchtest`／`win`）は
+タッチを使う画面（`paint`／`touchtest`／通常GUI）は
 [`APPS.md`](APPS.md)を参照してください。

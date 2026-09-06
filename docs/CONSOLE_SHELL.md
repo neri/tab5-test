@@ -2,6 +2,17 @@
 
 > 索引: [`../DESIGN.md`](../DESIGN.md)
 
+## GUIとの境界
+
+Consoleは上端余白8 pixel、156列×44行を維持し、system barを表示しない。
+`win`／`browser`と各専有GUIへの入口がcoordinatorへrouteを返し、通常のcommandはConsole内で完結する。
+引数なし`wifi`はサブコマンド一覧を表示し、`help wifi connect`等で詳細を表示する。
+Wi-Fi操作は`wifi <subcommand>`へ統合し、旧単独コマンド名は受け付けない。
+`battery`／`batinfo`は廃止。引数なし`win`はデスクトップを開く。バッテリー詳細はsystem barから開く。
+GUI終了後はデスクトップへ戻り、ConsoleはLauncherから明示的に開く。
+GUIから戻った時に進行中のradio操作があれば、競合するWi-Fi／networkコマンドは完了後の再実行を案内する。
+詳細と実機未確認の統合経路は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)。
+
 ## コンソール
 
 `src/console.rs` は 156 列 × 44 行の固定サイズ端末です。1セルは8×16 pixelで、
@@ -117,6 +128,7 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 
 コマンドは`src/app/shell.rs`の`HELP_ENTRIES`という1本の表で定義します。各項目は
 名前、別名、`Group`、`Cmd`、使用法、説明行を持ちます。`execute`は打たれた名前を
+`wifi`の場合は先頭2語を`wifi connect`等の名前にまとめ、残りを引数として扱う。
 `lookup`でこの表から引き、見つからなければそこで`unknown command`を返します。
 見つかった場合は`entry.id`（`Cmd`）で`match`します。
 
@@ -402,6 +414,9 @@ handshakeが何を証明したかを報告します。既定portは443、既定p
 
 ## 再起動
 
+通常GUIからはLauncherのPower... → Rebootで同じ処理を呼ぶ。入力・資源解放の境界は
+[`SYSTEM_BAR.md`](SYSTEM_BAR.md)を参照。GUI経由の動作は実機未確認。
+
 `reboot`は`src/startup.rs`の`reboot()`が実装しており、HPCPU 0自身の
 ソフトウェアリセットビット（`LP_CLKRST_HPCPU_RESET_CTRL0_REG`のbit13、
 `HPCORE0_SW_RESET`、write-1-to-trigger）を1回書き込むだけです。これは
@@ -428,7 +443,7 @@ I2Cエクスパンダごとリセットされないため、**アクセスポイ
 まま再起動をまたいで生き続けます**。そして次に`sdio::init`がリセット線を
 叩いた瞬間、アソシエート中に何も告げずに消えます。APには「応答しなくなった
 ステーション」のエントリが残り、**その無通信タイムアウトが次のアソシエーション
-に降ってくる**ので、再起動後の最初の`wificonnect`が`reason 4
+に降ってくる**ので、再起動後の最初の`wifi connect`が`reason 4
 DISASSOC_DUE_TO_INACTIVITY`で失敗し、2回目は成功する、という形で現れます。
 対処は2つで、役割が違います。
 
@@ -443,7 +458,7 @@ DISASSOC_DUE_TO_INACTIVITY`で失敗し、2回目は成功する、という形�
   保護ダイオード経由でチップを食わせてしまうためで、ついでに電源復帰時は
   リセットを保持したままレールが立ち上がる望ましい順序になります
 
-後者は競合を消すのではなく前倒しするだけです。起動直後に`wificonnect`を
+後者は競合を消すのではなく前倒しするだけです。起動直後に`wifi connect`を
 打てば同じことが起きえます。確実に消せるのは前者だけです。
 
 この後始末は以前から必要でしたが、DW-GDMAの優先度をCPUより高くするまでは
@@ -458,6 +473,9 @@ PSRAMが壊れた状態で起動してヒープ確保時にPANICする、とい�
 ブロックのレジスタを読むとバスアクセスが返らないためです。
 
 ## 全体電源断
+
+通常GUIからはLauncherのPower... → Shutdownで同じ処理を呼ぶ。GUI経由では電源断処理が
+戻った際に結果を表示し、キー入力後にConsoleへ戻る。
 
 `shutdown`（別名`poweroff`）はTab5全体の電源断を要求する引数なしのシェルコマンドです。
 メディアへの書き込みなど、アプリケーション側で必要な保存処理を完了してから実行する必要が

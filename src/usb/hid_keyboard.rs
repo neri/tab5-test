@@ -29,6 +29,11 @@ pub struct UsbKeyboard {
 }
 
 impl UsbKeyboard {
+    /// Drop already-decoded keys at a foreground transition; retain held-key history.
+    pub fn discard_queued_keys(&mut self) {
+        self.pending_len = 0;
+        self.pending_pos = 0;
+    }
     /// Takes a device that `protocol::enumerate_device` has already
     /// addressed and, if it has a HID Boot Protocol keyboard interface,
     /// puts that interface into Boot Protocol (see

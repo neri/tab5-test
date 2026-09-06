@@ -2,12 +2,18 @@
 
 > 索引: [`../DESIGN.md`](../DESIGN.md)
 
-シェルが受け付けるコマンド全103個を1行ずつ並べ、**残すか消すか**を示した表です。
+2026-09-04時点でシェルが受け付けたコマンド全103個を1行ずつ並べ、**残すか消すか**を示した表です。
 コンソールの仕組みとシェルの実装は[`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)、各コマンドの
 説明は`src/app/shell.rs`の`HELP_ENTRIES`（実機では`help <name>`）が唯一の出典で、
 この文書は説明を写し取らず**割り当てと根拠だけ**を持ちます。
 
 削除・feature化の実施計画は[`COMMAND_RETIREMENT_PLAN.md`](COMMAND_RETIREMENT_PLAN.md)です。
+
+## GUI統合後の差分
+
+`battery`／`batinfo`は廃止した。`win`は通常GUIデスクトップを開く製品コマンドに変更した。Wi-Fiは`wifi <subcommand>`へ統合し、
+旧単独名は廃止。以下の個数と区分は元の棚卸し時点の記録であり、現行の受付名は
+`HELP_ENTRIES`と[`WIFI.md`](WIFI.md)を参照する。
 
 ## 分け方
 
@@ -55,7 +61,7 @@
 | `automount` | — | 製品 | **残す** |  | USBの自動マウント切り替え |
 | `axistest` | — | 足場 | feature |  | センサー・入力の実証。`INPUT_MANAGER_PLAN`／`USB_HOST_PLAN`完了 |
 | `backlight` | — | 製品 | **残す** |  | バックライト |
-| `battery` | `batinfo` | 製品 | **残す** |  | 電圧・電流・残量の常時表示 |
+| `battery` | `batinfo` | 製品 | 廃止済み |  | Battery detailsへ統合 |
 | `blkread` | — | 足場 | feature |  | ストレージ低レベルI/O。`FILESYSTEM_PLAN`／`SD_CARD_PLAN`完了 |
 | `browser` | — | 製品 | **残す** |  | ハイパーテキストビューア |
 | `bt` | `browsertest` | 足場 | feature |  | ブラウザ取得経路。`WEB_BROWSER_PLAN`／`BROWSER_UI_PLAN`完了 |
@@ -139,18 +145,18 @@
 | `usbwritetest` | — | 足場 | feature | ⚠ | USB書き込みとBOT/HCD受入。`USB_BOT_HCD_REFACTOR_PLAN`／`USB_WRITE_STABILITY_PLAN`完了 |
 | `usbzero` | — | 足場 | feature | ⚠ | USB書き込みとBOT/HCD受入。`USB_BOT_HCD_REFACTOR_PLAN`／`USB_WRITE_STABILITY_PLAN`完了 |
 | `ut` | — | 足場 | feature |  | USB書き込みとBOT/HCD受入。`USB_BOT_HCD_REFACTOR_PLAN`／`USB_WRITE_STABILITY_PLAN`完了 |
-| `wifi` | — | 製品 | **残す** |  | Wi-Fi設定画面 |
-| `wificonnect` | — | 製品 | **残す** |  | AP接続 |
-| `wifidisconnect` | — | 製品 | **残す** |  | 切断 |
-| `wififorget` | — | 製品 | **残す** |  | 保存プロファイル削除 |
-| `wifiinfo` | — | 足場 | 削除 |  | C6をSDIOカードとして立ち上げる段階の名残。`wifi`が内部で通る |
-| `wifilog` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
-| `wifimac` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
-| `wifisaved` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
-| `wifiscan` | — | 製品 | **残す** |  | APスキャン |
-| `wifistatus` | — | 製品 | **残す** |  | 接続状態 |
-| `wifiup` | — | 足場 | 削除 |  | 同上 |
-| `win` | — | 足場 | feature |  | センサー・入力の実証。`INPUT_MANAGER_PLAN`／`USB_HOST_PLAN`完了 |
+| `wifi` | — | 製品 | **残す** |  | サブコマンドの入口 |
+| `wifi connect` | — | 製品 | **残す** |  | AP接続 |
+| `wifi disconnect` | — | 製品 | **残す** |  | 切断 |
+| `wifi forget` | — | 製品 | **残す** |  | 保存プロファイル削除 |
+| `wifi info` | — | 足場 | 削除 |  | C6をSDIOカードとして立ち上げる段階の名残。`wifi`が内部で通る |
+| `wifi log` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
+| `wifi mac` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
+| `wifi saved` | — | 足場 | feature |  | Wi-Fi。`WIFI_C6_PLAN`／`WIFI_REFACTOR_PLAN`完了 |
+| `wifi scan` | — | 製品 | **残す** |  | APスキャン |
+| `wifi status` | — | 製品 | **残す** |  | 接続状態 |
+| `wifi up` | — | 足場 | 削除 |  | 同上 |
+| `win` | — | 製品 | **残す** |  | 通常GUIデスクトップへの入口 |
 | `write` | — | 製品 | **残す** | ⚠ | ファイル作成・置換 |
 
 ## 別名

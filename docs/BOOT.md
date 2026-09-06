@@ -129,7 +129,9 @@ riscv-rt
   → RGB565コンソール画面を描画してキャッシュを同期
   → LCDリセット・D-PHY・パネル初期化
   → DSI BridgeとDW-GDMAを準備してvideo modeを開始
-  → IROM上の通常アプリへ移り、InputManagerが変更セルだけを描画・部分同期
+  → IROM上の起動画面でUSB／保存Wi-Fi接続を進める
+  → 完了時にWi-Fi Online＋IPv4ありならBrowser、その他はデスクトップ（どちらもsystem bar付き）（明示EscapeはConsole）
+  → coordinatorが通常GUI／専有GUI／Consoleの前景を1つだけ実行
 ```
 
 DSI HostのVideo Pattern Generatorは使用しません。ECO2では動作中のVPGからBridge

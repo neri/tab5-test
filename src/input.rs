@@ -124,6 +124,7 @@ pub struct InputManager {
     tab5_keyboard_health_check_frames: u32,
     touch: Option<Touch>,
     touch_reconnect_frames: u32,
+    primary_touch_blocked: bool,
     primary_touch_id: Option<u8>,
     usb_host: usb::UsbHost,
     usb_reconnect_frames: u32,
@@ -197,6 +198,7 @@ impl InputManager {
             tab5_keyboard_health_check_frames: 0,
             touch,
             touch_reconnect_frames: 0,
+            primary_touch_blocked: false,
             primary_touch_id: None,
             usb_host,
             usb_reconnect_frames: 0,
@@ -446,6 +448,12 @@ impl InputManager {
         event
     }
 
+    /// Discards only acquired events, without polling new hardware input.
+    pub fn discard_queued_keys(&mut self) {
+        self.clear_pending_keys();
+        self.usb_host.discard_queued_keys();
+    }
+
     fn clear_pending_keys(&mut self) {
         self.pending_key_events = [None; PENDING_KEY_EVENTS];
         self.pending_key_head = 0;
@@ -538,6 +546,12 @@ impl InputManager {
             .map(|touch| touch.poll_points(&mut points))
             .unwrap_or(0);
 
+        if self.primary_touch_blocked {
+            if count == 0 {
+                self.primary_touch_blocked = false;
+            }
+            return PrimaryTouch::Idle;
+        }
         if let Some(id) = self.primary_touch_id {
             if let Some(point) = points[..count].iter().find(|point| point.id == id) {
                 return PrimaryTouch::Moved(TouchPoint {
@@ -561,8 +575,10 @@ impl InputManager {
 
     /// Discards a saved primary-contact selection before starting a new
     /// pointer gesture consumer. The next active contact becomes `Pressed`.
-    pub fn reset_primary_touch(&mut self) {
+    /// Cancels a route-owned gesture and waits for every finger to lift.
+    pub fn cancel_primary_touch(&mut self) {
         self.primary_touch_id = None;
+        self.primary_touch_blocked = true;
     }
 
     /// Mutable USB bus registry for commands such as `usbrescan` and MSC I/O.

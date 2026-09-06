@@ -1077,6 +1077,14 @@ impl UsbHost {
     /// ports alike) and returns the first newly-available key.  The next scan
     /// begins after the slot that won this one, preventing a low-numbered
     /// slot from monopolizing input when more than one keyboard is active.
+    pub fn discard_queued_keys(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            if let DeviceKind::Keyboard(keyboard) = slot {
+                keyboard.discard_queued_keys();
+            }
+        }
+    }
+
     pub fn poll_keyboards(&mut self) -> Option<Key> {
         for offset in 0..SLOT_COUNT {
             let index = (self.next_keyboard_slot + offset) % SLOT_COUNT;

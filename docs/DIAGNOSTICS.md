@@ -127,7 +127,7 @@ Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起
   `access points=...`、scan経路の失敗、associationとDHCPの完了を記録します。
   入力したパスワードは値・長さとも出しません。association／DHCP待ちは接続管理器が
   フレームごとに進め、初回接続と接続後切断の再試行も理由別backoffで進めます。切断通知は
-  シェルやbrowserへ戻った後も`wifilog`へ残ります
+  シェルやbrowserへ戻った後も`wifi log`へ残ります
 - `NET: ...` — smoltcpによるIPv4の層。正常時は`NET: DHCP configured`だけで、
   それ以外は失敗の報告です。`NET: dropped an outgoing frame`はスレーブが
   スロットルを要求している間に送ろうとしたフレーム、`NET: DHCP lease lost`は
@@ -161,7 +161,7 @@ IP層が答えない場合の切り分けはUARTログよりコマンドの出�
 2つが離れていればティックを取りこぼしています（smoltcpのタイマの基準が
 狂うので、ネットワークの不調がここに出ることがあります）。
 
-`wifilog`は接続管理器の直近16件を古い順に表示します。各行は単調時刻、接続世代`g`、
+`wifi log`は接続管理器の直近16件を古い順に表示します。各行は単調時刻、接続世代`g`、
 試行番号`a`、旧状態→新状態、reason、RPC status、または`retry-ms`を持ちます。
 同じ状態が続く行は、再試行を決めた元のreasonや期限前に届いて拒否した古いイベントの記録です。
 `stable-reset`はassociationが10分安定してbackoffの失敗回数を0へ戻した記録です。入力した
@@ -184,10 +184,10 @@ associationの切断完了を待ってから新しい接続へ進んだ記録で
 遷移として記録した後にDHCPへ進みます。
 C6リンク喪失では最初のreasonが`link-lost`になり、再構築成功時に`link-ready`が入ります。
 
-`wifisaved`はC6が現在読み込んでいるSTA設定を調べ、SSIDと資格情報の有無だけを表示します。
+`wifi saved`はC6が現在読み込んでいるSTA設定を調べ、SSIDと資格情報の有無だけを表示します。
 RPC応答に含まれるpasswordは表示せず、長さも診断情報へ残しません。これはRAMの一回接続設定を
 表示する場合もあるため、C6 NVSだけを確認するにはC6 reset直後に実行します。OFF中はC6を
-起動せず、起動時に読んだ保存profile有無だけを表示します。`wififorget`成功後は現在のassociationが
+起動せず、起動時に読んだ保存profile有無だけを表示します。`wifi forget`成功後は現在のassociationが
 残る場合がありますが、管理器のRAM資格情報を消去し、次回起動時接続を止めます。OFF中のforgetは
 flash操作の間だけC6を起動し、空profileのOFF markerを書き直してから再びpower downします。
 同コマンド末尾の`profile writes this boot`、`failed`、`forgets`は起動後に管理器が要求した
@@ -523,10 +523,9 @@ channel 1 IRQ 254、complete／rearm 253／256でした。いずれもchannel ma
 submit=reap、cancel／errors／spurious／stale-token／unknown causeは0でした。rearmがcompleteより
 複数多いのは、同じ起動中に接続・再接続した各HIDの初回armも累積カウンタへ含むためです。
 
-`battery`実行時は、検出したINA226のI2Cアドレスを`Battery: INA226 found at I2C address=0x...`
-として出力します。初期化できない場合は`Battery: INA226 identity read failed`または
-`Battery: INA226 configuration write failed`、動作中の一時読出し失敗は
-`Battery: INA226 read failed; retaining last reading`を出力します。
+通常GUIの共通BatteryMonitorは、検出したINA226のI2Cアドレスを
+`Battery: INA226 found at I2C address=0x...`として出力する。初期化・読出し失敗は
+Battery detailsへ不明／エラー表示し、初期化は5秒後に再試行する。`battery`コマンドは廃止した。
 
 主な失敗ログ:
 

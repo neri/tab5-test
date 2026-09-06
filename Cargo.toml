@@ -2,7 +2,7 @@
 # of this binary so they can be built for the host and tested with `cargo
 # test`. This package cannot: `main.rs` and everything under it is RISC-V.
 [workspace]
-members = ["bot-protocol", "browser", "font", "spki", "time"]
+members = ["bot-protocol", "browser", "font", "spki", "time", "system-ui"]
 
 [package]
 name = "tab5-hello-world"
@@ -11,6 +11,7 @@ edition = "2024"
 publish = false
 
 [features]
+system-bar-static = []
 # Compiles the SPKI pins for the test fixtures (`tools/pins/fixture_pins.txt`)
 # into the image, so that `tls-fixture.invalid` can be reached as a pinned
 # host. Never for a release: the matching private keys are in `tools/tls/`,
@@ -19,6 +20,7 @@ publish = false
 tls-fixture-pins = []
 
 [dependencies]
+tab5-system-ui = { path = "system-ui" }
 # FAT12/16/32 (and, later, exFAT) parsing. Like `smoltcp` below, this is a
 # fully specified on-disk format rather than a hardware layer, which is where
 # this repository's "implement it yourself" rule stops applying. The candidate

@@ -124,42 +124,7 @@ pub fn start_initialized(rpc: &mut Rpc) -> Option<Status> {
 
 /// Sends `esp_wifi_init` with ESP-IDF's default configuration.
 pub fn initialize(rpc: &mut Rpc) -> Option<Status> {
-    // `WIFI_INIT_CONFIG_DEFAULT()` from ESP-IDF v5.5.3's `esp_wifi.h`, with
-    // the Kconfig-derived numbers at their defaults. `feature_caps` is left
-    // at zero on purpose: when it differs from the slave's own build the
-    // slave keeps its value, which is the safe direction.
-    let mut config = [0u8; 96];
-    let mut writer = Writer::new(&mut config);
-    writer.int32_field(1, 10); // static_rx_buf_num
-    writer.int32_field(2, 32); // dynamic_rx_buf_num
-    writer.int32_field(3, 1); // tx_buf_type: dynamic
-    writer.int32_field(4, 0); // static_tx_buf_num (unused when dynamic)
-    writer.int32_field(5, 32); // dynamic_tx_buf_num
-    writer.int32_field(6, 0); // cache_tx_buf_num
-    writer.int32_field(7, 0); // csi_enable
-    writer.int32_field(8, 1); // ampdu_rx_enable
-    writer.int32_field(9, 1); // ampdu_tx_enable
-    writer.int32_field(10, 0); // amsdu_tx_enable
-    writer.int32_field(11, 1); // nvs_enable
-    writer.int32_field(12, 0); // nano_enable
-    writer.int32_field(13, 6); // rx_ba_win
-    writer.int32_field(14, 0); // wifi_task_core_id
-    writer.int32_field(15, 752); // beacon_max_len
-    writer.int32_field(16, 32); // mgmt_sbuf_num
-    writer.uint32_field(17, 0); // feature_caps
-    writer.bool_field(18, true); // sta_disconnected_pm
-    writer.int32_field(19, 7); // espnow_max_encrypt_num
-    writer.int32_field(20, 0x1F2F3F4F); // magic
-    writer.int32_field(21, 0); // rx_mgmt_buf_type
-    writer.int32_field(22, 5); // rx_mgmt_buf_num
-    let config_length = writer.finish()?;
-
-    let mut body = [0u8; 128];
-    let mut writer = Writer::new(&mut body);
-    writer.bytes_field(1, &config[..config_length]);
-    let length = writer.finish()?;
-
-    simple_status(rpc, REQ_WIFI_INIT, &body[..length])
+    simple_status(rpc, REQ_WIFI_INIT, &init_request()?)
 }
 
 /// Reads the mode which the C6 loaded from its Wi-Fi NVS.
@@ -267,7 +232,7 @@ fn access_point_records(rpc: &mut Rpc, wanted: i32) -> Option<(Status, Vec<Acces
 
 /// One `wifi_ap_record`. Only the fields this firmware displays are read;
 /// country, HE and VHT details are skipped like any other unknown field.
-fn parse_access_point(bytes: &[u8]) -> Option<AccessPoint> {
+pub(crate) fn parse_access_point(bytes: &[u8]) -> Option<AccessPoint> {
     let mut record = AccessPoint {
         ssid: [0; SSID_MAX_BYTES],
         ssid_length: 0,
@@ -479,69 +444,9 @@ fn set_station_config_with_marker(
     password: &[u8],
     disabled_without_profile: bool,
 ) -> Option<Status> {
-    // `wifi_pmf_config { capable = 1 }`. The field is deprecated in recent
-    // IDF (a station always uses PMF when the AP offers it), but an older
-    // slave may still read it, and refusing PMF would rule out WPA3 APs.
-    let mut pmf = [0u8; 4];
-    let mut writer = Writer::new(&mut pmf);
-    writer.bool_field(1, true);
-    let pmf_length = writer.finish()?;
-
-    // `wifi_scan_threshold { rssi = 0, authmode = 0 }`: accept any signal
-    // and let the password decide the minimum security.
-    //
-    // This has to be sent even though every field is zero. A nested message
-    // that is absent decodes to a null pointer on the slave, and the
-    // firmware shipped on this C6 reads `threshold->rssi` without checking
-    // -- which reboots the co-processor mid-request. The reference host
-    // allocates `threshold` and `pmf_cfg` unconditionally
-    // (`rpc_req.c`, `RPC_ALLOC_ELEMENT`), so anything it always sends is
-    // effectively required.
-    let mut threshold = [0u8; 8];
-    let mut writer = Writer::new(&mut threshold);
-    writer.int32_field(1, 0);
-    writer.int32_field(2, 0);
-    let threshold_length = writer.finish()?;
-
-    // `wifi_sta_config`. Everything not set here stays at the slave's zero
-    // value, which is what ESP-IDF's own defaults amount to: fast scan,
-    // sort by signal, and an auth threshold of "whatever the password
-    // implies".
-    let mut sta = [0u8; 192];
-    let mut writer = Writer::new(&mut sta);
-    writer.bytes_field(1, ssid);
-    writer.bytes_field(2, password);
-    writer.bytes_field(9, &threshold[..threshold_length]);
-    writer.bytes_field(10, &pmf[..pmf_length]);
-    if disabled_without_profile {
-        // `failure_retry_cnt` is ignored with the default FAST scan method.
-        // Its protobuf field maps to the C structure's u8, making this a
-        // stable one-byte marker that does not alter an actual connection.
-        writer.uint32_field(13, DISABLED_WITHOUT_PROFILE_MARKER);
-    }
-    let sta_length = writer.finish()?;
-
-    // `wifi_config { sta = 2 }`.
-    let mut config = [0u8; 224];
-    let mut writer = Writer::new(&mut config);
-    writer.bytes_field(2, &sta[..sta_length]);
-    let config_length = writer.finish()?;
-
-    // `Rpc_Req_WifiSetConfig { iface = 1, cfg = 2 }`.
-    let mut body = [0u8; 256];
-    let mut writer = Writer::new(&mut body);
-    writer.int32_field(1, WIFI_IF_STA);
-    writer.bytes_field(2, &config[..config_length]);
-    let length = writer.finish()?;
-
-    // These two are logged because a link that dies mid-connect needs to be
-    // pinned to one of them.
+    let mut body = config_request(ssid, password, disabled_without_profile)?;
     uart::log(b"WIFI: sending the station configuration\r\n");
-    let result = simple_status(rpc, REQ_WIFI_SET_CONFIG, &body[..length]);
-    // All three messages contain the plaintext credential. Do not leave
-    // copies in this stack frame after the synchronous RPC returns.
-    zeroize(&mut sta);
-    zeroize(&mut config);
+    let result = simple_status(rpc, REQ_WIFI_SET_CONFIG, &body);
     zeroize(&mut body);
     result
 }
@@ -590,7 +495,7 @@ pub fn station_config(rpc: &mut Rpc) -> Option<(Status, StationConfig)> {
     result
 }
 
-fn parse_station_config_response(payload: &[u8]) -> Option<(Status, StationConfig)> {
+pub(crate) fn parse_station_config_response(payload: &[u8]) -> Option<(Status, StationConfig)> {
     // `resp` is an int32 in a proto3 message. Success is zero, so a normal
     // encoder omits field 1 entirely; absence must therefore decode as zero
     // just like it does in the other response parsers in this module.
@@ -782,4 +687,110 @@ fn zeroize(bytes: &mut [u8]) {
         // This buffer can contain the plaintext station credential.
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
+}
+
+/// Encoded requests reused by the incremental GUI operation driver.
+pub fn init_request() -> Option<alloc::vec::Vec<u8>> {
+    // `WIFI_INIT_CONFIG_DEFAULT()` from ESP-IDF v5.5.3's `esp_wifi.h`, with
+    // the Kconfig-derived numbers at their defaults. `feature_caps` is left
+    // at zero on purpose: when it differs from the slave's own build the
+    // slave keeps its value, which is the safe direction.
+    let mut config = [0u8; 96];
+    let mut writer = Writer::new(&mut config);
+    writer.int32_field(1, 10); // static_rx_buf_num
+    writer.int32_field(2, 32); // dynamic_rx_buf_num
+    writer.int32_field(3, 1); // tx_buf_type: dynamic
+    writer.int32_field(4, 0); // static_tx_buf_num (unused when dynamic)
+    writer.int32_field(5, 32); // dynamic_tx_buf_num
+    writer.int32_field(6, 0); // cache_tx_buf_num
+    writer.int32_field(7, 0); // csi_enable
+    writer.int32_field(8, 1); // ampdu_rx_enable
+    writer.int32_field(9, 1); // ampdu_tx_enable
+    writer.int32_field(10, 0); // amsdu_tx_enable
+    writer.int32_field(11, 1); // nvs_enable
+    writer.int32_field(12, 0); // nano_enable
+    writer.int32_field(13, 6); // rx_ba_win
+    writer.int32_field(14, 0); // wifi_task_core_id
+    writer.int32_field(15, 752); // beacon_max_len
+    writer.int32_field(16, 32); // mgmt_sbuf_num
+    writer.uint32_field(17, 0); // feature_caps
+    writer.bool_field(18, true); // sta_disconnected_pm
+    writer.int32_field(19, 7); // espnow_max_encrypt_num
+    writer.int32_field(20, 0x1F2F3F4F); // magic
+    writer.int32_field(21, 0); // rx_mgmt_buf_type
+    writer.int32_field(22, 5); // rx_mgmt_buf_num
+    let config_length = writer.finish()?;
+
+    let mut body = [0u8; 128];
+    let mut writer = Writer::new(&mut body);
+    writer.bytes_field(1, &config[..config_length]);
+    let length = writer.finish()?;
+
+    Some(body[..length].to_vec())
+}
+pub fn config_request(
+    ssid: &[u8],
+    password: &[u8],
+    disabled_without_profile: bool,
+) -> Option<alloc::vec::Vec<u8>> {
+    // `wifi_pmf_config { capable = 1 }`. The field is deprecated in recent
+    // IDF (a station always uses PMF when the AP offers it), but an older
+    // slave may still read it, and refusing PMF would rule out WPA3 APs.
+    let mut pmf = [0u8; 4];
+    let mut writer = Writer::new(&mut pmf);
+    writer.bool_field(1, true);
+    let pmf_length = writer.finish()?;
+
+    // `wifi_scan_threshold { rssi = 0, authmode = 0 }`: accept any signal
+    // and let the password decide the minimum security.
+    //
+    // This has to be sent even though every field is zero. A nested message
+    // that is absent decodes to a null pointer on the slave, and the
+    // firmware shipped on this C6 reads `threshold->rssi` without checking
+    // -- which reboots the co-processor mid-request. The reference host
+    // allocates `threshold` and `pmf_cfg` unconditionally
+    // (`rpc_req.c`, `RPC_ALLOC_ELEMENT`), so anything it always sends is
+    // effectively required.
+    let mut threshold = [0u8; 8];
+    let mut writer = Writer::new(&mut threshold);
+    writer.int32_field(1, 0);
+    writer.int32_field(2, 0);
+    let threshold_length = writer.finish()?;
+
+    // `wifi_sta_config`. Everything not set here stays at the slave's zero
+    // value, which is what ESP-IDF's own defaults amount to: fast scan,
+    // sort by signal, and an auth threshold of "whatever the password
+    // implies".
+    let mut sta = [0u8; 192];
+    let mut writer = Writer::new(&mut sta);
+    writer.bytes_field(1, ssid);
+    writer.bytes_field(2, password);
+    writer.bytes_field(9, &threshold[..threshold_length]);
+    writer.bytes_field(10, &pmf[..pmf_length]);
+    if disabled_without_profile {
+        // `failure_retry_cnt` is ignored with the default FAST scan method.
+        // Its protobuf field maps to the C structure's u8, making this a
+        // stable one-byte marker that does not alter an actual connection.
+        writer.uint32_field(13, DISABLED_WITHOUT_PROFILE_MARKER);
+    }
+    let sta_length = writer.finish()?;
+
+    // `wifi_config { sta = 2 }`.
+    let mut config = [0u8; 224];
+    let mut writer = Writer::new(&mut config);
+    writer.bytes_field(2, &sta[..sta_length]);
+    let config_length = writer.finish()?;
+
+    // `Rpc_Req_WifiSetConfig { iface = 1, cfg = 2 }`.
+    let mut body = [0u8; 256];
+    let mut writer = Writer::new(&mut body);
+    writer.int32_field(1, WIFI_IF_STA);
+    writer.bytes_field(2, &config[..config_length]);
+    let length = writer.finish()?;
+
+    let result = body[..length].to_vec();
+    zeroize(&mut sta);
+    zeroize(&mut config);
+    zeroize(&mut body);
+    Some(result)
 }

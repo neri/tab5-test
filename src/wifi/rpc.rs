@@ -147,6 +147,9 @@ pub struct Event {
 /// because RPC and raw frames cannot be interleaved on the same link
 /// without keeping the fragment state consistent.
 pub struct Rpc {
+    call_timed_out: bool,
+    pending_call: Option<(u32, u32, u64)>,
+    reply: Option<Vec<u8>>,
     transport: Transport,
     next_uid: u32,
     /// Payload of one received frame, reused across calls.
@@ -172,6 +175,9 @@ pub struct Rpc {
 impl Rpc {
     pub fn new(transport: Transport) -> Self {
         Rpc {
+            call_timed_out: false,
+            pending_call: None,
+            reply: None,
             transport,
             // Zero is what an uninitialized field decodes to, so start at
             // one to keep "no uid" distinguishable from the first call.
@@ -191,8 +197,11 @@ impl Rpc {
 
     /// Whether the underlying link is still usable; see
     /// [`Transport::is_alive`].
+    pub fn set_gui_mode(&mut self, enabled: bool) {
+        self.transport.set_bounded_send(enabled);
+    }
     pub fn is_alive(&self) -> bool {
-        self.transport.is_alive()
+        self.transport.is_alive() && !self.call_timed_out
     }
 
     pub fn dropped_data_frames(&self) -> u32 {
@@ -299,7 +308,13 @@ impl Rpc {
                     payload: message.payload,
                 }),
                 Some(message) => {
-                    uart::log_hex(b"RPC: dropping an unclaimed message, id=", message.msg_id);
+                    if self.pending_call.is_some_and(|(id, uid, _)| {
+                        message.msg_type == MSG_TYPE_RESPONSE
+                            && message.msg_id == id
+                            && (message.uid == uid || message.uid == 0)
+                    }) {
+                        self.reply = Some(message.payload);
+                    }
                 }
             }
         }
@@ -311,6 +326,58 @@ impl Rpc {
         core::mem::take(&mut self.events)
     }
 
+    /// One outstanding GUI RPC, collected by ordinary link servicing.
+    pub fn begin_call(&mut self, request_id: u32, body: &[u8]) -> bool {
+        if self.pending_call.is_some() {
+            return false;
+        }
+        let uid = self.next_uid;
+        self.next_uid = self.next_uid.wrapping_add(1).max(1);
+        let mut buffer = [0u8; REQUEST_BUFFER_BYTES];
+        let Some(length) = encode_request(&mut buffer, request_id, uid, body) else {
+            return false;
+        };
+        let sent = self.send_fragmented(&buffer[..length]);
+        for b in &mut buffer {
+            unsafe {
+                core::ptr::write_volatile(b, 0);
+            }
+        }
+        if !sent {
+            return false;
+        }
+        self.reply = None;
+        self.pending_call = Some((
+            request_id + RESPONSE_ID_OFFSET,
+            uid,
+            crate::tick::now_ms().saturating_add(RESPONSE_TIMEOUT_MS as u64),
+        ));
+        true
+    }
+    /// None means still pending; errors retire the UID so late replies cannot
+    /// satisfy a later operation. Timeout/cancellation retires the link, so
+    /// peers without UID echo cannot alias a late reply with a later call.
+    pub fn poll_call(&mut self) -> Option<Result<Vec<u8>, ()>> {
+        let (_, _, deadline) = self.pending_call?;
+        if let Some(reply) = self.reply.take() {
+            self.pending_call = None;
+            return Some(Ok(reply));
+        }
+        if !self.is_alive() || crate::tick::now_ms() >= deadline {
+            self.call_timed_out = true;
+            self.pending_call = None;
+            return Some(Err(()));
+        }
+        None
+    }
+    pub fn cancel_call(&mut self) {
+        if self.pending_call.is_some() {
+            self.call_timed_out = true;
+        }
+        self.pending_call = None;
+        self.reply = None;
+    }
+
     /// Sends one request and waits for the matching response, returning the
     /// response's payload message.
     ///
@@ -319,6 +386,9 @@ impl Rpc {
     /// that carry no arguments (the field still has to be present, because
     /// that is what selects the union case on the slave).
     pub fn call(&mut self, request_id: u32, body: &[u8]) -> Option<Vec<u8>> {
+        if self.pending_call.is_some() {
+            return None;
+        }
         let uid = self.next_uid;
         self.next_uid = self.next_uid.wrapping_add(1).max(1);
 
