@@ -143,5 +143,6 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   この詳細表示のときだけ取得します。多段ハブは未実装です
   （[USB.md](docs/USB.md)）。
 - USB Mass Storageは挿抜に合わせて自動でマウント・アンマウントします
-  （`automount off`で止まります）。SDスロットには挿抜検出線が無いので対象外で、
-  従来どおり明示マウントだけです（[FILESYSTEM.md](docs/FILESYSTEM.md)）。
+  （`automount off`で止まります）。CFとして扱うSDスロットには挿抜検出線が無いので、
+  起動画面でだけ有限回リトライして自動マウントし、以後の自動マウント・アンマウントは
+  行いません（[FILESYSTEM.md](docs/FILESYSTEM.md)）。

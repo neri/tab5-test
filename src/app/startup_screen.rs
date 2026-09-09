@@ -1,8 +1,8 @@
 //! White startup screen and its frame-driven USB/Wi-Fi sub-apps.
 
-use crate::framebuffer::{BLACK, BLUE, Framebuffer, GREEN, HEIGHT, RED, WHITE, WIDTH};
-use crate::fs::RamBlockDevice;
-use crate::fs::vfs::Vfs;
+use crate::framebuffer::{Framebuffer, BLACK, BLUE, GREEN, HEIGHT, RED, WHITE, WIDTH};
+use crate::fs::vfs::{MountRequest, Vfs};
+use crate::fs::{mbr, DeviceId, Devices, RamBlockDevice, SdSlot};
 use crate::input::{InputManager, Key};
 use crate::lcd::Display;
 use crate::{font, tick, uart, usb};
@@ -16,6 +16,10 @@ const USB_PROBE_INTERVAL_MS: u64 = 100;
 const USB_PROBE_CONNECT_WAIT_MS: u32 = 1;
 const WIFI_BEGIN_RETRY_MS: u64 = 500;
 const WIFI_BEGIN_MAX_ATTEMPTS: u32 = 3;
+/// The slot has no detect line, so startup gets a small, bounded activation
+/// campaign instead of treating every later frame as a possible insertion.
+const CF_MOUNT_MAX_ATTEMPTS: u32 = 3;
+const CF_MOUNT_RETRY_MS: u64 = 500;
 
 const ICON_SIZE: usize = 64;
 const ICON_PIXELS: usize = ICON_SIZE * ICON_SIZE;
@@ -24,8 +28,9 @@ const ICON_PIXELS: usize = ICON_SIZE * ICON_SIZE;
 const ICON_TOP: usize = HEIGHT * 3 / 4 - ICON_SIZE / 2;
 const TITLE_Y: usize = HEIGHT / 2 - font::HEIGHT * 2;
 const ICON_CELL_WIDTH: usize = 176;
-const USB_CELL_LEFT: usize = WIDTH / 2 - ICON_CELL_WIDTH;
-const WIFI_CELL_LEFT: usize = WIDTH / 2;
+const CF_CELL_LEFT: usize = WIDTH / 2 - ICON_CELL_WIDTH * 3 / 2;
+const USB_CELL_LEFT: usize = WIDTH / 2 - ICON_CELL_WIDTH / 2;
+const WIFI_CELL_LEFT: usize = WIDTH / 2 + ICON_CELL_WIDTH / 2;
 const DETAIL_Y: usize = ICON_TOP + ICON_SIZE + 12;
 const CANCEL_Y: usize = HEIGHT - font::HEIGHT * 2;
 const CANCEL_TEXT: &str = "ESC  CANCEL STARTUP AND OPEN CONSOLE";
@@ -39,6 +44,7 @@ const AMBER: u16 = 0xA500;
 const USB_ICON_ALPHA: &[u8; ICON_PIXELS] = include_bytes!("../../assets/startup/usb-64-alpha.bin");
 const WIFI_ICON_ALPHA: &[u8; ICON_PIXELS] =
     include_bytes!("../../assets/startup/wifi-64-alpha.bin");
+const CF_ICON_ALPHA: &[u8; ICON_PIXELS] = include_bytes!("../../assets/startup/cf-64-alpha.bin");
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Phase {
@@ -74,8 +80,9 @@ pub enum InitialRoute {
 pub fn draw_initial(framebuffer: &mut Framebuffer) -> bool {
     framebuffer.fill(WHITE);
     centred(framebuffer, TITLE_Y, "パソコンを起動しています…", 2, BLACK);
-    draw_cell(framebuffer, USB_CELL_LEFT, Visual::pending(), true);
-    draw_cell(framebuffer, WIFI_CELL_LEFT, Visual::pending(), false);
+    draw_cell(framebuffer, CF_CELL_LEFT, Visual::pending(), Icon::Cf);
+    draw_cell(framebuffer, USB_CELL_LEFT, Visual::pending(), Icon::Usb);
+    draw_cell(framebuffer, WIFI_CELL_LEFT, Visual::pending(), Icon::Wifi);
     framebuffer.flush()
 }
 
@@ -90,6 +97,7 @@ pub fn run(
 ) -> InitialRoute {
     let started_ms = tick::now_ms();
     let mut screen = Screen::new();
+    let mut cf_app = CfStartup::new(started_ms);
     let mut usb_app = UsbStartup::new(started_ms);
     let mut wifi_app = WifiStartup::new();
     wifi.begin_startup_retry_policy();
@@ -103,6 +111,13 @@ pub fn run(
         Visual {
             phase: Phase::Running,
             detail: "LOOKING FOR DEVICES",
+        },
+    );
+    screen.update_cf(
+        framebuffer,
+        Visual {
+            phase: Phase::Running,
+            detail: "MOUNTING CF",
         },
     );
     screen.update_wifi(
@@ -139,12 +154,14 @@ pub fn run(
             }
         }
 
+        let cf_visual = cf_app.poll(vfs, ram_disk.as_deref_mut(), input.usb_host_mut());
         let usb_visual = usb_app.poll(framebuffer, input, auto_mount, vfs, ram_disk.as_deref_mut());
         let wifi_visual = wifi_app.poll(wifi);
+        screen.update_cf(framebuffer, cf_visual);
         screen.update_usb(framebuffer, usb_visual);
         screen.update_wifi(framebuffer, wifi_visual);
 
-        if usb_app.is_done() && wifi_app.is_done() {
+        if cf_app.is_done() && usb_app.is_done() && wifi_app.is_done() {
             wifi.finish_startup_retry_policy();
             // Use the current link state: USB setup can outlast the first
             // successful Wi-Fi verdict, and the link may have dropped since.
@@ -160,6 +177,7 @@ pub fn run(
 }
 
 struct Screen {
+    cf: Visual,
     usb: Visual,
     wifi: Visual,
     cancel_visible: bool,
@@ -168,10 +186,24 @@ struct Screen {
 impl Screen {
     const fn new() -> Self {
         Self {
+            cf: Visual::pending(),
             usb: Visual::pending(),
             wifi: Visual::pending(),
             cancel_visible: false,
         }
+    }
+
+    fn update_cf(&mut self, framebuffer: &mut Framebuffer, visual: Visual) {
+        if self.cf == visual {
+            return;
+        }
+        self.cf = visual;
+        draw_cell(framebuffer, CF_CELL_LEFT, visual, Icon::Cf);
+        flush_cell(
+            framebuffer,
+            CF_CELL_LEFT,
+            b"STARTUP: CF icon flush failed\r\n",
+        );
     }
 
     fn update_usb(&mut self, framebuffer: &mut Framebuffer, visual: Visual) {
@@ -179,7 +211,7 @@ impl Screen {
             return;
         }
         self.usb = visual;
-        draw_cell(framebuffer, USB_CELL_LEFT, visual, true);
+        draw_cell(framebuffer, USB_CELL_LEFT, visual, Icon::Usb);
         flush_cell(
             framebuffer,
             USB_CELL_LEFT,
@@ -192,7 +224,7 @@ impl Screen {
             return;
         }
         self.wifi = visual;
-        draw_cell(framebuffer, WIFI_CELL_LEFT, visual, false);
+        draw_cell(framebuffer, WIFI_CELL_LEFT, visual, Icon::Wifi);
         flush_cell(
             framebuffer,
             WIFI_CELL_LEFT,
@@ -208,6 +240,121 @@ impl Screen {
             uart::log(b"STARTUP: cancel hint flush failed\r\n");
         }
     }
+}
+
+/// Startup-only mounting for the card slot. Unlike USB, the slot has no
+/// electrical insertion signal, so this deliberately has no post-startup
+/// service path and never removes a mount after a card is pulled.
+struct CfStartup {
+    attempts: u32,
+    next_attempt_ms: u64,
+    done: bool,
+    mounted: bool,
+}
+
+impl CfStartup {
+    const fn new(started_ms: u64) -> Self {
+        Self {
+            attempts: 0,
+            next_attempt_ms: started_ms,
+            done: false,
+            mounted: false,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        usb_host: &mut usb::UsbHost,
+    ) -> Visual {
+        if self.done {
+            return self.terminal_visual();
+        }
+        if tick::now_ms() < self.next_attempt_ms {
+            return Visual {
+                phase: Phase::Running,
+                detail: "RETRYING CF",
+            };
+        }
+
+        self.attempts += 1;
+        self.mounted = mount_cf(vfs, ram_disk, usb_host);
+        if self.mounted || self.attempts >= CF_MOUNT_MAX_ATTEMPTS {
+            self.done = true;
+        } else {
+            self.next_attempt_ms = tick::now_ms().saturating_add(CF_MOUNT_RETRY_MS);
+            uart::log(b"STARTUP: CF mount failed; retrying\r\n");
+        }
+        self.terminal_visual()
+    }
+
+    const fn terminal_visual(&self) -> Visual {
+        if !self.done {
+            Visual {
+                phase: Phase::Running,
+                detail: "MOUNTING CF",
+            }
+        } else if self.mounted {
+            Visual {
+                phase: Phase::Succeeded,
+                detail: "CF MOUNTED",
+            }
+        } else {
+            Visual {
+                phase: Phase::Warning,
+                detail: "CF NOT MOUNTED",
+            }
+        }
+    }
+
+    const fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+/// Mounts every usable MBR primary partition on the onboard card. A fresh
+/// `SdSlot` is intentional: a failed activation must not poison the next
+/// startup retry, while this function is never called after startup.
+fn mount_cf(
+    vfs: &mut Vfs,
+    ram_disk: Option<&mut RamBlockDevice>,
+    usb_host: &mut usb::UsbHost,
+) -> bool {
+    let mut sd = SdSlot::new();
+    let mut devices = Devices {
+        ram: ram_disk,
+        sd: &mut sd,
+        usb: usb_host,
+    };
+    let Some(Ok(mbr::Layout::Mbr(table))) = devices.with_device(DeviceId::Sd, mbr::inspect) else {
+        return false;
+    };
+
+    let mut mounted = false;
+    for number in 1..=mbr::MAX_PARTITIONS as u8 {
+        if table.partition(number).is_none() {
+            continue;
+        }
+        if vfs.mounts().any(|mount| {
+            mount.volume.device == DeviceId::Sd && mount.volume.partition == Some(number)
+        }) {
+            mounted = true;
+            continue;
+        }
+        if super::files::attach(
+            &mut devices,
+            vfs,
+            DeviceId::Sd,
+            Some(number),
+            MountRequest::Default,
+        )
+        .is_ok()
+        {
+            mounted = true;
+        }
+    }
+    mounted
 }
 
 struct UsbStartup {
@@ -504,7 +651,14 @@ const fn begin_failure_retryable(failure: Failure) -> bool {
     )
 }
 
-fn draw_cell(framebuffer: &mut Framebuffer, cell_left: usize, visual: Visual, usb_icon: bool) {
+#[derive(Clone, Copy)]
+enum Icon {
+    Cf,
+    Usb,
+    Wifi,
+}
+
+fn draw_cell(framebuffer: &mut Framebuffer, cell_left: usize, visual: Visual, icon: Icon) {
     framebuffer.fill_rect(
         cell_left,
         ICON_TOP - 8,
@@ -513,12 +667,29 @@ fn draw_cell(framebuffer: &mut Framebuffer, cell_left: usize, visual: Visual, us
         WHITE,
     );
     let icon_left = cell_left + (ICON_CELL_WIDTH - ICON_SIZE) / 2;
-    let alpha = if usb_icon {
-        USB_ICON_ALPHA
-    } else {
-        WIFI_ICON_ALPHA
-    };
-    draw_bitmap_icon(framebuffer, icon_left, ICON_TOP, visual.phase, alpha);
+    match icon {
+        Icon::Cf => draw_bitmap_icon(
+            framebuffer,
+            icon_left,
+            ICON_TOP,
+            visual.phase,
+            CF_ICON_ALPHA,
+        ),
+        Icon::Usb => draw_bitmap_icon(
+            framebuffer,
+            icon_left,
+            ICON_TOP,
+            visual.phase,
+            USB_ICON_ALPHA,
+        ),
+        Icon::Wifi => draw_bitmap_icon(
+            framebuffer,
+            icon_left,
+            ICON_TOP,
+            visual.phase,
+            WIFI_ICON_ALPHA,
+        ),
+    }
     centred_in(
         framebuffer,
         cell_left,
