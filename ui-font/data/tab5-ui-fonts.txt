@@ -1,0 +1,15 @@
+tab5 UI fonts
+format: T5A4 v1, column-major A4
+generator: tools/ui-font/generate.py; Pillow 10.2.0
+faces: DejaVu Sans 2.37; DejaVu Sans Mono 2.37
+code points: 210 per strike
+DejaVu Sans 16px: glyphs=210 bitmap=7674 bytes advance=3..13
+DejaVu Sans 24px: glyphs=210 bitmap=18762 bytes advance=5..20
+DejaVu Sans 32px: glyphs=210 bitmap=33885 bytes advance=6..27
+DejaVu Sans Mono 16px: glyphs=210 bitmap=7768 bytes advance=8..8
+DejaVu Sans Mono 24px: glyphs=210 bitmap=18339 bytes advance=12..12
+DejaVu Sans Mono 32px: glyphs=210 bitmap=32902 bytes advance=16..16
+metadata=20288 bytes bitmap=119330 bytes total=139618 bytes
+crc32=307f3760
+sha256=f38451c7d9d01d639e86343971eb3d69e81559ffd78851c14a6f987fca418c2a
+intermediate coverage: yes (both faces)

@@ -12,8 +12,8 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     text.push_str("VOLTAGE ESTIMATE  ");
     text.push_u32(percent);
     text.push_str("%");
-    framebuffer.draw_text(68, 530, text.as_str(), 1, level_color, None);
-    framebuffer.draw_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, theme::TEXT, None);
+    framebuffer.draw_gui_text(68, 530, text.as_str(), 1, level_color, None);
+    framebuffer.draw_gui_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, theme::TEXT, None);
 
     draw_value(
         framebuffer,
@@ -83,8 +83,8 @@ fn draw_battery(framebuffer: &mut Framebuffer, percent: u32, color: u16) {
     // Centred in the battery body rather than offset by a fixed amount: the
     // reading is one to four characters wide, and the old offset was only
     // right for the widest of them.
-    let width = crate::font::text_width(text.as_str()) * 2;
-    framebuffer.draw_text(
+    let width = crate::font::ui_text_width(text.as_str(), crate::font::UiTextStyle::HEADING);
+    framebuffer.draw_gui_text(
         LEFT + (BODY_WIDTH - width) / 2,
         TOP + (BODY_HEIGHT - crate::font::HEIGHT * 2) / 2,
         text.as_str(),
@@ -102,8 +102,8 @@ fn draw_value(
     value: &str,
     value_color: u16,
 ) {
-    framebuffer.draw_text(x, y, label, 1, theme::TEXT, None);
-    framebuffer.draw_text(x, y + 34, value, 2, value_color, None);
+    framebuffer.draw_gui_text(x, y, label, 1, theme::TEXT, None);
+    framebuffer.draw_gui_text(x, y + 34, value, 2, value_color, None);
     framebuffer.draw_line(x, y + 102, WIDTH - 54, y + 102, theme::BORDER);
 }
 
@@ -234,7 +234,7 @@ pub fn draw_details(fb: &mut Framebuffer, monitor: &super::battery_monitor::Batt
     if let Some(sample) = monitor.sample {
         draw_reading(fb, sample);
     } else {
-        fb.draw_text(
+        fb.draw_gui_text(
             32,
             300,
             monitor.error.unwrap_or("WAITING FOR INA226 DATA"),
@@ -243,7 +243,7 @@ pub fn draw_details(fb: &mut Framebuffer, monitor: &super::battery_monitor::Batt
             None,
         );
     }
-    fb.draw_text(
+    fb.draw_gui_text(
         32,
         674,
         "VOLTAGE ESTIMATE ONLY / ESC BACK / F3 LAUNCHER",

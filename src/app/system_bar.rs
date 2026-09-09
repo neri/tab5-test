@@ -139,11 +139,14 @@ impl View {
                             b'0' + m % 10,
                         ];
                     }
-                    fb.draw_text(
-                        r.x + 20,
+                    let text = core::str::from_utf8(&text).unwrap_or("--:--");
+                    let style = crate::font::UiTextStyle::MONO;
+                    let text_width = crate::font::ui_text_width(text, style);
+                    fb.draw_ui_text(
+                        r.x + r.width.saturating_sub(text_width) / 2,
                         16,
-                        core::str::from_utf8(&text).unwrap_or("--:--"),
-                        1,
+                        text,
+                        style,
                         BLACK,
                         None,
                     );
@@ -211,7 +214,7 @@ mod host {
         {
             fb.fill(WHITE);
             fb.fill_rect(APP.x, 0, APP.width, HEIGHT, BUTTON_FACE);
-            fb.draw_text(
+            fb.draw_gui_text(
                 APP.x + 12,
                 16,
                 "System bar geometry / press any key to leave",
@@ -603,7 +606,7 @@ mod host {
                                     theme::SUBTLE
                                 },
                             );
-                            fb.draw_text(
+                            fb.draw_gui_text(
                                 ROW_LEFT + 16,
                                 ROW_TOP + i * ROW_HEIGHT + 8,
                                 label,
@@ -630,10 +633,18 @@ mod host {
                             }
                             _ => "Launcher / M or F3   Arrows select, Enter opens, Escape returns",
                         };
-                        fb.draw_text(APP.x + 12, 16, title, 1, BLACK, None);
+                        fb.draw_gui_text_clipped(
+                            APP.x + 12,
+                            16,
+                            title,
+                            APP.width.saturating_sub(24),
+                            1,
+                            BLACK,
+                            None,
+                        );
                         if matches!(screen, Screen::Mini(_)) {
                             // Synthesize bold with the same one-pixel overstrike as Browser.
-                            fb.draw_text(APP.x + 13, 16, "< Back", 1, BLACK, None);
+                            fb.draw_gui_text(APP.x + 13, 16, "< Back", 1, BLACK, None);
                         }
                         if !fb.flush_rect(APP.x, 0, APP.width, HEIGHT) {
                             uart::log(b"SYSTEM BAR: title flush failed\r\n");

@@ -27,3 +27,6 @@ Network settingsとBattery detailsのバー内`< Back`は、既存のBrowserと�
 1 pixel右への重ね描きで太字にする。タイトルは通常の太さのまま。
 Network settings下部の`Esc Back`も太字にする。
 これらの配色・文字の実機での視認性は未確認。
+
+通常GUIのEnglish LatinはA4 coverageを各theme色と描画先背景のRGB565 channelでblendする。
+選択行の青やDesktop barのtealでも二値化せず、太字の二度打ちも各passでblendする。

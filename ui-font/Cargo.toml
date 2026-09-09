@@ -1,0 +1,15 @@
+[package]
+name = "tab5-ui-font"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+drom-direct = ["tab5-font/drom-direct"]
+
+[dependencies]
+tab5-font = { path = "../font" }
+tab5-font-codec = { path = "../font-codec" }
+
+[build-dependencies]
+tab5-font-codec = { path = "../font-codec", features = ["encoder"] }

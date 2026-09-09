@@ -1,6 +1,6 @@
 //! Full-screen 16 pixel font diagnostic.
 //!
-//! One static screen that puts every case the renderer has to get right next
+//! Three static screens put every case the renderers have to get right next
 //! to every other one: half-width and full-width side by side, a combining
 //! mark that has to land on the character before it, characters the subset
 //! does not cover that have to be boxes rather than blanks, an opaque repaint
@@ -62,18 +62,25 @@ const ROWS: [(&str, &str); 9] = [
     // U+20BB7 and the emoji are outside the BMP, which the source font does
     // not cover; U+FDFD is inside it but outside the subset. All three have to
     // draw a box.
-    ("missing", "\u{20BB7} \u{1F600} \u{FDFD} <- boxes, never blanks"),
+    (
+        "missing",
+        "\u{20BB7} \u{1F600} \u{FDFD} <- boxes, never blanks",
+    ),
 ];
 
 /// Body text at 1x, which is the size everything except headings uses.
-const BODY: &str =
-    "この画面は16ピクセルのビットマップフォントの見え方を確かめるためのものです。\n\
+const BODY: &str = "この画面は16ピクセルのビットマップフォントの見え方を確かめるためのものです。\n\
      漢字とかなの混じった長い文が、実機の画面でどのくらい読めるかを見ます。行の\n\
      高さは16ピクセル、英数字とラテン文字は8ピクセル送り、かなと漢字は16ピクセル\n\
      送りです。拡大は整数倍だけで、見出しは2倍の32ピクセルにします。";
 
 pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
+    #[cfg(feature = "font-drom-direct")]
+    uart::log(b"Font test: source=plain DROM direct\r\n");
+    #[cfg(not(feature = "font-drom-direct"))]
+    uart::log(b"Font test: source=decoded PSRAM\r\n");
     framebuffer.fill(BLACK);
+    let started = crate::delay::cycle_count();
 
     framebuffer.draw_text(MARGIN, 8, "fonttest", 2, WHITE, None);
     framebuffer.draw_text(MARGIN + 160, 16, "16px glyph renderer", 1, CYAN, None);
@@ -118,7 +125,14 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     // first row means an opaque repaint is not covering its own box.
     framebuffer.draw_text(x, y, "MMMMMMMMMMMMMMMM", 1, RED, Some(BLUE));
     framebuffer.draw_text(x, y, "あいうえおかきく", 1, WHITE, Some(BLACK));
-    framebuffer.draw_text(x + 8 * 16 + 16, y, "<- no red or blue may remain", 1, WHITE, None);
+    framebuffer.draw_text(
+        x + 8 * 16 + 16,
+        y,
+        "<- no red or blue may remain",
+        1,
+        WHITE,
+        None,
+    );
 
     y += LINE + 8;
     framebuffer.draw_text(MARGIN, y, "見出し 32px Heading 0123", 2, WHITE, None);
@@ -152,12 +166,273 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         None,
     );
 
-    framebuffer.draw_text(MARGIN, 700, "any key exits", 1, CYAN, None);
+    let draw_us = crate::delay::cycle_count().wrapping_sub(started) / 360;
+    uart::log_u32(b"Font test: legacy glyph phase us=", draw_us);
+    let footer_width = framebuffer.draw_text(MARGIN, 700, "source: ", 1, CYAN, None);
+    let footer_width = footer_width
+        + framebuffer.draw_text(
+            MARGIN + footer_width,
+            700,
+            font::STORAGE_LABEL,
+            1,
+            YELLOW,
+            None,
+        );
+    framebuffer.draw_text(
+        MARGIN + footer_width,
+        700,
+        " — any key: A4 UI fonts",
+        1,
+        CYAN,
+        None,
+    );
 
     if !framebuffer.flush() {
         uart::log(b"Font test: flush failed\r\n");
         return;
     }
-    uart::log(b"Font test: sheet displayed, press any key to exit\r\n");
+    uart::log(b"Font test: legacy sheet displayed, press any key for A4 UI fonts\r\n");
     input.wait_for_key();
+    draw_ui_sheet(framebuffer);
+    input.wait_for_key();
+    draw_aa_comparison(framebuffer);
+    input.wait_for_key();
+}
+
+fn draw_ui_sheet(framebuffer: &mut Framebuffer) {
+    framebuffer.fill(BLACK);
+    let started = crate::delay::cycle_count();
+    framebuffer.draw_gui_text(MARGIN, 8, "A4 proportional / monospace", 2, WHITE, None);
+    framebuffer.draw_gui_text(
+        MARGIN,
+        52,
+        "Sans 16: AVATAR To Wi-Fi  iIl1Wm  café — € ™",
+        1,
+        WHITE,
+        None,
+    );
+    framebuffer.draw_ui_text(
+        MARGIN,
+        80,
+        "Mono 16: AVATAR To Wi-Fi  iIl1Wm  00:00 23:59",
+        font::UiTextStyle::MONO,
+        CYAN,
+        None,
+    );
+    framebuffer.draw_ui_text(
+        MARGIN,
+        110,
+        "Sans 24: proportional anti-aliased text",
+        font::UiTextStyle::new(font::UiFace::Sans, 24),
+        YELLOW,
+        None,
+    );
+    framebuffer.draw_ui_text(
+        MARGIN,
+        148,
+        "Mono 24: code() 0123456789",
+        font::UiTextStyle::new(font::UiFace::Mono, 24),
+        GREEN,
+        None,
+    );
+    framebuffer.draw_gui_text(MARGIN, 190, "Sans 32: Heading 0123", 2, WHITE, None);
+    framebuffer.draw_ui_text(
+        MARGIN,
+        232,
+        "Mono 32: 0123456789",
+        font::UiTextStyle::new(font::UiFace::Mono, 32),
+        CYAN,
+        None,
+    );
+    framebuffer.fill_rect(MARGIN, 286, 590, 60, BLUE);
+    framebuffer.draw_gui_text(
+        MARGIN + 12,
+        300,
+        "Blue selection: anti-aliased edge",
+        1,
+        WHITE,
+        None,
+    );
+    framebuffer.fill_rect(MARGIN, 358, 590, 60, 0x0430);
+    framebuffer.draw_gui_text(
+        MARGIN + 12,
+        372,
+        "Theme teal: AVATAR To Wi-Fi",
+        1,
+        YELLOW,
+        None,
+    );
+    framebuffer.draw_gui_text(
+        MARGIN,
+        438,
+        "Mixed: Tab5 Browser 日本語 / e\u{301} legacy cluster",
+        1,
+        WHITE,
+        None,
+    );
+    let width = framebuffer.draw_gui_text(MARGIN, 474, "Bold overstrike: Wi-Fi", 1, WHITE, None);
+    framebuffer.draw_gui_text(MARGIN + 1, 474, "Bold overstrike: Wi-Fi", 1, WHITE, None);
+    framebuffer.draw_gui_text(
+        MARGIN + width + 20,
+        474,
+        "transparent background",
+        1,
+        RED,
+        None,
+    );
+    let draw_us = crate::delay::cycle_count().wrapping_sub(started) / 360;
+    uart::log_u32(b"Font test: A4 glyph phase us=", draw_us);
+    framebuffer.draw_gui_text(MARGIN, 690, "any key: A4 / 1-bit comparison", 1, CYAN, None);
+    if !framebuffer.flush() {
+        uart::log(b"Font test: A4 sheet flush failed\r\n");
+    } else {
+        uart::log(b"Font test: A4 sheet displayed, press any key for AA comparison\r\n");
+    }
+}
+
+const COMPARE_LEFT: usize = 24;
+const COMPARE_RIGHT: usize = 656;
+
+fn draw_compare_row(
+    framebuffer: &mut Framebuffer,
+    y: usize,
+    text: &str,
+    style: font::UiTextStyle,
+    foreground: u16,
+    background: Option<u16>,
+) {
+    framebuffer.draw_ui_text(COMPARE_LEFT, y, text, style, foreground, background);
+    framebuffer.draw_ui_text_1bpp(COMPARE_RIGHT, y, text, style, foreground, background);
+}
+
+/// Side-by-side AA comparison. Both columns read the same A4 glyph records;
+/// only the right column thresholds coverage at 8, so advances, bearings and
+/// outline rasterisation cannot accidentally bias the comparison.
+fn draw_aa_comparison(framebuffer: &mut Framebuffer) {
+    framebuffer.fill(BLACK);
+    framebuffer.draw_gui_text(
+        MARGIN,
+        8,
+        "AA test — same glyphs and metrics",
+        1,
+        WHITE,
+        None,
+    );
+    framebuffer.draw_gui_text(COMPARE_LEFT, 38, "A4 coverage (0..15)", 1, CYAN, None);
+    framebuffer.draw_gui_text(COMPARE_RIGHT, 38, "1-bit (A4 >= 8)", 1, YELLOW, None);
+    framebuffer.draw_gui_text(1020, 8, font::STORAGE_LABEL, 1, YELLOW, None);
+    framebuffer.fill_rect(638, 36, 2, 626, 0x4208);
+
+    draw_compare_row(
+        framebuffer,
+        74,
+        "16px  iIl1|AVATAR|Sphinx|0123456789",
+        font::UiTextStyle::new(font::UiFace::Sans, 16),
+        WHITE,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        102,
+        "curves: aeocsg  diagonals: AVWXYZ  fine: .,:;'!",
+        font::UiTextStyle::new(font::UiFace::Sans, 16),
+        WHITE,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        148,
+        "24px iIl1 AVATAR Sphinx 012345",
+        font::UiTextStyle::new(font::UiFace::Sans, 24),
+        WHITE,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        184,
+        "curves aeocsg / diagonals AVWXYZ",
+        font::UiTextStyle::new(font::UiFace::Sans, 24),
+        WHITE,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        240,
+        "32px iIl1 AVATAR 0123",
+        font::UiTextStyle::new(font::UiFace::Sans, 32),
+        WHITE,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        282,
+        "Sphinx aeocsg AVWXYZ",
+        font::UiTextStyle::new(font::UiFace::Sans, 32),
+        WHITE,
+        None,
+    );
+
+    // The same edges against dark colour and light backgrounds make lost
+    // coverage or colour fringes much easier to see than black alone.
+    framebuffer.fill_rect(COMPARE_LEFT, 342, 584, 58, BLUE);
+    framebuffer.fill_rect(COMPARE_RIGHT, 342, 584, 58, BLUE);
+    draw_compare_row(
+        framebuffer,
+        357,
+        "24px colour: Sphinx AVWXYZ 0123",
+        font::UiTextStyle::new(font::UiFace::Sans, 24),
+        YELLOW,
+        Some(BLUE),
+    );
+    framebuffer.fill_rect(COMPARE_LEFT, 414, 584, 58, WHITE);
+    framebuffer.fill_rect(COMPARE_RIGHT, 414, 584, 58, WHITE);
+    draw_compare_row(
+        framebuffer,
+        429,
+        "24px light: Sphinx AVWXYZ 0123",
+        font::UiTextStyle::new(font::UiFace::Sans, 24),
+        BLACK,
+        Some(WHITE),
+    );
+
+    draw_compare_row(
+        framebuffer,
+        500,
+        "Mono 16: iIl1|MWMW|00:00|23:59",
+        font::UiTextStyle::new(font::UiFace::Mono, 16),
+        CYAN,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        534,
+        "Mono 24: iIl1|MWMW|012345",
+        font::UiTextStyle::new(font::UiFace::Mono, 24),
+        GREEN,
+        None,
+    );
+    draw_compare_row(
+        framebuffer,
+        578,
+        "Mono 32: iIl1|MW|0123",
+        font::UiTextStyle::new(font::UiFace::Mono, 32),
+        WHITE,
+        None,
+    );
+
+    framebuffer.draw_gui_text(
+        MARGIN,
+        674,
+        "Compare readability, curves and diagonals at normal viewing distance — any key exits",
+        1,
+        CYAN,
+        None,
+    );
+    if !framebuffer.flush() {
+        uart::log(b"Font test: AA comparison flush failed\r\n");
+    } else {
+        uart::log(
+            b"Font test: AA comparison displayed (A4 left, 1-bit right); press any key to exit\r\n",
+        );
+    }
 }

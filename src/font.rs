@@ -16,6 +16,63 @@
 
 // Deliberately narrow: each name arrives with the code that needs it, so the
 // list doubles as a record of how far the migration has got.
-pub use tab5_font::{
-    Glyph, HEIGHT, MAX_WIDTH, advance, console, glyph_or_replacement, text_width,
+#[cfg(not(feature = "font-drom-direct"))]
+use alloc::vec::Vec;
+
+pub use tab5_font::{Glyph, HEIGHT, MAX_WIDTH, console, glyph_or_replacement, text_width};
+
+pub use tab5_ui_font::{Face as UiFace, Glyph as UiGlyph, TextStyle as UiTextStyle};
+
+pub fn ui_text_width(text: &str, style: UiTextStyle) -> usize {
+    tab5_ui_font::text_width(text, style)
+}
+
+pub const STORAGE_LABEL: &str = if cfg!(feature = "font-drom-direct") {
+    "DROM direct"
+} else {
+    "PSRAM decoded"
 };
+
+#[cfg(not(feature = "font-drom-direct"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PsramInstallError {
+    OutOfMemory,
+    Legacy(tab5_font::InstallError),
+    Ui(tab5_ui_font::InstallError),
+}
+
+#[cfg(not(feature = "font-drom-direct"))]
+pub struct PsramFontStorage {
+    pub legacy_bytes: usize,
+    pub ui_bytes: usize,
+    pub compressed_bytes: usize,
+    pub legacy_address: usize,
+    pub ui_address: usize,
+}
+
+#[cfg(not(feature = "font-drom-direct"))]
+fn permanent_buffer(length: usize) -> Result<&'static mut [u8], PsramInstallError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| PsramInstallError::OutOfMemory)?;
+    buffer.resize(length, 0);
+    Ok(buffer.leak())
+}
+
+/// Expands the two LZ4 DROM font blobs into permanent decoded PSRAM.
+/// Must be called after the global PSRAM allocator is ready and before UI.
+#[cfg(not(feature = "font-drom-direct"))]
+pub fn install_psram() -> Result<PsramFontStorage, PsramInstallError> {
+    let legacy = permanent_buffer(tab5_font::STORAGE_BYTES)?;
+    tab5_font::install_psram(legacy).map_err(PsramInstallError::Legacy)?;
+    let ui = permanent_buffer(tab5_ui_font::STORAGE_BYTES)?;
+    tab5_ui_font::install_psram(ui).map_err(PsramInstallError::Ui)?;
+    Ok(PsramFontStorage {
+        legacy_bytes: tab5_font::STORAGE_BYTES,
+        ui_bytes: tab5_ui_font::STORAGE_BYTES,
+        compressed_bytes: tab5_font::COMPRESSED_BYTES + tab5_ui_font::COMPRESSED_BYTES,
+        legacy_address: tab5_font::psram_address().unwrap(),
+        ui_address: tab5_ui_font::psram_address().unwrap(),
+    })
+}

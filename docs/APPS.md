@@ -43,8 +43,10 @@ CardKBまたはUSBキーボードの任意のキーで抜けられます。
 
 ## フォント診断画面
 
-`fonttest`コマンドは`src/app/font_test.rs`の全画面シートを開きます。16 pixel
-フォントとrendererが正しく組み合わさっているかを、1画面で見比べるためのものです。
+`fonttest`コマンドは3枚の全画面シートを順に開きます。1枚目は従来16 pixel font、
+2枚目はA4 Sans／Sans Monoの16／24／32 pixelとrenderer、3枚目は同一のA4 glyphを
+coverageの閾値8で二値化した比較baselineです。キーを押すたびに次のシートへ進み、
+3枚目から終了します。
 
 - ASCII、かな、漢字、記号、半角カナ、Latin、ギリシャ・キリル文字の見本
 - combining mark（U+3099／U+309A／U+0301）が直前の文字へ重なり、幅を増やさないこと
@@ -58,8 +60,17 @@ CardKBまたはUSBキーボードの任意のキーで抜けられます。
   進む行送りがglyph高と一致しているか、文字送りがglyph幅と一致しているかを
   1 pixel単位で見られます
 - 16 pixelの日本語本文4行。実機での可読性はここで判断します
+- A4比例幅／固定幅の`AVATAR To Wi-Fi`、`iIl1Wm`、accent、時計、英日混在
+- 黒、青い選択背景、themeのteal、透明背景、1 pixel二度打ち太字でのalpha edge
+- 最初にfont sourceを`decoded PSRAM`または`plain DROM direct`としてUARTへ出し、従来fontと
+  A4のglyph phase時間を`Font test: legacy glyph phase us=`、
+  `Font test: A4 glyph phase us=`として出力。同じラベルなので2 buildをそのまま比較できます
+- 3枚目では左に通常のA4、右に`alpha >= 8`だけを前景色にする1bit baselineを配置。
+  glyph、bearing、advanceは同じまま、Sans／Sans Monoの16／24／32 pixelを比較します。
+  黒背景だけでなく青背景の黄文字と白背景の黒文字でも、通常の視距離から可読性、曲線、
+  斜線、細い縦画を見比べられます。この1bit経路は診断専用で、製品画面には使いません
 
-静止画面で、描いてflushしたらキー入力を待つだけです。文字列は
+各静止画面を描いてflushしたらキー入力を待ちます。最初の2枚の文字列は
 [`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)が固定したものと同じです。
 
 ## BMI270軸センサーテスト

@@ -249,7 +249,7 @@ fn draw_access_points(
     count.push_u32(access_points.len() as u32);
     count.push_str(" NETWORKS  ");
     count.push_str(if status.enabled { "ON" } else { "OFF" });
-    framebuffer.draw_text(930, 52, count.as_str(), 1, MUTED, None);
+    framebuffer.draw_gui_text(930, 52, count.as_str(), 1, MUTED, None);
 
     if access_points.is_empty() {
         centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, WARNING);
@@ -278,7 +278,7 @@ fn draw_access_points(
         draw_access_point_row(framebuffer, network, y, status, selected_row);
     }
 
-    framebuffer.draw_text(
+    framebuffer.draw_gui_text(
         28,
         FOOTER_TOP,
         "UP/DOWN/PAGE SELECT   ENTER/TOUCH CONNECT   O OFF   F FORGET",
@@ -287,9 +287,9 @@ fn draw_access_points(
         None,
     );
     if let Some(message) = message {
-        framebuffer.draw_text(28, FOOTER_TOP + 32, message, 1, WARNING, None);
+        framebuffer.draw_gui_text(28, FOOTER_TOP + 32, message, 1, WARNING, None);
     } else {
-        framebuffer.draw_text(
+        framebuffer.draw_gui_text(
             28,
             FOOTER_TOP + 32,
             "R RESCAN   ESC EXIT   MENU CONNECTIONS REQUEST DHCP AUTOMATICALLY",
@@ -313,7 +313,7 @@ fn draw_column_labels(framebuffer: &mut Framebuffer) {
         (AUTH_LEFT, "SECURITY"),
         (COUNT_LEFT, "APS"),
     ] {
-        framebuffer.draw_text(x, COLUMN_LABEL_TOP, label, 1, MUTED, None);
+        framebuffer.draw_gui_text(x, COLUMN_LABEL_TOP, label, 1, MUTED, None);
     }
 }
 
@@ -433,13 +433,37 @@ fn draw_ssid(
     bold: bool,
     color: u16,
 ) {
+    let budget = SIGNAL_LEFT.saturating_sub(x + 8);
     match core::str::from_utf8(ssid) {
-        Ok(name) => draw_label(framebuffer, x, y, name, color, bold),
+        Ok(name) => draw_label_clipped(framebuffer, x, y, name, budget, color, bold),
         Err(_) => {
             let mut line = Line::new();
             line.push_ascii(ssid);
-            draw_label(framebuffer, x, y, line.as_str(), color, bold);
+            draw_label_clipped(framebuffer, x, y, line.as_str(), budget, color, bold);
         }
+    }
+}
+
+fn draw_label_clipped(
+    framebuffer: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    text: &str,
+    budget: usize,
+    colour: u16,
+    bold: bool,
+) {
+    framebuffer.draw_gui_text_clipped(x, y, text, budget, 1, colour, None);
+    if bold {
+        framebuffer.draw_gui_text_clipped(
+            x + 1,
+            y,
+            text,
+            budget.saturating_sub(1),
+            1,
+            colour,
+            None,
+        );
     }
 }
 
@@ -526,9 +550,9 @@ fn draw_label(
     colour: u16,
     bold: bool,
 ) {
-    framebuffer.draw_text(x, y, text, 1, colour, None);
+    framebuffer.draw_gui_text(x, y, text, 1, colour, None);
     if bold {
-        framebuffer.draw_text(x + 1, y, text, 1, colour, None);
+        framebuffer.draw_gui_text(x + 1, y, text, 1, colour, None);
     }
 }
 
@@ -537,22 +561,22 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
     let mut network = Line::new();
     network.push_str("NETWORK  ");
     network.push_ascii(ssid);
-    framebuffer.draw_text(90, 150, network.as_str(), 2, BLACK, None);
-    framebuffer.draw_text(90, 226, "PASSWORD", 1, MUTED, None);
+    framebuffer.draw_gui_text(90, 150, network.as_str(), 2, BLACK, None);
+    framebuffer.draw_gui_text(90, 226, "PASSWORD", 1, MUTED, None);
     framebuffer.fill_rect(90, 258, 900, 64, BLACK);
     framebuffer.fill_rect(92, 260, 896, 60, BACKGROUND);
 
     let mut masked = [b'*'; wifi::station::PASSWORD_MAX_BYTES];
     let masked_text = core::str::from_utf8(&masked[..length]).unwrap_or("");
-    framebuffer.draw_text(106, 276, masked_text, 1, BLACK, Some(BACKGROUND));
+    framebuffer.draw_gui_text(106, 276, masked_text, 1, BLACK, Some(BACKGROUND));
     // Do not let the display copy be mistaken for credential storage either.
     zeroize(&mut masked);
 
     let mut count = Line::new();
     count.push_u32(length as u32);
     count.push_str(" / 64 BYTES");
-    framebuffer.draw_text(1010, 279, count.as_str(), 1, PRIMARY, None);
-    framebuffer.draw_text(
+    framebuffer.draw_gui_text(1010, 279, count.as_str(), 1, PRIMARY, None);
+    framebuffer.draw_gui_text(
         90,
         370,
         "ENTER CONNECT    BACKSPACE DELETE    ESC CANCEL",
@@ -560,7 +584,7 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
         PRIMARY,
         None,
     );
-    framebuffer.draw_text(
+    framebuffer.draw_gui_text(
         90,
         414,
         "THE PASSWORD IS NOT WRITTEN TO THE CONSOLE OR UART LOG",
@@ -585,9 +609,11 @@ fn centred_in(
     scale: usize,
     color: u16,
 ) {
-    let drawn = crate::font::text_width(text) * scale;
+    let style =
+        crate::font::UiTextStyle::new(crate::font::UiFace::Sans, if scale >= 2 { 32 } else { 16 });
+    let drawn = crate::font::ui_text_width(text, style);
     let x = left + width.saturating_sub(drawn) / 2;
-    framebuffer.draw_text(x, y, text, scale, color, None);
+    framebuffer.draw_gui_text(x, y, text, scale, color, None);
 }
 
 /// Centred across the whole screen.
@@ -598,7 +624,7 @@ fn centred(framebuffer: &mut Framebuffer, y: usize, text: &str, scale: usize, co
 fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
     framebuffer.fill_rect(0, 48, WIDTH, HEIGHT - 48, BACKGROUND);
     framebuffer.fill_rect(0, 48, WIDTH, HEADER_HEIGHT - 48, HEADER);
-    framebuffer.draw_text(28, 52, title, 1, BLACK, None);
+    framebuffer.draw_gui_text(28, 52, title, 1, BLACK, None);
     framebuffer.fill_rect(
         0,
         FOOTER_TOP - 16,
@@ -610,8 +636,8 @@ fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
 
 fn show_progress(framebuffer: &mut Framebuffer, title: &str, detail: &str) {
     draw_chrome(framebuffer, "WI-FI SETUP");
-    framebuffer.draw_text(90, 235, title, 2, PRIMARY, None);
-    framebuffer.draw_text(90, 318, detail, 1, BLACK, None);
+    framebuffer.draw_gui_text(90, 235, title, 2, PRIMARY, None);
+    framebuffer.draw_gui_text(90, 318, detail, 1, BLACK, None);
     flush(framebuffer, b"WIFI MENU: progress-screen flush failed\r\n");
 }
 
@@ -955,7 +981,7 @@ impl Screen {
             fb.fill_rect(0, 610, WIDTH, 34, FOOTER);
             for (i, label) in ["Page up", "Page down"].iter().enumerate() {
                 fb.fill_rect(24 + i * 616, 610, 600, 32, HEADER);
-                fb.draw_text(40 + i * 616, 618, label, 1, BLACK, None);
+                fb.draw_gui_text(40 + i * 616, 618, label, 1, BLACK, None);
             }
         }
         let labels = self.footer_labels();

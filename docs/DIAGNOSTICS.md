@@ -26,6 +26,12 @@ PSRAM: ready (framebuffer + heap)
 XIP: post-PSRAM DROM probe start
 XIP: post-PSRAM IROM probe start
 XIP: post-PSRAM DROM+IROM ok
+FONT PSRAM: decoded bytes=497525
+FONT LZ4: compressed bytes=303830
+FONT PSRAM: LZ4+CRC cycles=...
+FONT PSRAM: legacy address=0x48...
+FONT PSRAM: UI address=0x48...
+FONT SOURCE: LZ4 DROM -> decoded PSRAM
 LCD: D-PHY 4/4 ready
 LCD: DCS init complete
 ICM: clk_en=0x...
@@ -35,6 +41,13 @@ ICM: master awqos=0x...
 LCD: DMA 3/3 full-frame interrupt installed
 LCD: RGB565 framebuffer DMA active
 ```
+
+font addressはどちらもPSRAM mapの`0x48000000..0x4a000000`内でなければなりません。DROM内の
+blobはLZ4 containerで平文fontではなく、起動時検証に失敗した場合は
+`FONT PSRAM: allocation failed`、`legacy LZ4/validation failed`または
+`UI LZ4/validation failed`を出して停止します。
+`font-drom-direct` featureの比較buildではこれら6行の代わりに
+`FONT SOURCE: plain DROM direct (A/B baseline)`だけが出ます。
 
 ログはUSB Serial/JTAG（GPIO24/25）のCDCシリアルへ出ます。ホストが接続されていない間は
 SOF（1 msごとのフレーム開始パケット）が来ないので、`uart.rs`はTX FIFOが埋まった時点で

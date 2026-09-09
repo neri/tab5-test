@@ -22,7 +22,8 @@ ESP-IDF v5.5の2nd-stage bootloaderが読み込めるよう、`memory.x`では�
 定義しています。
 
 - `0x40000020..0x4008fff8`: アプリケーション記述子、通常の読み取り専用データ、
-  16 pixelフォントのbitmap、`.eh_frame`、IROMとの位置関係を固定するパディング（DROM）
+  16 pixel日本語フォントとA4 UI fontのLZ4 container、`.eh_frame`、IROMとの位置関係を固定する
+  パディング（DROM）
 - `0x40090000`以降: 通常の実行コード（IROM）
 - `0x4ff40000..0x4ff80000`: FLASH停止中にも必要なコードと定数、`.data`、
   `.bss`、スタック（内部L2MEM）
@@ -50,17 +51,31 @@ ESP-IDF v5.5.3のESP32-P4ブートローダーは、XIP領域にあるセグメ�
 
 DROM終端とIROM開始は、読み取り専用データが増えるたびに64 KiB境界単位で動かしています。
 最初は128 KiB枠を越えたときに1ページ、次に`tab5-font`の349.5 KiBのbitmapが加わったときに
-`0x40090000`まで移しました。DROMは領域を必ず埋め切る構成なので、余裕は末尾の0埋めの量
-（現在約89 KiB）として見えます。XIP窓の総終端`0x40400000`、セグメント数、物理／仮想
+`0x40090000`まで移しました。A4 UI font追加時は一時的に`0x400c0000`まで広げましたが、2 fontを
+LZ4化して合計303,830 byteへ減らしたため`0x40090000`へ戻しました。DROMは領域を必ず埋め切る
+構成なので、余裕は末尾の0埋めの量として見えます。XIP窓の総終端`0x40400000`、セグメント数、物理／仮想
 ページ内offsetの一致は変えず、releaseごとに同じ検査で確認します。フォントを内部RAMや
 別パーティションへ置かない理由は[`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)に
 あります。
+
+`font-drom-direct`を有効にした比較buildだけは2つの平文blobを収めるため、build scriptがlinker
+symbolを渡し、DROM終端／IROM開始を一時的に`0x400c0000`へ戻します。既定buildのROM削減と
+比較用buildの成立を両立するためで、どちらもXIP窓終端とsegment数は同じです。
 
 PSRAM初期化前後には、互いに別の64 byteキャッシュラインにあるDROM/IROMプローブを
 実行します。初期実装ではPSRAM用dual-MSPIリセットのbit 23/25ではなくFLASH側の
 bit 22/24を操作していたため、初期化後の最初の通常DROM参照で停止しました。
 ESP-IDF v5.5.3と同じbit 23/25へ修正し、キャッシュヒットで誤通過しないcold probeに
 分離した構成で実機確認しています。
+
+post-PSRAM XIP probe後にglobal allocatorを初期化し、DROMの2つのLZ4 raw blockを
+合計497,525 byteの永続PSRAM bufferへ展開します。wrapperと圧縮blockのCRC、展開後の
+長さ、font header、layout、CRCが
+一致した場合だけ`app::run`へ進みます。失敗時は画面を開始せずUARTへ`FONT PSRAM:`の理由を
+出して停止します。比較用feature `font-drom-direct`ではこの段階を省略して
+`FONT SOURCE: plain DROM direct (A/B baseline)`を出します。
+既定LZ4 buildがこの初期化を完了して画面を開始することは実機確認済みです。展開cycleの具体値は
+記録を受け取っていません。
 
 ## Flashパーティションと書き込み
 

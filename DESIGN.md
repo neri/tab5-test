@@ -26,7 +26,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [DISPLAY.md](docs/DISPLAY.md) | LCDとパネル初期化、映像データ経路、フレーム割り込み |
 | [DISPLAY_BANDWIDTH.md](docs/DISPLAY_BANDWIDTH.md) | 表示帯域とFIFOアンダーラン、PSRAMの実測値、PPA／2D-DMAへの移行、試して駄目だった方法 |
 | [GRAPHICS.md](docs/GRAPHICS.md) | `Framebuffer`の描画API、CW回転による論理↔ネイティブ座標変換 |
-| [FONT.md](docs/FONT.md) | 16pxビットマップフォント、文字幅の契約、収録範囲、生成物の形式と再生成 |
+| [FONT.md](docs/FONT.md) | 日本語／Console用16px bitmapと通常GUI用A4比例幅・固定幅font、文字幅、生成物 |
 | [CONSOLE_SHELL.md](docs/CONSOLE_SHELL.md) | コンソールのセル管理と部分書き戻し、シェル、再起動、全体電源断 |
 | [CONSOLE_COMMAND_REVIEW.md](docs/CONSOLE_COMMAND_REVIEW.md) | シェルコマンド全数の棚卸しと、一般実用／専門家向け／開発検証専用の分類 |
 | [INPUT.md](docs/INPUT.md) | ソフトI2C、CardKB／USBキーボード、`Key`正規化、`InputManager`、ポインタ、タッチコントローラー |
@@ -74,6 +74,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
 [DNS_PLAN.md](docs/DNS_PLAN.md)、
 [TLS_PLAN.md](docs/TLS_PLAN.md)、
+[TLSF_ALLOCATOR_PLAN.md](docs/TLSF_ALLOCATOR_PLAN.md)、
 [WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)、
 [BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)、
 [SCALABLE_PROPORTIONAL_FONT_PLAN.md](docs/SCALABLE_PROPORTIONAL_FONT_PLAN.md)。
@@ -87,10 +88,12 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 - PSRAMは32 MiB全体を固定アドレスへMMU割り当てし、フレームバッファ（1,843,200
   byte）、`/`へ載せるRAMディスク（固定8 MiB）、残る23,322,624 byte（約22.24 MiB）の
   ヒープの3つへ分けます。ヒープは`linked_list_allocator`によるグローバル
-  アロケータです（[PSRAM.md](docs/PSRAM.md)）。
+  アロケータで、通常アプリ開始前にDROMのLZ4 fontを展開し、payload 497,525 byteを永続確保します
+  （[PSRAM.md](docs/PSRAM.md)、[FONT.md](docs/FONT.md)）。
 - DSIタイミングとパネルシーケンスは確認したTab5個体向けです。
-- 省電力制御は未実装です。日本語フォントは16ピクセルのbitmap subsetがあり
-  （[FONT.md](docs/FONT.md)）、収録外の文字は中空の枠で表示します。日本語入力は
+- 省電力制御は未実装です。通常GUIのEnglish Latinは16／24／32 pixelのA4 font、
+  日本語は16 pixelのbitmap subsetで表示し（[FONT.md](docs/FONT.md)）、収録外の文字は
+  中空の枠で表示します。日本語入力は
   ありません。
 - バッテリー表示はINA226による瞬時測定と電圧ベースの目安だけです。充電状態、USB-Cの
   接続状態、正確なSoC／残り時間、電池の健全性は取得しません。
@@ -130,7 +133,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   ありません。`https://`は取得できますが未認証TLSなので、toolbarは
   `TLS UNVERIFIED`を平文と同じ赤で出します。`https`→`http`のredirectは
   `https-downgrade`で拒否します。
-  日本語フォントが無いので非ASCII文字は1文字1マスの四角で表示します
+  日本語は従来の16 pixel fontへfallbackし、English Latinは比例幅で表示します
   （[BROWSER.md](docs/BROWSER.md)）。
 - USB-AホストはHID Bootキーボード、HID Bootマウス、1段のハブ、Mass Storageの
   読み書きまで実機確認済みです。High-Speedハブ配下Low-Speed HIDのSplit経路も

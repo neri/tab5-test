@@ -30,15 +30,18 @@ MEMORY
      * header then puts the IROM payload at image offset +0x90000, matching the
      * virtual address below without an extra espflash padding segment.
      *
-     * DROM is sized around `tab5-font`, whose generated bitmap is by far the
-     * largest thing in it -- 349.5 KiB against roughly 135 KiB of ordinary
-     * rodata (`docs/FONT_MIGRATION_PLAN.md`).  0x90000 leaves about 91 KiB of
-     * padding at the end, more than the 64 KiB page of headroom the plan asks
-     * for, and the padding is what the next move eats into.  Growing DROM
+     * DROM is sized around the two LZ4-compressed font containers.  Together
+     * they occupy about 297 KiB instead of the 486 KiB decoded payload; the
+     * 0x90000 boundary leaves the required padding after ordinary rodata.
+     * The diagnostic font-drom-direct feature defines __font_drom_direct and
+     * temporarily restores the 0xc0000 boundary needed by both plain blobs.
+     * Growing DROM
      * costs image size rather than RAM: the segment is written to flash in
      * full, zero padding included, and is mapped rather than loaded. */
-    ROM_RODATA : ORIGIN = 0x40000020, LENGTH = 0x0008ffd8
-    ROM_TEXT : ORIGIN = 0x40090000, LENGTH = 0x00370000
+    ROM_RODATA : ORIGIN = 0x40000020,
+                 LENGTH = DEFINED(__font_drom_direct) ? 0x000bffd8 : 0x0008ffd8
+    ROM_TEXT : ORIGIN = DEFINED(__font_drom_direct) ? 0x400c0000 : 0x40090000,
+               LENGTH = DEFINED(__font_drom_direct) ? 0x00340000 : 0x00370000
     RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
 }
 

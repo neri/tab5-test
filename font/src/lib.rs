@@ -9,8 +9,10 @@
 //!
 //! The data is generated: `tools/font/generate.py` reads Unifont-JP and the
 //! subset manifest and writes `data/tab5font16.bin`, which is checked in.
-//! Nothing here parses BDF, and the firmware links the bytes straight into
-//! DROM. `data/tab5font16.txt` is the generation report for that file.
+//! Nothing here parses BDF. The build script stores an LZ4 raw-block container
+//! in DROM and startup expands it into PSRAM before any lookup, making an
+//! accidental direct-DROM rendering path visibly invalid. The report describes
+//! the uncompressed source blob.
 //!
 //! Glyphs are stored column by column, least significant bit at the top,
 //! because the framebuffer maps increasing logical X onto decreasing native
@@ -18,6 +20,11 @@
 //! out the way it is consumed.
 
 #![cfg_attr(not(test), no_std)]
+
+#[cfg(not(feature = "drom-direct"))]
+use core::ptr;
+#[cfg(not(feature = "drom-direct"))]
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub mod console;
 
@@ -28,64 +35,125 @@ pub const HEIGHT: usize = 16;
 /// The widest a glyph can be, and the number of columns each one is stored in.
 pub const MAX_WIDTH: usize = 16;
 
-const DATA: &[u8] = include_bytes!("../data/tab5font16.bin");
+#[cfg(not(feature = "drom-direct"))]
+const COMPRESSED_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tab5font16.lz4"));
+#[cfg(any(test, not(target_arch = "riscv32"), feature = "drom-direct"))]
+const TEST_DATA: &[u8] = include_bytes!("../data/tab5font16.bin");
+#[cfg(not(feature = "drom-direct"))]
+static ACTIVE_DATA: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 
+include!(concat!(env!("OUT_DIR"), "/font_meta.rs"));
+
+#[cfg(not(feature = "drom-direct"))]
 const MAGIC: [u8; 4] = *b"T5F1";
+#[cfg(not(feature = "drom-direct"))]
 const FORMAT_VERSION: u16 = 1;
-const HEADER_BYTES: usize = 32;
+pub const HEADER_BYTES: usize = 32;
 const RANGE_BYTES: usize = 8;
 const GLYPH_BYTES: usize = 32;
 
-const fn u16_at(offset: usize) -> u16 {
-    (DATA[offset] as u16) | ((DATA[offset + 1] as u16) << 8)
+fn u16_from(bytes: &[u8], offset: usize) -> u16 {
+    (bytes[offset] as u16) | ((bytes[offset + 1] as u16) << 8)
 }
 
-const fn u32_at(offset: usize) -> u32 {
-    (DATA[offset] as u32)
-        | ((DATA[offset + 1] as u32) << 8)
-        | ((DATA[offset + 2] as u32) << 16)
-        | ((DATA[offset + 3] as u32) << 24)
+fn u32_from(bytes: &[u8], offset: usize) -> u32 {
+    (bytes[offset] as u32)
+        | ((bytes[offset + 1] as u32) << 8)
+        | ((bytes[offset + 2] as u32) << 16)
+        | ((bytes[offset + 3] as u32) << 24)
 }
 
-/// Number of glyphs in the subset.
-pub const GLYPH_COUNT: usize = u32_at(8) as usize;
-/// Number of contiguous code point runs the lookup binary-searches.
-pub const RANGE_COUNT: usize = u32_at(12) as usize;
-const RANGES_OFFSET: usize = u32_at(16) as usize;
-const BITMAPS_OFFSET: usize = u32_at(20) as usize;
-const ADVANCES_OFFSET: usize = u32_at(24) as usize;
-/// CRC-32 of everything after the header, as recorded by the generator.
-pub const CRC32: u32 = u32_at(28);
+fn u16_at(offset: usize) -> u16 {
+    u16_from(data(), offset)
+}
 
-// The generator writes these, so a mismatch means the checked-in binary and
-// this file have drifted apart. Fail the build rather than index into
-// whatever is there.
-const _: () = assert!(DATA.len() > HEADER_BYTES, "font data is truncated");
-const _: () = assert!(
-    DATA[0] == MAGIC[0] && DATA[1] == MAGIC[1] && DATA[2] == MAGIC[2] && DATA[3] == MAGIC[3],
-    "font data does not start with the expected magic"
-);
-const _: () = assert!(
-    u16_at(4) == FORMAT_VERSION,
-    "font data was generated for a different format version"
-);
-const _: () = assert!(
-    u16_at(6) as usize == HEADER_BYTES,
-    "font data header is not the expected size"
-);
-const _: () = assert!(RANGES_OFFSET == HEADER_BYTES, "ranges do not follow the header");
-const _: () = assert!(
-    BITMAPS_OFFSET == RANGES_OFFSET + RANGE_COUNT * RANGE_BYTES,
-    "bitmaps do not follow the range table"
-);
-const _: () = assert!(
-    ADVANCES_OFFSET == BITMAPS_OFFSET + GLYPH_COUNT * GLYPH_BYTES,
-    "advances do not follow the bitmaps"
-);
-const _: () = assert!(
-    DATA.len() == ADVANCES_OFFSET + GLYPH_COUNT,
-    "font data is not exactly header + ranges + bitmaps + advances"
-);
+fn u32_at(offset: usize) -> u32 {
+    u32_from(data(), offset)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+#[cfg(not(feature = "drom-direct"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InstallError {
+    Decode(tab5_font_codec::DecodeError),
+    BadHeader,
+    BadLayout,
+    BadCrc,
+    AlreadyInstalled,
+}
+
+#[cfg(not(feature = "drom-direct"))]
+fn decode_and_validate(destination: &mut [u8]) -> Result<(), InstallError> {
+    tab5_font_codec::decode(COMPRESSED_DATA, destination).map_err(InstallError::Decode)?;
+    if destination[..4] != MAGIC
+        || u16_from(destination, 4) != FORMAT_VERSION
+        || u16_from(destination, 6) as usize != HEADER_BYTES
+    {
+        return Err(InstallError::BadHeader);
+    }
+    if u32_from(destination, 8) as usize != GLYPH_COUNT
+        || u32_from(destination, 12) as usize != RANGE_COUNT
+        || u32_from(destination, 16) as usize != RANGES_OFFSET
+        || u32_from(destination, 20) as usize != BITMAPS_OFFSET
+        || u32_from(destination, 24) as usize != ADVANCES_OFFSET
+        || RANGES_OFFSET != HEADER_BYTES
+        || BITMAPS_OFFSET != RANGES_OFFSET + RANGE_COUNT * RANGE_BYTES
+        || ADVANCES_OFFSET != BITMAPS_OFFSET + GLYPH_COUNT * GLYPH_BYTES
+        || STORAGE_BYTES != ADVANCES_OFFSET + GLYPH_COUNT
+    {
+        return Err(InstallError::BadLayout);
+    }
+    if u32_from(destination, 28) != CRC32 || crc32(&destination[HEADER_BYTES..]) != CRC32 {
+        return Err(InstallError::BadCrc);
+    }
+    Ok(())
+}
+
+/// Expands the build-time LZ4 DROM blob into permanent PSRAM storage.
+/// This must run exactly once before any firmware font lookup.
+#[cfg(not(feature = "drom-direct"))]
+pub fn install_psram(destination: &'static mut [u8]) -> Result<(), InstallError> {
+    decode_and_validate(destination)?;
+    ACTIVE_DATA
+        .compare_exchange(
+            ptr::null_mut(),
+            destination.as_mut_ptr(),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .map(|_| ())
+        .map_err(|_| InstallError::AlreadyInstalled)
+}
+
+/// Address of the active decoded blob, for boot diagnostics.
+#[cfg(not(feature = "drom-direct"))]
+pub fn psram_address() -> Option<usize> {
+    let pointer = ACTIVE_DATA.load(Ordering::Acquire);
+    (!pointer.is_null()).then_some(pointer as usize)
+}
+
+#[cfg(all(not(test), target_arch = "riscv32", not(feature = "drom-direct")))]
+fn data() -> &'static [u8] {
+    let pointer = ACTIVE_DATA.load(Ordering::Acquire);
+    assert!(!pointer.is_null(), "font PSRAM is not installed");
+    unsafe { core::slice::from_raw_parts(pointer, STORAGE_BYTES) }
+}
+
+#[cfg(any(test, not(target_arch = "riscv32"), feature = "drom-direct"))]
+fn data() -> &'static [u8] {
+    TEST_DATA
+}
 
 /// One glyph's pixels and the pen movement that follows it.
 ///
@@ -182,7 +250,7 @@ fn glyph_at(index: usize) -> Glyph {
     }
     Glyph {
         columns,
-        advance: DATA[ADVANCES_OFFSET + index],
+        advance: data()[ADVANCES_OFFSET + index],
     }
 }
 
@@ -213,7 +281,7 @@ pub fn glyph_or_replacement(character: char) -> Glyph {
 /// replacement glyph.
 pub fn advance(character: char) -> u8 {
     match index_of(character as u32) {
-        Some(index) => DATA[ADVANCES_OFFSET + index],
+        Some(index) => data()[ADVANCES_OFFSET + index],
         None if character.is_ascii() => 8,
         None => 16,
     }
@@ -227,28 +295,29 @@ pub fn is_combining(character: char) -> bool {
 
 /// The total advance of `text`, in pixels.
 pub fn text_width(text: &str) -> usize {
-    text.chars().map(|character| advance(character) as usize).sum()
+    text.chars()
+        .map(|character| advance(character) as usize)
+        .sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// CRC-32/ISO-HDLC, the same one `zlib.crc32` computes.
-    fn crc32(bytes: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for byte in bytes {
-            crc ^= *byte as u32;
-            for _ in 0..8 {
-                crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
-            }
-        }
-        !crc
+    #[test]
+    #[cfg(not(feature = "drom-direct"))]
+    fn firmware_blob_is_compressed_and_restores_exact_source() {
+        assert_eq!(&COMPRESSED_DATA[..4], b"T5L4");
+        assert_ne!(&COMPRESSED_DATA[..4], &MAGIC);
+        assert_eq!(COMPRESSED_DATA.len(), COMPRESSED_BYTES);
+        let mut restored = std::vec![0u8; STORAGE_BYTES];
+        decode_and_validate(&mut restored).unwrap();
+        assert_eq!(restored, TEST_DATA);
     }
 
     #[test]
     fn payload_matches_its_recorded_crc() {
-        assert_eq!(crc32(&DATA[HEADER_BYTES..]), CRC32);
+        assert_eq!(crc32(&data()[HEADER_BYTES..]), CRC32);
     }
 
     #[test]
@@ -265,7 +334,10 @@ mod tests {
                 range == 0 || first > previous_end,
                 "range {range} starts at U+{first:04X}, inside or touching the one before"
             );
-            assert_eq!(first_glyph, expected_index, "range {range} glyph index jumped");
+            assert_eq!(
+                first_glyph, expected_index,
+                "range {range} glyph index jumped"
+            );
             assert!(first + length - 1 <= 0xFFFF, "range {range} leaves the BMP");
             previous_end = first + length - 1;
             expected_index += length as usize;
@@ -276,7 +348,7 @@ mod tests {
     #[test]
     fn every_advance_is_zero_eight_or_sixteen() {
         for index in 0..GLYPH_COUNT {
-            let advance = DATA[ADVANCES_OFFSET + index];
+            let advance = data()[ADVANCES_OFFSET + index];
             assert!(
                 matches!(advance, 0 | 8 | 16),
                 "glyph {index} has advance {advance}"
@@ -289,7 +361,7 @@ mod tests {
         // A painter is allowed to clip to the advance, so ink beyond it would
         // appear or not depending on which path drew the character.
         for index in 0..GLYPH_COUNT {
-            if DATA[ADVANCES_OFFSET + index] != 8 {
+            if data()[ADVANCES_OFFSET + index] != 8 {
                 continue;
             }
             let glyph = glyph_at(index);
@@ -310,7 +382,10 @@ mod tests {
             let first_glyph = u16_at(entry + 6) as usize;
             for step in 0..length {
                 let character = char::from_u32(first + step).expect("subset holds scalars only");
-                assert_eq!(index_of(character as u32), Some(first_glyph + step as usize));
+                assert_eq!(
+                    index_of(character as u32),
+                    Some(first_glyph + step as usize)
+                );
             }
         }
     }

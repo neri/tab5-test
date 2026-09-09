@@ -14,3 +14,4 @@ publish = false
 # only ever builds for RISC-V.
 [dependencies]
 tab5-font = { path = "../font" }
+tab5-ui-font = { path = "../ui-font" }

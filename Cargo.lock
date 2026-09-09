@@ -946,10 +946,18 @@ name = "tab5-browser"
 version = "0.1.0"
 dependencies = [
  "tab5-font",
+ "tab5-ui-font",
 ]
 
 [[package]]
 name = "tab5-font"
+version = "0.1.0"
+dependencies = [
+ "tab5-font-codec",
+]
+
+[[package]]
+name = "tab5-font-codec"
 version = "0.1.0"
 
 [[package]]
@@ -976,6 +984,7 @@ dependencies = [
  "tab5-spki",
  "tab5-system-ui",
  "tab5-time",
+ "tab5-ui-font",
 ]
 
 [[package]]
@@ -989,6 +998,14 @@ version = "0.1.0"
 [[package]]
 name = "tab5-time"
 version = "0.1.0"
+
+[[package]]
+name = "tab5-ui-font"
+version = "0.1.0"
+dependencies = [
+ "tab5-font",
+ "tab5-font-codec",
+]
 
 [[package]]
 name = "thiserror"

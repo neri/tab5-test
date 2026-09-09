@@ -37,7 +37,9 @@ Browserの終了操作は同じhost内のデスクトップへ切り替え、本
 
 bar全体の背景はbutton faceのグレー（RGB565 `0xC618`）で統一する。
 基本色は[`GUI_THEME.md`](GUI_THEME.md)の`theme.rs`を参照する。Launcherの選択行は青地に白文字、
-Network／Batteryの`< Back`は太字とし、タイトルは通常の太さにする。
+Network／Batteryの`< Back`は太字とし、タイトルは通常の太さにする。titleとmenu labelは
+A4比例幅Sans、ClockはA4 Sans Monoで実際のpixel幅を80 pixel slot内へ中央揃えする。
+状態iconの`!`／`?`と日本語は従来fontへfallbackする。
 
 Browser本文の開始y=56、下端y=688、status高32は維持する。
 app領域の横配置は[`BROWSER.md`](BROWSER.md)。寸法とbar targetは`system-ui/`の

@@ -24,7 +24,7 @@
 //! line breaker, and the styles are applied afterwards by cutting each line
 //! at the run boundaries it crosses.
 //!
-//! Widths are pixels, and they come from [`tab5_font::advance`] -- the same
+//! Widths are pixels, and they come from [`tab5_ui_font::text_width`] -- the same
 //! function the renderer paints with. Half-width characters take 8 pixels,
 //! full-width ones 16, and a combining mark none at all. Nothing here counts
 //! characters and multiplies: a line of Japanese, a line of ASCII and a line
@@ -52,15 +52,30 @@ pub const CELL_WIDTH: u16 = 8;
 /// The single place widths come from. A combining mark returns 0: it is
 /// painted over the character before it and adds nothing to the line.
 pub fn advance(character: char, scale: u8) -> u16 {
-    tab5_font::advance(character) as u16 * scale as u16
+    let style = ui_style(scale, 0);
+    if tab5_ui_font::is_english_latin(character) {
+        tab5_ui_font::glyph(style, character).unwrap().advance as u16
+    } else {
+        tab5_font::advance(character) as u16 * style.legacy_scale() as u16
+    }
 }
 
 /// The advance of `text` at `scale`, in pixels.
 pub fn text_width(text: &str, scale: u8) -> u16 {
-    text.chars()
-        .fold(0u16, |total, character| {
-            total.saturating_add(advance(character, scale))
-        })
+    text_width_styled(text, scale, 0)
+}
+
+pub fn text_width_styled(text: &str, scale: u8, run_style: u8) -> u16 {
+    tab5_ui_font::text_width(text, ui_style(scale, run_style)).min(u16::MAX as usize) as u16
+}
+
+fn ui_style(scale: u8, run_style: u8) -> tab5_ui_font::TextStyle {
+    let face = if run_style & crate::document::STYLE_CODE != 0 {
+        tab5_ui_font::Face::Mono
+    } else {
+        tab5_ui_font::Face::Sans
+    };
+    tab5_ui_font::TextStyle::new(face, if scale >= HEADING_SCALE { 32 } else { 16 })
 }
 
 /// The vertical part of the font's size, at scale 1.
@@ -174,6 +189,9 @@ pub struct Piece {
     pub start: u32,
     pub end: u32,
     pub style: u8,
+    /// Font role, independent of colour/emphasis style. `pre` sets this even
+    /// though it is not an inline `code` element.
+    pub mono: bool,
     pub link: Option<u16>,
 }
 
@@ -316,12 +334,7 @@ impl Layout {
 
     // --- building -----------------------------------------------------
 
-    fn place_block(
-        &mut self,
-        document: &Document,
-        block: &Block,
-        top: u32,
-    ) -> Result<u32, Error> {
+    fn place_block(&mut self, document: &Document, block: &Block, top: u32) -> Result<u32, Error> {
         let (scale, indent_cells, gap_before, gap_after) = self.block_metrics(block.kind);
         let mut y = top + gap_before as u32;
 
@@ -368,11 +381,13 @@ impl Layout {
         let mut cursor = 0usize;
         let mut first_line = true;
         loop {
-            let (line_end, next) = next_line(text, cursor, budget, scale, preformatted);
+            let (line_end, next) =
+                next_line(text, cursor, budget, scale, preformatted, span.start, runs);
             let start = span.start + cursor;
             let end = span.start + line_end;
             let first_piece = self.pieces.len() as u32;
-            let piece_count = self.push_pieces(document.text(), runs, start, end, scale)?;
+            let piece_count =
+                self.push_pieces(document.text(), runs, start, end, scale, preformatted)?;
             self.push_line(Line {
                 y,
                 height: line_height,
@@ -407,16 +422,34 @@ impl Layout {
         start: usize,
         end: usize,
         scale: u8,
+        force_mono: bool,
     ) -> Result<u16, Error> {
         let mut count = 0u16;
         let mut x = 0u16;
+        let mut consumed_to = start;
         for run in runs {
-            let from = (run.start as usize).max(start);
-            let to = (run.end as usize).min(end);
+            let from = (run.start as usize).max(start).max(consumed_to);
+            let mut to = (run.end as usize).min(end);
             if from >= to {
                 continue;
             }
-            let width = text.get(from..to).map_or(0, |slice| text_width(slice, scale));
+            // A style boundary may sit between a base and its combining
+            // mark (`<b>e</b>&#x301;`). Keep the whole cluster in the base's
+            // piece so both measurement and drawing route it to the legacy
+            // font together.
+            if to < end {
+                while let Some(character) = text.get(to..end).and_then(|tail| tail.chars().next()) {
+                    if !tab5_font::is_combining(character) {
+                        break;
+                    }
+                    to += character.len_utf8();
+                }
+            }
+            let mono = force_mono || run.style & crate::document::STYLE_CODE != 0;
+            let measurement_style = run.style | if mono { crate::document::STYLE_CODE } else { 0 };
+            let width = text.get(from..to).map_or(0, |slice| {
+                text_width_styled(slice, scale, measurement_style)
+            });
             memory::push(
                 &mut self.pieces,
                 Piece {
@@ -425,11 +458,13 @@ impl Layout {
                     start: from as u32,
                     end: to as u32,
                     style: run.style,
+                    mono,
                     link: run.link,
                 },
             )?;
             x = x.saturating_add(width);
             count = count.saturating_add(1);
+            consumed_to = to;
         }
         Ok(count)
     }
@@ -451,12 +486,9 @@ impl Layout {
             BlockKind::Heading(1 | 2) => (HEADING_SCALE, 0, half * 2, half),
             BlockKind::Heading(_) => (BODY_SCALE, 0, half, half / 2),
             BlockKind::Paragraph => (BODY_SCALE, 0, 0, half),
-            BlockKind::ListItem { depth, .. } => (
-                BODY_SCALE,
-                MARKER_CELLS + depth as u16 * INDENT_CELLS,
-                0,
-                0,
-            ),
+            BlockKind::ListItem { depth, .. } => {
+                (BODY_SCALE, MARKER_CELLS + depth as u16 * INDENT_CELLS, 0, 0)
+            }
             BlockKind::Preformatted => (BODY_SCALE, PRE_INDENT_CELLS, half, half),
             BlockKind::Rule => (BODY_SCALE, 0, half, half),
         }
@@ -510,6 +542,8 @@ fn next_line(
     budget: u16,
     scale: u8,
     preformatted: bool,
+    block_start: usize,
+    runs: &[Run],
 ) -> (usize, usize) {
     if from >= text.len() {
         return (text.len(), text.len());
@@ -525,7 +559,30 @@ fn next_line(
             // A hard break: `<br>`, or a newline inside `pre`.
             return (absolute, absolute + 1);
         }
-        let width = advance(character, scale);
+        let run_style = runs
+            .iter()
+            .find(|run| {
+                (run.start as usize) <= block_start + offset
+                    && block_start + offset < run.end as usize
+            })
+            .map_or(0, |run| run.style)
+            | if preformatted {
+                crate::document::STYLE_CODE
+            } else {
+                0
+            };
+        let next_is_combining = rest[offset + character.len_utf8()..]
+            .chars()
+            .next()
+            .is_some_and(tab5_font::is_combining);
+        let width = if tab5_ui_font::is_english_latin(character) && next_is_combining {
+            tab5_font::advance(character) as u16 * ui_style(scale, run_style).legacy_scale() as u16
+        } else if tab5_font::is_combining(character) {
+            0
+        } else {
+            let mut encoded = [0u8; 4];
+            text_width_styled(character.encode_utf8(&mut encoded), scale, run_style)
+        };
         if placed > 0 && used.saturating_add(width) > budget {
             // One character past the line. If it is a space, the line is
             // exactly full and the space is the break -- taking it here
@@ -573,7 +630,10 @@ fn kinsoku(text: &str, from: usize, end: usize, next: usize) -> (usize, usize) {
     }
     let mut candidate = end;
     for _ in 0..MAX_KINSOKU_SHIFT {
-        let Some(previous) = text.get(from..candidate).and_then(|s| s.chars().next_back()) else {
+        let Some(previous) = text
+            .get(from..candidate)
+            .and_then(|s| s.chars().next_back())
+        else {
             break;
         };
         candidate -= previous.len_utf8();
@@ -671,15 +731,17 @@ mod tests {
     #[test]
     fn long_text_wraps_at_word_boundaries() {
         let word = "abcdefghij";
-        let markup = format!("<p>{}</p>", (0..30).map(|_| word).collect::<Vec<_>>().join(" "));
+        let markup = format!(
+            "<p>{}</p>",
+            (0..30).map(|_| word).collect::<Vec<_>>().join(" ")
+        );
         let (document, layout) = layout_of(&markup);
         let lines = rendered(&document, &layout);
         assert!(lines.len() > 1);
         for line in &lines {
             assert!(
-                line.chars().count() <= ASCII_COLUMNS,
-                "{line:?} is {} wide",
-                line.chars().count()
+                text_width(line, BODY_SCALE) <= WIDTH,
+                "{line:?} exceeds the pixel width"
             );
             // No line starts or ends on the space that broke it.
             assert!(!line.starts_with(' '), "{line:?}");
@@ -724,6 +786,28 @@ mod tests {
         // The long line is broken at the width rather than not at all.
         assert!(lines[1].chars().count() <= ASCII_COLUMNS);
         assert!(lines[1].chars().all(|character| character == 'y'));
+        for line in layout.lines() {
+            for piece in layout.pieces(line) {
+                assert!(piece.mono);
+                let text = &document.text()[piece.start as usize..piece.end as usize];
+                assert_eq!(piece.width, text.chars().count() as u16 * CELL_WIDTH);
+            }
+        }
+    }
+
+    #[test]
+    fn pre_is_monospace_even_without_an_inner_code_element() {
+        let (document, layout) = layout_of("<p>iiiiWWWW</p><pre>iiiiWWWW</pre>");
+        let paragraph = layout.pieces(&layout.lines()[0])[0];
+        let pre = layout.pieces(&layout.lines()[1])[0];
+        assert!(!paragraph.mono);
+        assert!(pre.mono);
+        assert_ne!(paragraph.width, pre.width);
+        assert_eq!(pre.width, 8 * CELL_WIDTH);
+        assert_eq!(
+            &document.text()[pre.start as usize..pre.end as usize],
+            "iiiiWWWW"
+        );
     }
 
     // --- mixed widths -----------------------------------------------------
@@ -733,12 +817,12 @@ mod tests {
     const MIXED: &str = "aあiいuうeえoお";
 
     #[test]
-    fn a_full_width_character_is_twice_a_half_width_one() {
-        assert_eq!(advance('a', BODY_SCALE), 8);
+    fn latin_is_proportional_and_legacy_full_width_keeps_its_cells() {
+        assert_eq!(advance('i', BODY_SCALE), 4);
+        assert_eq!(advance('W', BODY_SCALE), 13);
         assert_eq!(advance('あ', BODY_SCALE), 16);
-        assert_eq!(advance('a', HEADING_SCALE), 16);
         assert_eq!(advance('あ', HEADING_SCALE), 32);
-        assert_eq!(text_width(MIXED, BODY_SCALE), 5 * 8 + 5 * 16);
+        assert_eq!(text_width(MIXED, BODY_SCALE), 116);
     }
 
     #[test]
@@ -747,6 +831,19 @@ mod tests {
         // character, not two.
         assert_eq!(text_width("か\u{3099}", BODY_SCALE), 16);
         assert_eq!(text_width("e\u{301}", BODY_SCALE), 8);
+    }
+
+    #[test]
+    fn a_style_boundary_does_not_split_a_combining_cluster() {
+        let (document, layout) = layout_of("<p><b>e</b>&#x301; next</p>");
+        let line = &layout.lines()[0];
+        let pieces = layout.pieces(line);
+        assert_eq!(
+            &document.text()[pieces[0].start as usize..pieces[0].end as usize],
+            "e\u{301}"
+        );
+        assert_eq!(pieces[0].width, 8);
+        assert_eq!(pieces[1].x, 8);
     }
 
     #[test]
@@ -893,7 +990,10 @@ mod tests {
         );
         let mut previous_bottom = 0u32;
         for line in layout.lines() {
-            assert!(line.y >= previous_bottom, "{line:?} above {previous_bottom}");
+            assert!(
+                line.y >= previous_bottom,
+                "{line:?} above {previous_bottom}"
+            );
             previous_bottom = line.y + line.height as u32;
         }
         assert_eq!(layout.height() >= previous_bottom, true);
@@ -913,9 +1013,7 @@ mod tests {
 
     #[test]
     fn list_items_are_indented_by_depth_and_carry_a_marker() {
-        let (_, layout) = layout_of(
-            "<ul><li>one</li><li>two<ol><li>inner</li></ol></li></ul>",
-        );
+        let (_, layout) = layout_of("<ul><li>one</li><li>two<ol><li>inner</li></ol></li></ul>");
         let lines = layout.lines();
         assert_eq!(lines[0].marker, Some(Marker::Bullet));
         assert_eq!(lines[2].marker, Some(Marker::Number(1)));
@@ -991,9 +1089,7 @@ mod tests {
         assert_eq!(pieces.len(), 3);
         let texts: Vec<&str> = pieces
             .iter()
-            .map(|piece| {
-                &document.text()[piece.start as usize..piece.end as usize]
-            })
+            .map(|piece| &document.text()[piece.start as usize..piece.end as usize])
             .collect();
         assert_eq!(texts, ["plain ", "bold", " plain"]);
         // Pieces are laid out left to right with no gaps.
@@ -1028,7 +1124,9 @@ mod tests {
 
     #[test]
     fn only_the_lines_crossing_the_viewport_are_visible() {
-        let markup: String = (0..200).map(|index| format!("<p>Line {index}</p>")).collect();
+        let markup: String = (0..200)
+            .map(|index| format!("<p>Line {index}</p>"))
+            .collect();
         let (_, layout) = layout_of(&markup);
         let range = layout.visible(0, 720);
         assert_eq!(range.start, 0);
@@ -1054,7 +1152,9 @@ mod tests {
 
     #[test]
     fn a_viewport_in_the_middle_starts_at_a_partly_visible_line() {
-        let markup: String = (0..200).map(|index| format!("<p>Line {index}</p>")).collect();
+        let markup: String = (0..200)
+            .map(|index| format!("<p>Line {index}</p>"))
+            .collect();
         let (_, layout) = layout_of(&markup);
         // Land inside a line rather than on a boundary.
         let target = layout.lines()[50].y + 3;

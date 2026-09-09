@@ -115,13 +115,19 @@ URL上限は変えず、編集中はcaretへ横追従する。bar操作は押下
 
 ### 文字の幅は数えずに測る
 
-**折返し、piece幅、下線、選択背景、当たり判定はすべてpixelで、幅は
-`font::advance`から来ます。** rendererが描くときに使うのと同じ関数なので、
-測った幅と描いた幅が食い違いません。半角は8 pixel、全角は16 pixel、combining
-markは0 pixelです。文字数を数えて一定幅を掛ける計算はどこにもありません。
+**折返し、piece幅、下線、選択背景、当たり判定はすべてpixelです。** 通常本文・link・
+見出しはA4比例幅Sans、`pre`と`code`／`kbd`／`samp`／`tt`／`var`はSans Monoです。
+layoutとrendererは同じstrike metricsを使います。日本語は従来glyphへfallbackし、combining
+markを伴うLatin baseもcluster単位で従来経路へ戻します。
 
-本文は16 pixel等倍、`h1`と`h2`は2倍の32 pixelです。`h3`以降は本文と同じ大きさで、
-1 pixelずらして二度描きすることで太く見せます。bitmapなので拡大は整数倍だけです。
+`pre`はHTML parserのrun styleに依存せず、layoutが`BlockKind::Preformatted`の全pieceで
+font roleをMonoにします。色・強調styleとは別の軸なので、`pre`をcode色へ変えません。これにより
+内側に`<code>`が無い通常の`<pre>`でも、折返し測定と描画の
+両方が固定幅になります。組み込み`http://built-in/sample`には同じ`iiiiiiii`／`WWWWWWWW`／
+`00000000`を比例幅段落、inline code、桁ルーラー付き`pre`で並べた比較欄があります。
+
+本文は16 pixel strike、`h1`と`h2`は32 pixel strikeです。`h3`以降は本文と同じ大きさで、
+1 pixelずらして二度描きすることで太く見せます。日本語は従来16 pixel glyphの1倍／2倍です。
 
 行の高さはglyphの箱に**4分の1の空きを下へ足した**ものです。足さないと16 pixelの
 活字が隙間なく並び、ページが壁のように見えます。本文で4 pixel、見出し（2倍角）で
@@ -224,7 +230,8 @@ associationとDHCPが完了したら**同じGETを先頭から自動的にやり
 
 `←`／`→`でカーソルを動かし、`Home`／`End`で両端へ飛び、`Backspace`と`Delete`で
 前後の1文字を消します。表示は常にカーソルが見える位置へ追従するので、長い
-アドレスの途中を直すこともできます。入力はASCIIだけ、長さは`MAX_URL_BYTES`
+アドレスの途中を直すこともできます。caretと横scrollは比例幅のpixel測定で追従します。
+入力はASCIIだけ、長さは`MAX_URL_BYTES`
 までです。
 
 ### 漏れを見るための`i`

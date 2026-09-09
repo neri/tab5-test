@@ -58,6 +58,26 @@ pub struct Framebuffer {
     memory: Psram,
 }
 
+struct UiSurface(*mut u16);
+
+impl tab5_ui_font::PixelSurface for UiSurface {
+    fn width(&self) -> usize {
+        WIDTH
+    }
+
+    fn height(&self) -> usize {
+        HEIGHT
+    }
+
+    fn read(&self, x: usize, y: usize) -> u16 {
+        unsafe { self.0.add(native_offset(x, y)).read_volatile() }
+    }
+
+    fn write(&mut self, x: usize, y: usize, color: u16) {
+        unsafe { self.0.add(native_offset(x, y)).write_volatile(color) }
+    }
+}
+
 impl Framebuffer {
     pub fn new(memory: Psram) -> Option<Self> {
         memory.framebuffer()?;
@@ -462,6 +482,187 @@ impl Framebuffer {
             cursor_x = cursor_x.saturating_add(previous_advance);
         }
         widest.max(cursor_x - origin_x)
+    }
+
+    /// Draws normal-UI text with pre-rasterised A4 Latin glyphs and legacy
+    /// Japanese fallback. Console and diagnostics deliberately keep using
+    /// `draw_text`, preserving their fixed 8x16 cell contract.
+    pub fn draw_ui_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        style: font::UiTextStyle,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        self.draw_ui_text_inner::<false>(x, y, text, style, foreground, background)
+    }
+
+    /// Diagnostic-only counterpart to `draw_ui_text`: it uses the exact same
+    /// A4 glyphs and metrics but thresholds Latin coverage to one bit.
+    pub fn draw_ui_text_1bpp(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        style: font::UiTextStyle,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        self.draw_ui_text_inner::<true>(x, y, text, style, foreground, background)
+    }
+
+    fn draw_ui_text_inner<const BINARY: bool>(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        style: font::UiTextStyle,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        let origin_x = x;
+        let (mut cursor_x, mut cursor_y) = (x, y);
+        let mut widest = 0usize;
+        let mut previous_legacy_advance = 0usize;
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            if character == '\n' {
+                widest = widest.max(cursor_x.saturating_sub(origin_x));
+                cursor_x = origin_x;
+                cursor_y = cursor_y.saturating_add(style.size as usize);
+                previous_legacy_advance = 0;
+                continue;
+            }
+            let combining_cluster = characters
+                .peek()
+                .is_some_and(|next| tab5_font::is_combining(*next));
+            if tab5_ui_font::is_english_latin(character) && !combining_cluster {
+                let glyph = tab5_ui_font::glyph(style, character)
+                    .expect("validated UI Latin glyph is missing");
+                self.draw_ui_glyph::<BINARY>(
+                    cursor_x, cursor_y, &glyph, style, foreground, background,
+                );
+                cursor_x = cursor_x.saturating_add(glyph.advance as usize);
+                previous_legacy_advance = 0;
+                continue;
+            }
+
+            let scale = style.legacy_scale();
+            let glyph = font::glyph_or_replacement(character);
+            if glyph.advance == 0 {
+                if previous_legacy_advance == 0 {
+                    let replacement = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
+                    self.draw_glyph(
+                        cursor_x,
+                        cursor_y,
+                        &replacement,
+                        scale,
+                        foreground,
+                        background,
+                    );
+                    previous_legacy_advance = replacement.advance as usize * scale;
+                    cursor_x = cursor_x.saturating_add(previous_legacy_advance);
+                } else {
+                    self.draw_glyph(
+                        cursor_x.saturating_sub(previous_legacy_advance),
+                        cursor_y,
+                        &glyph,
+                        scale,
+                        foreground,
+                        None,
+                    );
+                }
+            } else {
+                self.draw_glyph(cursor_x, cursor_y, &glyph, scale, foreground, background);
+                previous_legacy_advance = glyph.advance as usize * scale;
+                cursor_x = cursor_x.saturating_add(previous_legacy_advance);
+            }
+        }
+        widest.max(cursor_x.saturating_sub(origin_x))
+    }
+
+    /// Normal GUI policy: proportional DejaVu Sans, with the legacy font for
+    /// Japanese and symbols outside the English Latin set.
+    pub fn draw_gui_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        scale: usize,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        self.draw_ui_text(
+            x,
+            y,
+            text,
+            font::UiTextStyle::new(font::UiFace::Sans, if scale >= 2 { 32 } else { 16 }),
+            foreground,
+            background,
+        )
+    }
+
+    /// Draws the longest whole-character prefix fitting `budget` pixels.
+    /// Measurement and drawing share the same style, so the following fixed
+    /// column cannot be crossed by a proportional label.
+    pub fn draw_gui_text_clipped(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        budget: usize,
+        scale: usize,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        let style = font::UiTextStyle::new(font::UiFace::Sans, if scale >= 2 { 32 } else { 16 });
+        let mut end = 0usize;
+        for (offset, character) in text.char_indices() {
+            let candidate = offset + character.len_utf8();
+            if font::ui_text_width(&text[..candidate], style) > budget {
+                break;
+            }
+            end = candidate;
+        }
+        self.draw_ui_text(x, y, &text[..end], style, foreground, background)
+    }
+
+    fn draw_ui_glyph<const BINARY: bool>(
+        &mut self,
+        x: usize,
+        y: usize,
+        glyph: &font::UiGlyph,
+        style: font::UiTextStyle,
+        foreground: u16,
+        background: Option<u16>,
+    ) {
+        let Some(pointer) = self.memory.framebuffer() else {
+            return;
+        };
+        let mut surface = UiSurface(pointer);
+        if BINARY {
+            tab5_ui_font::paint_glyph_1bpp(
+                &mut surface,
+                x as isize,
+                y as isize,
+                glyph,
+                tab5_ui_font::line_metrics(style),
+                foreground,
+                background,
+            );
+        } else {
+            tab5_ui_font::paint_glyph(
+                &mut surface,
+                x as isize,
+                y as isize,
+                glyph,
+                tab5_ui_font::line_metrics(style),
+                foreground,
+                background,
+            );
+        }
     }
 
     /// Writes back the complete framebuffer in chunks rather than one

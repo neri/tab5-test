@@ -12,12 +12,13 @@ description = "Update the dependencies"
 run = "cargo update"
 
 [tasks.test]
-description = "Run the host-side tests of the browser, font, spki, time and system UI crates"
+description = "Run the host-side tests of the browser, font codec, fonts, spki, time and system UI crates"
 # Explicitly host-targeted: `.cargo/config.toml` points the default target at
 # `riscv32imafc-unknown-none-elf`, where there is no test harness to run. Only
-# `tab5-browser`, `tab5-font`, `tab5-spki`, `tab5-time` and `tab5-system-ui` build for the host;
+# `tab5-browser`, `tab5-font-codec`, `tab5-font`, `tab5-ui-font`, `tab5-spki`,
+# `tab5-time` and `tab5-system-ui` build for the host;
 # the firmware package does not.
-run = "cargo test -p tab5-browser -p tab5-font -p tab5-spki -p tab5-time -p tab5-system-ui --target x86_64-unknown-linux-gnu"
+run = "cargo test -p tab5-browser -p tab5-font-codec -p tab5-font -p tab5-ui-font -p tab5-spki -p tab5-time -p tab5-system-ui --features tab5-font-codec/encoder --target x86_64-unknown-linux-gnu"
 
 # [tasks.doc]
 # description = "Generate documentation"

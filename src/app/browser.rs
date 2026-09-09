@@ -1965,27 +1965,35 @@ impl Viewer {
             FIELD_HEIGHT,
             EDIT_BACKGROUND,
         );
-        // One cell is kept for the caret, so it has somewhere to sit when it
-        // is past the last character.
-        let columns = ADDRESS_CELLS.saturating_sub(1).max(1);
-        // The window follows the caret rather than the end of the text:
-        // editing the middle of a long address has to be visible too.
-        let first = editing.caret.saturating_sub(columns);
-        let visible = editing
-            .text
-            .get(first..(first + columns).min(editing.text.len()))
-            .unwrap_or("");
-        draw_ascii(
+        let text_budget = CLEAR_LEFT.saturating_sub(8 + ADDRESS_LEFT);
+        // Follow the caret by measured pixels. URL input is ASCII, so walking
+        // byte offsets is also walking character boundaries.
+        let mut first = editing.caret.min(editing.text.len());
+        while first > 0 {
+            let candidate = first - 1;
+            let width = crate::font::ui_text_width(
+                &editing.text[candidate..editing.caret],
+                crate::font::UiTextStyle::BODY,
+            );
+            if width + 2 > text_budget {
+                break;
+            }
+            first = candidate;
+        }
+        draw_clipped(
             framebuffer,
             ADDRESS_LEFT,
             CHROME_TEXT_Y,
-            visible,
-            CHROME_SCALE,
+            &editing.text[first..],
+            text_budget,
             BLACK,
         );
-        let caret_column = editing.caret.saturating_sub(first);
+        let caret_x = crate::font::ui_text_width(
+            &editing.text[first..editing.caret],
+            crate::font::UiTextStyle::BODY,
+        );
         framebuffer.fill_rect(
-            ADDRESS_LEFT + caret_column * CHROME_CELL,
+            ADDRESS_LEFT + caret_x,
             CHROME_TEXT_Y,
             2,
             CELL_HEIGHT * CHROME_SCALE,
@@ -2189,6 +2197,7 @@ impl Viewer {
                 scale,
                 color,
                 line.heading || piece.style & STYLE_BOLD != 0,
+                piece.mono,
             );
             if is_link && !is_focused {
                 // Underlined as well as coloured: colour alone is not an
@@ -2322,7 +2331,9 @@ fn draw_marker(framebuffer: &mut Framebuffer, line: &Line, screen_y: usize, mark
     let cell = CELL_WIDTH * scale;
     // The marker column ends one cell before the text starts.
     let right = (MARGIN + line.x as usize).saturating_sub(cell);
-    let x = right.saturating_sub(text.len() * cell);
+    let marker_style =
+        crate::font::UiTextStyle::new(crate::font::UiFace::Sans, if scale >= 2 { 32 } else { 16 });
+    let x = right.saturating_sub(crate::font::ui_text_width(text.as_str(), marker_style));
     draw_ascii(framebuffer, x, screen_y, text.as_str(), scale, TEXT_COLOR);
 }
 
@@ -2358,15 +2369,22 @@ fn draw_text_run(
     scale: usize,
     color: u16,
     bold: bool,
+    mono: bool,
 ) {
-    framebuffer.draw_text(x, y, text, scale, color, None);
+    let face = if mono {
+        crate::font::UiFace::Mono
+    } else {
+        crate::font::UiFace::Sans
+    };
+    let style = crate::font::UiTextStyle::new(face, if scale >= 2 { 32 } else { 16 });
+    framebuffer.draw_ui_text(x, y, text, style, color, None);
     if bold {
         // Struck twice, one pixel apart. The font has one weight, so bold
         // has to be synthesised or dropped -- and dropping it means `<b>`
         // renders as nothing at all. One physical pixel rather than one
         // glyph pixel (`scale`): at scale 2 a full-cell offset would smear
         // into the next column.
-        framebuffer.draw_text(x + 1, y, text, scale, color, None);
+        framebuffer.draw_ui_text(x + 1, y, text, style, color, None);
     }
 }
 
@@ -2380,7 +2398,9 @@ fn draw_ascii(
     scale: usize,
     color: u16,
 ) -> usize {
-    x + framebuffer.draw_text(x, y, text, scale, color, None)
+    let style =
+        crate::font::UiTextStyle::new(crate::font::UiFace::Sans, if scale >= 2 { 32 } else { 16 });
+    x + framebuffer.draw_ui_text(x, y, text, style, color, None)
 }
 
 /// Draws as much of `text` as fits in `budget` pixels, so a long URL or a
@@ -2400,13 +2420,15 @@ fn draw_clipped(
 ) {
     let mut cursor = x;
     let end = x + budget;
+    let style = crate::font::UiTextStyle::BODY;
     for character in text.chars() {
-        let advance = crate::font::advance(character) as usize * CHROME_SCALE;
+        let mut encoded = [0u8; 4];
+        let character_text = character.encode_utf8(&mut encoded);
+        let advance = crate::font::ui_text_width(character_text, style);
         if cursor + advance > end {
             break;
         }
-        let glyph = crate::font::glyph_or_replacement(character);
-        framebuffer.draw_glyph(cursor, y, &glyph, CHROME_SCALE, color, None);
+        framebuffer.draw_ui_text(cursor, y, character_text, style, color, None);
         cursor += advance;
     }
 }
@@ -2545,10 +2567,6 @@ impl Summary {
                 self.length += 1;
             }
         }
-    }
-
-    fn len(&self) -> usize {
-        self.length
     }
 
     fn as_str(&self) -> &str {
@@ -2702,6 +2720,15 @@ mod builtin {
              Whitespace     between     words collapses, and the paragraph \
              wraps at the width of the screen rather than at whatever width \
              the author had in mind.</p>\
+             <h2>Proportional and fixed width</h2>\
+             <p>Proportional Sans makes these groups visibly different: \
+             iiiiiiii WWWWWWWW 00000000.</p>\
+             <p>Inline code uses Mono, so every character has one advance: \
+             <code>iiiiiiii|WWWWWWWW|00000000|Tab5</code></p>\
+             <pre>MONO GRID -- bars must align by column
+12345678|12345678|12345678|1234
+iiiiiiii|WWWWWWWW|00000000|Tab5
+</pre>\
              <h2>Heading level 2</h2>\
              <p>A second paragraph, so the gap between blocks is visible. It \
              also has a <a href=\"/\">link back to the home page</a> in the \

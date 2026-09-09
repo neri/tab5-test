@@ -36,6 +36,12 @@ PPA/2D-DMAへ移す」）。`scroll_up`は2D-DMAのブロックコピーで画�
 
 ### 文字描画
 
+通常GUIは`draw_ui_text`／`draw_gui_text`を使います。English Latinは生成済みA4 glyphを
+RGB565へalpha blendし、Sansは比例幅、Sans Monoは固定幅です。背景なしでは既存pixelを読み、
+背景ありではadvance boxを消してから描きます。描画coreは`tab5-ui-font::paint_glyph`にあり、
+host testとfirmwareが同じclip／blend処理を使います。日本語、未収録記号、combining clusterは
+次の従来経路へfallbackします。
+
 `draw_glyph`は`crate::font`（`tab5-font` crate）の16 pixel glyphを1つ描きます。
 lookupは行わず、渡されたglyph自身の幅の枠——半角8列、全角16列、combining markは
 16列——にピクセルを置くだけです。`draw_text`がlookup、combining、文字送りを扱い、
@@ -51,7 +57,7 @@ combining markは直前の文字へ重ねて描き、自分の幅を持ちませ
 combining markの描画は必ず背景なしです。markの枠は左右の隣の文字と重なるため、
 背景ありで描くと隣を消します。
 
-文字描画の経路はこれだけです。以前あった5×7 ASCIIフォントと
+従来1bpp文字描画の経路はこれだけです。以前あった5×7 ASCIIフォントと
 `draw_text_5x7`／`draw_ascii_char_5x7`は削除しました
 （[`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)）。
 

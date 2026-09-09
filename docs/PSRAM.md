@@ -109,6 +109,16 @@ RAMディスクをヒープから動的に確保せず固定予約にしてい�
 `psram::init()`が失敗した場合はヒープが初期化されないまま`app::run`を呼ばずに
 待機ループへ入るので、`alloc`を使うコードは実行されません。
 
+allocator初期化直後、画面を開始する前にfont storageを2つ永続確保します。従来16 pixel fontが
+357,907 byte、A4 UI fontが139,618 byte、payload合計497,525 byte（約485.9 KiB）です。DROMには
+227,004 byteと76,826 byteの独立したLZ4 containerがあり、PSRAMへ展開してwrapper、圧縮block、
+展開後fontの長さ、header、layout、CRCを検査します。従ってheap領域そのものは23,322,624 byteの
+ままですが、通常アプリ開始時点でfont payloadとallocator管理分が使用済みです。展開用の別作業
+bufferは持たず、LZ4 matchは同じ出力bufferの展開済み範囲を参照します。
+比較用の`font-drom-direct` featureではこの確保を行わず、平文fontをDROMから直接参照します。
+実機A/BではPSRAM版のBrowser最長viewport repaint値が少し増えましたが、更新タイミングはDROM版と
+ほぼ同じで表示にも問題がなく、利用者判断で許容されました。具体的な時間値は未記録です。
+
 シェルの`alloctest <MiB>`コマンドは、この確保済みヒープから実際に
 `Vec<u8>`を`try_reserve_exact`で確保し、インデックス由来のパターンを書き込んで
 読み直すことで、PSRAM全域の読み書きを実機検証します（`src/app/shell.rs`）。

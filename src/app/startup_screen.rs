@@ -621,7 +621,8 @@ fn centred_in(
     scale: usize,
     color: u16,
 ) {
-    let drawn = font::text_width(text) * scale;
+    let style = font::UiTextStyle::new(font::UiFace::Sans, if scale >= 2 { 32 } else { 16 });
+    let drawn = font::ui_text_width(text, style);
     let x = left + width.saturating_sub(drawn) / 2;
-    framebuffer.draw_text(x, y, text, scale, color, None);
+    framebuffer.draw_gui_text(x, y, text, scale, color, None);
 }
