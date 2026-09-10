@@ -39,7 +39,7 @@ bar全体の背景はbutton faceのグレー（RGB565 `0xC618`）で統一する
 基本色は[`GUI_THEME.md`](GUI_THEME.md)の`theme.rs`を参照する。Launcherの選択行は青地に白文字、
 Network／Batteryの`< Back`は太字とし、タイトルは通常の太さにする。titleとmenu labelは
 A4比例幅Sans、ClockはA4 Sans Monoで実際のpixel幅を80 pixel slot内へ中央揃えする。
-状態iconの`!`／`?`と日本語は従来fontへfallbackする。
+状態iconの`!`／`?`はLatin A4、日本語は16 pixelのNoto CJK A4 strikeへfallbackする。
 
 Browser本文の開始y=56、下端y=688、status高32は維持する。
 app領域の横配置は[`BROWSER.md`](BROWSER.md)。寸法とbar targetは`system-ui/`の
@@ -70,7 +70,7 @@ Wi-Fiの画面向け完了通知は1件で、要求tokenが合う画面だけが
 - Launcherの項目は左端8 pixel、bar直下8 pixelから幅400 pixelで左上に配置する。
   行の高さは48 pixel、行間は8 pixel。項目の外側や行間のtap／clickでは選択しない。
 - Launcherは矢印／Page Up・Down、Enter、Escape、行のtap／mouse clickで操作する。
-- Browser、Console、デスクトップ、Power...の4項目。Power...は最下段。
+- Browser、Console、Desktop、Power...の4項目。Power...は最下段。
   Network settingsとBattery detailsはそれぞれbarのWi-Fi／Battery slotから開く。
 - Power...は同じ左上位置のサブメニュー（Reboot、Shutdown、Back）を開く。
   Back／Escapeで親のPower...選択へ戻る。ハンバーガー再クリックはメニュー全体を閉じて呼出元へ戻る。

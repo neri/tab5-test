@@ -4,14 +4,5 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[features]
-drom-direct = []
-
-# Runtime dependencies remain `no_std`: this crate is a lookup over a byte
-# array produced ahead of time plus the small boot-time LZ4 decoder. The
-# encoder feature is used only by this crate's host build script.
+# Dependency-free direct-DROM lookup over a generated printable-ASCII blob.
 [dependencies]
-tab5-font-codec = { path = "../font-codec" }
-
-[build-dependencies]
-tab5-font-codec = { path = "../font-codec", features = ["encoder"] }

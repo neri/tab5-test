@@ -311,19 +311,12 @@ fn main() -> ! {
                     uart::log(b"FONT PSRAM: allocation failed\r\n");
                     halt();
                 }
-                Err(font::PsramInstallError::Legacy(_)) => {
-                    uart::log(b"FONT PSRAM: legacy LZ4/validation failed\r\n");
-                    halt();
-                }
                 Err(font::PsramInstallError::Ui(_)) => {
                     uart::log(b"FONT PSRAM: UI LZ4/validation failed\r\n");
                     halt();
                 }
             };
-            uart::log_u32(
-                b"FONT PSRAM: decoded bytes=",
-                (font_storage.legacy_bytes + font_storage.ui_bytes) as u32,
-            );
+            uart::log_u32(b"FONT PSRAM: decoded bytes=", font_storage.ui_bytes as u32);
             uart::log_u32(
                 b"FONT LZ4: compressed bytes=",
                 font_storage.compressed_bytes as u32,
@@ -332,15 +325,12 @@ fn main() -> ! {
                 b"FONT PSRAM: LZ4+CRC cycles=",
                 delay::cycle_count().wrapping_sub(font_started),
             );
-            uart::log_hex(
-                b"FONT PSRAM: legacy address=",
-                font_storage.legacy_address as u32,
-            );
+            uart::log_u32(b"FONT ROM: ASCII bytes=", tab5_font::STORAGE_BYTES as u32);
             uart::log_hex(b"FONT PSRAM: UI address=", font_storage.ui_address as u32);
-            uart::log(b"FONT SOURCE: LZ4 DROM -> decoded PSRAM\r\n");
+            uart::log(b"FONT SOURCE: ASCII plain DROM + A4 LZ4 -> PSRAM\r\n");
         }
         #[cfg(feature = "font-drom-direct")]
-        uart::log(b"FONT SOURCE: plain DROM direct (A/B baseline)\r\n");
+        uart::log(b"FONT SOURCE: ASCII + A4 plain DROM direct (A/B baseline)\r\n");
         app::run(psram);
     }
 

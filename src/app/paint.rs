@@ -5,7 +5,7 @@ use crate::input::{InputManager, TouchPoint};
 use crate::{interrupts, uart};
 
 const BRUSH_RADIUS: usize = 5;
-const HINT: &str = "PAINT - TOUCH TO DRAW, ANY KEY TO EXIT";
+const HINT: &str = "Paint - touch to draw, any key to exit";
 
 /// Runs the paint screen until any managed keyboard key is pressed. The
 /// framebuffer holds the finished canvas on return, so the caller can render

@@ -203,11 +203,11 @@ fn bounce(position: &mut i32, velocity: &mut i32, low: i32, high: i32) {
 
 fn draw_scene(framebuffer: &mut Framebuffer) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 8, "AXIS SENSOR TEST", 2, CYAN, None);
+    framebuffer.draw_text(16, 8, "Axis sensor test", 2, CYAN, None);
     framebuffer.draw_text(
         16,
         40,
-        "TILT THE TAB5 - THE BALL ROLLS DOWNHILL",
+        "Tilt the Tab5 - the ball rolls downhill",
         1,
         WHITE,
         None,
@@ -243,7 +243,7 @@ fn draw_hud(framebuffer: &mut Framebuffer, sample: MotionSample) {
     framebuffer.draw_text(
         600,
         84,
-        if level { "HORIZONTAL" } else { "TILTED" },
+        if level { "Horizontal" } else { "Tilted" },
         2,
         if level { GREEN } else { YELLOW },
         None,
@@ -297,7 +297,7 @@ fn draw_level(framebuffer: &mut Framebuffer, raw_x: i16, raw_y: i16, level: bool
     const CENTER_Y: i32 = TOP as i32 + HEIGHT as i32 / 2 + 8;
 
     framebuffer.stroke_rect(LEFT, TOP, WIDTH, HEIGHT, CYAN);
-    framebuffer.draw_text(LEFT + 8, TOP + 6, "LEVEL", 1, WHITE, None);
+    framebuffer.draw_text(LEFT + 8, TOP + 6, "Level", 1, WHITE, None);
     framebuffer.draw_line(
         CENTER_X as usize - 48,
         CENTER_Y as usize,
@@ -361,7 +361,7 @@ impl AxisLine {
         for divisor in [1_000, 100, 10, 1] {
             self.push_byte(b'0' + ((magnitude / divisor) % 10) as u8);
         }
-        self.push_str("DPS");
+        self.push_str("dps");
     }
 
     fn as_str(&self) -> &str {
@@ -438,9 +438,9 @@ fn ball_dirty_height(old_y: i32, new_y: i32) -> usize {
 
 fn show_unavailable(framebuffer: &mut Framebuffer, error: InitError) {
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 16, "AXIS SENSOR TEST", 2, CYAN, None);
+    framebuffer.draw_text(16, 16, "Axis sensor test", 2, CYAN, None);
     framebuffer.draw_text(16, 72, error.message(), 2, RED, None);
-    framebuffer.draw_text(16, 120, "PRESS ANY KEY TO EXIT", 1, YELLOW, None);
+    framebuffer.draw_text(16, 120, "Press any key to exit", 1, YELLOW, None);
     if !framebuffer.flush() {
         uart::log(b"Axis test: unavailable-screen flush failed\r\n");
         return;

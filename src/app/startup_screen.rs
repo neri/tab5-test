@@ -33,7 +33,7 @@ const USB_CELL_LEFT: usize = WIDTH / 2 - ICON_CELL_WIDTH / 2;
 const WIFI_CELL_LEFT: usize = WIDTH / 2 + ICON_CELL_WIDTH / 2;
 const DETAIL_Y: usize = ICON_TOP + ICON_SIZE + 12;
 const CANCEL_Y: usize = HEIGHT - font::HEIGHT * 2;
-const CANCEL_TEXT: &str = "ESC  CANCEL STARTUP AND OPEN CONSOLE";
+const CANCEL_TEXT: &str = "Esc  Cancel startup and open Console";
 
 const MUTED: u16 = 0x8410;
 const AMBER: u16 = 0xA500;
@@ -65,7 +65,7 @@ impl Visual {
     const fn pending() -> Self {
         Self {
             phase: Phase::Pending,
-            detail: "WAITING",
+            detail: "Waiting",
         }
     }
 }
@@ -110,21 +110,21 @@ pub fn run(
         framebuffer,
         Visual {
             phase: Phase::Running,
-            detail: "LOOKING FOR DEVICES",
+            detail: "Looking for devices",
         },
     );
     screen.update_cf(
         framebuffer,
         Visual {
             phase: Phase::Running,
-            detail: "MOUNTING CF",
+            detail: "Mounting CF",
         },
     );
     screen.update_wifi(
         framebuffer,
         Visual {
             phase: Phase::Running,
-            detail: "STARTING RADIO",
+            detail: "Starting radio",
         },
     );
 
@@ -274,7 +274,7 @@ impl CfStartup {
         if tick::now_ms() < self.next_attempt_ms {
             return Visual {
                 phase: Phase::Running,
-                detail: "RETRYING CF",
+                detail: "Retrying CF",
             };
         }
 
@@ -293,17 +293,17 @@ impl CfStartup {
         if !self.done {
             Visual {
                 phase: Phase::Running,
-                detail: "MOUNTING CF",
+                detail: "Mounting CF",
             }
         } else if self.mounted {
             Visual {
                 phase: Phase::Succeeded,
-                detail: "CF MOUNTED",
+                detail: "CF mounted",
             }
         } else {
             Visual {
                 phase: Phase::Warning,
-                detail: "CF NOT MOUNTED",
+                detail: "CF not mounted",
             }
         }
     }
@@ -421,7 +421,7 @@ impl UsbStartup {
         if !self.scan_finished {
             return Visual {
                 phase: Phase::Running,
-                detail: "LOOKING FOR DEVICES",
+                detail: "Looking for devices",
             };
         }
 
@@ -465,7 +465,7 @@ impl UsbStartup {
             self.done = false;
             return Visual {
                 phase: Phase::Running,
-                detail: "MOUNTING STORAGE",
+                detail: "Mounting storage",
             };
         }
 
@@ -485,12 +485,12 @@ impl UsbStartup {
         if self.enumeration_warning || self.mount_warning {
             Visual {
                 phase: Phase::Warning,
-                detail: "ENUMERATION WARNING",
+                detail: "Enumeration warning",
             }
         } else {
             Visual {
                 phase: Phase::Succeeded,
-                detail: "READY",
+                detail: "Ready",
             }
         }
     }
@@ -574,7 +574,7 @@ impl WifiStartup {
         if !self.begun {
             return Visual {
                 phase: Phase::Running,
-                detail: "STARTING RADIO",
+                detail: "Starting radio",
             };
         }
 
@@ -605,17 +605,17 @@ impl WifiStartup {
         if self.online {
             Visual {
                 phase: Phase::Succeeded,
-                detail: "ONLINE",
+                detail: "Online",
             }
         } else if self.failed {
             Visual {
                 phase: Phase::Failed,
-                detail: "SETUP REQUIRED",
+                detail: "Setup required",
             }
         } else {
             Visual {
                 phase: Phase::Warning,
-                detail: "SETUP REQUIRED",
+                detail: "Setup required",
             }
         }
     }
@@ -627,12 +627,12 @@ impl WifiStartup {
 
 fn running_wifi_visual(state: WifiState) -> Visual {
     let detail = match state {
-        WifiState::LinkDown => "STARTING RADIO",
-        WifiState::Associating { .. } => "CONNECTING",
-        WifiState::RetryWaiting { .. } => "RETRYING",
-        WifiState::Associated(_) => "CONNECTED",
-        WifiState::RequestingDhcp { .. } => "WAITING FOR DHCP",
-        _ => "INITIALIZING",
+        WifiState::LinkDown => "Starting radio",
+        WifiState::Associating { .. } => "Connecting",
+        WifiState::RetryWaiting { .. } => "Retrying",
+        WifiState::Associated(_) => "Connected",
+        WifiState::RequestingDhcp { .. } => "Waiting for DHCP",
+        _ => "Initializing",
     };
     Visual {
         phase: Phase::Running,

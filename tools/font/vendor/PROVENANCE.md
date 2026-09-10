@@ -11,7 +11,7 @@
 | --- | --- |
 | 名称 | GNU Unifont Japanese (Unifont-JP) |
 | 版 | 17.0.05 (BDFの`FONT_VERSION`プロパティ) |
-| 取得元 | <https://unifoundry.com/unifont/index.html> の配布物`unifont_jp-17.0.05.bdf.gz` |
+| 取得元 | <https://unifoundry.com/pub/unifont/unifont-17.0.05/font-builds/unifont_jp-17.0.05.bdf.gz> |
 | 収録範囲 | Unicode Plane 0のみ。`ENCODING`の最大値は65533 (U+FFFD) |
 | glyph数 | 57,086 (`CHARS`プロパティ) |
 | 字幅 | `DWIDTH`が8または16、`FONTBOUNDINGBOX`は`16 16 0 -2` |
@@ -26,7 +26,8 @@ SHA-256 (展開後の unifont_jp-17.0.05.bdf) = 044463a47a5b320a1281dcd15fcb3010
 
 生成toolが検証するのは**展開後のBDF**のhashです。gzipの再圧縮やファイル名の変更で
 archive側のhashは変わりますが、BDF本文のhashは変わらないためです。archive側のhashは
-このリポジトリへ取り込んだ時点のファイルに対する値として記録しています。
+版固定URLから取得する配布物にも一致します。1,302,466 byteのarchiveはリポジトリへcommitせず、
+root `Makefile`がdownloadとarchive hash検証を行います。
 
 ### licenseの本文について
 

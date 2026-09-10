@@ -14,7 +14,9 @@ fn u32_at(data: &[u8], offset: usize) -> u32 {
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
-    let data = fs::read(SOURCE).expect("read generated UI font blob");
+    let data = fs::read(SOURCE).unwrap_or_else(|error| {
+        panic!("cannot read generated UI font blob {SOURCE}: {error}; run `make fonts`")
+    });
     assert_eq!(&data[..4], b"T5A4");
     assert_eq!(u16_at(&data, 4), 1);
     assert_eq!(u16_at(&data, 6), 32);

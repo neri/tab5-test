@@ -167,54 +167,54 @@ fn consolidate_access_points(access_points: Vec<wifi::station::AccessPoint>) -> 
 
 fn failure_result(failure: Failure) -> ConnectionResult {
     match failure {
-        Failure::Disabled => ConnectionResult::error("WI-FI IS OFF", "ENABLE WI-FI FIRST"),
-        Failure::LinkBringUp => ConnectionResult::error("LINK BRING-UP FAILED", "SEE UART LOG"),
-        Failure::StartRpc => ConnectionResult::error("WI-FI START RPC FAILED", "SEE UART LOG"),
-        Failure::StartStatus(status) => ConnectionResult::status("WI-FI START REFUSED", status),
-        Failure::ConnectRpc => ConnectionResult::error("CONNECT RPC FAILED", "SEE UART LOG"),
-        Failure::ConnectStatus(status) => ConnectionResult::status("CONNECT REFUSED", status),
+        Failure::Disabled => ConnectionResult::error("Wi-Fi is off", "Enable Wi-Fi first"),
+        Failure::LinkBringUp => ConnectionResult::error("Link bring-up failed", "See UART log"),
+        Failure::StartRpc => ConnectionResult::error("Wi-Fi start RPC failed", "See UART log"),
+        Failure::StartStatus(status) => ConnectionResult::status("Wi-Fi start refused", status),
+        Failure::ConnectRpc => ConnectionResult::error("Connect RPC failed", "See UART log"),
+        Failure::ConnectStatus(status) => ConnectionResult::status("Connect refused", status),
         Failure::Disconnected(reason) => {
             let mut line = Line::new();
-            line.push_str("REASON ");
+            line.push_str("Reason ");
             line.push_u32(reason);
             if let Some(name) = wifi::station::disconnect_reason_name(reason) {
                 line.push_str("  ");
                 line.push_str(name);
             }
             ConnectionResult {
-                title: "ASSOCIATION FAILED",
+                title: "Association failed",
                 detail: line,
             }
         }
         Failure::AssociationTimedOut => {
-            ConnectionResult::error("ASSOCIATION TIMED OUT", "NO EVENT FROM THE C6")
+            ConnectionResult::error("Association timed out", "No event from the C6")
         }
         Failure::TickUnavailable => {
-            ConnectionResult::error("ASSOCIATED, NO IP STACK", "MILLISECOND TICK IS NOT RUNNING")
+            ConnectionResult::error("Associated, no IP stack", "Millisecond tick is not running")
         }
         Failure::MacRpc => {
-            ConnectionResult::error("ASSOCIATED, NO IP STACK", "STATION MAC RPC FAILED")
+            ConnectionResult::error("Associated, no IP stack", "Station MAC RPC failed")
         }
-        Failure::MacStatus(status) => ConnectionResult::status("STATION MAC REFUSED", status),
-        Failure::LinkLost => ConnectionResult::error("C6 LINK LOST", "CONNECTION DID NOT COMPLETE"),
-        Failure::ConfigRpc => ConnectionResult::error("CONFIG RPC FAILED", "SEE UART LOG"),
-        Failure::ConfigStatus(status) => ConnectionResult::status("CONFIG REFUSED", status),
-        Failure::StorageRpc => ConnectionResult::error("STORAGE RPC FAILED", "SEE UART LOG"),
-        Failure::StorageStatus(status) => ConnectionResult::status("STORAGE REFUSED", status),
+        Failure::MacStatus(status) => ConnectionResult::status("Station MAC refused", status),
+        Failure::LinkLost => ConnectionResult::error("C6 link lost", "Connection did not complete"),
+        Failure::ConfigRpc => ConnectionResult::error("Config RPC failed", "See UART log"),
+        Failure::ConfigStatus(status) => ConnectionResult::status("Config refused", status),
+        Failure::StorageRpc => ConnectionResult::error("Storage RPC failed", "See UART log"),
+        Failure::StorageStatus(status) => ConnectionResult::status("Storage refused", status),
         Failure::DisconnectRpc => {
-            ConnectionResult::error("OLD CONNECTION DISCONNECT FAILED", "SEE UART LOG")
+            ConnectionResult::error("Old connection disconnect failed", "See UART log")
         }
         Failure::DisconnectStatus(status) => {
-            ConnectionResult::status("OLD CONNECTION DISCONNECT REFUSED", status)
+            ConnectionResult::status("Old connection disconnect refused", status)
         }
         Failure::DisconnectTimedOut => ConnectionResult::error(
-            "OLD CONNECTION DISCONNECT TIMED OUT",
-            "NO EVENT FROM THE C6",
+            "Old connection disconnect timed out",
+            "No event from the C6",
         ),
-        Failure::ModeRpc => ConnectionResult::error("WI-FI MODE RPC FAILED", "SEE UART LOG"),
-        Failure::ModeStatus(status) => ConnectionResult::status("WI-FI MODE REFUSED", status),
-        Failure::StopRpc => ConnectionResult::error("WI-FI STOP RPC FAILED", "SEE UART LOG"),
-        Failure::StopStatus(status) => ConnectionResult::status("WI-FI STOP REFUSED", status),
+        Failure::ModeRpc => ConnectionResult::error("Wi-Fi mode RPC failed", "See UART log"),
+        Failure::ModeStatus(status) => ConnectionResult::status("Wi-Fi mode refused", status),
+        Failure::StopRpc => ConnectionResult::error("Wi-Fi stop RPC failed", "See UART log"),
+        Failure::StopStatus(status) => ConnectionResult::status("Wi-Fi stop refused", status),
     }
 }
 
@@ -244,16 +244,16 @@ fn draw_access_points(
     message: Option<&str>,
     status: Status,
 ) {
-    draw_chrome(framebuffer, "WI-FI NETWORKS");
+    draw_chrome(framebuffer, "Wi-Fi networks");
     let mut count = Line::new();
     count.push_u32(access_points.len() as u32);
-    count.push_str(" NETWORKS  ");
-    count.push_str(if status.enabled { "ON" } else { "OFF" });
+    count.push_str(" networks  ");
+    count.push_str(if status.enabled { "On" } else { "Off" });
     framebuffer.draw_gui_text(930, 52, count.as_str(), 1, MUTED, None);
 
     if access_points.is_empty() {
-        centred(framebuffer, 285, "NO ACCESS POINTS FOUND", 2, WARNING);
-        centred(framebuffer, 335, "PRESS R TO RESCAN", 1, BLACK);
+        centred(framebuffer, 285, "No access points found", 2, WARNING);
+        centred(framebuffer, 335, "Press R to rescan", 1, BLACK);
     } else {
         draw_column_labels(framebuffer);
     }
@@ -281,7 +281,7 @@ fn draw_access_points(
     framebuffer.draw_gui_text(
         28,
         FOOTER_TOP,
-        "UP/DOWN/PAGE SELECT   ENTER/TOUCH CONNECT   O OFF   F FORGET",
+        "Up/Down/Page select   Enter/Touch connect   O off   F forget",
         1,
         PRIMARY,
         None,
@@ -292,7 +292,7 @@ fn draw_access_points(
         framebuffer.draw_gui_text(
             28,
             FOOTER_TOP + 32,
-            "R RESCAN   ESC EXIT   MENU CONNECTIONS REQUEST DHCP AUTOMATICALLY",
+            "R rescan   Esc exit   Menu connections request DHCP automatically",
             1,
             MUTED,
             None,
@@ -307,11 +307,11 @@ fn draw_access_points(
 /// which reads as a measurement of something but does not say of what.
 fn draw_column_labels(framebuffer: &mut Framebuffer) {
     for (x, label) in [
-        (SSID_LEFT, "NETWORK"),
-        (SIGNAL_LEFT, "SIGNAL"),
+        (SSID_LEFT, "Network"),
+        (SIGNAL_LEFT, "Signal"),
         (CHANNEL_LEFT, "CH"),
-        (AUTH_LEFT, "SECURITY"),
-        (COUNT_LEFT, "APS"),
+        (AUTH_LEFT, "Security"),
+        (COUNT_LEFT, "APs"),
     ] {
         framebuffer.draw_gui_text(x, COLUMN_LABEL_TOP, label, 1, MUTED, None);
     }
@@ -345,7 +345,7 @@ fn draw_access_point_row(
         } else {
             WARNING
         };
-        framebuffer.draw_text(MARK_LEFT, text_y, "\u{2713}", 1, colour, None);
+        framebuffer.draw_gui_text(MARK_LEFT, text_y, "\u{2713}", 1, colour, None);
     }
 
     // Bold on the row that is connected. The name is what the reader
@@ -388,7 +388,7 @@ fn draw_access_point_row(
     match wifi::station::auth_mode_name(access_point.auth_mode) {
         Some(name) => auth.push_str(name),
         None => {
-            auth.push_str("AUTH ");
+            auth.push_str("Auth ");
             auth.push_u32(access_point.auth_mode as u32);
         }
     }
@@ -557,12 +557,12 @@ fn draw_label(
 }
 
 fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usize) {
-    draw_chrome(framebuffer, "WI-FI PASSWORD");
+    draw_chrome(framebuffer, "Wi-Fi password");
     let mut network = Line::new();
-    network.push_str("NETWORK  ");
+    network.push_str("Network  ");
     network.push_ascii(ssid);
     framebuffer.draw_gui_text(90, 150, network.as_str(), 2, BLACK, None);
-    framebuffer.draw_gui_text(90, 226, "PASSWORD", 1, MUTED, None);
+    framebuffer.draw_gui_text(90, 226, "Password", 1, MUTED, None);
     framebuffer.fill_rect(90, 258, 900, 64, BLACK);
     framebuffer.fill_rect(92, 260, 896, 60, BACKGROUND);
 
@@ -574,12 +574,12 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
 
     let mut count = Line::new();
     count.push_u32(length as u32);
-    count.push_str(" / 64 BYTES");
+    count.push_str(" / 64 bytes");
     framebuffer.draw_gui_text(1010, 279, count.as_str(), 1, PRIMARY, None);
     framebuffer.draw_gui_text(
         90,
         370,
-        "ENTER CONNECT    BACKSPACE DELETE    ESC CANCEL",
+        "Enter connect    Backspace delete    Esc cancel",
         1,
         PRIMARY,
         None,
@@ -587,7 +587,7 @@ fn draw_password_screen(framebuffer: &mut Framebuffer, ssid: &[u8], length: usiz
     framebuffer.draw_gui_text(
         90,
         414,
-        "THE PASSWORD IS NOT WRITTEN TO THE CONSOLE OR UART LOG",
+        "The password is not written to the Console or UART log",
         1,
         MUTED,
         None,
@@ -635,7 +635,7 @@ fn draw_chrome(framebuffer: &mut Framebuffer, title: &str) {
 }
 
 fn show_progress(framebuffer: &mut Framebuffer, title: &str, detail: &str) {
-    draw_chrome(framebuffer, "WI-FI SETUP");
+    draw_chrome(framebuffer, "Wi-Fi setup");
     framebuffer.draw_gui_text(90, 235, title, 2, PRIMARY, None);
     framebuffer.draw_gui_text(90, 318, detail, 1, BLACK, None);
     flush(framebuffer, b"WIFI MENU: progress-screen flush failed\r\n");
@@ -653,7 +653,7 @@ fn zeroize(bytes: &mut [u8]) {
 
 fn push_status(line: &mut Line, operation: &str, status: i32) {
     line.push_str(operation);
-    line.push_str(" SLAVE STATUS 0X");
+    line.push_str(" slave status 0x");
     line.push_hex(status as u32, 8);
 }
 
@@ -674,7 +674,7 @@ impl ConnectionResult {
 
     fn status(title: &'static str, status: i32) -> Self {
         let mut line = Line::new();
-        push_status(&mut line, "REQUEST", status);
+        push_status(&mut line, "Request", status);
         Self {
             title,
             detail: line,
@@ -968,13 +968,13 @@ impl Screen {
             ),
             Mode::ConfirmForget => show_progress(
                 fb,
-                "FORGET SAVED PROFILE?",
-                "Y / ENTER CONFIRM   ANY OTHER KEY CANCEL",
+                "Forget saved profile?",
+                "Y / Enter confirm   any other key cancel",
             ),
             Mode::Busy => show_progress(
                 fb,
-                "WI-FI OPERATION IN PROGRESS",
-                "SYSTEM BAR AND ESC REMAIN AVAILABLE",
+                "Wi-Fi operation in progress",
+                "System bar and Esc remain available",
             ),
         }
         if self.mode == Mode::List {

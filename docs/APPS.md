@@ -15,7 +15,7 @@ coordinator、入力・timer・資源の所有と実機未確認事項は[`SYSTE
 画面だけを説明します。
 
 `touchtest`コマンドは全画面のマルチタッチ診断を開きます。現在の同時接触数と観測した
-最大数を表示し、同一レポート内で2点以上を読み取れた時点で`PASS: MULTITOUCH DETECTED`を
+最大数を表示し、同一レポート内で2点以上を読み取れた時点で`Pass: multitouch detected`を
 表示します。CardKBまたはUSBキーボードの任意のキーでシェルに戻ります。
 
 `src/app/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
@@ -43,35 +43,19 @@ CardKBまたはUSBキーボードの任意のキーで抜けられます。
 
 ## フォント診断画面
 
-`fonttest`コマンドは3枚の全画面シートを順に開きます。1枚目は従来16 pixel font、
-2枚目はA4 Sans／Sans Monoの16／24／32 pixelとrenderer、3枚目は同一のA4 glyphを
-coverageの閾値8で二値化した比較baselineです。キーを押すたびに次のシートへ進み、
-3枚目から終了します。
+`fonttest`コマンドは3枚の全画面シートを順に開きます。キーを押すたびに次へ進み、3枚目から
+終了します。
 
-- ASCII、かな、漢字、記号、半角カナ、Latin、ギリシャ・キリル文字の見本
-- combining mark（U+3099／U+309A／U+0301）が直前の文字へ重なり、幅を増やさないこと
-- 直前の文字が無いcombining markがU+FFFDとして1文字で描かれること
-- 収録していない文字（BMP外、emoji、subset外）が空白ではなく中空枠になること
-- 前景色5色、太字（1 pixelずらして二度描き）、2倍拡大
-- 背景ありの再描画が自分の枠を塗り切ること。16セル分の`M`を赤地青で描いた上へ、
-  同じ128 pixelの枠を全角8文字で塗り直します。赤や青が残ればopaque描画の枠が
-  足りていません
-- 罫線の枠と塗り潰しブロックが継ぎ目なくつながること。`draw_text`が改行で
-  進む行送りがglyph高と一致しているか、文字送りがglyph幅と一致しているかを
-  1 pixel単位で見られます
-- 16 pixelの日本語本文4行。実機での可読性はここで判断します
-- A4比例幅／固定幅の`AVATAR To Wi-Fi`、`iIl1Wm`、accent、時計、英日混在
-- 黒、青い選択背景、themeのteal、透明背景、1 pixel二度打ち太字でのalpha edge
-- 最初にfont sourceを`decoded PSRAM`または`plain DROM direct`としてUARTへ出し、従来fontと
-  A4のglyph phase時間を`Font test: legacy glyph phase us=`、
-  `Font test: A4 glyph phase us=`として出力。同じラベルなので2 buildをそのまま比較できます
-- 3枚目では左に通常のA4、右に`alpha >= 8`だけを前景色にする1bit baselineを配置。
-  glyph、bearing、advanceは同じまま、Sans／Sans Monoの16／24／32 pixelを比較します。
-  黒背景だけでなく青背景の黄文字と白背景の黒文字でも、通常の視距離から可読性、曲線、
-  斜線、細い縦画を見比べられます。この1bit経路は診断専用で、製品画面には使いません
+- 1枚目は3,175 byteの非圧縮ASCII 1bppをDROMから直接描きます。printable ASCII、色、太字、
+  opaque再描画、2倍、改行を示し、非ASCIIの例は意図どおり中空枠になります
+- 2枚目はLatin A4 Sans／Sans Monoの16／24／32 pixel、色背景、英日混在と、日本語A4の
+  16 pixelおよび16 pixel bitmapを2倍にした32 pixelを示します
+- 3枚目は左に通常A4、右に同じglyphを`alpha >= 8`で二値化した1bit baselineを置きます。
+  Latinの16／24／32 pixelに加え、日本語の16／32 pixelも左右で比較できます
+- UARTには`ASCII=plain DROM`とA4の`decoded PSRAM`／`plain DROM direct`を区別して出し、
+  `ASCII ROM glyph phase us=`と`A4 glyph phase us=`を出します
 
-各静止画面を描いてflushしたらキー入力を待ちます。最初の2枚の文字列は
-[`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)が固定したものと同じです。
+二値化経路は診断専用です。製品画面は常にA4 blendを使います。
 
 ## BMI270軸センサーテスト
 
@@ -91,7 +75,7 @@ Tab5内蔵BMI270はボードI2Cバス（SDA31/SCL32）のアドレス`0x68`に�
 
 ボールは固定小数点（1 pixel = 256単位）で位置・速度を持つ。加速度、軽い減衰、壁面で
 の60%反発を使い、画面端の枠内を転がる。ヘッダにはX/Y加速度から求める気泡水準器と
-`HORIZONTAL`／`TILTED`を表示し、`abs(acc_x) + abs(acc_y) <= 700 LSB`（±4 g設定で
+`Horizontal`／`Tilted`を表示し、`abs(acc_x) + abs(acc_y) <= 700 LSB`（±4 g設定で
 約0.085 g、約5度）を水平と判定する。任意のCardKBまたはUSBキーボード入力で終了する。
 
 画面のちらつきと入力維持処理による停止を防ぐため、診断中は`InputManager::service`を
@@ -147,7 +131,7 @@ association／DHCPをフレーム駆動で並行して進め、両方が終端�
 USBの失敗は警告として起動を続け、完了時にWi-FiがOnlineかつIPv4取得済みならBrowser、それ以外はデスクトップへ進む。
 
 初回表示から5秒経っても処理中なら、最下行より1行上へ
-`ESC  CANCEL STARTUP AND OPEN CONSOLE`を表示する。案内の表示後だけEscapeを受け付け、
+`Esc  Cancel startup and open Console`を表示する。案内の表示後だけEscapeを受け付け、
 起動待ちを打ち切ってConsoleへ進む。完了済みのmountは残し、進行中のUSB自動マウントと
 Wi-Fi接続は同じ管理器をConsoleへ引き継ぐ。Browser終了後はデスクトップへ進む。
 起動からミニアプリを直接開かない。
@@ -165,7 +149,7 @@ Wi-Fi一覧の選択行は青地に白文字とし、電波の点灯部・接続
 ## デスクトップ
 
 `src/app/desktop.rs`はティール色の背景だけを描く通常GUIアプリ。上部には共有システムバーを表示する。
-メニュー項目名は「デスクトップ」。Browser／専有GUI終了後の戻り先になる。起動完了時にWi-Fiが使えなければデスクトップ、OnlineかつIPv4取得済みならBrowserを表示する。
+メニュー項目名は`Desktop`。Browser／専有GUI終了後の戻り先になる。起動完了時にWi-Fiが使えなければデスクトップ、OnlineかつIPv4取得済みならBrowserを表示する。
 アイコン、ウィンドウ、ドラッグ、独自taskbarは持たない。旧モックアップは廃止し、引数なし`win`はこのデスクトップを開く。
 ConsoleはLauncherのConsole項目から明示的に開く。描画エラー時は診断のためConsoleへ戻る。
 

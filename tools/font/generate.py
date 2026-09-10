@@ -26,7 +26,7 @@ SOURCE = HERE / "vendor" / "unifont_jp-17.0.05.bdf.gz"
 # The hash of the *decompressed* BDF. Renaming or recompressing the archive
 # changes the archive's hash but not this one.
 SOURCE_SHA256 = "044463a47a5b320a1281dcd15fcb3010d6a4ec19603e4193bf28d12909cd009c"
-MANIFEST = HERE / "manifest.txt"
+MANIFEST = HERE / "ascii-manifest.txt"
 OUTPUT = REPOSITORY / "font" / "data" / "tab5font16.bin"
 REPORT = REPOSITORY / "font" / "data" / "tab5font16.txt"
 
@@ -36,17 +36,9 @@ HEADER_BYTES = 32
 GLYPH_BYTES = 32
 RANGE_BYTES = 8
 CELL = 16
-# `docs/FONT_MIGRATION_PLAN.md` fixes this ceiling. Generation fails above it
-# instead of quietly dropping characters to fit.
-SIZE_LIMIT = 512 * 1024
-# The console's cell IDs assume these are present and 8 pixels wide; see
-# `font/src/console.rs`, which derives its IDs from the same three spans.
-CONSOLE_HALFWIDTH = [range(0x20, 0x7F), range(0xA0, 0x100), range(0xFF61, 0xFFA0)]
-# Unifont draws U+00AD SOFT HYPHEN as a 16 pixel code point box, because the
-# character is a formatting hint with no visible form of its own. It keeps its
-# cell ID for the sake of a contiguous Latin-1 span, but the console renders
-# that ID as its placeholder rather than as this glyph.
-CONSOLE_EXCEPTIONS = {0xAD}
+# The direct-ROM ASCII blob is intentionally bounded. Generation fails above
+# this ceiling instead of quietly dropping characters to fit.
+SIZE_LIMIT = 16 * 1024
 
 
 class GenerationError(Exception):
@@ -274,20 +266,17 @@ def check_console_repertoire(
     code_points: list[int], advances: list[int]
 ) -> None:
     index = {code_point: position for position, code_point in enumerate(code_points)}
-    for span in CONSOLE_HALFWIDTH:
-        for code_point in span:
-            if code_point in CONSOLE_EXCEPTIONS:
-                continue
-            position = index.get(code_point)
-            if position is None:
-                raise GenerationError(
-                    f"U+{code_point:04X} is in the console repertoire but not in the subset"
-                )
-            if advances[position] != 8:
-                raise GenerationError(
-                    f"U+{code_point:04X} is in the console repertoire "
-                    f"but is {advances[position]} pixels wide, not 8"
-                )
+    for code_point in range(0x20, 0x7F):
+        position = index.get(code_point)
+        if position is None:
+            raise GenerationError(
+                f"U+{code_point:04X} is in printable ASCII but not in the subset"
+            )
+        if advances[position] != 8:
+            raise GenerationError(
+                f"U+{code_point:04X} is printable ASCII but is "
+                f"{advances[position]} pixels wide, not 8"
+            )
 
 
 def write_report(

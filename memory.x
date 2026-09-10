@@ -30,18 +30,19 @@ MEMORY
      * header then puts the IROM payload at image offset +0x90000, matching the
      * virtual address below without an extra espflash padding segment.
      *
-     * DROM is sized around the two LZ4-compressed font containers.  Together
-     * they occupy about 297 KiB instead of the 486 KiB decoded payload; the
-     * 0x90000 boundary leaves the required padding after ordinary rodata.
+     * DROM is sized around the plain ASCII blob and one LZ4-compressed A4
+     * container.  The A4 container occupies about 771 KiB and expands to
+     * about 1000 KiB;
+     * the 0x110000 boundary leaves the required padding after ordinary rodata.
      * The diagnostic font-drom-direct feature defines __font_drom_direct and
-     * temporarily restores the 0xc0000 boundary needed by both plain blobs.
+     * temporarily uses the 0x150000 boundary needed by the plain A4 blob.
      * Growing DROM
      * costs image size rather than RAM: the segment is written to flash in
      * full, zero padding included, and is mapped rather than loaded. */
     ROM_RODATA : ORIGIN = 0x40000020,
-                 LENGTH = DEFINED(__font_drom_direct) ? 0x000bffd8 : 0x0008ffd8
-    ROM_TEXT : ORIGIN = DEFINED(__font_drom_direct) ? 0x400c0000 : 0x40090000,
-               LENGTH = DEFINED(__font_drom_direct) ? 0x00340000 : 0x00370000
+                 LENGTH = DEFINED(__font_drom_direct) ? 0x0014ffd8 : 0x0010ffd8
+    ROM_TEXT : ORIGIN = DEFINED(__font_drom_direct) ? 0x40150000 : 0x40110000,
+               LENGTH = DEFINED(__font_drom_direct) ? 0x002b0000 : 0x002f0000
     RAM : ORIGIN = 0x4ff40000, LENGTH = 0x00040000
 }
 

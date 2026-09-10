@@ -9,10 +9,9 @@
 //!
 //! The data is generated: `tools/font/generate.py` reads Unifont-JP and the
 //! subset manifest and writes `data/tab5font16.bin`, which is checked in.
-//! Nothing here parses BDF. The build script stores an LZ4 raw-block container
-//! in DROM and startup expands it into PSRAM before any lookup, making an
-//! accidental direct-DROM rendering path visibly invalid. The report describes
-//! the uncompressed source blob.
+//! Nothing here parses BDF. The small printable-ASCII blob stays uncompressed
+//! in DROM and is read directly. Normal GUI Latin and Japanese use the separate
+//! A4 font crate.
 //!
 //! Glyphs are stored column by column, least significant bit at the top,
 //! because the framebuffer maps increasing logical X onto decreasing native
@@ -20,11 +19,6 @@
 //! out the way it is consumed.
 
 #![cfg_attr(not(test), no_std)]
-
-#[cfg(not(feature = "drom-direct"))]
-use core::ptr;
-#[cfg(not(feature = "drom-direct"))]
-use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub mod console;
 
@@ -35,19 +29,10 @@ pub const HEIGHT: usize = 16;
 /// The widest a glyph can be, and the number of columns each one is stored in.
 pub const MAX_WIDTH: usize = 16;
 
-#[cfg(not(feature = "drom-direct"))]
-const COMPRESSED_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tab5font16.lz4"));
-#[cfg(any(test, not(target_arch = "riscv32"), feature = "drom-direct"))]
-const TEST_DATA: &[u8] = include_bytes!("../data/tab5font16.bin");
-#[cfg(not(feature = "drom-direct"))]
-static ACTIVE_DATA: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+const DATA: &[u8] = include_bytes!("../data/tab5font16.bin");
 
 include!(concat!(env!("OUT_DIR"), "/font_meta.rs"));
 
-#[cfg(not(feature = "drom-direct"))]
-const MAGIC: [u8; 4] = *b"T5F1";
-#[cfg(not(feature = "drom-direct"))]
-const FORMAT_VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 32;
 const RANGE_BYTES: usize = 8;
 const GLYPH_BYTES: usize = 32;
@@ -83,76 +68,8 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-#[cfg(not(feature = "drom-direct"))]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InstallError {
-    Decode(tab5_font_codec::DecodeError),
-    BadHeader,
-    BadLayout,
-    BadCrc,
-    AlreadyInstalled,
-}
-
-#[cfg(not(feature = "drom-direct"))]
-fn decode_and_validate(destination: &mut [u8]) -> Result<(), InstallError> {
-    tab5_font_codec::decode(COMPRESSED_DATA, destination).map_err(InstallError::Decode)?;
-    if destination[..4] != MAGIC
-        || u16_from(destination, 4) != FORMAT_VERSION
-        || u16_from(destination, 6) as usize != HEADER_BYTES
-    {
-        return Err(InstallError::BadHeader);
-    }
-    if u32_from(destination, 8) as usize != GLYPH_COUNT
-        || u32_from(destination, 12) as usize != RANGE_COUNT
-        || u32_from(destination, 16) as usize != RANGES_OFFSET
-        || u32_from(destination, 20) as usize != BITMAPS_OFFSET
-        || u32_from(destination, 24) as usize != ADVANCES_OFFSET
-        || RANGES_OFFSET != HEADER_BYTES
-        || BITMAPS_OFFSET != RANGES_OFFSET + RANGE_COUNT * RANGE_BYTES
-        || ADVANCES_OFFSET != BITMAPS_OFFSET + GLYPH_COUNT * GLYPH_BYTES
-        || STORAGE_BYTES != ADVANCES_OFFSET + GLYPH_COUNT
-    {
-        return Err(InstallError::BadLayout);
-    }
-    if u32_from(destination, 28) != CRC32 || crc32(&destination[HEADER_BYTES..]) != CRC32 {
-        return Err(InstallError::BadCrc);
-    }
-    Ok(())
-}
-
-/// Expands the build-time LZ4 DROM blob into permanent PSRAM storage.
-/// This must run exactly once before any firmware font lookup.
-#[cfg(not(feature = "drom-direct"))]
-pub fn install_psram(destination: &'static mut [u8]) -> Result<(), InstallError> {
-    decode_and_validate(destination)?;
-    ACTIVE_DATA
-        .compare_exchange(
-            ptr::null_mut(),
-            destination.as_mut_ptr(),
-            Ordering::Release,
-            Ordering::Relaxed,
-        )
-        .map(|_| ())
-        .map_err(|_| InstallError::AlreadyInstalled)
-}
-
-/// Address of the active decoded blob, for boot diagnostics.
-#[cfg(not(feature = "drom-direct"))]
-pub fn psram_address() -> Option<usize> {
-    let pointer = ACTIVE_DATA.load(Ordering::Acquire);
-    (!pointer.is_null()).then_some(pointer as usize)
-}
-
-#[cfg(all(not(test), target_arch = "riscv32", not(feature = "drom-direct")))]
 fn data() -> &'static [u8] {
-    let pointer = ACTIVE_DATA.load(Ordering::Acquire);
-    assert!(!pointer.is_null(), "font PSRAM is not installed");
-    unsafe { core::slice::from_raw_parts(pointer, STORAGE_BYTES) }
-}
-
-#[cfg(any(test, not(target_arch = "riscv32"), feature = "drom-direct"))]
-fn data() -> &'static [u8] {
-    TEST_DATA
+    DATA
 }
 
 /// One glyph's pixels and the pen movement that follows it.
@@ -215,11 +132,9 @@ const FULLWIDTH_REPLACEMENT: Glyph = Glyph {
 
 /// The glyph index of `code_point`, or `None` if the subset does not have it.
 fn index_of(code_point: u32) -> Option<usize> {
-    // The range table is sorted and non-overlapping, and holds 4500-odd
-    // entries for 9700-odd glyphs: JIS kanji are scattered through CJK Unified
-    // Ideographs rather than contiguous, so runs are short and there are many
-    // of them. A binary search over runs is still 13 steps rather than the 14
-    // a flat per-glyph index would take, at a quarter of the size.
+    // The generated printable-ASCII repertoire is one contiguous run. Keep
+    // the format's binary-search reader so the checked-in T5F1 format and its
+    // validation remain usable without a special firmware-only representation.
     let mut low = 0;
     let mut high = RANGE_COUNT;
     while low < high {
@@ -305,14 +220,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(feature = "drom-direct"))]
-    fn firmware_blob_is_compressed_and_restores_exact_source() {
-        assert_eq!(&COMPRESSED_DATA[..4], b"T5L4");
-        assert_ne!(&COMPRESSED_DATA[..4], &MAGIC);
-        assert_eq!(COMPRESSED_DATA.len(), COMPRESSED_BYTES);
-        let mut restored = std::vec![0u8; STORAGE_BYTES];
-        decode_and_validate(&mut restored).unwrap();
-        assert_eq!(restored, TEST_DATA);
+    fn firmware_blob_is_plain_ascii() {
+        assert_eq!(&DATA[..4], b"T5F1");
+        assert_eq!(DATA.len(), STORAGE_BYTES);
+        assert_eq!(GLYPH_COUNT, 95);
     }
 
     #[test]
@@ -391,39 +302,26 @@ mod tests {
     }
 
     #[test]
-    fn ascii_is_halfwidth_and_kana_and_kanji_are_full() {
+    fn only_ascii_is_stored_and_other_characters_keep_a_fallback_width() {
         for character in ' '..='~' {
             assert_eq!(advance(character), 8, "{character:?}");
         }
-        for character in ['あ', 'ア', '漢', '。', '　', '１', '￥'] {
+        for character in ['あ', 'ア', '漢', '。', '　', '１', '￥', 'ｱ', 'é', 'Ω', '→']
+        {
             assert_eq!(advance(character), 16, "{character:?}");
-        }
-        for character in ['ｱ', 'ﾝ', '｡', 'é', 'Ω', '→'] {
-            assert_eq!(advance(character), 8, "{character:?}");
+            assert!(glyph(character).is_none(), "{character:?}");
         }
     }
 
     #[test]
-    fn combining_marks_take_no_advance() {
+    fn combining_marks_are_not_part_of_the_ascii_font() {
         for character in ['\u{3099}', '\u{309A}', '\u{0300}', '\u{0301}'] {
-            assert_eq!(advance(character), 0, "{character:?}");
-            assert!(is_combining(character), "{character:?}");
-            assert!(glyph(character).is_some(), "{character:?} has no bitmap");
+            assert_eq!(advance(character), 16, "{character:?}");
+            assert!(!is_combining(character), "{character:?}");
+            assert!(glyph(character).is_none(), "{character:?} has a bitmap");
         }
         assert!(!is_combining('あ'));
         assert!(!is_combining('a'));
-    }
-
-    #[test]
-    fn the_test_characters_the_plan_names_are_covered() {
-        // `docs/FONT_MIGRATION_PLAN.md` names these. U+20BB7 is outside the
-        // BMP, which Unifont-JP does not cover, so it is a known omission and
-        // has to come out as a replacement rather than as nothing.
-        assert!(glyph('髙').is_some(), "U+9AD9");
-        assert!(glyph('﨑').is_some(), "U+FA11");
-        assert!(glyph('\u{20BB7}').is_none());
-        assert_eq!(advance('\u{20BB7}'), 16);
-        assert_eq!(glyph_or_replacement('\u{20BB7}'), FULLWIDTH_REPLACEMENT);
     }
 
     #[test]
@@ -437,15 +335,6 @@ mod tests {
         let control = glyph_or_replacement('\u{7}');
         assert_eq!(control.advance, 8);
         assert_ne!(control.columns, [0u16; MAX_WIDTH]);
-    }
-
-    #[test]
-    fn replacement_character_is_a_real_glyph_not_the_fallback() {
-        // Unifont draws U+FFFD half-width, so it is narrower than the box a
-        // missing full-width character falls back to, and is its own glyph.
-        let glyph = glyph('\u{FFFD}').expect("U+FFFD is in the manifest");
-        assert_eq!(glyph.advance, 8);
-        assert_ne!(glyph, HALFWIDTH_REPLACEMENT);
     }
 
     #[test]
@@ -468,8 +357,7 @@ mod tests {
         assert_eq!(text_width("abc"), 24);
         assert_eq!(text_width("あいう"), 48);
         assert_eq!(text_width("aあ"), 24);
-        // The combining mark rides on the kana before it.
-        assert_eq!(text_width("か\u{3099}"), 16);
+        assert_eq!(text_width("か\u{3099}"), 32);
         assert_eq!(text_width(""), 0);
     }
 }

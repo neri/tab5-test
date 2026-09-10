@@ -484,9 +484,9 @@ impl Framebuffer {
         widest.max(cursor_x - origin_x)
     }
 
-    /// Draws normal-UI text with pre-rasterised A4 Latin glyphs and legacy
-    /// Japanese fallback. Console and diagnostics deliberately keep using
-    /// `draw_text`, preserving their fixed 8x16 cell contract.
+    /// Draws normal-UI text with pre-rasterised A4 Latin and Japanese glyphs.
+    /// Console and direct-ROM diagnostics deliberately keep using `draw_text`,
+    /// preserving their fixed 8x16 ASCII cell contract.
     pub fn draw_ui_text(
         &mut self,
         x: usize,
@@ -525,19 +525,19 @@ impl Framebuffer {
         let origin_x = x;
         let (mut cursor_x, mut cursor_y) = (x, y);
         let mut widest = 0usize;
-        let mut previous_legacy_advance = 0usize;
+        let mut previous_advance = 0usize;
         let mut characters = text.chars().peekable();
         while let Some(character) = characters.next() {
             if character == '\n' {
                 widest = widest.max(cursor_x.saturating_sub(origin_x));
                 cursor_x = origin_x;
                 cursor_y = cursor_y.saturating_add(style.size as usize);
-                previous_legacy_advance = 0;
+                previous_advance = 0;
                 continue;
             }
             let combining_cluster = characters
                 .peek()
-                .is_some_and(|next| tab5_font::is_combining(*next));
+                .is_some_and(|next| tab5_ui_font::is_combining(*next));
             if tab5_ui_font::is_english_latin(character) && !combining_cluster {
                 let glyph = tab5_ui_font::glyph(style, character)
                     .expect("validated UI Latin glyph is missing");
@@ -545,14 +545,62 @@ impl Framebuffer {
                     cursor_x, cursor_y, &glyph, style, foreground, background,
                 );
                 cursor_x = cursor_x.saturating_add(glyph.advance as usize);
-                previous_legacy_advance = 0;
+                previous_advance = 0;
                 continue;
             }
 
-            let scale = style.legacy_scale();
+            if let Some(glyph) = tab5_ui_font::japanese_glyph(character) {
+                let scale = tab5_ui_font::japanese_scale(style);
+                if glyph.advance == 0 {
+                    if previous_advance == 0 {
+                        let replacement = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
+                        self.draw_glyph(
+                            cursor_x,
+                            cursor_y,
+                            &replacement,
+                            style.fallback_scale(),
+                            foreground,
+                            background,
+                        );
+                        previous_advance = replacement.advance as usize * style.fallback_scale();
+                        cursor_x = cursor_x.saturating_add(previous_advance);
+                    } else {
+                        self.draw_ui_glyph_scaled::<BINARY>(
+                            cursor_x.saturating_sub(previous_advance),
+                            cursor_y,
+                            &glyph,
+                            tab5_ui_font::line_metrics(font::UiTextStyle::new(
+                                font::UiFace::Japanese,
+                                16,
+                            )),
+                            scale,
+                            foreground,
+                            None,
+                        );
+                    }
+                } else {
+                    self.draw_ui_glyph_scaled::<BINARY>(
+                        cursor_x,
+                        cursor_y,
+                        &glyph,
+                        tab5_ui_font::line_metrics(font::UiTextStyle::new(
+                            font::UiFace::Japanese,
+                            16,
+                        )),
+                        scale,
+                        foreground,
+                        background,
+                    );
+                    previous_advance = glyph.advance as usize * scale;
+                    cursor_x = cursor_x.saturating_add(previous_advance);
+                }
+                continue;
+            }
+
+            let scale = style.fallback_scale();
             let glyph = font::glyph_or_replacement(character);
             if glyph.advance == 0 {
-                if previous_legacy_advance == 0 {
+                if previous_advance == 0 {
                     let replacement = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
                     self.draw_glyph(
                         cursor_x,
@@ -562,11 +610,11 @@ impl Framebuffer {
                         foreground,
                         background,
                     );
-                    previous_legacy_advance = replacement.advance as usize * scale;
-                    cursor_x = cursor_x.saturating_add(previous_legacy_advance);
+                    previous_advance = replacement.advance as usize * scale;
+                    cursor_x = cursor_x.saturating_add(previous_advance);
                 } else {
                     self.draw_glyph(
-                        cursor_x.saturating_sub(previous_legacy_advance),
+                        cursor_x.saturating_sub(previous_advance),
                         cursor_y,
                         &glyph,
                         scale,
@@ -576,15 +624,15 @@ impl Framebuffer {
                 }
             } else {
                 self.draw_glyph(cursor_x, cursor_y, &glyph, scale, foreground, background);
-                previous_legacy_advance = glyph.advance as usize * scale;
-                cursor_x = cursor_x.saturating_add(previous_legacy_advance);
+                previous_advance = glyph.advance as usize * scale;
+                cursor_x = cursor_x.saturating_add(previous_advance);
             }
         }
         widest.max(cursor_x.saturating_sub(origin_x))
     }
 
-    /// Normal GUI policy: proportional DejaVu Sans, with the legacy font for
-    /// Japanese and symbols outside the English Latin set.
+    /// Normal GUI policy: proportional DejaVu Sans for Latin and the 16 pixel
+    /// Noto CJK A4 strike for Japanese (integer-scaled at 32 pixels).
     pub fn draw_gui_text(
         &mut self,
         x: usize,
@@ -638,27 +686,50 @@ impl Framebuffer {
         foreground: u16,
         background: Option<u16>,
     ) {
+        self.draw_ui_glyph_scaled::<BINARY>(
+            x,
+            y,
+            glyph,
+            tab5_ui_font::line_metrics(style),
+            1,
+            foreground,
+            background,
+        );
+    }
+
+    fn draw_ui_glyph_scaled<const BINARY: bool>(
+        &mut self,
+        x: usize,
+        y: usize,
+        glyph: &font::UiGlyph,
+        metrics: tab5_ui_font::LineMetrics,
+        scale: usize,
+        foreground: u16,
+        background: Option<u16>,
+    ) {
         let Some(pointer) = self.memory.framebuffer() else {
             return;
         };
         let mut surface = UiSurface(pointer);
         if BINARY {
-            tab5_ui_font::paint_glyph_1bpp(
+            tab5_ui_font::paint_glyph_1bpp_scaled(
                 &mut surface,
                 x as isize,
                 y as isize,
                 glyph,
-                tab5_ui_font::line_metrics(style),
+                metrics,
+                scale,
                 foreground,
                 background,
             );
         } else {
-            tab5_ui_font::paint_glyph(
+            tab5_ui_font::paint_glyph_scaled(
                 &mut surface,
                 x as isize,
                 y as isize,
                 glyph,
-                tab5_ui_font::line_metrics(style),
+                metrics,
+                scale,
                 foreground,
                 background,
             );
@@ -926,12 +997,12 @@ impl Framebuffer {
         // Centred and corner-aligned from the text's own width rather than
         // from a hand-counted cell count, which is what let the old fixed
         // coordinates go stale every time a string changed.
-        let title = "LOGICAL 1280X720 CW";
+        let title = "Logical 1280x720 CW";
         // At scale 2 the drawn width is twice the measured one, so half of it
         // is the measured width itself.
         let title_x = WIDTH / 2 - font::text_width(title);
         self.draw_text(title_x, 52, title, 2, CYAN, Some(BLACK));
-        self.draw_text(674, 378, "CENTER (640,360)", 2, YELLOW, Some(BLACK));
+        self.draw_text(674, 378, "Center (640,360)", 2, YELLOW, Some(BLACK));
         self.draw_text(20, 42, "(0,0)", 1, WHITE, Some(BLACK));
         self.draw_corner_label(42, "(1279,0)");
         self.draw_text(20, 686, "(0,719)", 1, WHITE, Some(BLACK));

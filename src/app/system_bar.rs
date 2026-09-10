@@ -186,7 +186,7 @@ mod host {
     use tab5_system_ui::{Gesture, SystemAction, Timer};
 
     use tab5_system_ui::{LaunchChoice, MiniId, ReturnTo, Screen};
-    const ITEMS: [&str; 4] = ["Browser", "Console", "デスクトップ", "Power..."];
+    const ITEMS: [&str; 4] = ["Browser", "Console", "Desktop", "Power..."];
     const POWER_ITEMS: [&str; 3] = ["Reboot", "Shutdown", "Back"];
     fn menu_items(power: bool) -> &'static [&'static str] {
         if power { &POWER_ITEMS } else { &ITEMS }
@@ -625,7 +625,7 @@ mod host {
                     if full {
                         fb.fill_rect(APP.x, 0, APP.width, HEIGHT, BUTTON_FACE);
                         let title = match screen {
-                            Screen::Desktop => "デスクトップ",
+                            Screen::Desktop => "Desktop",
                             Screen::Mini(MiniId::Network) => "< Back   Network settings",
                             Screen::Mini(MiniId::Battery) => "< Back   Battery details",
                             Screen::Launcher { power: true, .. } => {

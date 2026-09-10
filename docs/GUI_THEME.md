@@ -28,5 +28,8 @@ Network settingsとBattery detailsのバー内`< Back`は、既存のBrowserと�
 Network settings下部の`Esc Back`も太字にする。
 これらの配色・文字の実機での視認性は未確認。
 
+GUIの英語文言は文頭と固有名詞・略語だけを大文字にする。初期フォントの制約に由来する
+全大文字表記は使わず、`Wi-Fi`、`USB`、`DHCP`、`UART`、IC名などは通常の表記を保つ。
+
 通常GUIのEnglish LatinはA4 coverageを各theme色と描画先背景のRGB565 channelでblendする。
 選択行の青やDesktop barのtealでも二値化せず、太字の二度打ちも各passでblendする。

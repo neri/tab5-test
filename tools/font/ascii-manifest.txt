@@ -1,0 +1,2 @@
+# Printable ASCII retained in the direct-DROM 1bpp font.
+0020-007E

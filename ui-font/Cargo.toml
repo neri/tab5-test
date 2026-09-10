@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [features]
-drom-direct = ["tab5-font/drom-direct"]
+drom-direct = []
 
 [dependencies]
 tab5-font = { path = "../font" }

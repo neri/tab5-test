@@ -1,0 +1,20 @@
+# Japanese UI repertoire. Keep this aligned with the Japanese portion of
+# tools/font/manifest.txt; the Unifont source supplies an A4-format fallback
+# for glyphs Noto does not contain or cannot fit in the 16 pixel line box.
+include ../font/repertoire/jisx0213-plane1.txt
+3000-303F
+3040-309F
+30A0-30FF
+31F0-31FF
+FF01-FF60
+FF61-FF9F
+FFE0-FFE6
+9AD9
+FA00-FA6D
+20BB7
+
+# Non-ASCII symbols used directly by firmware UI chrome.
+2190
+2192
+21BB
+2713

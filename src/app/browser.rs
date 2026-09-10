@@ -167,7 +167,7 @@ const STOP_GLYPH: &str = "\u{00D7}";
 const ICON_WIDTH: usize = 24;
 /// What the lock says when it is asked while a connection is being made and
 /// has proved nothing. Not a security state: the absence of one.
-const CONNECTING_TEXT: &str = "CONNECTING: nothing has been proved yet";
+const CONNECTING_TEXT: &str = "Connecting: nothing has been proved yet";
 const ICON_LEFT: usize = tab5_system_ui::ICON_LEFT;
 const ADDRESS_LEFT: usize = tab5_system_ui::ADDRESS_LEFT;
 const ADDRESS_RIGHT: usize = tab5_system_ui::ADDRESS_RIGHT;
@@ -1892,11 +1892,14 @@ impl Viewer {
             } else {
                 DISABLED_COLOR
             };
-            // Twice the body's size, centred in the button. The glyphs are
-            // half-width, so a scaled one is 16 by 32 in a 44 by 40 slot.
-            let x = BUTTONS_LEFT + index * BUTTON_WIDTH + (BUTTON_WIDTH - CELL_WIDTH * 2) / 2;
+            // Twice the body's size, centred from the same A4 metrics the
+            // renderer uses. Symbol advances need not all be half-width.
+            let glyph_width =
+                crate::font::ui_text_width(glyphs[index], crate::font::UiTextStyle::HEADING);
+            let x =
+                BUTTONS_LEFT + index * BUTTON_WIDTH + BUTTON_WIDTH.saturating_sub(glyph_width) / 2;
             let y = (TOOLBAR_HEIGHT - CELL_HEIGHT * 2) / 2;
-            framebuffer.draw_text(x, y, glyphs[index], 2, color, None);
+            framebuffer.draw_gui_text(x, y, glyphs[index], 2, color, None);
         }
     }
 
@@ -2013,8 +2016,9 @@ impl Viewer {
         } else {
             CHROME_TEXT
         };
-        framebuffer.draw_text(
-            CLEAR_LEFT + (CLEAR_WIDTH - CELL_WIDTH * 2) / 2,
+        let glyph_width = crate::font::ui_text_width(STOP_GLYPH, crate::font::UiTextStyle::HEADING);
+        framebuffer.draw_gui_text(
+            CLEAR_LEFT + CLEAR_WIDTH.saturating_sub(glyph_width) / 2,
             FIELD_TOP,
             STOP_GLYPH,
             2,

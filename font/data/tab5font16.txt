@@ -5,18 +5,14 @@ source sha256    044463a47a5b320a1281dcd15fcb3010d6a4ec19603e4193bf28d12909cd009
 unicodedata      15.0.0
 format version   1
 
-glyphs           9747
-  halfwidth      1382
-  fullwidth      8327
-  combining      38
-ranges           4528
-highest code     U+FFFD
-bytes            357907 (349.5 KiB of the 512 KiB ceiling)
-crc32            e0fefdc3
+glyphs           95
+  halfwidth      95
+  fullwidth      0
+  combining      0
+ranges           1
+highest code     U+007E
+bytes            3175 (3.1 KiB of the 16 KiB ceiling)
+crc32            0d9dcf0d
 
-requested but outside the BMP, dropped: 26
-  U+2000B U+20B9F U+2123D U+2131B U+2146E U+216B4 U+218BD U+21E34
-  U+231C4 U+235C4 U+2373F U+23763 U+23CFE U+247F1 U+2548E U+2550E
-  U+25771 U+259C4 U+25DA1 U+26AFF U+26E40 U+270F4 U+27684 U+28277
-  U+283CD U+2A190
+requested but outside the BMP, dropped: 0
 requested but absent from the source font, dropped: 0

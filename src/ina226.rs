@@ -53,8 +53,8 @@ pub enum InitError {
 impl InitError {
     pub fn message(self) -> &'static str {
         match self {
-            Self::NotFound => "INA226 NOT FOUND ON I2C 0X40-0X4F",
-            Self::Configure => "INA226 CONFIGURATION FAILED",
+            Self::NotFound => "INA226 not found on I2C 0x40-0x4f",
+            Self::Configure => "INA226 configuration failed",
         }
     }
 }

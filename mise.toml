@@ -1,15 +1,15 @@
 [tasks.run]
 description = "Run the application"
-run = "cargo run --release"
+run = "make run"
 
 [tasks.clean]
 confirm = "Are you sure?"
 description = "Clean the build artifacts"
-run = "cargo clean"
+run = "make clean"
 
 [tasks.update]
 description = "Update the dependencies"
-run = "cargo update"
+run = "make update"
 
 [tasks.test]
 description = "Run the host-side tests of the browser, font codec, fonts, spki, time and system UI crates"
@@ -18,15 +18,15 @@ description = "Run the host-side tests of the browser, font codec, fonts, spki, 
 # `tab5-browser`, `tab5-font-codec`, `tab5-font`, `tab5-ui-font`, `tab5-spki`,
 # `tab5-time` and `tab5-system-ui` build for the host;
 # the firmware package does not.
-run = "cargo test -p tab5-browser -p tab5-font-codec -p tab5-font -p tab5-ui-font -p tab5-spki -p tab5-time -p tab5-system-ui --features tab5-font-codec/encoder --target x86_64-unknown-linux-gnu"
+run = "make test"
 
 # [tasks.doc]
 # description = "Generate documentation"
-# run = "cargo doc"
+# run = "make doc"
 
 [tasks.build]
 description = "Build the application"
-run = "cargo build --release"
+run = "make build"
 
 [tasks.monitor]
 description = "Run a monitor for the application"

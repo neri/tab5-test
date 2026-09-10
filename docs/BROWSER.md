@@ -48,7 +48,7 @@ toolbarのアドレス欄の左にある**南京錠**がこの区別を出しま
 | 開いた錠 | 赤 | 平文HTTP。経路上の誰でも読める | `INSECURE HTTP: plaintext; anyone carrying it can read it` |
 | 開いた錠 | 赤 | 未認証TLS。暗号化されているが相手が誰かは未確認 | `TLS UNVERIFIED: encrypted, but nobody checked who answered` |
 | 閉じた錠 | 緑 | leafのSPKIがfirmware組み込みのpinと一致（pin表は空なので通常buildでは出ません） | `TLS PINNED: the peer's key matches a pin built into this firmware` |
-| 輪郭だけ | 地の文字色 | 接続中。まだ何も証明されていない | `CONNECTING: nothing has been proved yet` |
+| 輪郭だけ | 地の文字色 | 接続中。まだ何も証明されていない | `Connecting: nothing has been proved yet` |
 
 **平文と未認証TLSは同じ絵です。**読み手にとって意味が同じだからで——画面に
 出ているものがアドレスどおりの出所とは限らない——これは以前この2つを同じ赤の

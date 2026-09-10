@@ -37,16 +37,13 @@ pub const STORAGE_LABEL: &str = if cfg!(feature = "font-drom-direct") {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PsramInstallError {
     OutOfMemory,
-    Legacy(tab5_font::InstallError),
     Ui(tab5_ui_font::InstallError),
 }
 
 #[cfg(not(feature = "font-drom-direct"))]
 pub struct PsramFontStorage {
-    pub legacy_bytes: usize,
     pub ui_bytes: usize,
     pub compressed_bytes: usize,
-    pub legacy_address: usize,
     pub ui_address: usize,
 }
 
@@ -60,19 +57,15 @@ fn permanent_buffer(length: usize) -> Result<&'static mut [u8], PsramInstallErro
     Ok(buffer.leak())
 }
 
-/// Expands the two LZ4 DROM font blobs into permanent decoded PSRAM.
+/// Expands the A4 LZ4 DROM font blob into permanent decoded PSRAM.
 /// Must be called after the global PSRAM allocator is ready and before UI.
 #[cfg(not(feature = "font-drom-direct"))]
 pub fn install_psram() -> Result<PsramFontStorage, PsramInstallError> {
-    let legacy = permanent_buffer(tab5_font::STORAGE_BYTES)?;
-    tab5_font::install_psram(legacy).map_err(PsramInstallError::Legacy)?;
     let ui = permanent_buffer(tab5_ui_font::STORAGE_BYTES)?;
     tab5_ui_font::install_psram(ui).map_err(PsramInstallError::Ui)?;
     Ok(PsramFontStorage {
-        legacy_bytes: tab5_font::STORAGE_BYTES,
         ui_bytes: tab5_ui_font::STORAGE_BYTES,
-        compressed_bytes: tab5_font::COMPRESSED_BYTES + tab5_ui_font::COMPRESSED_BYTES,
-        legacy_address: tab5_font::psram_address().unwrap(),
+        compressed_bytes: tab5_ui_font::COMPRESSED_BYTES,
         ui_address: tab5_ui_font::psram_address().unwrap(),
     })
 }

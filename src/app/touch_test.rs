@@ -6,21 +6,21 @@ use crate::{interrupts, uart};
 
 const MAX_POINTS: usize = 10;
 const COUNT_TEXT: [&str; MAX_POINTS + 1] = [
-    "LIVE TOUCHES: 0",
-    "LIVE TOUCHES: 1",
-    "LIVE TOUCHES: 2",
-    "LIVE TOUCHES: 3",
-    "LIVE TOUCHES: 4",
-    "LIVE TOUCHES: 5",
-    "LIVE TOUCHES: 6",
-    "LIVE TOUCHES: 7",
-    "LIVE TOUCHES: 8",
-    "LIVE TOUCHES: 9",
-    "LIVE TOUCHES: 10",
+    "Live touches: 0",
+    "Live touches: 1",
+    "Live touches: 2",
+    "Live touches: 3",
+    "Live touches: 4",
+    "Live touches: 5",
+    "Live touches: 6",
+    "Live touches: 7",
+    "Live touches: 8",
+    "Live touches: 9",
+    "Live touches: 10",
 ];
 const PEAK_TEXT: [&str; MAX_POINTS + 1] = [
-    "PEAK: 0", "PEAK: 1", "PEAK: 2", "PEAK: 3", "PEAK: 4", "PEAK: 5", "PEAK: 6", "PEAK: 7",
-    "PEAK: 8", "PEAK: 9", "PEAK: 10",
+    "Peak: 0", "Peak: 1", "Peak: 2", "Peak: 3", "Peak: 4", "Peak: 5", "Peak: 6", "Peak: 7",
+    "Peak: 8", "Peak: 9", "Peak: 10",
 ];
 
 /// Shows the active contact count and succeeds once two contacts are read in
@@ -29,7 +29,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     let touch_controller = input.touch_controller_name();
     let touch_max_points = input.touch_max_points();
     framebuffer.fill(BLACK);
-    framebuffer.draw_text(16, 8, "MULTITOUCH TEST", 2, CYAN, None);
+    framebuffer.draw_text(16, 8, "Multitouch test", 2, CYAN, None);
     framebuffer.draw_text(
         16,
         48,
@@ -58,7 +58,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
             None,
         );
     } else {
-        framebuffer.draw_text(16, 128, "NO TOUCH CONTROLLER FOUND", 1, RED, None);
+        framebuffer.draw_text(16, 128, "No touch controller found", 1, RED, None);
     }
     draw_status(framebuffer, 0, 0, false);
     if !framebuffer.flush() {
@@ -118,17 +118,17 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
 
 fn configured_text(max_touches: usize) -> &'static str {
     match max_touches.min(MAX_POINTS) {
-        0 => "CONTROLLER REPORT SLOTS: 0",
-        1 => "CONTROLLER REPORT SLOTS: 1",
-        2 => "CONTROLLER REPORT SLOTS: 2",
-        3 => "CONTROLLER REPORT SLOTS: 3",
-        4 => "CONTROLLER REPORT SLOTS: 4",
-        5 => "CONTROLLER REPORT SLOTS: 5",
-        6 => "CONTROLLER REPORT SLOTS: 6",
-        7 => "CONTROLLER REPORT SLOTS: 7",
-        8 => "CONTROLLER REPORT SLOTS: 8",
-        9 => "CONTROLLER REPORT SLOTS: 9",
-        _ => "CONTROLLER REPORT SLOTS: 10",
+        0 => "Controller report slots: 0",
+        1 => "Controller report slots: 1",
+        2 => "Controller report slots: 2",
+        3 => "Controller report slots: 3",
+        4 => "Controller report slots: 4",
+        5 => "Controller report slots: 5",
+        6 => "Controller report slots: 6",
+        7 => "Controller report slots: 7",
+        8 => "Controller report slots: 8",
+        9 => "Controller report slots: 9",
+        _ => "Controller report slots: 10",
     }
 }
 
@@ -137,9 +137,9 @@ fn draw_status(framebuffer: &mut Framebuffer, current: usize, peak: usize, passe
     framebuffer.draw_text(16, 192, COUNT_TEXT[current], 2, WHITE, None);
     framebuffer.draw_text(16, 240, PEAK_TEXT[peak], 2, WHITE, None);
     let (message, color) = if passed {
-        ("PASS: MULTITOUCH DETECTED", GREEN)
+        ("Pass: multitouch detected", GREEN)
     } else {
-        ("WAITING FOR 2+ SIMULTANEOUS TOUCHES", YELLOW)
+        ("Waiting for 2+ simultaneous touches", YELLOW)
     };
     framebuffer.draw_text(16, 288, message, 2, color, None);
 }

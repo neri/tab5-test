@@ -26,7 +26,7 @@ impl BatteryMonitor {
         if let Some(device) = &self.device {
             self.sample = device.read_sample();
             self.error = if self.sample.is_none() {
-                Some("INA226 READ FAILED")
+                Some("INA226 read failed")
             } else {
                 None
             };

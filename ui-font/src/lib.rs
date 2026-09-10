@@ -1,10 +1,11 @@
-//! Pre-rasterised anti-aliased Latin fonts for normal GUI surfaces.
+//! Pre-rasterised anti-aliased Latin and Japanese fonts for normal GUI surfaces.
 //!
-//! The checked-in blob contains DejaVu Sans and Sans Mono at 16, 24 and 32
-//! pixels. The build-time DROM image is an LZ4 raw-block container expanded
-//! into PSRAM at startup; runtime code performs only bounds-checked table
-//! lookup and A4 blending from that copy. FreeType, Pillow and the TTF sources
-//! are generator-side tools.
+//! The generated blob contains DejaVu Sans and Sans Mono at 16, 24 and 32
+//! pixels, plus Noto Sans CJK JP at 16 pixels. Japanese 32 pixel text is an
+//! integer-scaled view of that one strike. The build-time DROM image is an LZ4
+//! raw-block container expanded into PSRAM at startup; runtime code performs
+//! only bounds-checked lookup and A4 blending. FreeType, Pillow, TTC and TTF
+//! sources are generator-side tools.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -82,8 +83,7 @@ fn decode_and_validate(destination: &mut [u8]) -> Result<(), InstallError> {
         || u32_from(destination, 16) as usize != GLYPHS_OFFSET
         || u32_from(destination, 20) as usize != BITMAPS_OFFSET
         || u32_from(destination, 24) as usize != TOTAL_BYTES
-        || STRIKE_COUNT != 6
-        || GLYPH_COUNT != 1260
+        || STRIKE_COUNT != 7
         || STRIKES_OFFSET != HEADER_BYTES
         || GLYPHS_OFFSET != STRIKES_OFFSET + STRIKE_COUNT * STRIKE_BYTES
         || BITMAPS_OFFSET != GLYPHS_OFFSET + GLYPH_COUNT * GLYPH_BYTES
@@ -137,6 +137,7 @@ fn data() -> &'static [u8] {
 pub enum Face {
     Sans = 0,
     Mono = 1,
+    Japanese = 2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,7 +164,7 @@ impl TextStyle {
         Self { face, size }
     }
 
-    pub const fn legacy_scale(self) -> usize {
+    pub const fn fallback_scale(self) -> usize {
         if self.size >= 32 { 2 } else { 1 }
     }
 }
@@ -275,22 +276,34 @@ pub const fn is_english_latin(character: char) -> bool {
         0x2018..=0x201f | 0x2022 | 0x2026 | 0x2032 | 0x2033 | 0x20ac | 0x2122)
 }
 
+pub fn japanese_glyph(character: char) -> Option<Glyph> {
+    glyph(TextStyle::new(Face::Japanese, 16), character)
+}
+
+pub fn is_combining(character: char) -> bool {
+    japanese_glyph(character).is_some_and(|glyph| glyph.advance == 0)
+}
+
+pub const fn japanese_scale(style: TextStyle) -> usize {
+    if style.size >= 32 { 2 } else { 1 }
+}
+
 /// Width used by layout and drawing. A Latin base followed by a combining
-/// mark routes as one legacy cluster, avoiding a mark positioned against a
-/// proportional advance.
+/// mark routes as one fixed-cell cluster, matching the overlay position used
+/// by the renderer.
 pub fn text_width(text: &str, style: TextStyle) -> usize {
     let mut chars = text.chars().peekable();
     let mut width = 0usize;
     while let Some(character) = chars.next() {
-        let combining_cluster = chars
-            .peek()
-            .is_some_and(|next| tab5_font::is_combining(*next));
+        let combining_cluster = chars.peek().is_some_and(|next| is_combining(*next));
         if is_english_latin(character) && !combining_cluster {
             width += glyph(style, character)
                 .expect("validated Latin glyph missing")
                 .advance as usize;
+        } else if let Some(glyph) = japanese_glyph(character) {
+            width += glyph.advance as usize * japanese_scale(style);
         } else {
-            width += tab5_font::advance(character) as usize * style.legacy_scale();
+            width += tab5_font::advance(character) as usize * style.fallback_scale();
         }
     }
     width
@@ -339,7 +352,22 @@ pub fn paint_glyph<S: PixelSurface>(
     background: Option<u16>,
 ) {
     paint_glyph_inner::<S, false>(
-        surface, origin_x, origin_y, glyph, metrics, foreground, background,
+        surface, origin_x, origin_y, glyph, metrics, 1, foreground, background,
+    );
+}
+
+pub fn paint_glyph_scaled<S: PixelSurface>(
+    surface: &mut S,
+    origin_x: isize,
+    origin_y: isize,
+    glyph: &Glyph,
+    metrics: LineMetrics,
+    scale: usize,
+    foreground: u16,
+    background: Option<u16>,
+) {
+    paint_glyph_inner::<S, false>(
+        surface, origin_x, origin_y, glyph, metrics, scale, foreground, background,
     );
 }
 
@@ -357,7 +385,22 @@ pub fn paint_glyph_1bpp<S: PixelSurface>(
     background: Option<u16>,
 ) {
     paint_glyph_inner::<S, true>(
-        surface, origin_x, origin_y, glyph, metrics, foreground, background,
+        surface, origin_x, origin_y, glyph, metrics, 1, foreground, background,
+    );
+}
+
+pub fn paint_glyph_1bpp_scaled<S: PixelSurface>(
+    surface: &mut S,
+    origin_x: isize,
+    origin_y: isize,
+    glyph: &Glyph,
+    metrics: LineMetrics,
+    scale: usize,
+    foreground: u16,
+    background: Option<u16>,
+) {
+    paint_glyph_inner::<S, true>(
+        surface, origin_x, origin_y, glyph, metrics, scale, foreground, background,
     );
 }
 
@@ -367,12 +410,14 @@ fn paint_glyph_inner<S: PixelSurface, const BINARY: bool>(
     origin_y: isize,
     glyph: &Glyph,
     metrics: LineMetrics,
+    scale: usize,
     foreground: u16,
     background: Option<u16>,
 ) {
+    let scale = scale.max(1);
     if let Some(color) = background {
-        for x in 0..glyph.advance as isize {
-            for y in 0..metrics.size as isize {
+        for x in 0..glyph.advance as isize * scale as isize {
+            for y in 0..metrics.size as isize * scale as isize {
                 write_clipped(surface, origin_x + x, origin_y + y, color);
             }
         }
@@ -383,26 +428,32 @@ fn paint_glyph_inner<S: PixelSurface, const BINARY: bool>(
             if alpha == 0 {
                 continue;
             }
-            let pixel_x = origin_x + glyph.x_bearing as isize + x as isize;
-            let pixel_y = origin_y + glyph.y as isize + y as isize;
-            if pixel_x < 0
-                || pixel_y < 0
-                || pixel_x >= surface.width() as isize
-                || pixel_y >= surface.height() as isize
-            {
-                continue;
-            }
-            let base =
-                background.unwrap_or_else(|| surface.read(pixel_x as usize, pixel_y as usize));
-            let color = if BINARY {
-                if alpha < BINARY_ALPHA_THRESHOLD {
-                    continue;
+            let first_x = origin_x + (glyph.x_bearing as isize + x as isize) * scale as isize;
+            let first_y = origin_y + (glyph.y as isize + y as isize) * scale as isize;
+            for offset_x in 0..scale {
+                for offset_y in 0..scale {
+                    let pixel_x = first_x + offset_x as isize;
+                    let pixel_y = first_y + offset_y as isize;
+                    if pixel_x < 0
+                        || pixel_y < 0
+                        || pixel_x >= surface.width() as isize
+                        || pixel_y >= surface.height() as isize
+                    {
+                        continue;
+                    }
+                    let base = background
+                        .unwrap_or_else(|| surface.read(pixel_x as usize, pixel_y as usize));
+                    let color = if BINARY {
+                        if alpha < BINARY_ALPHA_THRESHOLD {
+                            continue;
+                        }
+                        foreground
+                    } else {
+                        blend_rgb565(foreground, base, alpha)
+                    };
+                    surface.write(pixel_x as usize, pixel_y as usize, color);
                 }
-                foreground
-            } else {
-                blend_rgb565(foreground, base, alpha)
-            };
-            surface.write(pixel_x as usize, pixel_y as usize, color);
+            }
         }
     }
 }
@@ -440,7 +491,7 @@ mod tests {
             assert!(
                 glyph.bitmap_offset as usize + glyph.bitmap_len() <= data().len() - BITMAPS_OFFSET
             );
-            if glyph.code_point != 0x20 && glyph.code_point != 0xa0 {
+            if !matches!(glyph.code_point, 0x20 | 0xa0 | 0xad | 0x3000) {
                 assert!(
                     (0..glyph.width as usize)
                         .any(|x| (0..glyph.height as usize).any(|y| glyph.alpha(x, y) != 0)),
@@ -468,6 +519,13 @@ mod tests {
                 assert_eq!(count, 210);
             }
         }
+        for character in [
+            'あ', 'ア', '漢', '髙', '﨑', '𠮷', '。', '　', '１', '￥', 'ｱ',
+        ] {
+            assert!(japanese_glyph(character).is_some(), "missing {character:?}");
+        }
+        assert!(glyph(TextStyle::new(Face::Japanese, 24), '漢').is_none());
+        assert!(glyph(TextStyle::new(Face::Japanese, 32), '漢').is_none());
     }
 
     #[test]
@@ -487,15 +545,17 @@ mod tests {
     }
 
     #[test]
-    fn combining_cluster_falls_back_as_a_unit() {
+    fn combining_cluster_and_japanese_use_the_a4_metrics() {
         assert_ne!(text_width("i", TextStyle::BODY), tab5_font::text_width("i"));
-        assert_eq!(
-            text_width("i\u{301}", TextStyle::BODY),
-            tab5_font::text_width("i\u{301}")
-        );
-        assert_eq!(
-            text_width("日本語", TextStyle::HEADING),
-            tab5_font::text_width("日本語") * 2
+        assert_eq!(text_width("i\u{301}", TextStyle::BODY), 8);
+        assert_eq!(japanese_glyph('\u{301}').unwrap().advance, 0);
+        assert_eq!(text_width("日本語", TextStyle::BODY), 48);
+        assert_eq!(text_width("日本語", TextStyle::HEADING), 96);
+        let kanji = japanese_glyph('漢').unwrap();
+        assert!(
+            (0..kanji.width as usize).any(|x| {
+                (0..kanji.height as usize).any(|y| matches!(kanji.alpha(x, y), 1..=14))
+            })
         );
     }
 

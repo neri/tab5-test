@@ -20,9 +20,6 @@ fn main() {
     assert_eq!(u16_at(&data, 6), 32);
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let compressed = tab5_font_codec::encode_container(&data);
-    fs::write(out.join("tab5font16.lz4"), &compressed).unwrap();
-
     let metadata = format!(
         "pub const STORAGE_BYTES: usize = {};\n\
          pub const GLYPH_COUNT: usize = {};\n\
@@ -30,7 +27,6 @@ fn main() {
          const RANGES_OFFSET: usize = {};\n\
          const BITMAPS_OFFSET: usize = {};\n\
          const ADVANCES_OFFSET: usize = {};\n\
-         pub const COMPRESSED_BYTES: usize = {};\n\
          pub const CRC32: u32 = 0x{:08x};\n",
         data.len(),
         u32_at(&data, 8),
@@ -38,7 +34,6 @@ fn main() {
         u32_at(&data, 16),
         u32_at(&data, 20),
         u32_at(&data, 24),
-        compressed.len(),
         u32_at(&data, 28),
     );
     fs::write(out.join("font_meta.rs"), metadata).unwrap();

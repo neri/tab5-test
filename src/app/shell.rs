@@ -496,12 +496,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         id: Cmd::Fonttest,
         usage: "fonttest",
         lines: &[
-            "full-screen 16 pixel font sheet: ASCII, kana, kanji, symbols,",
-            "half-width katakana, Latin, combining marks, and characters the",
-            "subset does not cover, which have to appear as boxes rather than",
-            "blanks. also an opaque repaint over wider text, bold, 2x, and a",
-            "paragraph of Japanese long enough to judge legibility. any key",
-            "exits.",
+            "three full-screen sheets: the uncompressed ROM-only ASCII 1bpp",
+            "font, the Latin/Japanese A4 UI font at 16/24/32 pixels, then A4",
+            "versus thresholded 1-bit edges side by side. Japanese is stored",
+            "only at 16 pixels and enlarged 2x for the 32-pixel sample. press",
+            "a key to advance; the third key exits.",
         ],
     },
     HelpEntry {

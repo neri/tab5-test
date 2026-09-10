@@ -9,17 +9,17 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
     draw_battery(framebuffer, percent, level_color);
 
     let mut text = Text::new();
-    text.push_str("VOLTAGE ESTIMATE  ");
+    text.push_str("Voltage estimate  ");
     text.push_u32(percent);
     text.push_str("%");
     framebuffer.draw_gui_text(68, 530, text.as_str(), 1, level_color, None);
-    framebuffer.draw_gui_text(68, 562, "6.00V EMPTY  /  8.23V FULL", 1, theme::TEXT, None);
+    framebuffer.draw_gui_text(68, 562, "6.00 V empty  /  8.23 V full", 1, theme::TEXT, None);
 
     draw_value(
         framebuffer,
         510,
         148,
-        "PACK VOLTAGE",
+        "Pack voltage",
         voltage_text(sample.bus_voltage_mv).as_str(),
         theme::ACCENT,
     );
@@ -27,7 +27,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
         framebuffer,
         510,
         270,
-        "CURRENT (IN+ TO IN-)",
+        "Current (IN+ to IN-)",
         current_text(sample.current_ua).as_str(),
         level_color,
     );
@@ -35,7 +35,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
         framebuffer,
         510,
         392,
-        "POWER (V X I)",
+        "Power (V x I)",
         power_text(sample.power_uw).as_str(),
         level_color,
     );
@@ -43,7 +43,7 @@ fn draw_reading(framebuffer: &mut Framebuffer, sample: BatterySample) {
         framebuffer,
         510,
         514,
-        "SHUNT VOLTAGE",
+        "Shunt voltage",
         shunt_text(sample.shunt_voltage_uv).as_str(),
         theme::TEXT,
     );
@@ -192,7 +192,7 @@ fn current_text(ua: i32) -> Text {
     text.push_u32(magnitude / 1_000);
     text.push_byte(b'.');
     push_fraction(&mut text, magnitude % 1_000, 1);
-    text.push_str(" MA");
+    text.push_str(" mA");
     text
 }
 
@@ -210,7 +210,7 @@ fn power_text(uw: i32) -> Text {
 fn shunt_text(uv: i32) -> Text {
     let mut text = Text::new();
     text.push_signed(uv);
-    text.push_str(" UV");
+    text.push_str(" uV");
     text
 }
 
@@ -237,7 +237,7 @@ pub fn draw_details(fb: &mut Framebuffer, monitor: &super::battery_monitor::Batt
         fb.draw_gui_text(
             32,
             300,
-            monitor.error.unwrap_or("WAITING FOR INA226 DATA"),
+            monitor.error.unwrap_or("Waiting for INA226 data"),
             2,
             theme::TEXT,
             None,
@@ -246,7 +246,7 @@ pub fn draw_details(fb: &mut Framebuffer, monitor: &super::battery_monitor::Batt
     fb.draw_gui_text(
         32,
         674,
-        "VOLTAGE ESTIMATE ONLY / ESC BACK / F3 LAUNCHER",
+        "Voltage estimate only / Esc Back / F3 Launcher",
         1,
         theme::TEXT,
         None,

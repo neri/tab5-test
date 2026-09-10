@@ -952,9 +952,6 @@ dependencies = [
 [[package]]
 name = "tab5-font"
 version = "0.1.0"
-dependencies = [
- "tab5-font-codec",
-]
 
 [[package]]
 name = "tab5-font-codec"

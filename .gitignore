@@ -1,3 +1,12 @@
 target/
 esp-idf-reference
 __pycache__/
+tools/font/vendor/unifont_jp-17.0.05.bdf.gz
+tools/font/vendor/unifont_jp-17.0.05.bdf.gz.tmp
+tools/ui-font/vendor/DejaVuSans.ttf
+tools/ui-font/vendor/DejaVuSans.ttf.tmp
+tools/ui-font/vendor/DejaVuSansMono.ttf
+tools/ui-font/vendor/DejaVuSansMono.ttf.tmp
+tools/ui-font/vendor/NotoSansCJK-Regular.ttc
+tools/ui-font/vendor/NotoSansCJK-Regular.ttc.tmp
+ui-font/data/tab5-ui-fonts.bin

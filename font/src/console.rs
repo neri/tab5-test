@@ -3,8 +3,8 @@
 //! The console is a 8x16 character cell terminal and stays one, so it does not
 //! use [`advance`](crate::advance) for layout the way the browser does. Every
 //! Unicode scalar it is asked to print becomes exactly one cell: the ones this
-//! repertoire covers become themselves, and everything else -- kanji, kana,
-//! combining marks, characters the font does not have -- becomes a visible
+//! printable ASCII repertoire covers become themselves, and everything else
+//! -- kanji, kana, Latin-1, combining marks -- becomes a visible
 //! placeholder. Nothing becomes a blank, because a blank would claim there was
 //! no character there.
 //!
@@ -27,9 +27,7 @@ use crate::{Glyph, MAX_WIDTH, glyph, hollow_box};
 /// | 0 | blank |
 /// | 1 | placeholder |
 /// | 2..=95 | U+0021..U+007E |
-/// | 96..=191 | U+00A0..U+00FF |
-/// | 192..=254 | U+FF61..U+FF9F |
-/// | 255 | reserved, drawn as the placeholder |
+/// | 96..=255 | reserved, drawn as the placeholder |
 pub type Id = u8;
 
 /// An empty cell. This is what `clear` and `scroll` fill with.
@@ -40,19 +38,6 @@ pub const PLACEHOLDER: Id = 1;
 const ASCII_FIRST: Id = 2;
 const ASCII_START: u32 = 0x21;
 const ASCII_END: u32 = 0x7E;
-const LATIN1_FIRST: Id = 96;
-const LATIN1_START: u32 = 0xA0;
-const LATIN1_END: u32 = 0xFF;
-const KANA_FIRST: Id = 192;
-const KANA_START: u32 = 0xFF61;
-const KANA_END: u32 = 0xFF9F;
-
-/// U+00AD SOFT HYPHEN keeps its id so that Latin-1 stays one contiguous span,
-/// but Unifont draws it as a 16 pixel code point box -- it is a line breaking
-/// hint with no visible form of its own -- so the console shows the
-/// placeholder instead. `tools/font/generate.py` skips the same code point
-/// when it checks that the repertoire is half-width.
-const SOFT_HYPHEN: u32 = 0xAD;
 
 /// The cell for `character`. Always exactly one cell, for every scalar.
 ///
@@ -63,10 +48,7 @@ pub const fn id(character: char) -> Id {
     let code_point = character as u32;
     match code_point {
         0x20 => BLANK,
-        SOFT_HYPHEN => PLACEHOLDER,
         ASCII_START..=ASCII_END => ASCII_FIRST + (code_point - ASCII_START) as Id,
-        LATIN1_START..=LATIN1_END => LATIN1_FIRST + (code_point - LATIN1_START) as Id,
-        KANA_START..=KANA_END => KANA_FIRST + (code_point - KANA_START) as Id,
         _ => PLACEHOLDER,
     }
 }
@@ -77,18 +59,10 @@ pub const fn id(character: char) -> Id {
 /// This is the inverse of [`id`] over the repertoire, and exists so that a
 /// caller holding a grid can recover printable text from it.
 pub const fn character(id: Id) -> Option<char> {
-    let (first, start) = match id {
-        BLANK | PLACEHOLDER | 255 => return None,
-        _ if id < LATIN1_FIRST => (ASCII_FIRST, ASCII_START),
-        _ if id < KANA_FIRST => (LATIN1_FIRST, LATIN1_START),
-        _ => (KANA_FIRST, KANA_START),
-    };
-    match char::from_u32(start + (id - first) as u32) {
-        // Its id exists to keep Latin-1 contiguous, but no cell ever holds it:
-        // `id` maps it to the placeholder, and so this direction has to agree.
-        Some(character) if character as u32 == SOFT_HYPHEN => None,
-        character => character,
+    if id < ASCII_FIRST || id > 95 {
+        return None;
     }
+    char::from_u32(ASCII_START + (id - ASCII_FIRST) as u32)
 }
 
 /// The pixels for a cell. Always 8 columns wide.
@@ -125,19 +99,10 @@ mod tests {
 
     #[test]
     fn the_repertoire_round_trips() {
-        for range in [
-            ASCII_START..=ASCII_END,
-            LATIN1_START..=LATIN1_END,
-            KANA_START..=KANA_END,
-        ] {
-            for character in range.filter_map(char::from_u32) {
-                if character as u32 == SOFT_HYPHEN {
-                    continue;
-                }
-                let id = id(character);
-                assert_ne!(id, PLACEHOLDER, "{character:?} fell out of the repertoire");
-                assert_eq!(super::character(id), Some(character), "id {id}");
-            }
+        for character in (ASCII_START..=ASCII_END).filter_map(char::from_u32) {
+            let id = id(character);
+            assert_ne!(id, PLACEHOLDER, "{character:?} fell out of the repertoire");
+            assert_eq!(super::character(id), Some(character), "id {id}");
         }
         assert_eq!(id(' '), BLANK);
         assert_eq!(super::character(BLANK), None);
@@ -148,11 +113,7 @@ mod tests {
     #[test]
     fn ids_are_unique_across_the_repertoire() {
         let mut seen = [false; 256];
-        for character in (ASCII_START..=ASCII_END)
-            .chain(LATIN1_START..=LATIN1_END)
-            .chain(KANA_START..=KANA_END)
-            .filter_map(char::from_u32)
-        {
+        for character in (ASCII_START..=ASCII_END).filter_map(char::from_u32) {
             let id = id(character);
             if id == PLACEHOLDER {
                 continue;
@@ -176,7 +137,7 @@ mod tests {
 
     #[test]
     fn unrepresentable_characters_are_visible_not_blank() {
-        for character in ['あ', '漢', '\u{3099}', '\u{1F600}', '\u{7}', '\u{AD}'] {
+        for character in ['é', 'ｶ', 'あ', '漢', '\u{3099}', '\u{1F600}', '\u{7}'] {
             assert_eq!(id(character), PLACEHOLDER, "{character:?}");
         }
         assert_ne!(

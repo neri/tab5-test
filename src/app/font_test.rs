@@ -1,19 +1,14 @@
-//! Full-screen 16 pixel font diagnostic.
+//! Full-screen direct-ROM ASCII and A4 UI font diagnostic.
 //!
-//! Three static screens put every case the renderers have to get right next
-//! to every other one: half-width and full-width side by side, a combining
-//! mark that has to land on the character before it, characters the subset
-//! does not cover that have to be boxes rather than blanks, an opaque repaint
-//! over wider text that has to leave nothing of it behind, and a paragraph of
-//! ordinary Japanese long enough to judge whether the font is actually
-//! readable at 16 pixels.
+//! The first screen proves that the uncompressed 1bpp DROM font contains only
+//! printable ASCII. The next two exercise Latin and Japanese A4 coverage.
 //!
 //! It draws once and holds. Nothing here is animated and nothing polls the
 //! network: a full screen of text is a few milliseconds of PSRAM writes, far
 //! short of the interval that makes the browser service the C6 link mid-draw.
 //!
-//! The strings are the ones fixed in `docs/FONT_MIGRATION_PLAN.md`, so what is
-//! on the panel can be compared against what that document says should be.
+//! The labels make the storage source and the deliberate 1-bit/A4 difference
+//! visible without needing a serial log beside the panel.
 
 use crate::font;
 use crate::framebuffer::{BLACK, BLUE, CYAN, Framebuffer, GREEN, RED, WHITE, YELLOW};
@@ -28,62 +23,36 @@ const SAMPLE_X: usize = MARGIN + 8 * 8;
 const LINE: usize = 20;
 
 /// The repertoire rows: a label and the characters it stands for.
-const ROWS: [(&str, &str); 9] = [
+const ROWS: [(&str, &str); 5] = [
     (
-        "ascii  ",
+        "punct  ",
         "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
     ),
+    ("upper  ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("lower  ", "abcdefghijklmnopqrstuvwxyz"),
+    ("digits ", "0123456789  0O 1Il 5S 8B"),
     (
-        "kana   ",
-        "あいうえお アイウエオ ぁぃぅぇぉ ヴヵヶ がぎぐげご ぱぴぷぺぽ ゛゜ー〜",
-    ),
-    (
-        "kanji  ",
-        "日本語表示 東京都渋谷区 髙﨑 灣鬱靄 一二三四五六七八九十百千万",
-    ),
-    (
-        "symbol ",
-        "、。・「」『』（）［］｛｝〜―…※＿ ￥＄£ →←↑↓ ①②③ ★☆■□◆ ┌┬┐├┼┤└┴┘",
-    ),
-    ("hankaku", "ｱｲｳｴｵ ｶﾞｷﾞｸﾞ ﾊﾟﾋﾟﾌﾟ ｰ｡､･｢｣"),
-    ("latin  ", "àéîõü ÀÉÎÕÜ ß æ œ Ł ż Ġ ΩΔμ авгд"),
-    // Decomposed on purpose: each mark has to ride on the character before it
-    // and take no width of its own.
-    (
-        "combine",
-        "か\u{3099} き\u{309A} e\u{301}  (marks ride on the character before)",
-    ),
-    // This row *starts* with a mark, so there is nothing before it to ride on.
-    // It has to become a visible character of its own rather than disappear.
-    (
-        "orphan ",
-        "\u{3099} <- a mark with nothing before it draws U+FFFD",
-    ),
-    // U+20BB7 and the emoji are outside the BMP, which the source font does
-    // not cover; U+FDFD is inside it but outside the subset. All three have to
-    // draw a box.
-    (
-        "missing",
-        "\u{20BB7} \u{1F600} \u{FDFD} <- boxes, never blanks",
+        "boxes  ",
+        "é ｱ あ 漢 → <- every non-ASCII item is a box here",
     ),
 ];
 
 /// Body text at 1x, which is the size everything except headings uses.
-const BODY: &str = "この画面は16ピクセルのビットマップフォントの見え方を確かめるためのものです。\n\
-     漢字とかなの混じった長い文が、実機の画面でどのくらい読めるかを見ます。行の\n\
-     高さは16ピクセル、英数字とラテン文字は8ピクセル送り、かなと漢字は16ピクセル\n\
-     送りです。拡大は整数倍だけで、見出しは2倍の32ピクセルにします。";
+const BODY: &str = "This page reads the 3,175-byte 1bpp ASCII font directly from ROM.\n\
+     It is never copied to PSRAM and it is not LZ4-compressed. All non-ASCII\n\
+     text deliberately becomes a visible box on this page. Normal GUI text\n\
+     uses the A4 Latin and Japanese font shown on the next page.";
 
 pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     #[cfg(feature = "font-drom-direct")]
-    uart::log(b"Font test: source=plain DROM direct\r\n");
+    uart::log(b"Font test: ASCII=plain DROM, A4=plain DROM direct\r\n");
     #[cfg(not(feature = "font-drom-direct"))]
-    uart::log(b"Font test: source=decoded PSRAM\r\n");
+    uart::log(b"Font test: ASCII=plain DROM, A4=decoded PSRAM\r\n");
     framebuffer.fill(BLACK);
     let started = crate::delay::cycle_count();
 
     framebuffer.draw_text(MARGIN, 8, "fonttest", 2, WHITE, None);
-    framebuffer.draw_text(MARGIN + 160, 16, "16px glyph renderer", 1, CYAN, None);
+    framebuffer.draw_text(MARGIN + 160, 16, "plain ROM ASCII only", 1, CYAN, None);
 
     let mut y = 56;
     for (label, sample) in ROWS {
@@ -96,11 +65,11 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     framebuffer.draw_text(MARGIN, y, "colour ", 1, YELLOW, None);
     let mut x = SAMPLE_X;
     for (color, sample) in [
-        (RED, "赤 red "),
-        (GREEN, "緑 green "),
-        (BLUE, "青 blue "),
-        (CYAN, "水 cyan "),
-        (YELLOW, "黄 yellow"),
+        (RED, "red "),
+        (GREEN, "green "),
+        (BLUE, "blue "),
+        (CYAN, "cyan "),
+        (YELLOW, "yellow"),
     ] {
         // The return value is the advance the text actually took, which is
         // what makes laying pieces out left to right possible without the
@@ -111,20 +80,19 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     y += LINE;
     framebuffer.draw_text(MARGIN, y, "weight ", 1, YELLOW, None);
     let x = SAMPLE_X;
-    let width = framebuffer.draw_text(x, y, "通常 normal  ", 1, WHITE, None);
+    let width = framebuffer.draw_text(x, y, "normal  ", 1, WHITE, None);
     // Bold is the same glyph drawn twice, one physical pixel to the right.
-    let bold = "太字 bold";
+    let bold = "bold";
     framebuffer.draw_text(x + width, y, bold, 1, WHITE, None);
     framebuffer.draw_text(x + width + 1, y, bold, 1, WHITE, None);
 
     y += LINE;
     framebuffer.draw_text(MARGIN, y, "opaque ", 1, YELLOW, None);
     let x = SAMPLE_X;
-    // Sixteen half-width cells of solid ink, then exactly the same 128 pixel
-    // box repainted with eight full-width characters. Anything left of the
-    // first row means an opaque repaint is not covering its own box.
+    // Repaint the same sixteen ASCII cells with narrower ink. Anything left
+    // from the first pass means an opaque repaint did not clear its own box.
     framebuffer.draw_text(x, y, "MMMMMMMMMMMMMMMM", 1, RED, Some(BLUE));
-    framebuffer.draw_text(x, y, "あいうえおかきく", 1, WHITE, Some(BLACK));
+    framebuffer.draw_text(x, y, "iiiiiiiiiiiiiiii", 1, WHITE, Some(BLACK));
     framebuffer.draw_text(
         x + 8 * 16 + 16,
         y,
@@ -135,53 +103,31 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
     );
 
     y += LINE + 8;
-    framebuffer.draw_text(MARGIN, y, "見出し 32px Heading 0123", 2, WHITE, None);
+    framebuffer.draw_text(MARGIN, y, "32px ASCII Heading 0123", 2, WHITE, None);
 
     y += 32 + 12;
     framebuffer.draw_text(MARGIN, y, BODY, 1, WHITE, None);
     y += font::HEIGHT * 4 + 20;
 
-    // Drawn as one string, so the newlines exercise the renderer's own line
-    // pitch rather than a loop's. Box drawing joins only if that pitch is
-    // exactly the glyph height and the advance is exactly the glyph width: a
-    // pixel either way shows up as a broken corner or a doubled rule.
     framebuffer.draw_text(MARGIN, y, "frame  ", 1, YELLOW, None);
     framebuffer.draw_text(
         SAMPLE_X,
         y,
-        "\u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\n\
-         \u{2502} joined  \u{2502}\n\
-         \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}",
+        "+----------+\n\
+         | ROM ASCII|\n\
+         +----------+",
         1,
         WHITE,
         None,
     );
-    // Eight full blocks have to be one solid 64 pixel bar with no seams.
-    framebuffer.draw_text(
-        SAMPLE_X + 8 * 16,
-        y + font::HEIGHT,
-        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} <- solid, no seams",
-        1,
-        WHITE,
-        None,
-    );
-
     let draw_us = crate::delay::cycle_count().wrapping_sub(started) / 360;
-    uart::log_u32(b"Font test: legacy glyph phase us=", draw_us);
-    let footer_width = framebuffer.draw_text(MARGIN, 700, "source: ", 1, CYAN, None);
-    let footer_width = footer_width
-        + framebuffer.draw_text(
-            MARGIN + footer_width,
-            700,
-            font::STORAGE_LABEL,
-            1,
-            YELLOW,
-            None,
-        );
+    uart::log_u32(b"Font test: ASCII ROM glyph phase us=", draw_us);
+    let footer_width =
+        framebuffer.draw_text(MARGIN, 700, "source: ASCII plain DROM", 1, YELLOW, None);
     framebuffer.draw_text(
         MARGIN + footer_width,
         700,
-        " — any key: A4 UI fonts",
+        " - any key: A4 UI fonts",
         1,
         CYAN,
         None,
@@ -191,7 +137,7 @@ pub fn run(framebuffer: &mut Framebuffer, input: &mut InputManager) {
         uart::log(b"Font test: flush failed\r\n");
         return;
     }
-    uart::log(b"Font test: legacy sheet displayed, press any key for A4 UI fonts\r\n");
+    uart::log(b"Font test: ASCII ROM sheet displayed, press any key for A4 UI fonts\r\n");
     input.wait_for_key();
     draw_ui_sheet(framebuffer);
     input.wait_for_key();
@@ -265,7 +211,7 @@ fn draw_ui_sheet(framebuffer: &mut Framebuffer) {
     framebuffer.draw_gui_text(
         MARGIN,
         438,
-        "Mixed: Tab5 Browser 日本語 / e\u{301} legacy cluster",
+        "Mixed: Tab5 Browser 日本語 / e\u{301} combining cluster",
         1,
         WHITE,
         None,
@@ -278,6 +224,22 @@ fn draw_ui_sheet(framebuffer: &mut Framebuffer) {
         "transparent background",
         1,
         RED,
+        None,
+    );
+    framebuffer.draw_gui_text(
+        MARGIN,
+        530,
+        "日本語16px: 漢字かな交じり文 髙﨑・東京都・ブラウザ表示",
+        1,
+        WHITE,
+        None,
+    );
+    framebuffer.draw_gui_text(
+        MARGIN,
+        565,
+        "日本語32px（16px A4を2倍描画）",
+        2,
+        YELLOW,
         None,
     );
     let draw_us = crate::delay::cycle_count().wrapping_sub(started) / 360;
@@ -406,16 +368,16 @@ fn draw_aa_comparison(framebuffer: &mut Framebuffer) {
     draw_compare_row(
         framebuffer,
         534,
-        "Mono 24: iIl1|MWMW|012345",
-        font::UiTextStyle::new(font::UiFace::Mono, 24),
+        "日本語16: 漢字かな 髙﨑 東京",
+        font::UiTextStyle::new(font::UiFace::Sans, 16),
         GREEN,
         None,
     );
     draw_compare_row(
         framebuffer,
         578,
-        "Mono 32: iIl1|MW|0123",
-        font::UiTextStyle::new(font::UiFace::Mono, 32),
+        "日本語32: 漢字かな",
+        font::UiTextStyle::new(font::UiFace::Sans, 32),
         WHITE,
         None,
     );

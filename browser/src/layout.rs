@@ -55,8 +55,10 @@ pub fn advance(character: char, scale: u8) -> u16 {
     let style = ui_style(scale, 0);
     if tab5_ui_font::is_english_latin(character) {
         tab5_ui_font::glyph(style, character).unwrap().advance as u16
+    } else if let Some(glyph) = tab5_ui_font::japanese_glyph(character) {
+        glyph.advance as u16 * tab5_ui_font::japanese_scale(style) as u16
     } else {
-        tab5_font::advance(character) as u16 * style.legacy_scale() as u16
+        tab5_font::advance(character) as u16 * style.fallback_scale() as u16
     }
 }
 
@@ -435,11 +437,11 @@ impl Layout {
             }
             // A style boundary may sit between a base and its combining
             // mark (`<b>e</b>&#x301;`). Keep the whole cluster in the base's
-            // piece so both measurement and drawing route it to the legacy
+            // piece so both measurement and drawing route it to the fixed-cell
             // font together.
             if to < end {
                 while let Some(character) = text.get(to..end).and_then(|tail| tail.chars().next()) {
-                    if !tab5_font::is_combining(character) {
+                    if !tab5_ui_font::is_combining(character) {
                         break;
                     }
                     to += character.len_utf8();
@@ -574,10 +576,11 @@ fn next_line(
         let next_is_combining = rest[offset + character.len_utf8()..]
             .chars()
             .next()
-            .is_some_and(tab5_font::is_combining);
+            .is_some_and(tab5_ui_font::is_combining);
         let width = if tab5_ui_font::is_english_latin(character) && next_is_combining {
-            tab5_font::advance(character) as u16 * ui_style(scale, run_style).legacy_scale() as u16
-        } else if tab5_font::is_combining(character) {
+            tab5_font::advance(character) as u16
+                * ui_style(scale, run_style).fallback_scale() as u16
+        } else if tab5_ui_font::is_combining(character) {
             0
         } else {
             let mut encoded = [0u8; 4];
@@ -817,7 +820,7 @@ mod tests {
     const MIXED: &str = "aあiいuうeえoお";
 
     #[test]
-    fn latin_is_proportional_and_legacy_full_width_keeps_its_cells() {
+    fn latin_is_proportional_and_fallback_full_width_keeps_its_cells() {
         assert_eq!(advance('i', BODY_SCALE), 4);
         assert_eq!(advance('W', BODY_SCALE), 13);
         assert_eq!(advance('あ', BODY_SCALE), 16);

@@ -37,10 +37,10 @@ pub enum InitError {
 impl InitError {
     pub fn message(self) -> &'static str {
         match self {
-            InitError::NotFound => "BMI270 NOT FOUND ON I2C",
-            InitError::Reset => "BMI270 RESET WRITE FAILED",
-            InitError::Firmware => "BMI270 FIRMWARE LOAD FAILED",
-            InitError::Settings => "BMI270 CONFIGURATION FAILED",
+            InitError::NotFound => "BMI270 not found on I2C",
+            InitError::Reset => "BMI270 reset write failed",
+            InitError::Firmware => "BMI270 firmware load failed",
+            InitError::Settings => "BMI270 configuration failed",
         }
     }
 

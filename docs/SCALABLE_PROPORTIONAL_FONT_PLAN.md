@@ -874,3 +874,29 @@ SDFのdistance値を単純thresholdして1bpp表示する方式は採らない�
   English Latin setとして必須収録する
 - U+00AD SOFT HYPHENはglyph収録で意味を誤魔化さず、layout対応を別途行うまで初期対象外とする
 - U+00A0 NBSPはspaceと同じadvanceを持つが改行可能なspaceとして扱わない
+
+### 2026-09-10: ASCII 1bppをROMへ残し、日本語を16 px A4へ移行
+
+- 利用者の指示により、従来1bpp blobはprintable ASCII U+0020–U+007Eだけへ縮小した。95 glyph、
+  3,175 byteで、圧縮せず通常buildと比較buildの両方からDROMを直接参照する。Consoleと低水準診断で
+  非ASCIIを要求した場合は8 pixel幅の中空枠とする
+- 日本語はNoto Sans CJK JP Regularを16 pxのA4 strikeとして収録した。JIS X 0213第1面を中心とする
+  BMP外のJIS第1面26文字と`𠮷`を含む8,923 glyph、bitmap 738,877 byteで、32 px表示は保存strikeを増やさず整数2倍描画する。日本語24 px
+  strikeは収録しない
+- 8,923 glyphのうちNotoから生成したものは8,735、Notoに無いか16 px line boxへ収まらないglyphと
+  combining markの計188 glyphはUnifont-JPの1bpp形状をA4値0／15として同じblobへ格納した。欠落枠への置換ではないが、この188 glyph
+  だけはanti-aliasの中間階調を持たない
+- Latin 6 strikeを含むA4 blob全体は10,183 glyph、平文1,021,279 byte、LZ4 container 792,089 byte。
+  通常buildでPSRAMへ展開するのはこのA4 blobだけで、ASCIIにはinstall／copy処理を持たせない
+- `font-drom-direct`はA4だけを平文DROM参照へ切り替えるA/B featureとして維持した。DROM/IROM境界は
+  通常buildが`0x40110000`、比較buildが`0x40150000`
+- `fonttest`は1枚目をDROM ASCII専用、2枚目をLatin／日本語A4、3枚目をLatin／日本語のA4対1bit
+  比較へ更新し、画面とUARTでASCIIとA4の参照元を別々に判別できるようにした
+- generator再現性、host test（browser 206＋fixture 29、ASCII font 17、codec 5、UI font 9ほか）、
+  通常／比較release buildとELF XIP配置検査は合格した。通常buildのDROMは1,113,816 byte、IROMは
+  1,278,284 byte。比較buildもDROM 1,375,960 byte、IROM 1,275,720 byteで同じ検査に合格した。
+  新しい日本語A4の起動、表示品質、長文scroll性能は実機未確認である
+- Unifont BDF、DejaVu Sans／Sans Mono TTF、Noto TTC 19,484,784 byteと生成済みA4 blob
+  1,021,279 byteはrepositoryへcommitしない。root `Makefile`の`make fonts`が版固定URLからsourceを
+  取得し、配布物と使用ファイルのSHA-256一致後にASCII／A4 blobを生成する。新規checkoutは最初の
+  Cargo build前にこの処理が必要

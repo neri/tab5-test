@@ -60,7 +60,7 @@
     - `src/app/paint.rs`: `paint`コマンドで起動するタッチお絵描き画面
     - `src/app/touch_test.rs`: `touchtest`コマンドで起動するマルチタッチ診断画面
     - `src/app/coord_test.rs`: `coordtest`コマンドで起動する座標キャリブレーションチャート画面
-    - `src/app/font_test.rs`: 従来font、A4 Sans／Sans Mono、A4対1bit thresholdを3画面で比較する`fonttest`
+    - `src/app/font_test.rs`: DROM直参照ASCII、Latin／日本語A4、A4対1bit thresholdを3画面で比較する`fonttest`
     - `src/app/axis_test.rs`: `axistest`コマンドで起動するBMI270の6軸表示、水平器、傾きボール診断画面
     - `src/app/battery.rs`: Battery detailsのcontent描画。Consoleコマンドは持たない
     - `src/app/startup_screen.rs`: 白背景の`Tab5`、USB／Wi-Fi状態アイコン、5秒後のEscape案内を描き、USB初回探索・自動マウントと保存Wi-Fi接続をフレーム駆動で協調実行する。完了時はWi-Fi Online＋IPv4ありならBrowser、それ以外はデスクトップ、明示キャンセル時はConsoleを選ぶ
@@ -93,16 +93,19 @@
   できるので、収録範囲と文字幅を`cargo test`で検査できる。firmware内のパスは
   `crate::font::advance`のようになる
 - `font/src/lib.rs`: code pointからglyphを引くlookup、`advance`、combining判定、
-  未収録時のreplacement。データ`font/data/tab5font16.bin`は
-  `tools/font/generate.py`が生成してcommitしたもので、通常のbuildはBDFを解析せず
-  `font/build.rs`がLZ4 raw blockへ圧縮してDROMへ置き、起動時にPSRAMへ展開する
+  未収録時のreplacement。データ`font/data/tab5font16.bin`はprintable ASCIIだけで、
+  `tools/font/generate.py`が生成し、非圧縮DROMから常時直接参照する
 - `font-codec/`: font build script用の決定的LZ4 encoderと、firmwareが使うallocator不要の
   bounds付きT5L4 decoder。wrapperの長さとCRCも検査するhost-test可能な`no_std` crate
 - `font/src/console.rs`: コンソール専用の半角セル変換。すべてのUnicode scalarを
   必ず1セル分の1 byte IDへ写し、表示できない文字も空白ではなくplaceholderにする
-- `ui-font/`: 通常GUI用DejaVu Sans／Sans Monoの生成済みA4 strike、blob reader、共通RGB565
-  painter（パッケージ名`tab5-ui-font`）。`ui-font/build.rs`がDROM用LZ4 containerを生成し、
-  `tools/ui-font/`にgenerator、元TTF、license、由来を置く
+- `ui-font/`: 通常GUI用DejaVu Sans／Sans Monoと16 pixel Noto CJK JPの生成済みA4 strike、blob
+  reader、共通RGB565 painter（パッケージ名`tab5-ui-font`）。`ui-font/build.rs`がDROM用LZ4
+  containerを生成し、`tools/ui-font/`にgenerator、manifest、元fontの由来を置く
+- `Makefile`: Git管理しないUnifont BDF、DejaVu TTF、Noto TTCを版固定URLからdownloadして
+  配布物と使用ファイルのSHA-256を検証し、ASCII／A4の生成物を一括再生成する`fonts`と、local
+  生成物の再現性を検査する`fonts-check`。source fontと`ui-font/data/tab5-ui-fonts.bin`は
+  `.gitignore`対象で、新規checkoutではbuild前に`make fonts`が必要
 - `src/browser.rs`: ハイパーテキストビューアの非UI部（URL・HTML・文書モデル・
   折返し）の再export。実体は依存ゼロの別クレート`browser/`（パッケージ名
   `tab5-browser`）にあり、ホストでビルドできるので`cargo test`で検査できる。

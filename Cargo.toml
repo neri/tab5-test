@@ -14,7 +14,7 @@ publish = false
 system-bar-static = []
 # A/B diagnostic: use the checked-in plain font blobs directly from DROM,
 # bypassing the default LZ4-DROM -> decoded-PSRAM startup path.
-font-drom-direct = ["tab5-font/drom-direct", "tab5-ui-font/drom-direct"]
+font-drom-direct = ["tab5-ui-font/drom-direct"]
 # Compiles the SPKI pins for the test fixtures (`tools/pins/fixture_pins.txt`)
 # into the image, so that `tls-fixture.invalid` can be reached as a pinned
 # host. Never for a release: the matching private keys are in `tools/tls/`,
