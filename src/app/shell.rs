@@ -106,6 +106,7 @@ enum Cmd {
     Ppafill,
     Paint,
     Touchtest,
+    Touchcheck,
     Coordtest,
     Fonttest,
     Axistest,
@@ -474,6 +475,20 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         id: Cmd::Touchtest,
         usage: "touchtest",
         lines: &["live multi-touch test; use two fingers, any key exits"],
+    },
+    HelpEntry {
+        name: "touchcheck",
+        aliases: &[],
+        group: Group::Scaffold,
+        id: Cmd::Touchcheck,
+        usage: "touchcheck",
+        lines: &[
+            "open the built-in long Browser page for GUI touch acceptance.",
+            "a press alone must do nothing; a short press and release within",
+            "500 ms and 10 px follows the bottom link; dragging more than 10",
+            "px scrolls and must not follow a link; holding over 500 ms and",
+            "releasing must do nothing. Ctrl+Q (or q) leaves.",
+        ],
     },
     HelpEntry {
         name: "coordtest",
@@ -2004,6 +2019,14 @@ pub fn execute(
         }
         Cmd::Paint => return Outcome::Paint,
         Cmd::Touchtest => return Outcome::TouchTest,
+        Cmd::Touchcheck => {
+            if argument.is_empty() {
+                return Outcome::Browser(Some(
+                    Url::parse("http://built-in/long").expect("built-in touchcheck URL"),
+                ));
+            }
+            console.write_output_line(framebuffer, "usage: touchcheck");
+        }
         Cmd::Coordtest => return Outcome::CoordTest,
         Cmd::Fonttest => return Outcome::FontTest,
         Cmd::Axistest => return Outcome::AxisTest,

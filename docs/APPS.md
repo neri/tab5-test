@@ -18,6 +18,11 @@ coordinator、入力・timer・資源の所有と実機未確認事項は[`SYSTE
 最大数を表示し、同一レポート内で2点以上を読み取れた時点で`Pass: multitouch detected`を
 表示します。CardKBまたはUSBキーボードの任意のキーでシェルに戻ります。
 
+`touchcheck`コマンドはネットワークを使わずBrowser内蔵の長文を開く、通常GUI gestureの
+実機確認入口です。短いtap、hold後release、drag scrollを同じ画面で確認できます。
+判定値と状態遷移の正本は[`INPUT.md`](INPUT.md)、画面への配信規則は
+[`SYSTEM_BAR.md`](SYSTEM_BAR.md)を参照してください。
+
 `src/app/paint.rs`はシェルの`paint`コマンドから呼ばれる全画面お絵描きモードです。
 `app::run`のフレームループと同じ「描画してから部分書き戻し」パターンを使い、
 直前のタッチ点から現在のタッチ点まで`fill_circle`をスタンプ

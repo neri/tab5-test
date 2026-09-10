@@ -97,6 +97,74 @@ impl Gesture {
     }
 }
 
+/// Touch interpretation shared by the normal GUI and its diagnostic.
+///
+/// A contact is only a tap when it is released within 500 ms without ever
+/// moving more than 10 pixels from its starting point. Once dragging starts it
+/// remains a drag until release, even if the finger returns to the start.
+pub const TAP_MAX_MS: u64 = 500;
+pub const TAP_SLOP_PX: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchRelease {
+    None,
+    Tap { x: usize, y: usize },
+    Drag,
+}
+
+#[derive(Default)]
+pub struct TouchGesture {
+    start: Option<(usize, usize)>,
+    last: (usize, usize),
+    started_ms: u64,
+    dragging: bool,
+}
+
+impl TouchGesture {
+    pub fn press(&mut self, x: usize, y: usize, now_ms: u64) {
+        self.start = Some((x, y));
+        self.last = (x, y);
+        self.started_ms = now_ms;
+        self.dragging = false;
+    }
+
+    /// Returns movement since the preceding sample after the gesture has
+    /// crossed the drag threshold. The threshold-crossing sample includes all
+    /// movement since press, so the content does not jump behind the finger.
+    pub fn move_to(&mut self, x: usize, y: usize) -> Option<(isize, isize)> {
+        let start = self.start?;
+        let previous = if self.dragging { self.last } else { start };
+        if !self.dragging {
+            let dx = x.abs_diff(start.0) as u64;
+            let dy = y.abs_diff(start.1) as u64;
+            self.dragging = dx * dx + dy * dy > (TAP_SLOP_PX * TAP_SLOP_PX) as u64;
+        }
+        self.last = (x, y);
+        self.dragging.then_some((
+            x as isize - previous.0 as isize,
+            y as isize - previous.1 as isize,
+        ))
+    }
+
+    pub fn release(&mut self, now_ms: u64) -> TouchRelease {
+        let start = self.start.take();
+        let result = match start {
+            Some(_) if self.dragging => TouchRelease::Drag,
+            Some((x, y)) if now_ms.saturating_sub(self.started_ms) <= TAP_MAX_MS => {
+                TouchRelease::Tap { x, y }
+            }
+            _ => TouchRelease::None,
+        };
+        self.dragging = false;
+        result
+    }
+
+    pub fn cancel(&mut self) {
+        self.start = None;
+        self.dragging = false;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub wifi: u8,
@@ -214,6 +282,21 @@ mod tests {
         g.press(WIFI);
         g.cancel();
         assert!(!g.release(1056, 0));
+    }
+    #[test]
+    fn touch_tap_drag_and_hold_boundaries() {
+        let mut g = TouchGesture::default();
+        g.press(100, 100, 1_000);
+        assert_eq!(g.move_to(106, 108), None); // exactly 10 px
+        assert_eq!(g.release(1_500), TouchRelease::Tap { x: 100, y: 100 });
+
+        g.press(100, 100, 2_000);
+        assert_eq!(g.move_to(111, 100), Some((11, 0)));
+        assert_eq!(g.move_to(105, 100), Some((-6, 0)));
+        assert_eq!(g.release(2_100), TouchRelease::Drag);
+
+        g.press(100, 100, 3_000);
+        assert_eq!(g.release(3_501), TouchRelease::None);
     }
     #[test]
     fn voltage_and_dirty() {

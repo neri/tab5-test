@@ -183,7 +183,7 @@ mod host {
     use crate::input::{InputManager, Key, PrimaryTouch};
     use crate::usb::MOUSE_BUTTON_LEFT;
     use crate::{interrupts, tick, uart};
-    use tab5_system_ui::{Gesture, SystemAction, Timer};
+    use tab5_system_ui::{Gesture, SystemAction, Timer, TouchGesture, TouchRelease};
 
     use tab5_system_ui::{LaunchChoice, MiniId, ReturnTo, Screen};
     const ITEMS: [&str; 4] = ["Browser", "Console", "Desktop", "Power..."];
@@ -266,6 +266,8 @@ mod host {
         let mut cursor = Cursor::new(WIDTH / 2, SCREEN_HEIGHT / 2);
         let mut pointer_visible = false;
         let mut gesture = Gesture::default();
+        let mut touch_gesture = TouchGesture::default();
+        let mut touch_scroll_px = 0isize;
         let mut press: Option<(usize, usize, bool)> = None;
         let mut touch_down = false;
         let mut content_dirty = true;
@@ -298,6 +300,7 @@ mod host {
             if epoch != topology {
                 topology = epoch;
                 gesture.cancel();
+                touch_gesture.cancel();
                 press = None;
             }
             let mut transition: Option<Screen> = None;
@@ -394,6 +397,8 @@ mod host {
                         touch_down = true;
                         target = (p.x, p.y);
                         press = Some((p.x, p.y, true));
+                        touch_gesture.press(p.x, p.y, now);
+                        touch_scroll_px = 0;
                         if p.y < HEIGHT {
                             gesture.press(if matches!(screen, Screen::Browser) {
                                 target_rect(p.x, &browser)
@@ -405,13 +410,29 @@ mod host {
                     PrimaryTouch::Moved(p) => {
                         target = (p.x, p.y);
                         gesture.move_to(p.x, p.y);
+                        if let Some((_, dy)) = touch_gesture.move_to(p.x, p.y) {
+                            if press.is_some_and(|(_, y, touch)| touch && y >= HEIGHT)
+                                && matches!(screen, Screen::Browser)
+                            {
+                                touch_scroll_px += dy;
+                                const PIXELS_PER_LINE: isize = 24;
+                                let lines = touch_scroll_px / PIXELS_PER_LINE;
+                                if lines != 0 {
+                                    browser.wheel(lines as i32);
+                                    touch_scroll_px -= lines * PIXELS_PER_LINE;
+                                }
+                            }
+                        }
                     }
                     PrimaryTouch::Released => {
+                        let release = touch_gesture.release(now);
                         if let Some((x, y, true)) = press.take() {
-                            if y >= HEIGHT || gesture.release(cursor.x, cursor.y) {
+                            let same_target = y >= HEIGHT || gesture.release(cursor.x, cursor.y);
+                            if matches!(release, TouchRelease::Tap { .. }) && same_target {
                                 clicked = Some((x, y));
                             }
                         }
+                        gesture.cancel();
                         touch_down = false;
                     }
                     PrimaryTouch::Idle => {}
@@ -531,6 +552,7 @@ mod host {
                 }
                 screen = next;
                 gesture.cancel();
+                touch_gesture.cancel();
                 press = None;
                 touch_down = false;
                 input.discard_queued_keys();

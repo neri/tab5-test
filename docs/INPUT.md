@@ -151,6 +151,17 @@ Browser contentだけで処理する。M（文字編集中以外）／F3でLaunc
 遷移時の`discard_queued_keys`はInputManagerと各USBキーボードの取得済みqueueだけを捨て、
 held keyの履歴を保つ。`cancel_primary_touch`は全指が離れるまで新しいpressを抑止する。
 旧UIだけで使用していた`reset_primary_touch`は削除した。
+
+### 通常GUIのタッチgesture判定
+
+この節を通常GUIのtap／drag判定仕様の正本とする。press時点ではactionを発火しない。
+releaseまで500 ms以内、かつpress位置からの最大移動距離が10 pixel以下の接触だけを
+tapとする。距離は直線距離で、一度10 pixelを超えてdragへ移った接触は開始位置へ
+戻ってもtapへ戻らない。500 msを超えて静止した接触はrelease時にも何も発火しない。
+dragへ移った接触もreleaseまでtapを発火しない。この時間・距離判定はUSB mouse clickには
+適用しない。画面別のdrag配信は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)、実機確認入口は
+[`APPS.md`](APPS.md)を参照する。
+
 USB topology変化でもhostのbar押下を取り消す。統合後の実機挿抜・同時入力は未確認。
 詳細は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)。
 

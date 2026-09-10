@@ -2,7 +2,7 @@
 
 > 索引: [`../DESIGN.md`](../DESIGN.md)
 
-2026-09-04時点でシェルが受け付けたコマンド全103個を1行ずつ並べ、**残すか消すか**を示した表です。
+2026-09-04時点の棚卸しを基に、シェルが受け付けるコマンドを1行ずつ並べ、**残すか消すか**を示した表です。
 コンソールの仕組みとシェルの実装は[`CONSOLE_SHELL.md`](CONSOLE_SHELL.md)、各コマンドの
 説明は`src/app/shell.rs`の`HELP_ENTRIES`（実機では`help <name>`）が唯一の出典で、
 この文書は説明を写し取らず**割り当てと根拠だけ**を持ちます。
@@ -124,6 +124,7 @@
 | `tftpget` | — | 製品 | **残す** |  | TFTP取得 |
 | `tls` | — | 足場 | feature |  | ネットワーク。`TCPIP_PLAN`／`DNS_PLAN`／`TLS_PLAN`完了 |
 | `touchtest` | — | 足場 | feature |  | センサー・入力の実証。`INPUT_MANAGER_PLAN`／`USB_HOST_PLAN`完了 |
+| `touchcheck` | — | 足場 | **残す** |  | 通常GUIのtap／hold／drag受入が実機未確認 |
 | `ui` | — | 足場 | feature |  | 表示帯域とアンダーラン。`DISPLAY_UNDERRUN_REFACTOR_PLAN`完了 |
 | `umount` | — | 製品 | **残す** |  | ボリュームの切断 |
 | `uptime` | — | 製品 | **残す** |  | 起動からの経過時間 |

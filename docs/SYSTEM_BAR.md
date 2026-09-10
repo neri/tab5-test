@@ -81,6 +81,8 @@ Wi-Fiの画面向け完了通知は1件で、要求tokenが合う画面だけが
 
 barのgestureは押下開始位置が所有し、release時に確定する。targetから一度でも出ると、
 元へ戻っても取消。contentからbarへ移ってもsystem actionは発火しない。
+touchのtap／drag分類は[`INPUT.md`](INPUT.md)を正本とする。Browser本文から始まったdragは
+指の移動24 pixelごとに1行scrollへ変換し、接触終了までlinkを発火しない。
 touchをmouseより優先し、touch中のmouse actionは捨てる。wheelはBrowser content上だけで処理する。
 遷移時は全接触が離れるまで新しいtouchを受け付けず、USB topology変化時も押下を取り消す。マウスがなくtouchも離れていればcursorを消す。
 
