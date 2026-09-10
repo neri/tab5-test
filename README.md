@@ -120,4 +120,3 @@ mise run test
 - `browser`のCSS・JavaScript・画像デコード・form送信・cookie
   （[docs/BROWSER.md](docs/BROWSER.md)）
 - Wi-FiのSoftAPとBLE。5 GHz帯はESP32-C6が2.4 GHz専用のため使えません
-- ESP32-P4 revision v3以降での動作確認

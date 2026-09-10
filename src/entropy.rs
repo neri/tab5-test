@@ -37,7 +37,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rand_chacha::ChaCha20Rng;
-use rand_core::{CryptoRng, RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
+use rand_core_06::{CryptoRng, RngCore};
 
 use crate::{delay, regi2c};
 
@@ -189,8 +190,9 @@ impl RngCore for Csprng {
         self.0.fill_bytes(destination);
     }
 
-    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.0.try_fill_bytes(destination)
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand_core_06::Error> {
+        self.0.fill_bytes(destination);
+        Ok(())
     }
 }
 

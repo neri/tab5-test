@@ -4137,7 +4137,7 @@ fn cmd_entropy_show(console: &mut Console, framebuffer: &mut Framebuffer) {
 /// a statistical test cannot prove randomness, but a repeat proves its
 /// absence.
 fn cmd_entropy_test(console: &mut Console, framebuffer: &mut Framebuffer, rounds: u32) {
-    use rand_core::RngCore;
+    use rand_core_06::RngCore;
 
     let (enables_before, disables_before) = entropy::transition_counts();
     let mut previous = [0u8; entropy::SEED_BYTES];

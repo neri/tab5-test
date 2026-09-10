@@ -64,7 +64,8 @@ use embedded_tls::{
     Aes128GcmSha256, CertificateEntryRef, CertificateRef, CertificateVerifyRef, CryptoProvider,
     SignatureScheme, TlsCipherSuite, TlsConfig, TlsConnection, TlsContext, TlsError, TlsVerifier,
 };
-use sha2::Digest;
+use digest::Digest as _;
+use sha2_10::Digest as _;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
@@ -670,13 +671,13 @@ fn verify_scheme(
             };
             Some(key.verify(message, &signature).is_ok())
         }
-        SignatureScheme::RsaPssRsaeSha256 => Some(verify_rsa_pss::<sha2::Sha256>(
+        SignatureScheme::RsaPssRsaeSha256 => Some(verify_rsa_pss::<sha2_10::Sha256>(
             key, message, signature,
         )),
-        SignatureScheme::RsaPssRsaeSha384 => Some(verify_rsa_pss::<sha2::Sha384>(
+        SignatureScheme::RsaPssRsaeSha384 => Some(verify_rsa_pss::<sha2_10::Sha384>(
             key, message, signature,
         )),
-        SignatureScheme::RsaPssRsaeSha512 => Some(verify_rsa_pss::<sha2::Sha512>(
+        SignatureScheme::RsaPssRsaeSha512 => Some(verify_rsa_pss::<sha2_10::Sha512>(
             key, message, signature,
         )),
         _ => None,
@@ -685,7 +686,7 @@ fn verify_scheme(
 
 fn verify_rsa_pss<Hash>(key: &[u8], message: &[u8], signature: &[u8]) -> bool
 where
-    Hash: Digest + digest::FixedOutputReset,
+    Hash: sha2_10::Digest + digest_10::FixedOutputReset,
 {
     use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::signature::Verifier;
@@ -711,7 +712,7 @@ impl<CipherSuite: TlsCipherSuite> CryptoProvider for Provider<CipherSuite> {
     /// Only used for client certificates, which this never sends.
     type Signature = p256::ecdsa::DerSignature;
 
-    fn rng(&mut self) -> impl rand_core::CryptoRngCore {
+    fn rng(&mut self) -> impl rand_core_06::CryptoRngCore {
         &mut self.rng
     }
 

@@ -39,7 +39,7 @@ tab5-system-ui = { path = "system-ui" }
 # cluster instead of allocating a new one. The RAM disk formats with 512-byte
 # clusters, which makes every 4 KiB append hit it; `fswritetest /tmp` catches
 # it at the first byte of the overwritten cluster.
-hadris-fat = { version = "2.2.0", default-features = false, features = [
+hadris-fat = { version = "2.4", default-features = false, features = [
     "read",
     "write",
     "lfn",
@@ -49,9 +49,9 @@ hadris-fat = { version = "2.2.0", default-features = false, features = [
     # read-only here for that reason among others -- see `docs/FILESYSTEM.md`.
     "unstable-exfat",
 ] }
-hadris-io = { version = "2.2.0", default-features = false, features = ["sync"] }
+hadris-io = { version = "2.4", default-features = false, features = ["sync"] }
 embedded-io = { version = "0.7", default-features = false }
-linked_list_allocator = "0.10.6"
+linked_list_allocator = "0.10"
 # Generic RISC-V startup: unlike esp-riscv-rt's current ESP32-P4 support,
 # this does not invoke ECO5-only ROM functions before Rust reaches `main`.
 riscv-rt = "0.18"
@@ -101,8 +101,12 @@ tab5-time = { path = "time" }
 # same reason it does for smoltcp -- and a stream cipher written here would be
 # a stream cipher with no test vectors behind it. `rand_core` is the trait
 # the TLS library asks its randomness for.
-rand_chacha = { version = "0.3", default-features = false }
-rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
+# `embedded-tls` 0.19 still exposes rand_core 0.6 in its provider API. Keep
+# that interface version under an explicit compatibility name while the
+# firmware's own generator uses the current rand_core API.
+rand_core_06 = { package = "rand_core", version = "0.6", default-features = false }
 # TLS 1.3 client. Like smoltcp, this is a fully specified wire protocol
 # rather than a hardware layer -- and unlike a hardware layer, a TLS stack
 # written here would be one whose mistakes nobody else has already found.
@@ -120,9 +124,13 @@ embedded-io-async = { version = "0.7", default-features = false }
 # The signature and digest work `src/net/tls.rs`'s verifier does itself.
 # `embedded-tls` does not re-export these, and a verifier that cannot name
 # its own primitives cannot be written outside the library.
-sha2 = { version = "0.10", default-features = false }
-digest = { version = "0.10", default-features = false }
-p256 = { version = "0.13", default-features = false, features = [
+sha2 = { version = "0.11", default-features = false }
+digest = { version = "0.11", default-features = false }
+# `embedded-tls` 0.19 and stable `rsa` 0.9 expose digest 0.10 types in
+# verifier-facing APIs. These aliases isolate that compatibility boundary.
+sha2_10 = { package = "sha2", version = "0.10", default-features = false }
+digest_10 = { package = "digest", version = "0.10", default-features = false }
+p256 = { version = "0.14", default-features = false, features = [
     "ecdsa",
     "sha256",
 ] }
