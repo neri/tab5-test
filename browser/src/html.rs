@@ -48,6 +48,10 @@ const MAX_ATTRIBUTE_NAME: usize = 64;
 /// Longest `alt` text kept. It stands in for an image on one line; past
 /// this it would be a paragraph pretending to be a picture.
 const MAX_ALT_BYTES: usize = 256;
+/// Span values are deliberately kept as text here.  Interpreting malformed
+/// values belongs to the document builder, which is where the table limits
+/// live; the tokenizer only guarantees that the value survives chunking.
+const MAX_SPAN_BYTES: usize = 16;
 
 /// Longest `href` kept, one byte past the URL bound so that an over-long
 /// one is still recognisably over-long when the resolver sees it rather
@@ -69,8 +73,8 @@ const TEXT_FLUSH_THRESHOLD: usize = 4096;
 
 /// One start tag, with the bounded attribute values the document model uses.
 ///
-/// `href`, `alt`, `id` and legacy anchor `name`. Every other attribute is parsed far
-/// enough to be skipped and its value is never stored, which is what makes
+/// `href`, `alt`, `id`, legacy anchor `name`, and table spans. Every other
+/// attribute is parsed far enough to be skipped and its value is never stored, which is what makes
 /// an element carrying a kilobyte of `data-` attributes cost a scan rather
 /// than a page's memory budget.
 pub struct Tag<'a> {
@@ -80,6 +84,9 @@ pub struct Tag<'a> {
     pub alt: Option<&'a str>,
     pub id: Option<&'a str>,
     pub anchor_name: Option<&'a str>,
+    pub rowspan: Option<&'a str>,
+    pub colspan: Option<&'a str>,
+    pub border: Option<&'a str>,
     /// `<br/>`. Advisory: the document builder already knows which elements
     /// are empty, and uses this only for the ones it does not know.
     pub self_closing: bool,
@@ -177,6 +184,9 @@ enum Capture {
     Alt,
     Id,
     Name,
+    Rowspan,
+    Colspan,
+    Border,
 }
 
 /// The tag being read, and the two attribute values worth keeping.
@@ -190,6 +200,9 @@ struct TagBuffer {
     alt: Option<Vec<u8>>,
     id: Option<Vec<u8>>,
     anchor_name: Option<Vec<u8>>,
+    rowspan: Option<Vec<u8>>,
+    colspan: Option<Vec<u8>>,
+    border: Option<Vec<u8>>,
     attributes_seen: usize,
 }
 
@@ -205,6 +218,9 @@ impl TagBuffer {
             alt: None,
             id: None,
             anchor_name: None,
+            rowspan: None,
+            colspan: None,
+            border: None,
             attributes_seen: 0,
         }
     }
@@ -219,6 +235,9 @@ impl TagBuffer {
         self.alt = None;
         self.id = None;
         self.anchor_name = None;
+        self.rowspan = None;
+        self.colspan = None;
+        self.border = None;
         self.attributes_seen = 0;
     }
 }
@@ -242,6 +261,9 @@ pub struct Tokenizer {
     scratch_alt: String,
     scratch_id: String,
     scratch_anchor_name: String,
+    scratch_rowspan: String,
+    scratch_colspan: String,
+    scratch_border: String,
     scratch_name: String,
     /// Total input bytes, for [`MAX_DECODED_HTML_BYTES`].
     consumed: usize,
@@ -270,6 +292,9 @@ impl Tokenizer {
             scratch_alt: String::new(),
             scratch_id: String::new(),
             scratch_anchor_name: String::new(),
+            scratch_rowspan: String::new(),
+            scratch_colspan: String::new(),
+            scratch_border: String::new(),
             scratch_name: String::new(),
             consumed: 0,
             longest_token: 0,
@@ -314,6 +339,17 @@ impl Tokenizer {
                 .anchor_name
                 .as_ref()
                 .map_or(0, |value| value.capacity())
+            + self
+                .tag
+                .rowspan
+                .as_ref()
+                .map_or(0, |value| value.capacity())
+            + self
+                .tag
+                .colspan
+                .as_ref()
+                .map_or(0, |value| value.capacity())
+            + self.tag.border.as_ref().map_or(0, |value| value.capacity())
             + self.text.capacity()
             + self.decoded.capacity()
             + self.entity.capacity()
@@ -321,6 +357,9 @@ impl Tokenizer {
             + self.scratch_alt.capacity()
             + self.scratch_id.capacity()
             + self.scratch_anchor_name.capacity()
+            + self.scratch_rowspan.capacity()
+            + self.scratch_colspan.capacity()
+            + self.scratch_border.capacity()
             + self.scratch_name.capacity()
     }
 
@@ -445,8 +484,14 @@ impl Tokenizer {
             },
 
             State::AttributeName => match byte {
-                b'>' => return self.emit_tag(sink).map(|()| None),
-                b'/' => self.state = State::SelfClosing,
+                b'>' => {
+                    self.finish_valueless_attribute();
+                    return self.emit_tag(sink).map(|()| None);
+                }
+                b'/' => {
+                    self.finish_valueless_attribute();
+                    self.state = State::SelfClosing;
+                }
                 b'=' => {
                     self.begin_capture();
                     self.state = State::BeforeAttributeValue;
@@ -460,8 +505,14 @@ impl Tokenizer {
             },
 
             State::AfterAttributeName => match byte {
-                b'>' => return self.emit_tag(sink).map(|()| None),
-                b'/' => self.state = State::SelfClosing,
+                b'>' => {
+                    self.finish_valueless_attribute();
+                    return self.emit_tag(sink).map(|()| None);
+                }
+                b'/' => {
+                    self.finish_valueless_attribute();
+                    self.state = State::SelfClosing;
+                }
                 b'=' => {
                     self.begin_capture();
                     self.state = State::BeforeAttributeValue;
@@ -469,6 +520,7 @@ impl Tokenizer {
                 byte if byte.is_ascii_whitespace() => {}
                 byte => {
                     // A valueless attribute, then the next one starts.
+                    self.finish_valueless_attribute();
                     self.tag.attribute_name.clear();
                     self.tag.attributes_seen += 1;
                     self.state = State::AttributeName;
@@ -725,6 +777,24 @@ impl Tokenizer {
         } else if self.tag.attribute_name == b"name" && self.tag.anchor_name.is_none() {
             self.tag.anchor_name = Some(Vec::new());
             self.tag.capture = Capture::Name;
+        } else if self.tag.attribute_name == b"rowspan" && self.tag.rowspan.is_none() {
+            self.tag.rowspan = Some(Vec::new());
+            self.tag.capture = Capture::Rowspan;
+        } else if self.tag.attribute_name == b"colspan" && self.tag.colspan.is_none() {
+            self.tag.colspan = Some(Vec::new());
+            self.tag.capture = Capture::Colspan;
+        } else if self.tag.attribute_name == b"border" && self.tag.border.is_none() {
+            self.tag.border = Some(Vec::new());
+            self.tag.capture = Capture::Border;
+        }
+    }
+
+    fn finish_valueless_attribute(&mut self) {
+        if self.tag.attributes_seen <= MAX_ATTRIBUTES_PER_ELEMENT
+            && self.tag.attribute_name == b"border"
+            && self.tag.border.is_none()
+        {
+            self.tag.border = Some(Vec::new());
         }
     }
 
@@ -738,6 +808,9 @@ impl Tokenizer {
                 &mut self.tag.anchor_name,
                 crate::limits::MAX_ANCHOR_NAME_BYTES,
             ),
+            Capture::Rowspan => (&mut self.tag.rowspan, MAX_SPAN_BYTES),
+            Capture::Colspan => (&mut self.tag.colspan, MAX_SPAN_BYTES),
+            Capture::Border => (&mut self.tag.border, MAX_SPAN_BYTES),
         };
         let Some(buffer) = buffer.as_mut() else {
             return Ok(());
@@ -777,6 +850,18 @@ impl Tokenizer {
         if let Some(bytes) = &self.tag.anchor_name {
             push_repaired(&mut self.scratch_anchor_name, bytes)?;
         }
+        self.scratch_rowspan.clear();
+        if let Some(bytes) = &self.tag.rowspan {
+            push_repaired(&mut self.scratch_rowspan, bytes)?;
+        }
+        self.scratch_colspan.clear();
+        if let Some(bytes) = &self.tag.colspan {
+            push_repaired(&mut self.scratch_colspan, bytes)?;
+        }
+        self.scratch_border.clear();
+        if let Some(bytes) = &self.tag.border {
+            push_repaired(&mut self.scratch_border, bytes)?;
+        }
         sink.start_tag(Tag {
             name: &self.scratch_name,
             href: self.tag.href.as_ref().map(|_| self.scratch_href.as_str()),
@@ -787,6 +872,21 @@ impl Tokenizer {
                 .anchor_name
                 .as_ref()
                 .map(|_| self.scratch_anchor_name.as_str()),
+            rowspan: self
+                .tag
+                .rowspan
+                .as_ref()
+                .map(|_| self.scratch_rowspan.as_str()),
+            colspan: self
+                .tag
+                .colspan
+                .as_ref()
+                .map(|_| self.scratch_colspan.as_str()),
+            border: self
+                .tag
+                .border
+                .as_ref()
+                .map(|_| self.scratch_border.as_str()),
             self_closing: self.tag.self_closing,
         })?;
 
@@ -992,6 +1092,15 @@ mod tests {
             if let Some(alt) = tag.alt {
                 event.push_str(&format!(" alt={alt}"));
             }
+            if let Some(rowspan) = tag.rowspan {
+                event.push_str(&format!(" rowspan={rowspan}"));
+            }
+            if let Some(colspan) = tag.colspan {
+                event.push_str(&format!(" colspan={colspan}"));
+            }
+            if let Some(border) = tag.border {
+                event.push_str(&format!(" border={border}"));
+            }
             if tag.self_closing {
                 event.push('/');
             }
@@ -1079,6 +1188,42 @@ mod tests {
             parse(b"<DIV></DIV>"),
             ["<div>".to_string(), "</div>".to_string()]
         );
+    }
+
+    #[test]
+    fn table_span_attributes_are_bounded_and_chunk_independent() {
+        let input = b"<td rowspan='2' colspan=03 ROWSPAN=ignored>cell</td>";
+        assert_eq!(
+            parse(input),
+            [
+                "<td rowspan=2 colspan=03>".to_string(),
+                "text:cell".to_string(),
+                "</td>".to_string()
+            ]
+        );
+        assert_chunking_invisible(input);
+        // The builder, rather than the tokenizer, decides what an invalid
+        // value means.  It must still receive it unchanged.
+        assert_eq!(
+            parse(b"<td rowspan='' colspan=oops>"),
+            ["<td rowspan= colspan=oops>".to_string()]
+        );
+    }
+
+    #[test]
+    fn table_border_keeps_valued_empty_and_valueless_forms() {
+        for input in [
+            b"<table border='2'>".as_slice(),
+            b"<table border>",
+            b"<table border=''>",
+        ] {
+            assert_chunking_invisible(input);
+        }
+        assert_eq!(
+            parse(b"<table border='2'>"),
+            ["<table border=2>".to_string()]
+        );
+        assert_eq!(parse(b"<table border>"), ["<table border=>".to_string()]);
     }
 
     #[test]

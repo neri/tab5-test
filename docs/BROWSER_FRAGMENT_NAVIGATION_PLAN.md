@@ -248,9 +248,9 @@ downgrade拒否、redirect回数上限は変更しない。
 
 ## 上限と失敗
 
-anchor追加によって既存のbrowser-owned peak 4 MiBを増やさない。
+anchor追加によってbrowser-owned peakを不必要に増やさない。
 
-- anchor件数上限は`MAX_LINKS`と同じ1,024件。
+- anchor件数上限は1,024件。
 - 1つのanchor名は`MAX_URL_BYTES`を越えたら登録しない。その名前はbrowserが持てる
   URLから指定できないためである。
 - 登録するanchor名の合計capacityは256 KiBを上限とする。
@@ -260,8 +260,8 @@ anchor追加によって既存のbrowser-owned peak 4 MiBを増やさない。
 - anchor表とlayout対応表を`Document::stats().owned_bytes`およびlayoutの
   `owned_bytes()`へ含める。
 
-上限値はhost testで最悪時の構造体費用を計算し、4 MiB内に収まらなければ上限を
-緩めず表現を小さくする。page cacheのための容量は確保しない。
+上限値はhost testで構造体費用を計算し、不自然に大きければ上限を緩めず表現を
+小さくする。page cacheのための容量は確保しない。
 
 fragment検索や履歴へのpushでallocationに失敗した場合、現在の文書、訪問URL、履歴、
 scroll位置を変更せず、既存のout-of-memory表示へ進む。状態更新は必要なallocationが

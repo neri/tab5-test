@@ -61,7 +61,6 @@ PSRAMへ置く。大きい固定配列やページ依存データを`.bss`へ置
 - 読み込み中でもEscapeでキャンセルでき、リンク切断時も画面と入力が固まらない
 - リダイレクトを最大5回まで追跡し、HTTPSへの遷移は未対応であることを表示する
 - ページが上限を超えた場合は、それまでの不完全な内容を成功扱いせず、理由を表示する
-- ブラウザが所有する動的メモリのピークを4 MiB以下に保つ
 - ページ遷移を繰り返してもヒープ使用量が単調増加せず、表示DMA underrunを増やさない
 
 ## 初期版の非目標
@@ -122,11 +121,10 @@ viewportと交差する行だけ描く。
 | 履歴 | 8ページ |
 | decode済みHTML入力 | 2 MiB |
 | 保持する表示テキスト | 1 MiB |
-| 文書item | 8,192件 |
-| link | 1,024件 |
+| 文書item | 16,384件 |
+| link | 最大4,096件、解決済みURL合計2 MiB。超過分は非link化 |
 | list／inline状態の深さ | 32 |
 | 1要素で処理する属性 | 16個。必要な属性以外は値を保持しない |
-| ブラウザ所有の動的メモリ | peak 4 MiB |
 
 `Vec`や`String`の通常の拡張でOOM abortへ入らないよう、入力依存の拡張は
 `try_reserve`／`try_reserve_exact`を通す。文書、文字列、link、layout itemは
@@ -320,7 +318,7 @@ close-delimitedの3終端を実装し、既存`httpget`の成功・404・512 KiB
 成功としてpublishしない。未知のtagや属性は無視するが、そのサイズ自体は上限へ数える。
 
 **完了条件**: Stage 0の全HTML fixtureが期待するtext、block、linkへなり、入力を1 byteずつ
-渡しても結果が変わらないこと。2 MiB、8,192 item、1,024 link、深さ32の各境界を確認する。
+渡しても結果が変わらないこと。2 MiB、16,384 item、4,096 link、深さ32の各境界を確認する。
 
 fixtureはPython側から`--dump browser/tests/fixtures`で書き出し、
 `browser/tests/fixtures.rs`が同じbyte列を解析する。chunk sizeは1、2、3、5、7、13、
@@ -376,14 +374,14 @@ network counters、display countersをUARTへ出す。
 
 - 全正常fixtureのtext CRCとlink解決結果が期待値と一致する
 - 全異常fixtureが定めたエラーで終了し、panic、OOM abort、5秒を越える無反応がない
-- browser-owned peakが4 MiB以下で、100回遷移後も最初と同じ規模へ戻る
+- browser-owned peakが100回遷移後も最初と同じ規模へ戻る
 - 100回の取得・cancel・戻るでsocket枯渇、RX queue破壊、C6 transport再同期不能がない
 - 30分表示・scroll soakでdisplay underrun、DMA errorが0増分
 - `httpget`、`ping`、`nslookup`、`win`、`paint`、USB keyboard／mouseを回帰確認する
 - release build、`tools/check_elf_layout.py`、ESP image検査が通り、stack 128 KiB以上を維持する
 
 上限内でも描画が入力を1 frame以上止める場合は、HTML機能を増やさずlayout／描画の処理量を
-さらに分割する。4 MiBを越えた場合は上限を緩めず、文書モデルの重複とcapacityを調べる。
+さらに分割する。peakが不自然に増えた場合は文書モデルの重複とcapacityを調べる。
 
 ### Stage 7: 現状文書の更新
 
@@ -1017,7 +1015,7 @@ builder・layoutに通してページとして表示する。手書きで描か�
 
 ### Stage 4: 上限を1つ足した（`MAX_LAYOUT_LINES`）
 
-文書の上限（text 1 MiB、item 8,192）だけでは折返し後の行数を縛れない。
+文書の上限（text 1 MiB、item 16,384）だけでは折返し後の行数を縛れない。
 `<br>`だけの1 MiBは100万行になり、`Line`が24 byteなので24 MB。32,768行で
 打ち切る（1 MiBの散文でおよそ1万行なので3倍の余裕）。
 

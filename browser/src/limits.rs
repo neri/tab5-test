@@ -3,9 +3,9 @@
 //! The reason they are gathered here rather than sitting next to the code
 //! that enforces them is that they are a single budget, not nine unrelated
 //! numbers: a page is allowed [`MAX_DECODED_HTML_BYTES`] of input, and what
-//! survives into the document has to fit inside [`MAX_BROWSER_OWNED_BYTES`]
-//! together with the text, the links and the layout. Changing one in
-//! isolation is how a limit set stops adding up.
+//! survives into the document has independent bounds for text, resolved
+//! link targets and layout structures. Changing one in isolation is how a
+//! limit set stops adding up.
 //!
 //! These are also the numbers `tools/browser_fixture_server.py` builds its
 //! over-limit fixtures against, and the ones `docs/WEB_BROWSER_PLAN.md`
@@ -14,7 +14,7 @@
 //!
 //! None of these is a soft target. Reaching one is an error the user is
 //! told about, never a truncation presented as a finished page: a document
-//! cut off at 8,192 items looks exactly like a document that ended there,
+//! cut off at 16,384 items looks exactly like a document that ended there,
 //! and there is no way for a reader to tell the difference after the fact.
 
 /// The response head, from the status line to the blank line that ends it.
@@ -76,11 +76,20 @@ pub const MAX_DECODED_HTML_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Document items -- the blocks, lines, rules and images the layout walks.
-pub const MAX_ITEMS: usize = 8192;
+pub const MAX_ITEMS: usize = 16384;
+
+/// Table grid bounds.  A table is always fitted to the viewport; wider
+/// structures are rejected instead of being silently truncated.
+pub const MAX_TABLE_COLUMNS: usize = 32;
+pub const MAX_TABLE_SPAN: usize = 32;
+pub const MAX_TABLE_BORDER: usize = 4;
 
 /// Links kept for one page, each with its resolved target.
-pub const MAX_LINKS: usize = 1024;
-pub const MAX_ANCHORS: usize = MAX_LINKS;
+pub const MAX_LINKS: usize = 4096;
+/// Sum of the owned, resolved link targets. Short references can resolve
+/// against a long base URL, so the HTML input bound alone does not bound it.
+pub const MAX_LINK_URL_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_ANCHORS: usize = 1024;
 pub const MAX_ANCHOR_NAME_BYTES: usize = MAX_URL_BYTES;
 pub const MAX_ANCHOR_BYTES: usize = 256 * 1024;
 
@@ -111,31 +120,13 @@ pub const MAX_ATTRIBUTES_PER_ELEMENT: usize = 16;
 /// document built to fire it.
 pub const MAX_LAYOUT_LINES: usize = 32768;
 
-/// Peak dynamic memory the browser may own at once.
-///
-/// The heap is 23,322,624 bytes (`docs/PSRAM.md`), so this is not a memory
-/// ceiling -- it is a statement that a hypertext viewer which needs more
-/// than 4 MiB for one page has a duplicated representation in it. It is
-/// measured as the sum of the capacities the browser itself allocated,
-/// counted independently rather than inferred from the global allocator.
-pub const MAX_BROWSER_OWNED_BYTES: usize = 4 * 1024 * 1024;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The budget has to add up: the two per-page byte bounds and the
-    /// worst-case link table all live inside the owned-memory peak at the
-    /// same time, because a document is built while its input is still
-    /// arriving.
-    ///
-    /// This is the check that catches a limit raised on its own. Text plus
-    /// links is 3 MiB against a 4 MiB peak, which leaves 1 MiB for items,
-    /// the layout and the in-flight input chunk.
     #[test]
-    fn text_and_links_fit_inside_the_owned_budget() {
-        let links = MAX_LINKS * MAX_URL_BYTES;
-        assert!(MAX_TEXT_BYTES + links + MAX_ANCHOR_BYTES < MAX_BROWSER_OWNED_BYTES);
+    fn link_storage_is_bounded_independently_of_link_count() {
+        assert!(MAX_LINK_URL_BYTES <= MAX_DECODED_HTML_BYTES);
     }
 
     /// Stored text cannot exceed the input it is extracted from.

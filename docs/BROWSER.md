@@ -266,7 +266,7 @@ heap 21592K sockets 1 back 3 fwd 2 page 41K peak 13K
 | `sockets` | socket setに入っている数。`+1 loading`が付けば取得が走っている。`-`はstackが無い |
 | `back`／`fwd` | 履歴と進む履歴の件数 |
 | `page` | 表示中のページの費用（文書＋layout） |
-| `peak` | 直前の取得でparserが一度に持った最大（`MAX_BROWSER_OWNED_BYTES`が書かれている相手） |
+| `peak` | 直前の取得でparserが一度に持った最大。固定予算との合否判定ではなく、同じ操作の前後差を見る診断値 |
 
 **値ではなく差を見るためのものです。**「同じ操作を20回して、この行が元へ戻るか」
 が知りたいことで、`sockets`が戻らないのはとくに厄介です——socket setが尽きるのは
@@ -304,6 +304,7 @@ Wi-Fiが落ちているときに表示側だけを確認できる唯一の文書
 | `/long` | scroll用の長い文書 |
 | `/wide` | URL上限と同じ長さの1行 |
 | `/japanese` | 半角と全角の混在、禁則、行をまたぐリンク、結合文字、未収録文字 |
+| `/table` | caption、header、長短3列、cell内link、rowspan／colspan、空cell、不正span、多列折返し |
 | `/fragments` | fragment、anchor、履歴位置、別文書往復の実機確認。各target間は複数画面分 |
 | `/empty` | 空文書 |
 
@@ -407,6 +408,7 @@ BOMだけで、先頭1 KiBを溜める必要もありません。
 | `ul`、`ol`、`li` | markerと字下げ。深さは`MAX_NESTING_DEPTH`で頭打ち |
 | `hr` | 水平線 |
 | `img alt` | `[alt text]`、`alt`が無ければ`[image]` |
+| `table`、`caption`、`thead`、`tbody`、`tfoot`、`tr`、`th`、`td` | 本文幅内の表。cell内折返し、見出し背景、罫線、正整数の`rowspan`／`colspan`に対応 |
 | `strong`、`b` | 二度打ちで太く見せる |
 | `em`、`i` | 濃い赤 |
 | `code`、`kbd`、`samp`、`tt`、`var` | 緑 |
@@ -416,6 +418,14 @@ BOMだけで、先頭1 KiBを溜める必要もありません。
 未知の要素は**inline扱い**です。blockとして扱う要素名は明示列挙にしてあり
 ます。逆にすると`<span>`や`<font>`が文の途中で段落を割ってしまうためで、
 取り違えたときの被害が小さい側を既定にしています。
+
+tableは横scrollせず、列の希望幅を本文幅へ縮めてcell内で強制折返しします。
+`rowspan`／`colspan`は1〜32で、欠落・空・非数値・`0`は1、上限超過は32です。
+`border`は未指定または`0`なら罫線なし、値なし・空または正整数なら罫線ありです。
+太さは1〜4 pixelへ丸めます。非数値は罫線なしです。CSS由来の罫線、
+`col`／`colgroup`、nested table、`rowspan=0`の特殊意味には対応しません。
+このtable描画経路はhost testとrelease buildに加え、2026-09-11に
+`http://built-in/table`とfixture serverを使ってTab5実機で確認済みです。
 
 文字参照は数値参照（10進・16進）と`amp`・`lt`・`gt`・`quot`・`apos`・`nbsp`
 の6つだけです。**終端の`;`は必須**で、`&amp`（`;`なし）は`&amp`とそのまま
@@ -540,12 +550,12 @@ EUC-JPは同じ表を別の算術で引くだけですが、今は対応して�
 | 履歴 | 8ページ |
 | decode済みHTML入力 | 2 MiB |
 | 保持する表示テキスト | 1 MiB |
-| 文書item（block＋run） | 8,192件 |
-| link | 1,024件 |
+| 文書item（block＋run＋table構造） | 16,384件 |
+| 有効なlink | 最大4,096件、解決済みURL合計2 MiB。以後は本文を残して非link化 |
 | 折返し後の行 | 32,768行 |
 | list／inlineの深さ | 32 |
 | 1要素で処理する属性 | 16個 |
-| ブラウザ所有の動的メモリ | peak 4 MiB |
+| tableの列数、`rowspan`／`colspan` | 32 |
 
 上限が複数あるとき「どれに先に当たるか」は入力の中身が決まります。同じ
 2 MiBでも、markupばかりなら入力上限に、テキストばかりなら1 MiBのテキスト
@@ -634,7 +644,7 @@ manifestはこの名前で期待値を書きます。
 | `chunk` | chunked転送の書式が壊れている |
 | `body-limit` | 本文が2 MiBを超えた |
 | `text-limit` | 表示テキストが1 MiBを超えた |
-| `item-limit`／`link-limit`／`line-limit` | 文書・リンク・行の上限 |
+| `item-limit`／`line-limit` | 文書・行の上限 |
 | `encoding` | `identity`以外の`Content-Encoding` |
 | `dns` | 名前を引けなかった |
 | `no-network` | station接続かDHCPが済んでいない |

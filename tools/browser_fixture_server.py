@@ -50,12 +50,17 @@ MAX_REDIRECTS = 5
 MAX_HISTORY = 8
 MAX_DECODED_HTML_BYTES = 2 * 1024 * 1024
 MAX_TEXT_BYTES = 1024 * 1024
-MAX_ITEMS = 8192
-MAX_LINKS = 1024
+MAX_ITEMS = 16384
+MAX_LINKS = 4096
+MAX_LINK_URL_BYTES = 2 * 1024 * 1024
+MAX_ANCHORS = 1024
+MAX_ANCHOR_BYTES = 256 * 1024
 MAX_NESTING_DEPTH = 32
 MAX_ATTRIBUTES_PER_ELEMENT = 16
 MAX_LAYOUT_LINES = 32768
-MAX_BROWSER_OWNED_BYTES = 4 * 1024 * 1024
+MAX_TABLE_COLUMNS = 32
+MAX_TABLE_SPAN = 32
+MAX_TABLE_BORDER = 4
 
 LIMITS = {
     "MAX_HEADER_BYTES": MAX_HEADER_BYTES,
@@ -66,10 +71,15 @@ LIMITS = {
     "MAX_TEXT_BYTES": MAX_TEXT_BYTES,
     "MAX_ITEMS": MAX_ITEMS,
     "MAX_LINKS": MAX_LINKS,
+    "MAX_LINK_URL_BYTES": MAX_LINK_URL_BYTES,
+    "MAX_ANCHORS": MAX_ANCHORS,
+    "MAX_ANCHOR_BYTES": MAX_ANCHOR_BYTES,
     "MAX_NESTING_DEPTH": MAX_NESTING_DEPTH,
     "MAX_ATTRIBUTES_PER_ELEMENT": MAX_ATTRIBUTES_PER_ELEMENT,
     "MAX_LAYOUT_LINES": MAX_LAYOUT_LINES,
-    "MAX_BROWSER_OWNED_BYTES": MAX_BROWSER_OWNED_BYTES,
+    "MAX_TABLE_COLUMNS": MAX_TABLE_COLUMNS,
+    "MAX_TABLE_SPAN": MAX_TABLE_SPAN,
+    "MAX_TABLE_BORDER": MAX_TABLE_BORDER,
 }
 
 LIMITS_RS = Path(__file__).resolve().parent.parent / "browser" / "src" / "limits.rs"
@@ -207,7 +217,7 @@ is itself part of what is being tested.</p>
   <li><a href="limit/input-nolength">limit/input-nolength</a> - the same without a length</li>
   <li><a href="limit/text">limit/text</a> - past MAX_TEXT_BYTES</li>
   <li><a href="limit/items">limit/items</a> - past MAX_ITEMS</li>
-  <li><a href="limit/links">limit/links</a> - past MAX_LINKS</li>
+  <li><a href="limit/links">limit/links</a> - excess links become plain text</li>
   <li><a href="limit/url">limit/url</a> - a link past MAX_URL_BYTES</li>
   <li><a href="limit/longline">limit/longline</a> - one unbreakable line</li>
 </ul>
@@ -1199,7 +1209,7 @@ def limit_items(self: "FixtureHandler", request: Request) -> None:
     self.send_all(html_response(repeated_items(MAX_ITEMS + 64)))
 
 
-@route("/limit/links", "error:link-limit")
+@route("/limit/links", "excess links ignored")
 def limit_links(self: "FixtureHandler", request: Request) -> None:
     self.send_all(html_response(repeated_links(MAX_LINKS + 64)))
 

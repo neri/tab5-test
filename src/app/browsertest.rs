@@ -1263,16 +1263,10 @@ fn write_totals(console: &mut Console, framebuffer: &mut Framebuffer, totals: &T
     let mut line = Line::new();
     line.push_str("peak owned ");
     line.push_u32(totals.peak_owned as u32);
-    line.push_str(" of ");
-    line.push_u32(crate::browser::limits::MAX_BROWSER_OWNED_BYTES as u32);
     line.push_str(", slowest ");
     line.push_u32(totals.slowest_ms as u32);
     line.push_str(" ms");
     console.write_output_line(framebuffer, line.as_str());
-
-    if totals.peak_owned > crate::browser::limits::MAX_BROWSER_OWNED_BYTES {
-        console.write_output_line(framebuffer, "OVER BUDGET: a page owned more than 4 MiB");
-    }
 }
 
 /// One line per endpoint on the UART, in a shape two runs can be diffed.

@@ -1034,10 +1034,8 @@ struct Viewer {
     slowest_repaint_ms: u64,
     /// The most the last fetch's parser held at once.
     ///
-    /// Kept only so `i` can report it. It is the number the memory budget
-    /// is written against (`MAX_BROWSER_OWNED_BYTES`), and it is not
-    /// recoverable after the fetch is closed, so it is caught on the way
-    /// past rather than asked for later.
+    /// Kept only so `i` can report it. It is not recoverable after the fetch
+    /// is closed, so it is caught on the way past rather than asked for later.
     last_peak: usize,
     /// What the Wi-Fi indicator is currently drawn as.
     ///
@@ -1760,16 +1758,51 @@ impl Viewer {
         let range = self.page.layout.visible(top, VIEWPORT_HEIGHT as u32);
         // One line of overlap, so the reader keeps their place across a
         // page turn.
-        (range.end.saturating_sub(range.start).saturating_sub(1)).max(1) as i32
+        let lines = self.page.layout.lines();
+        let mut count = 0usize;
+        let mut previous = None;
+        for line in &lines[range] {
+            if previous != Some(line.y) {
+                count += 1;
+                previous = Some(line.y);
+            }
+        }
+        count.saturating_sub(1).max(1) as i32
     }
 
     fn scroll_by(&mut self, lines: i32) {
-        let target = self.page.first_line as i64 + lines as i64;
-        self.scroll_to(target.clamp(0, self.last_top_line() as i64) as usize);
+        let all = self.page.layout.lines();
+        if all.is_empty() {
+            return;
+        }
+        let mut target = self.page.first_line.min(all.len() - 1);
+        if lines > 0 {
+            for _ in 0..lines {
+                let y = all[target].y;
+                target = all.partition_point(|line| line.y <= y).min(all.len() - 1);
+            }
+        } else {
+            for _ in 0..lines.unsigned_abs() {
+                let y = all[target].y;
+                let first = all.partition_point(|line| line.y < y);
+                if first == 0 {
+                    target = 0;
+                    break;
+                }
+                let previous_y = all[first - 1].y;
+                target = all.partition_point(|line| line.y < previous_y);
+            }
+        }
+        self.scroll_to(target);
     }
 
     fn scroll_to(&mut self, line: usize) {
+        let lines = self.page.layout.lines();
         let line = line.min(self.last_top_line());
+        let line = lines
+            .get(line)
+            .map(|target| lines.partition_point(|candidate| candidate.y < target.y))
+            .unwrap_or(0);
         if line != self.page.first_line {
             self.page.first_line = line;
             self.dirty.viewport = true;
@@ -2174,6 +2207,60 @@ impl Viewer {
         let Some(top) = self.top_offset() else {
             return height;
         };
+        // Table geometry is painted before its text.  Cell outlines rather
+        // than row-wide rules naturally omit boundaries through rowspan and
+        // colspan cells.
+        for cell in self.page.layout.cells() {
+            let cell_bottom = cell.y.saturating_add(cell.height);
+            let viewport_bottom = top.saturating_add(VIEWPORT_HEIGHT as u32);
+            if cell_bottom <= top || cell.y >= viewport_bottom {
+                continue;
+            }
+            let visible_top = cell.y.max(top);
+            let visible_bottom = cell_bottom.min(viewport_bottom);
+            let screen_y = VIEWPORT_TOP + (visible_top - top) as usize;
+            let visible_height = (visible_bottom - visible_top) as usize;
+            let screen_x = MARGIN + cell.x as usize;
+            if cell.header && visible_height != 0 {
+                framebuffer.fill_rect(
+                    screen_x,
+                    screen_y,
+                    cell.width as usize,
+                    visible_height,
+                    CHROME_BACKGROUND,
+                );
+            }
+            let border = cell.border as usize;
+            if border == 0 {
+                continue;
+            }
+            if cell.y >= top {
+                framebuffer.fill_rect(
+                    screen_x,
+                    VIEWPORT_TOP + (cell.y - top) as usize,
+                    cell.width as usize,
+                    border,
+                    RULE_COLOR,
+                );
+            }
+            if cell_bottom <= viewport_bottom {
+                framebuffer.fill_rect(
+                    screen_x,
+                    VIEWPORT_TOP + (cell_bottom - top) as usize - border,
+                    cell.width as usize,
+                    border,
+                    RULE_COLOR,
+                );
+            }
+            framebuffer.fill_rect(screen_x, screen_y, border, visible_height, RULE_COLOR);
+            framebuffer.fill_rect(
+                screen_x + cell.width as usize - border,
+                screen_y,
+                border,
+                visible_height,
+                RULE_COLOR,
+            );
+        }
         let focused = self.focused_link();
         for (drawn, line) in self.page.layout.lines()[self.page.first_line..]
             .iter()
@@ -2805,11 +2892,12 @@ mod builtin {
              <li><a href=\"/long\">A long document, for scrolling</a></li>\
              <li><a href=\"/wide\">One line as long as a URL may be</a></li>\
              <li><a href=\"/japanese\">Japanese text, mixed widths</a></li>\
+             <li><a href=\"/table\">Table layout acceptance page</a></li>\
              <li><a href=\"/fragments\">Fragment navigation acceptance</a></li>\
              <li><a href=\"/empty\">A document with nothing in it</a></li>\
              </ul>\
              <hr>\
-             <p>These five are in flash and need no network. Fetching anything \
+             <p>These pages are in flash and need no network. Fetching anything \
              else needs a connection: tap the Wi-Fi bars at the right of the \
              toolbar to choose a network. <code>browser &lt;url&gt;</code> opens \
              one directly, and an address typed without a scheme -- here or in \
@@ -2933,6 +3021,27 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
         ),
     };
 
+    /// Flash-resident acceptance page: it exercises tables with Wi-Fi off.
+    pub const TABLE: &Page = &Page {
+        url: "http://built-in/table",
+        body: Body::Fixed(
+            "<title>table acceptance</title><h1>Table acceptance</h1>\
+             <p>Caption, headers, mixed 日本語 and ASCII, spans, empty cells, and a link.</p>\
+             <table border='1'><caption>Browser table fixture (border=1)</caption>\
+             <thead><tr><th>Item</th><th>ASCII / 日本語</th><th>Long value</th></tr></thead>\
+             <tbody><tr><td>one</td><td>short 日本語</td><td>This deliberately long cell must wrap inside its column.</td></tr>\
+             <tr><th rowspan='2'>rowspan header</th><td colspan='2'>A colspan cell with a <a href='/'>link back home</a>.</td></tr>\
+             <tr><td>left after rowspan</td><td>right after rowspan</td></tr>\
+             <tr><td></td><td colspan='2' rowspan='2'>Both spans: this text wraps while occupying two columns and two rows.</td></tr>\
+             <tr><td>empty-neighbour</td></tr>\
+             <tr><td rowspan='0'>zero means one</td><td colspan='oops'>invalid means one</td><td>omitted end tags\
+             </tbody></table>\
+             <h2>No border, many narrow columns</h2><table border='0'><tr><th>A</th><th>B</th><th>C</th><th>D</th><th>E</th><th>F</th><th>G</th><th>H</th></tr>\
+             <tr><td>alpha wraps</td><td>bravo wraps</td><td>日本語</td><td>delta</td><td>echo echo</td><td>foxtrot</td><td>golf</td><td>hotel</td></tr></table>\
+             <p><a href='/'>Home</a></p>",
+        ),
+    };
+
     pub const FRAGMENTS: &Page = &Page {
         url: "http://built-in/fragments",
         body: Body::FragmentDocument,
@@ -2946,6 +3055,7 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
             "/long" => Some(LONG),
             "/wide" => Some(WIDE),
             "/japanese" => Some(JAPANESE),
+            "/table" => Some(TABLE),
             "/empty" => Some(EMPTY),
             "/fragments" => Some(FRAGMENTS),
             _ => None,

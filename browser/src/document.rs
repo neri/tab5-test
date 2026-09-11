@@ -39,8 +39,8 @@ use crate::encoding::Decoder;
 use crate::error::Error;
 use crate::html::{self, Tag, Tokenizer};
 use crate::limits::{
-    MAX_ANCHOR_BYTES, MAX_ANCHOR_NAME_BYTES, MAX_ANCHORS, MAX_ITEMS, MAX_LINKS, MAX_NESTING_DEPTH,
-    MAX_TEXT_BYTES,
+    MAX_ANCHOR_BYTES, MAX_ANCHOR_NAME_BYTES, MAX_ANCHORS, MAX_ITEMS, MAX_LINK_URL_BYTES, MAX_LINKS,
+    MAX_NESTING_DEPTH, MAX_TEXT_BYTES,
 };
 use crate::memory;
 use crate::url::Url;
@@ -111,6 +111,41 @@ pub struct Block {
     pub run_count: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowGroup {
+    Head,
+    Body,
+    Foot,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Table {
+    pub first_cell: u32,
+    pub cell_count: u32,
+    pub first_row: u32,
+    pub row_count: u16,
+    pub column_count: u8,
+    pub border: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableRow {
+    pub table: u16,
+    pub number: u16,
+    pub group: RowGroup,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableCell {
+    pub table: u16,
+    pub block: u32,
+    pub row: u16,
+    pub column: u8,
+    pub rowspan: u8,
+    pub colspan: u8,
+    pub header: bool,
+}
+
 /// A link target, already resolved against the page's own URL.
 ///
 /// Resolved at parse time rather than at click time so that a page which
@@ -133,7 +168,7 @@ pub struct Stats {
     /// HTML bytes fed in.
     pub input_bytes: usize,
     pub text_bytes: usize,
-    /// Blocks plus runs, which together are what [`MAX_ITEMS`] bounds.
+    /// Blocks, runs, and table structures bounded by [`MAX_ITEMS`].
     pub items: usize,
     pub links: usize,
     /// Sum of the capacities the document holds.
@@ -150,6 +185,9 @@ pub struct Document {
     blocks: Vec<Block>,
     links: Vec<Link>,
     anchors: Vec<Anchor>,
+    tables: Vec<Table>,
+    table_rows: Vec<TableRow>,
+    table_cells: Vec<TableCell>,
     stats: Stats,
 }
 
@@ -182,6 +220,15 @@ impl Document {
     }
     pub fn anchors(&self) -> &[Anchor] {
         &self.anchors
+    }
+    pub fn tables(&self) -> &[Table] {
+        &self.tables
+    }
+    pub fn table_rows(&self) -> &[TableRow] {
+        &self.table_rows
+    }
+    pub fn table_cells(&self) -> &[TableCell] {
+        &self.table_cells
     }
 
     pub fn stats(&self) -> Stats {
@@ -223,6 +270,9 @@ impl Document {
             + links
             + self.anchors.capacity() * core::mem::size_of::<Anchor>()
             + anchors
+            + self.tables.capacity() * core::mem::size_of::<Table>()
+            + self.table_rows.capacity() * core::mem::size_of::<TableRow>()
+            + self.table_cells.capacity() * core::mem::size_of::<TableCell>()
     }
 }
 
@@ -308,7 +358,7 @@ impl Parser {
         self.tokenizer.finish(&mut self.builder)?;
         let longest = self.tokenizer.longest_token();
         let input = self.tokenizer.consumed();
-        Ok(self.builder.finish(input, longest))
+        self.builder.finish(input, longest)
     }
 
     /// What the parse owns right now: the decoder's held bytes, the
@@ -369,6 +419,29 @@ struct Builder {
     /// Nothing has been written to the current block yet, so leading
     /// whitespace is dropped.
     at_block_start: bool,
+    link_url_bytes: usize,
+    table: Option<TableBuild>,
+}
+
+struct TableBuild {
+    index: u16,
+    first_cell: u32,
+    first_row: u32,
+    row: Option<u16>,
+    group: RowGroup,
+    occupied: [u8; crate::limits::MAX_TABLE_COLUMNS],
+    open_cell: Option<OpenCell>,
+    columns: u8,
+    nested: u8,
+}
+
+#[derive(Clone, Copy)]
+struct OpenCell {
+    row: u16,
+    column: u8,
+    rowspan: u8,
+    colspan: u8,
+    header: bool,
 }
 
 impl Builder {
@@ -382,6 +455,9 @@ impl Builder {
                 blocks: Vec::new(),
                 links: Vec::new(),
                 anchors: Vec::new(),
+                tables: Vec::new(),
+                table_rows: Vec::new(),
+                table_cells: Vec::new(),
                 stats: Stats::default(),
             },
             open_kind: None,
@@ -396,17 +472,26 @@ impl Builder {
             in_title: false,
             pending_space: false,
             at_block_start: true,
+            link_url_bytes: 0,
+            table: None,
         })
     }
 
     fn items(&self) -> usize {
-        self.document.blocks.len() + self.document.runs.len()
+        self.document.blocks.len()
+            + self.document.runs.len()
+            + self.document.tables.len()
+            + self.document.table_rows.len()
+            + self.document.table_cells.len()
     }
 
-    fn finish(mut self, input_bytes: usize, longest_token: usize) -> Document {
+    fn finish(mut self, input_bytes: usize, longest_token: usize) -> Result<Document, Error> {
         // The last block is committed the same way every other one is; a
         // page that ends mid-paragraph is not a special case.
-        let _ = self.close_block();
+        if self.table.is_some() {
+            self.end_table()?;
+        }
+        self.close_block()?;
         self.document.stats = Stats {
             input_bytes,
             text_bytes: self.document.text.len(),
@@ -415,7 +500,7 @@ impl Builder {
             owned_bytes: self.document.owned_bytes(),
             longest_token,
         };
-        self.document
+        Ok(self.document)
     }
 
     // --- text ---------------------------------------------------------
@@ -643,6 +728,58 @@ impl Builder {
     // --- elements -----------------------------------------------------
 
     fn start_element(&mut self, tag: Tag<'_>) -> Result<(), Error> {
+        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
+            if tag.name == "table" {
+                if let Some(table) = self.table.as_mut() {
+                    table.nested = table.nested.saturating_add(1);
+                }
+                return self.push_break();
+            }
+            if matches!(
+                tag.name,
+                "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
+            ) {
+                return self.push_break();
+            }
+        }
+        match tag.name {
+            "table" => {
+                if let Some(table) = self.table.as_mut() {
+                    table.nested = table.nested.saturating_add(1);
+                    return self.push_break();
+                }
+                self.begin_table(tag.border)?;
+                return Ok(());
+            }
+            "thead" | "tbody" | "tfoot" if self.table.is_some() => {
+                self.end_table_cell()?;
+                if let Some(table) = self.table.as_mut() {
+                    table.group = match tag.name {
+                        "thead" => RowGroup::Head,
+                        "tfoot" => RowGroup::Foot,
+                        _ => RowGroup::Body,
+                    };
+                }
+                return Ok(());
+            }
+            "tr" if self.table.is_some() => {
+                self.begin_table_row()?;
+                return Ok(());
+            }
+            "td" | "th" if self.table.is_some() => {
+                self.begin_table_cell(tag.name == "th", tag.rowspan, tag.colspan)?;
+                return Ok(());
+            }
+            // Paragraph-like markup inside a cell remains cell content. A
+            // hard break retains the useful boundary without creating a
+            // second block that would no longer belong to the cell.
+            name if self.table.as_ref().is_some_and(|t| t.open_cell.is_some())
+                && is_block(name) =>
+            {
+                return self.push_break();
+            }
+            _ => {}
+        }
         let starts_block = tag.name == "hr"
             || tag.name == "pre"
             || tag.name == "li"
@@ -742,6 +879,46 @@ impl Builder {
     }
 
     fn end_element(&mut self, name: &str) -> Result<(), Error> {
+        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
+            if name == "table" {
+                if let Some(table) = self.table.as_mut() {
+                    table.nested -= 1;
+                }
+                return self.push_break();
+            }
+            if matches!(
+                name,
+                "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
+            ) {
+                return self.push_break();
+            }
+        }
+        match name {
+            "table" if self.table.is_some() => {
+                if self.table.as_ref().is_some_and(|table| table.nested != 0) {
+                    if let Some(table) = self.table.as_mut() {
+                        table.nested -= 1;
+                    }
+                    return self.push_break();
+                }
+                return self.end_table();
+            }
+            "td" | "th" if self.table.is_some() => return self.end_table_cell(),
+            "tr" if self.table.is_some() => {
+                self.end_table_cell()?;
+                return Ok(());
+            }
+            "thead" | "tbody" | "tfoot" if self.table.is_some() => {
+                self.end_table_cell()?;
+                return Ok(());
+            }
+            name if self.table.as_ref().is_some_and(|t| t.open_cell.is_some())
+                && is_block(name) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
         match name {
             "title" => {
                 self.in_title = false;
@@ -771,6 +948,160 @@ impl Builder {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn begin_table(&mut self, border: Option<&str>) -> Result<(), Error> {
+        self.close_block()?;
+        self.check_items(1)?;
+        let index = self.document.tables.len() as u16;
+        memory::push(
+            &mut self.document.tables,
+            Table {
+                first_cell: self.document.table_cells.len() as u32,
+                cell_count: 0,
+                first_row: self.document.table_rows.len() as u32,
+                row_count: 0,
+                column_count: 0,
+                border: parse_border(border),
+            },
+        )?;
+        self.table = Some(TableBuild {
+            index,
+            first_cell: self.document.table_cells.len() as u32,
+            first_row: self.document.table_rows.len() as u32,
+            row: None,
+            group: RowGroup::Body,
+            occupied: [0; crate::limits::MAX_TABLE_COLUMNS],
+            open_cell: None,
+            columns: 0,
+            nested: 0,
+        });
+        Ok(())
+    }
+
+    fn begin_table_row(&mut self) -> Result<(), Error> {
+        self.end_table_cell()?;
+        let (index, number, group) = {
+            let Some(table) = self.table.as_mut() else {
+                return Ok(());
+            };
+            for occupied in &mut table.occupied {
+                *occupied = occupied.saturating_sub(1);
+            }
+            let number = table.row.map_or(0, |row| row.saturating_add(1));
+            table.row = Some(number);
+            (table.index, number, table.group)
+        };
+        self.check_items(1)?;
+        memory::push(
+            &mut self.document.table_rows,
+            TableRow {
+                table: index,
+                number,
+                group,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn begin_table_cell(
+        &mut self,
+        header: bool,
+        rowspan: Option<&str>,
+        colspan: Option<&str>,
+    ) -> Result<(), Error> {
+        self.end_table_cell()?;
+        if self.table.as_ref().is_some_and(|table| table.row.is_none()) {
+            self.begin_table_row()?;
+        }
+        let rowspan = parse_span(rowspan);
+        let mut colspan = parse_span(colspan);
+        let table = self.table.as_mut().unwrap();
+        let row = table.row.unwrap();
+        let mut column = 0usize;
+        loop {
+            while column < table.occupied.len() && table.occupied[column] != 0 {
+                column += 1;
+            }
+            if column >= table.occupied.len() {
+                return Err(Error::TooManyItems);
+            }
+            colspan = colspan.min((table.occupied.len() - column) as u8);
+            let end = column + colspan as usize;
+            if table.occupied[column..end].iter().all(|&value| value == 0) {
+                break;
+            }
+            column += 1;
+        }
+        for slot in &mut table.occupied[column..column + colspan as usize] {
+            *slot = rowspan;
+        }
+        table.columns = table.columns.max((column + colspan as usize) as u8);
+        table.open_cell = Some(OpenCell {
+            row,
+            column: column as u8,
+            rowspan,
+            colspan,
+            header,
+        });
+        self.open_kind = Some(BlockKind::Paragraph);
+        self.open_first_run = self.document.runs.len() as u32;
+        self.at_block_start = true;
+        self.pending_space = false;
+        Ok(())
+    }
+
+    fn end_table_cell(&mut self) -> Result<(), Error> {
+        let Some(cell) = self.table.as_mut().and_then(|table| table.open_cell.take()) else {
+            return Ok(());
+        };
+        let block = self.document.blocks.len() as u32;
+        self.close_run()?;
+        let first_run = self.open_first_run;
+        let run_count = self.document.runs.len() as u32 - first_run;
+        self.open_kind = None;
+        self.check_items(2)?;
+        memory::push(
+            &mut self.document.blocks,
+            Block {
+                kind: BlockKind::Paragraph,
+                first_run,
+                run_count,
+            },
+        )?;
+        let table_index = self.table.as_ref().unwrap().index;
+        memory::push(
+            &mut self.document.table_cells,
+            TableCell {
+                table: table_index,
+                block,
+                row: cell.row,
+                column: cell.column,
+                rowspan: cell.rowspan,
+                colspan: cell.colspan,
+                header: cell.header,
+            },
+        )?;
+        self.at_block_start = true;
+        self.pending_space = false;
+        Ok(())
+    }
+
+    fn end_table(&mut self) -> Result<(), Error> {
+        self.end_table_cell()?;
+        let Some(table) = self.table.take() else {
+            return Ok(());
+        };
+        let row_count = table.row.map_or(0, |row| row.saturating_add(1));
+        self.document.tables[table.index as usize] = Table {
+            first_cell: table.first_cell,
+            cell_count: self.document.table_cells.len() as u32 - table.first_cell,
+            first_row: table.first_row,
+            row_count,
+            column_count: table.columns,
+            border: self.document.tables[table.index as usize].border,
+        };
         Ok(())
     }
 
@@ -825,11 +1156,18 @@ impl Builder {
             // which is better than dropping the words with the link.
             return self.push_inline("a", 0, false);
         };
-        if self.document.links.len() >= MAX_LINKS {
-            return Err(Error::TooManyLinks);
+        let owned = url.owned_bytes();
+        if self.document.links.len() >= MAX_LINKS
+            || self.link_url_bytes.saturating_add(owned) > MAX_LINK_URL_BYTES
+        {
+            // Keep the anchor's text and inline nesting, but stop making
+            // further targets interactive. A large link farm should not
+            // turn an otherwise readable page into an error page.
+            return self.push_inline("a", 0, false);
         }
         let index = self.document.links.len() as u16;
         memory::push(&mut self.document.links, Link { url })?;
+        self.link_url_bytes += owned;
         self.push_inline("a", 0, true)?;
         let style = self.style;
         self.set_style(style, Some(index))
@@ -931,6 +1269,26 @@ fn inline_style(name: &str) -> Option<u8> {
         "code" | "kbd" | "samp" | "tt" | "var" => Some(STYLE_CODE),
         _ => None,
     }
+}
+
+fn parse_span(value: Option<&str>) -> u8 {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value != 0)
+        .unwrap_or(1)
+        .min(crate::limits::MAX_TABLE_SPAN) as u8
+}
+
+fn parse_border(value: Option<&str>) -> u8 {
+    let Some(value) = value else { return 0 };
+    if value.is_empty() {
+        return 1;
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .unwrap_or(0)
+        .min(crate::limits::MAX_TABLE_BORDER) as u8
 }
 
 /// Elements that end the current block and start a new one.
@@ -1398,12 +1756,14 @@ mod tests {
     }
 
     #[test]
-    fn too_many_links_is_an_error() {
+    fn links_past_the_bound_keep_their_text_and_stop_being_clickable() {
         let mut markup = String::new();
-        for index in 0..=MAX_LINKS {
+        for index in 0..MAX_LINKS + 10 {
             markup.push_str(&format!("<a href=\"/t?n={index}\">l</a>"));
         }
-        assert_eq!(parse_error(markup.as_bytes()), Error::TooManyLinks);
+        let document = parse(markup.as_bytes());
+        assert_eq!(document.links().len(), MAX_LINKS);
+        assert_eq!(document.text().len(), MAX_LINKS + 10);
     }
 
     #[test]
@@ -1414,6 +1774,27 @@ mod tests {
         }
         let document = parse(markup.as_bytes());
         assert_eq!(document.links().len(), MAX_LINKS);
+    }
+
+    #[test]
+    fn resolved_link_bytes_are_bounded_without_rejecting_the_page() {
+        let base = Url::parse(&format!("http://example.com/{}/page", "x".repeat(1800))).unwrap();
+        let mut parser = Parser::new(base).unwrap();
+        let markup = (0..2000)
+            .map(|index| format!("<a href=\"#n{index}\">l</a>"))
+            .collect::<String>();
+        parser.feed(markup.as_bytes()).unwrap();
+        let document = parser.finish().unwrap();
+        assert!(document.links().len() < 2000);
+        assert_eq!(document.text().len(), 2000);
+        assert!(
+            document
+                .links()
+                .iter()
+                .map(|link| link.url.owned_bytes())
+                .sum::<usize>()
+                <= MAX_LINK_URL_BYTES
+        );
     }
 
     #[test]
@@ -1442,8 +1823,7 @@ mod tests {
     // --- memory -----------------------------------------------------------
 
     #[test]
-    fn a_large_page_stays_inside_the_owned_budget() {
-        use crate::limits::MAX_BROWSER_OWNED_BYTES;
+    fn a_large_page_remains_bounded_by_structural_limits() {
         let mut markup = String::new();
         // A page of real shape: headings, prose and links, up to about a
         // megabyte of markup.
@@ -1462,16 +1842,13 @@ mod tests {
                 // A page this size reaches the link bound long before the
                 // memory bound, which is the point: the limits bite first.
                 Err(error) => {
-                    assert!(matches!(
-                        error,
-                        Error::TooManyLinks | Error::TooManyItems | Error::TextTooLong
-                    ));
+                    assert!(matches!(error, Error::TooManyItems | Error::TextTooLong));
                     return;
                 }
             }
             peak = peak.max(parser.owned_bytes());
-            assert!(peak < MAX_BROWSER_OWNED_BYTES, "{peak}");
         }
+        assert!(peak > 0);
     }
 
     #[test]
@@ -1515,5 +1892,51 @@ mod tests {
         assert_eq!(document.anchors()[0].name, "x");
         assert_eq!(document.anchors()[1].name, "old");
         assert_eq!(document.anchors()[0].block_index, 0);
+    }
+
+    #[test]
+    fn tables_build_a_flat_grid_and_normalize_spans() {
+        let document = parse(b"<table><tr><th rowspan='2'>a</th><td>b</td></tr><tr><td colspan='99'>c</td></tr></table>");
+        assert_eq!(document.tables().len(), 1);
+        assert_eq!(document.tables()[0].row_count, 2);
+        assert_eq!(document.tables()[0].column_count, 32);
+        let cells = document.table_cells();
+        assert_eq!(
+            (
+                cells[0].row,
+                cells[0].column,
+                cells[0].rowspan,
+                cells[0].colspan,
+                cells[0].header
+            ),
+            (0, 0, 2, 1, true)
+        );
+        assert_eq!((cells[1].row, cells[1].column), (0, 1));
+        assert_eq!(
+            (cells[2].row, cells[2].column, cells[2].colspan),
+            (1, 1, 31)
+        );
+    }
+
+    #[test]
+    fn invalid_and_zero_spans_mean_one_and_empty_cells_survive() {
+        let document = parse(b"<table><td rowspan='0'></td><td colspan='x'>x</td></table>");
+        let cells = document.table_cells();
+        assert_eq!(cells.len(), 2);
+        assert_eq!((cells[0].rowspan, cells[0].colspan), (1, 1));
+        assert_eq!(document.blocks()[cells[0].block as usize].run_count, 0);
+    }
+
+    #[test]
+    fn table_border_is_absent_zero_present_and_bounded() {
+        let document = parse(b"<table><td>a</table><table border=0><td>b</table><table border><td>c</table><table border=99><td>d</table>");
+        assert_eq!(
+            document
+                .tables()
+                .iter()
+                .map(|table| table.border)
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 4]
+        );
     }
 }

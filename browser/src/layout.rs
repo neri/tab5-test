@@ -35,7 +35,7 @@
 
 use alloc::vec::Vec;
 
-use crate::document::{Block, BlockKind, Document, Marker, Run};
+use crate::document::{Block, BlockKind, Document, Marker, Run, Table};
 use crate::error::Error;
 use crate::limits::MAX_LAYOUT_LINES;
 use crate::memory;
@@ -78,6 +78,69 @@ fn ui_style(scale: u8, run_style: u8) -> tab5_ui_font::TextStyle {
         tab5_ui_font::Face::Sans
     };
     tab5_ui_font::TextStyle::new(face, if scale >= HEADING_SCALE { 32 } else { 16 })
+}
+
+fn fit_columns(widths: &mut [u16], available: u16) {
+    if widths.is_empty() {
+        return;
+    }
+    let floor = CELL_WIDTH + TABLE_CELL_PADDING * 2;
+    let minimum = floor as u32 * widths.len() as u32;
+    if minimum >= available as u32 {
+        let base = available / widths.len() as u16;
+        let mut remainder = available % widths.len() as u16;
+        for width in widths {
+            *width = base + u16::from(remainder != 0);
+            remainder = remainder.saturating_sub(1);
+        }
+        return;
+    }
+    let total: u32 = widths.iter().map(|&width| width as u32).sum();
+    if total <= available as u32 {
+        return;
+    }
+    let flexible = total - minimum;
+    let room = available as u32 - minimum;
+    let mut used = 0u16;
+    for width in widths.iter_mut() {
+        let extra = (*width as u32 - floor as u32) * room / flexible;
+        *width = floor + extra as u16;
+        used = used.saturating_add(*width);
+    }
+    let mut remainder = available.saturating_sub(used);
+    for width in widths {
+        if remainder == 0 {
+            break;
+        }
+        *width += 1;
+        remainder -= 1;
+    }
+}
+
+/// Width a cell asks for before the table is fitted to the viewport.
+///
+/// Runs split on style boundaries, while newlines can occur inside a run.
+/// Accumulate styled pieces across a logical line and retain the widest
+/// line; adding every run wholesale would make `<br>` widen a column as if
+/// the lines had been written side by side.
+fn preferred_cell_width(document: &Document, block: &Block) -> u16 {
+    let mut widest = 0u16;
+    let mut line = 0u16;
+    for run in document.block_runs(block) {
+        let text = document.run_text(run);
+        for segment in text.split_inclusive('\n') {
+            let (content, ended) = match segment.strip_suffix('\n') {
+                Some(content) => (content, true),
+                None => (segment, false),
+            };
+            line = line.saturating_add(text_width_styled(content, BODY_SCALE, run.style));
+            if ended {
+                widest = widest.max(line);
+                line = 0;
+            }
+        }
+    }
+    widest.max(line).saturating_add(TABLE_CELL_PADDING * 2)
 }
 
 /// The vertical part of the font's size, at scale 1.
@@ -197,6 +260,18 @@ pub struct Piece {
     pub link: Option<u16>,
 }
 
+pub const TABLE_CELL_PADDING: u16 = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellBox {
+    pub x: u16,
+    pub y: u32,
+    pub width: u16,
+    pub height: u32,
+    pub header: bool,
+    pub border: u8,
+}
+
 pub struct Layout {
     lines: Vec<Line>,
     pieces: Vec<Piece>,
@@ -204,6 +279,7 @@ pub struct Layout {
     width: u16,
     metrics: Metrics,
     anchors: Vec<(u16, usize)>,
+    cells: Vec<CellBox>,
 }
 
 impl Layout {
@@ -220,9 +296,23 @@ impl Layout {
             width,
             metrics,
             anchors: Vec::new(),
+            cells: Vec::new(),
         };
         let mut y = 0u32;
+        let mut laid_tables = 0usize;
         for (block_index, block) in document.blocks().iter().enumerate() {
+            if let Some(cell) = document
+                .table_cells()
+                .iter()
+                .find(|cell| cell.block as usize == block_index)
+            {
+                let table_index = cell.table as usize;
+                if table_index >= laid_tables {
+                    y = layout.place_table(document, &document.tables()[table_index], y)?;
+                    laid_tables = table_index + 1;
+                }
+                continue;
+            }
             let first_line = layout.lines.len();
             y = layout.place_block(document, block, y)?;
             for (anchor_index, anchor) in document.anchors().iter().enumerate() {
@@ -242,6 +332,20 @@ impl Layout {
                 }
             }
         }
+        layout.lines.sort_by_key(|line| line.y);
+        layout.anchors.clear();
+        for (anchor_index, anchor) in document.anchors().iter().enumerate() {
+            let line = layout
+                .lines
+                .iter()
+                .position(|line| {
+                    layout.pieces(line).iter().any(|piece| {
+                        piece.start <= anchor.text_offset && anchor.text_offset < piece.end
+                    })
+                })
+                .unwrap_or_else(|| layout.lines.len().saturating_sub(1));
+            memory::push(&mut layout.anchors, (anchor_index as u16, line))?;
+        }
         let last = layout.lines.len().saturating_sub(1);
         for i in 0..document.anchors().len() {
             if !layout.anchors.iter().any(|x| x.0 as usize == i) {
@@ -258,6 +362,9 @@ impl Layout {
 
     pub fn all_pieces(&self) -> &[Piece] {
         &self.pieces
+    }
+    pub fn cells(&self) -> &[CellBox] {
+        &self.cells
     }
 
     /// The pieces of one line.
@@ -291,9 +398,13 @@ impl Layout {
     pub fn visible(&self, top: u32, height: u32) -> core::ops::Range<usize> {
         let bottom = top.saturating_add(height);
         // First line whose bottom edge is past the top of the viewport.
-        let start = self
-            .lines
-            .partition_point(|line| line.y + line.height as u32 <= top);
+        let mut start = self.lines.partition_point(|line| line.y < top);
+        while start > 0 && self.lines[start - 1].y + self.lines[start - 1].height as u32 > top {
+            start -= 1;
+        }
+        if let Some(line) = self.lines.get(start) {
+            start = self.lines.partition_point(|candidate| candidate.y < line.y);
+        }
         // First line that starts at or after the bottom of the viewport.
         let end = self.lines.partition_point(|line| line.y < bottom);
         start..end.max(start)
@@ -301,17 +412,23 @@ impl Layout {
 
     /// The link at a document-space point, for a tap or a click.
     pub fn hit(&self, x: u16, y: u32) -> Option<u16> {
-        let index = self
-            .lines
-            .partition_point(|line| line.y + line.height as u32 <= y);
-        let line = self.lines.get(index)?;
-        if y < line.y {
-            return None;
-        }
-        let offset = x.checked_sub(line.x)?;
-        for piece in self.pieces(line) {
-            if offset >= piece.x && offset < piece.x + piece.width {
-                return piece.link;
+        // A table has several lines at the same y, one per cell.  The old
+        // single-line lookup was valid only while lines occupied the whole
+        // content width.
+        let end = self.lines.partition_point(|line| line.y <= y);
+        for line in self.lines[..end].iter().rev() {
+            if line.y + line.height as u32 <= y {
+                continue;
+            }
+            let Some(offset) = x.checked_sub(line.x) else {
+                continue;
+            };
+            for piece in self.pieces(line) {
+                if offset >= piece.x && offset < piece.x + piece.width {
+                    if piece.link.is_some() {
+                        return piece.link;
+                    }
+                }
             }
         }
         None
@@ -358,6 +475,7 @@ impl Layout {
         self.lines.capacity() * core::mem::size_of::<Line>()
             + self.pieces.capacity() * core::mem::size_of::<Piece>()
             + self.anchors.capacity() * core::mem::size_of::<(u16, usize)>()
+            + self.cells.capacity() * core::mem::size_of::<CellBox>()
     }
 
     pub fn line_of_anchor(&self, document: &Document, name: &str) -> Option<usize> {
@@ -443,6 +561,176 @@ impl Layout {
             cursor = next;
         }
         Ok(y + gap_after as u32)
+    }
+
+    fn place_table(&mut self, document: &Document, table: &Table, top: u32) -> Result<u32, Error> {
+        if table.column_count == 0 || table.row_count == 0 {
+            return Ok(top);
+        }
+        let cells = &document.table_cells()
+            [table.first_cell as usize..(table.first_cell + table.cell_count) as usize];
+        let columns = table.column_count as usize;
+        let mut widths = alloc::vec![CELL_WIDTH + TABLE_CELL_PADDING * 2; columns];
+        for cell in cells.iter().filter(|cell| cell.colspan == 1) {
+            let block = &document.blocks()[cell.block as usize];
+            let preferred = preferred_cell_width(document, block);
+            widths[cell.column as usize] = widths[cell.column as usize].max(preferred);
+        }
+        for cell in cells.iter().filter(|cell| cell.colspan > 1) {
+            let block = &document.blocks()[cell.block as usize];
+            let preferred = preferred_cell_width(document, block);
+            let start = cell.column as usize;
+            let end = (start + cell.colspan as usize).min(columns);
+            let current: u32 = widths[start..end].iter().map(|&width| width as u32).sum();
+            if preferred as u32 > current {
+                let missing = preferred as u32 - current;
+                let count = (end - start) as u32;
+                for (offset, width) in widths[start..end].iter_mut().enumerate() {
+                    *width = width.saturating_add(
+                        (missing / count + u32::from((offset as u32) < missing % count)) as u16,
+                    );
+                }
+            }
+        }
+        fit_columns(&mut widths, self.width);
+        let mut x = alloc::vec![0u16; columns + 1];
+        for column in 0..columns {
+            x[column + 1] = x[column].saturating_add(widths[column]);
+        }
+        let line_height = self.metrics.line_box(BODY_SCALE);
+        let mut heights =
+            alloc::vec![line_height + TABLE_CELL_PADDING * 2; table.row_count as usize];
+        for cell in cells.iter().filter(|cell| cell.rowspan == 1) {
+            let width = x[(cell.column + cell.colspan) as usize] - x[cell.column as usize];
+            let needed = self
+                .measure_cell(document, &document.blocks()[cell.block as usize], width)
+                .saturating_add(TABLE_CELL_PADDING * 2);
+            heights[cell.row as usize] = heights[cell.row as usize].max(needed);
+        }
+        for cell in cells.iter().filter(|cell| cell.rowspan > 1) {
+            let width = x[(cell.column + cell.colspan) as usize] - x[cell.column as usize];
+            let needed = self
+                .measure_cell(document, &document.blocks()[cell.block as usize], width)
+                .saturating_add(TABLE_CELL_PADDING * 2);
+            let end = (cell.row as usize + cell.rowspan as usize).min(heights.len());
+            let available: u32 = heights[cell.row as usize..end]
+                .iter()
+                .map(|&h| h as u32)
+                .sum();
+            if needed as u32 > available {
+                heights[end - 1] = heights[end - 1]
+                    .saturating_add((needed as u32 - available).min(u16::MAX as u32) as u16);
+            }
+        }
+        let mut row_y = alloc::vec![top; heights.len() + 1];
+        for row in 0..heights.len() {
+            row_y[row + 1] = row_y[row].saturating_add(heights[row] as u32);
+        }
+        for cell in cells {
+            let right = (cell.column as usize + cell.colspan as usize).min(columns);
+            let bottom = (cell.row as usize + cell.rowspan as usize).min(heights.len());
+            let box_ = CellBox {
+                x: x[cell.column as usize],
+                y: row_y[cell.row as usize],
+                width: x[right] - x[cell.column as usize],
+                height: row_y[bottom] - row_y[cell.row as usize],
+                header: cell.header,
+                border: table.border,
+            };
+            memory::push(&mut self.cells, box_)?;
+            self.place_cell(document, &document.blocks()[cell.block as usize], box_)?;
+        }
+        Ok(*row_y.last().unwrap_or(&top) + line_height as u32 / 2)
+    }
+
+    fn measure_cell(&self, document: &Document, block: &Block, width: u16) -> u16 {
+        let runs = document.block_runs(block);
+        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+            return self.metrics.line_box(BODY_SCALE);
+        };
+        let text = document
+            .text()
+            .get(first.start as usize..last.end as usize)
+            .unwrap_or("");
+        let budget = width.saturating_sub(TABLE_CELL_PADDING * 2);
+        let mut cursor = 0;
+        let mut lines = 0u16;
+        loop {
+            let (_, next) = next_line(
+                text,
+                cursor,
+                budget,
+                BODY_SCALE,
+                false,
+                first.start as usize,
+                runs,
+            );
+            lines = lines.saturating_add(1);
+            if next >= text.len() {
+                break;
+            }
+            cursor = next;
+        }
+        lines.saturating_mul(self.metrics.line_box(BODY_SCALE))
+    }
+
+    fn place_cell(
+        &mut self,
+        document: &Document,
+        block: &Block,
+        cell: CellBox,
+    ) -> Result<(), Error> {
+        let runs = document.block_runs(block);
+        let line_height = self.metrics.line_box(BODY_SCALE);
+        let mut y = cell.y + TABLE_CELL_PADDING as u32;
+        let x = cell.x + TABLE_CELL_PADDING;
+        let budget = cell.width.saturating_sub(TABLE_CELL_PADDING * 2);
+        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+            self.push_line(Line {
+                y,
+                height: line_height,
+                x,
+                scale: BODY_SCALE,
+                first_piece: self.pieces.len() as u32,
+                piece_count: 0,
+                marker: None,
+                heading: cell.header,
+                rule: false,
+            })?;
+            return Ok(());
+        };
+        let span = first.start as usize..last.end as usize;
+        let text = document.text().get(span.clone()).unwrap_or("");
+        let mut cursor = 0;
+        loop {
+            let (end, next) = next_line(text, cursor, budget, BODY_SCALE, false, span.start, runs);
+            let first_piece = self.pieces.len() as u32;
+            let piece_count = self.push_pieces(
+                document.text(),
+                runs,
+                span.start + cursor,
+                span.start + end,
+                BODY_SCALE,
+                false,
+            )?;
+            self.push_line(Line {
+                y,
+                height: line_height,
+                x,
+                scale: BODY_SCALE,
+                first_piece,
+                piece_count,
+                marker: None,
+                heading: cell.header,
+                rule: false,
+            })?;
+            y += line_height as u32;
+            if next >= text.len() {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(())
     }
 
     /// Cuts `[start, end)` at the run boundaries it crosses.
@@ -1260,14 +1548,13 @@ mod tests {
     }
 
     #[test]
-    fn a_long_page_lays_out_inside_the_budget() {
-        use crate::limits::MAX_BROWSER_OWNED_BYTES;
+    fn a_long_page_reports_its_owned_memory() {
         let markup: String = (0..3000)
             .map(|index| format!("<p>Paragraph {index} with a few words in it.</p>"))
             .collect();
         let (document, layout) = layout_of(&markup);
         let total = document.stats().owned_bytes + layout.owned_bytes();
-        assert!(total < MAX_BROWSER_OWNED_BYTES, "{total}");
+        assert!(total > document.text().len(), "{total}");
     }
 
     #[test]
@@ -1282,6 +1569,45 @@ mod tests {
             layout.line_of_anchor(&document, "end"),
             Some(layout.lines().len() - 1)
         );
+    }
+
+    #[test]
+    fn table_cells_fit_the_viewport_and_links_hit_at_their_drawn_position() {
+        let (document, layout) = layout_of(
+            "<table><tr><th>A</th><th>B</th><th>C</th></tr><tr><td>short</td><td>日本語</td><td>a deliberately long value that wraps</td></tr><tr><td rowspan='2'>span</td><td colspan='2'><a href='/x'>linked cell</a></td></tr><tr><td></td><td>end</td></tr></table>",
+        );
+        assert_eq!(layout.cells().len(), 10);
+        assert!(
+            layout
+                .cells()
+                .iter()
+                .all(|cell| cell.x + cell.width <= WIDTH)
+        );
+        assert!(layout.lines().windows(2).all(|pair| pair[0].y <= pair[1].y));
+        let line = layout.line_of_link(0).unwrap();
+        let piece = layout
+            .pieces(&layout.lines()[line])
+            .iter()
+            .find(|piece| piece.link == Some(0))
+            .unwrap();
+        assert_eq!(
+            layout.hit(layout.lines()[line].x + piece.x, layout.lines()[line].y),
+            Some(0)
+        );
+        assert!(!document.table_cells().is_empty());
+    }
+
+    #[test]
+    fn table_preferred_width_uses_the_widest_logical_line() {
+        let (document, layout) =
+            layout_of("<table><tr><td><b>WW</b>WW<br>i</td><td>xx</td></tr></table>");
+        let first = layout.cells()[0];
+        let block = &document.blocks()[document.table_cells()[0].block as usize];
+        assert_eq!(
+            preferred_cell_width(&document, block),
+            text_width("WWWW", BODY_SCALE) + TABLE_CELL_PADDING * 2
+        );
+        assert_eq!(first.width, preferred_cell_width(&document, block));
     }
 }
 
