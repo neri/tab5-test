@@ -650,6 +650,10 @@ fn begin(
     ram_disk: Option<&mut RamBlockDevice>,
     input: &mut InputManager,
 ) -> Option<Pending> {
+    let navigation = match viewer.page_navigation(navigation) {
+        Some(navigation) => navigation,
+        None => return None,
+    };
     if navigation.url.host() == builtin::HOST && navigation.url.scheme().is_network() {
         match builtin::by_path(navigation.url.path()) {
             Some(page) => viewer.show_builtin(page, &navigation),
@@ -872,6 +876,7 @@ struct Dirty {
 /// what drops the previous document, its layout and its links together.
 struct Page {
     document: Document,
+    visit_url: Url,
     /// What the connection this page came off proved, or `None` for a page
     /// that never crossed a network -- a built-in page, or this viewer's
     /// own error page. `None` is displayed from the scheme instead, which
@@ -1172,6 +1177,7 @@ impl Viewer {
             Ok(mut page) => {
                 page.security = security;
                 self.settle_history(navigation.how);
+                page.visit_url = landed;
                 self.page = page;
                 // Through `scroll_to` rather than assigned, so a remembered
                 // position past the end of a page that has since got
@@ -1186,6 +1192,9 @@ impl Viewer {
                 };
                 let _ = landed;
                 self.last_peak = peak_owned;
+                if navigation.how == Direction::Fresh && navigation.restore == 0 {
+                    self.scroll_to_fragment();
+                }
                 if let Some(status) = status {
                     self.say_status(status);
                 }
@@ -1211,6 +1220,7 @@ impl Viewer {
             Ok(loaded) => {
                 self.settle_history(navigation.how);
                 self.page = loaded;
+                self.page.visit_url = navigation.url.clone();
                 self.scroll_to(navigation.restore);
                 self.loading = None;
                 self.message = None;
@@ -1219,6 +1229,9 @@ impl Viewer {
                     viewport: true,
                     status: true,
                 };
+                if navigation.how == Direction::Fresh && navigation.restore == 0 {
+                    self.scroll_to_fragment();
+                }
             }
             Err(failure) => self.say(error::error_text(failure)),
         }
@@ -1287,7 +1300,7 @@ impl Viewer {
     /// Moves the page now on screen onto one of the two stacks.
     fn push_current(&mut self, stack: Stack) {
         let entry = HistoryEntry {
-            url: self.page.document.url().clone(),
+            url: self.page.visit_url.clone(),
             line: self.page.first_line,
         };
         let stack = match stack {
@@ -1352,12 +1365,64 @@ impl Viewer {
     /// down it. On an error page this retries what failed, which works
     /// because an error page's address is the address that failed.
     fn reload(&mut self) {
-        let url = self.page.document.url().clone();
+        let url = self.page.visit_url.clone();
         self.request(Navigation {
             url,
             restore: self.page.first_line,
             how: Direction::Reload,
         });
+    }
+
+    fn page_navigation(&mut self, navigation: Navigation) -> Option<Navigation> {
+        let same_document = self.page.document.url().same_document(&navigation.url);
+        let internal = match navigation.how {
+            Direction::Reload => false,
+            Direction::Back | Direction::Forward => same_document,
+            Direction::Fresh => same_document && navigation.url.fragment().is_some(),
+        };
+        if !internal {
+            return Some(navigation);
+        }
+        let repeated = navigation.how == Direction::Fresh && navigation.url == self.page.visit_url;
+        if !repeated {
+            self.settle_history(navigation.how);
+        }
+        self.page.visit_url = navigation.url;
+        self.page.focus = None;
+        self.clear_message();
+        if matches!(navigation.how, Direction::Back | Direction::Forward) {
+            self.scroll_to(navigation.restore);
+        } else {
+            self.scroll_to_fragment();
+        }
+        self.dirty.toolbar = true;
+        self.dirty.status = true;
+        None
+    }
+
+    fn scroll_to_fragment(&mut self) {
+        let Some(fragment) = self.page.visit_url.fragment() else {
+            return;
+        };
+        if fragment.is_empty() {
+            self.scroll_to(0);
+            return;
+        }
+        let Ok(Some(decoded)) = url::decode_fragment(fragment) else {
+            self.say("fragment not found");
+            return;
+        };
+        if let Some(line) = self
+            .page
+            .layout
+            .line_of_anchor(&self.page.document, &decoded)
+        {
+            self.scroll_to(line);
+        } else if decoded.eq_ignore_ascii_case("top") {
+            self.scroll_to(0);
+        } else {
+            self.say("fragment not found");
+        }
     }
 
     // --- input --------------------------------------------------------
@@ -1486,7 +1551,7 @@ impl Viewer {
         }
         // The address that is showing, with the caret after it. Changing
         // the end of an address is the usual reason to open this at all.
-        let text = self.page.document.url().to_text().unwrap_or_default();
+        let text = self.page.visit_url.to_text().unwrap_or_default();
         let caret = text.len();
         self.editing = Some(Editing { text, caret });
         self.page.focus = None;
@@ -1849,7 +1914,7 @@ impl Viewer {
                 CHROME_TEXT,
             ),
             (None, None) => {
-                if let Ok(text) = self.page.document.url().to_text() {
+                if let Ok(text) = self.page.visit_url.to_text() {
                     draw_clipped(
                         framebuffer,
                         ADDRESS_LEFT,
@@ -2448,8 +2513,10 @@ fn build_page(document: Document) -> Result<Page, Error> {
         },
     )?;
     let order = layout.link_order()?;
+    let visit_url = document.url().clone();
     Ok(Page {
         document,
+        visit_url,
         security: None,
         error: false,
         layout,
@@ -2605,6 +2672,7 @@ mod builtin {
         Fixed(&'static str),
         LongDocument,
         WideLine,
+        FragmentDocument,
     }
 
     impl Page {
@@ -2623,6 +2691,7 @@ mod builtin {
                 }
                 Body::LongDocument => write_long(parser),
                 Body::WideLine => write_wide(parser),
+                Body::FragmentDocument => write_fragments(parser),
             }
         }
     }
@@ -2651,6 +2720,40 @@ mod builtin {
         }
         parser.feed(b"</p><p>A normal paragraph after it.</p>")?;
         parser.feed(b"<p><a href=\"/\">back to the home page</a></p>")
+    }
+
+    fn write_fragment_filler(parser: &mut Parser, label: &[u8]) -> Result<(), Error> {
+        for _ in 0..14 {
+            parser.feed(b"<p>")?;
+            for _ in 0..24 {
+                parser.feed(label)?;
+                parser.feed(b" corridor text ")?;
+            }
+            parser.feed(b"</p>")?;
+        }
+        Ok(())
+    }
+
+    fn write_fragments(parser: &mut Parser) -> Result<(), Error> {
+        parser.feed(
+            b"<title>fragment navigation</title><h1 id='top-heading'>Fragment navigation</h1>\
+              <p>Every target is separated by many screens. The repeated uppercase word identifies the current corridor.</p>\
+              <ul><li><a href='#first'>FIRST target</a></li><li><a href='#second'>SECOND target</a></li>\
+              <li><a href='#legacy'>LEGACY named target</a></li><li><a href='#inline'>INLINE target</a></li>\
+              <li><a href='#end'>END target</a></li><li><a href='#missing'>Missing target</a></li></ul>\
+              <p>After a jump, scroll several screens into that corridor. Back and Forward must restore that exact position.</p>\
+              <h2 id='first'>FIRST TARGET -- corridor starts here</h2>",
+        )?;
+        write_fragment_filler(parser, b"FIRST")?;
+        parser.feed(b"<h2 id='second'>SECOND TARGET -- corridor starts here</h2>")?;
+        write_fragment_filler(parser, b"SECOND")?;
+        parser.feed(b"<h2><a name='legacy'></a>LEGACY TARGET -- corridor starts here</h2>")?;
+        write_fragment_filler(parser, b"LEGACY")?;
+        parser.feed(b"<p>INLINE corridor begins with text before the target so its line can be checked. More text before the <span id='inline'>INLINE TARGET INSIDE THIS PARAGRAPH</span>, followed by text that must remain on the same wrapped paragraph.</p>")?;
+        write_fragment_filler(parser, b"INLINE")?;
+        parser.feed(b"<p><a href='#'>Document top via empty fragment</a>. <a href=''>Reload without fragment</a>.</p><p><a href='/sample'>Other document</a>, for A to B to Back testing.</p>")?;
+        write_fragment_filler(parser, b"FINAL")?;
+        parser.feed(b"<span id='end'></span><h2>END TARGET -- final screen</h2><p><a href='#first'>First again</a> | <a href='/'>Home</a></p>")
     }
 
     pub const HOME: &Page = &Page {
@@ -2702,6 +2805,7 @@ mod builtin {
              <li><a href=\"/long\">A long document, for scrolling</a></li>\
              <li><a href=\"/wide\">One line as long as a URL may be</a></li>\
              <li><a href=\"/japanese\">Japanese text, mixed widths</a></li>\
+             <li><a href=\"/fragments\">Fragment navigation acceptance</a></li>\
              <li><a href=\"/empty\">A document with nothing in it</a></li>\
              </ul>\
              <hr>\
@@ -2829,6 +2933,11 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
         ),
     };
 
+    pub const FRAGMENTS: &Page = &Page {
+        url: "http://built-in/fragments",
+        body: Body::FragmentDocument,
+    };
+
     /// The built-in page at `path`, if there is one.
     pub fn by_path(path: &str) -> Option<&'static Page> {
         match path {
@@ -2838,6 +2947,7 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
             "/wide" => Some(WIDE),
             "/japanese" => Some(JAPANESE),
             "/empty" => Some(EMPTY),
+            "/fragments" => Some(FRAGMENTS),
             _ => None,
         }
     }

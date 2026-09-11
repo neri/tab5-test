@@ -203,6 +203,7 @@ pub struct Layout {
     height: u32,
     width: u16,
     metrics: Metrics,
+    anchors: Vec<(u16, usize)>,
 }
 
 impl Layout {
@@ -218,10 +219,34 @@ impl Layout {
             height: 0,
             width,
             metrics,
+            anchors: Vec::new(),
         };
         let mut y = 0u32;
-        for block in document.blocks() {
+        for (block_index, block) in document.blocks().iter().enumerate() {
+            let first_line = layout.lines.len();
             y = layout.place_block(document, block, y)?;
+            for (anchor_index, anchor) in document.anchors().iter().enumerate() {
+                if anchor.block_index as usize == block_index
+                    && !layout.anchors.iter().any(|x| x.0 as usize == anchor_index)
+                {
+                    let line = layout.lines[first_line..]
+                        .iter()
+                        .position(|line| {
+                            layout.pieces(line).iter().any(|p| {
+                                p.start <= anchor.text_offset && anchor.text_offset < p.end
+                            })
+                        })
+                        .map(|n| first_line + n)
+                        .unwrap_or(first_line);
+                    memory::push(&mut layout.anchors, (anchor_index as u16, line))?;
+                }
+            }
+        }
+        let last = layout.lines.len().saturating_sub(1);
+        for i in 0..document.anchors().len() {
+            if !layout.anchors.iter().any(|x| x.0 as usize == i) {
+                memory::push(&mut layout.anchors, (i as u16, last))?;
+            }
         }
         layout.height = y;
         Ok(layout)
@@ -332,6 +357,15 @@ impl Layout {
     pub fn owned_bytes(&self) -> usize {
         self.lines.capacity() * core::mem::size_of::<Line>()
             + self.pieces.capacity() * core::mem::size_of::<Piece>()
+            + self.anchors.capacity() * core::mem::size_of::<(u16, usize)>()
+    }
+
+    pub fn line_of_anchor(&self, document: &Document, name: &str) -> Option<usize> {
+        let index = document.anchors().iter().position(|a| a.name == name)?;
+        self.anchors
+            .iter()
+            .find(|entry| entry.0 as usize == index)
+            .map(|entry| entry.1)
     }
 
     // --- building -----------------------------------------------------
@@ -1234,6 +1268,20 @@ mod tests {
         let (document, layout) = layout_of(&markup);
         let total = document.stats().owned_bytes + layout.owned_bytes();
         assert!(total < MAX_BROWSER_OWNED_BYTES, "{total}");
+    }
+
+    #[test]
+    fn anchors_map_to_heading_inline_rule_and_document_end() {
+        let (document, layout) = layout_of(
+            "<h2 id='head'>heading</h2><p>before <span id='inline'>target</span></p><hr id='rule'><span id='end'></span>",
+        );
+        assert_eq!(layout.line_of_anchor(&document, "head"), Some(0));
+        assert!(layout.line_of_anchor(&document, "inline").unwrap() >= 1);
+        assert!(layout.line_of_anchor(&document, "rule").is_some());
+        assert_eq!(
+            layout.line_of_anchor(&document, "end"),
+            Some(layout.lines().len() - 1)
+        );
     }
 }
 

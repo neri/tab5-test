@@ -67,9 +67,9 @@ const MAX_ENTITY_BYTES: usize = 32;
 /// pending bytes and once as decoded text.
 const TEXT_FLUSH_THRESHOLD: usize = 4096;
 
-/// One start tag, with the only two attribute values this keeps.
+/// One start tag, with the bounded attribute values the document model uses.
 ///
-/// `href` and `alt` and nothing else. Every other attribute is parsed far
+/// `href`, `alt`, `id` and legacy anchor `name`. Every other attribute is parsed far
 /// enough to be skipped and its value is never stored, which is what makes
 /// an element carrying a kilobyte of `data-` attributes cost a scan rather
 /// than a page's memory budget.
@@ -78,6 +78,8 @@ pub struct Tag<'a> {
     pub name: &'a str,
     pub href: Option<&'a str>,
     pub alt: Option<&'a str>,
+    pub id: Option<&'a str>,
+    pub anchor_name: Option<&'a str>,
     /// `<br/>`. Advisory: the document builder already knows which elements
     /// are empty, and uses this only for the ones it does not know.
     pub self_closing: bool,
@@ -173,6 +175,8 @@ enum Capture {
     Nothing,
     Href,
     Alt,
+    Id,
+    Name,
 }
 
 /// The tag being read, and the two attribute values worth keeping.
@@ -184,6 +188,8 @@ struct TagBuffer {
     capture: Capture,
     href: Option<Vec<u8>>,
     alt: Option<Vec<u8>>,
+    id: Option<Vec<u8>>,
+    anchor_name: Option<Vec<u8>>,
     attributes_seen: usize,
 }
 
@@ -197,6 +203,8 @@ impl TagBuffer {
             capture: Capture::Nothing,
             href: None,
             alt: None,
+            id: None,
+            anchor_name: None,
             attributes_seen: 0,
         }
     }
@@ -209,6 +217,8 @@ impl TagBuffer {
         self.capture = Capture::Nothing;
         self.href = None;
         self.alt = None;
+        self.id = None;
+        self.anchor_name = None;
         self.attributes_seen = 0;
     }
 }
@@ -230,6 +240,8 @@ pub struct Tokenizer {
     /// `href` and `alt`, repaired, for the borrow the sink is handed.
     scratch_href: String,
     scratch_alt: String,
+    scratch_id: String,
+    scratch_anchor_name: String,
     scratch_name: String,
     /// Total input bytes, for [`MAX_DECODED_HTML_BYTES`].
     consumed: usize,
@@ -256,6 +268,8 @@ impl Tokenizer {
             entity: Vec::new(),
             scratch_href: String::new(),
             scratch_alt: String::new(),
+            scratch_id: String::new(),
+            scratch_anchor_name: String::new(),
             scratch_name: String::new(),
             consumed: 0,
             longest_token: 0,
@@ -294,11 +308,19 @@ impl Tokenizer {
             + self.tag.attribute_name.capacity()
             + self.tag.href.as_ref().map_or(0, |value| value.capacity())
             + self.tag.alt.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.id.as_ref().map_or(0, |value| value.capacity())
+            + self
+                .tag
+                .anchor_name
+                .as_ref()
+                .map_or(0, |value| value.capacity())
             + self.text.capacity()
             + self.decoded.capacity()
             + self.entity.capacity()
             + self.scratch_href.capacity()
             + self.scratch_alt.capacity()
+            + self.scratch_id.capacity()
+            + self.scratch_anchor_name.capacity()
             + self.scratch_name.capacity()
     }
 
@@ -697,6 +719,12 @@ impl Tokenizer {
         } else if self.tag.attribute_name == b"alt" && self.tag.alt.is_none() {
             self.tag.alt = Some(Vec::new());
             self.tag.capture = Capture::Alt;
+        } else if self.tag.attribute_name == b"id" && self.tag.id.is_none() {
+            self.tag.id = Some(Vec::new());
+            self.tag.capture = Capture::Id;
+        } else if self.tag.attribute_name == b"name" && self.tag.anchor_name.is_none() {
+            self.tag.anchor_name = Some(Vec::new());
+            self.tag.capture = Capture::Name;
         }
     }
 
@@ -705,6 +733,11 @@ impl Tokenizer {
             Capture::Nothing => return Ok(()),
             Capture::Href => (&mut self.tag.href, MAX_HREF_BYTES),
             Capture::Alt => (&mut self.tag.alt, MAX_ALT_BYTES),
+            Capture::Id => (&mut self.tag.id, crate::limits::MAX_ANCHOR_NAME_BYTES),
+            Capture::Name => (
+                &mut self.tag.anchor_name,
+                crate::limits::MAX_ANCHOR_NAME_BYTES,
+            ),
         };
         let Some(buffer) = buffer.as_mut() else {
             return Ok(());
@@ -736,10 +769,24 @@ impl Tokenizer {
         if let Some(bytes) = &self.tag.alt {
             push_repaired(&mut self.scratch_alt, bytes)?;
         }
+        self.scratch_id.clear();
+        if let Some(bytes) = &self.tag.id {
+            push_repaired(&mut self.scratch_id, bytes)?;
+        }
+        self.scratch_anchor_name.clear();
+        if let Some(bytes) = &self.tag.anchor_name {
+            push_repaired(&mut self.scratch_anchor_name, bytes)?;
+        }
         sink.start_tag(Tag {
             name: &self.scratch_name,
             href: self.tag.href.as_ref().map(|_| self.scratch_href.as_str()),
             alt: self.tag.alt.as_ref().map(|_| self.scratch_alt.as_str()),
+            id: self.tag.id.as_ref().map(|_| self.scratch_id.as_str()),
+            anchor_name: self
+                .tag
+                .anchor_name
+                .as_ref()
+                .map(|_| self.scratch_anchor_name.as_str()),
             self_closing: self.tag.self_closing,
         })?;
 

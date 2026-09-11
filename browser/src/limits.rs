@@ -80,6 +80,9 @@ pub const MAX_ITEMS: usize = 8192;
 
 /// Links kept for one page, each with its resolved target.
 pub const MAX_LINKS: usize = 1024;
+pub const MAX_ANCHORS: usize = MAX_LINKS;
+pub const MAX_ANCHOR_NAME_BYTES: usize = MAX_URL_BYTES;
+pub const MAX_ANCHOR_BYTES: usize = 256 * 1024;
 
 /// How deep list nesting and inline state may go.
 ///
@@ -132,7 +135,7 @@ mod tests {
     #[test]
     fn text_and_links_fit_inside_the_owned_budget() {
         let links = MAX_LINKS * MAX_URL_BYTES;
-        assert!(MAX_TEXT_BYTES + links < MAX_BROWSER_OWNED_BYTES);
+        assert!(MAX_TEXT_BYTES + links + MAX_ANCHOR_BYTES < MAX_BROWSER_OWNED_BYTES);
     }
 
     /// Stored text cannot exceed the input it is extracted from.

@@ -38,7 +38,10 @@ use alloc::vec::Vec;
 use crate::encoding::Decoder;
 use crate::error::Error;
 use crate::html::{self, Tag, Tokenizer};
-use crate::limits::{MAX_ITEMS, MAX_LINKS, MAX_NESTING_DEPTH, MAX_TEXT_BYTES};
+use crate::limits::{
+    MAX_ANCHOR_BYTES, MAX_ANCHOR_NAME_BYTES, MAX_ANCHORS, MAX_ITEMS, MAX_LINKS, MAX_NESTING_DEPTH,
+    MAX_TEXT_BYTES,
+};
 use crate::memory;
 use crate::url::Url;
 
@@ -118,6 +121,12 @@ pub struct Link {
     pub url: Url,
 }
 
+pub struct Anchor {
+    pub name: String,
+    pub text_offset: u32,
+    pub block_index: u32,
+}
+
 /// What one page cost, for the UART line and the memory budget.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Stats {
@@ -140,6 +149,7 @@ pub struct Document {
     runs: Vec<Run>,
     blocks: Vec<Block>,
     links: Vec<Link>,
+    anchors: Vec<Anchor>,
     stats: Stats,
 }
 
@@ -170,6 +180,9 @@ impl Document {
     pub fn links(&self) -> &[Link] {
         &self.links
     }
+    pub fn anchors(&self) -> &[Anchor] {
+        &self.anchors
+    }
 
     pub fn stats(&self) -> Stats {
         self.stats
@@ -197,12 +210,19 @@ impl Document {
 
     fn owned_bytes(&self) -> usize {
         let links: usize = self.links.iter().map(|link| link.url.owned_bytes()).sum();
+        let anchors: usize = self
+            .anchors
+            .iter()
+            .map(|anchor| anchor.name.capacity())
+            .sum();
         self.title.capacity()
             + self.text.capacity()
             + self.runs.capacity() * core::mem::size_of::<Run>()
             + self.blocks.capacity() * core::mem::size_of::<Block>()
             + self.links.capacity() * core::mem::size_of::<Link>()
             + links
+            + self.anchors.capacity() * core::mem::size_of::<Anchor>()
+            + anchors
     }
 }
 
@@ -361,6 +381,7 @@ impl Builder {
                 runs: Vec::new(),
                 blocks: Vec::new(),
                 links: Vec::new(),
+                anchors: Vec::new(),
                 stats: Stats::default(),
             },
             open_kind: None,
@@ -622,6 +643,23 @@ impl Builder {
     // --- elements -----------------------------------------------------
 
     fn start_element(&mut self, tag: Tag<'_>) -> Result<(), Error> {
+        let starts_block = tag.name == "hr"
+            || tag.name == "pre"
+            || tag.name == "li"
+            || heading_level(tag.name).is_some()
+            || is_block(tag.name);
+        let pending_block =
+            self.open_kind.is_some() && (self.run_open || self.open_kind == Some(BlockKind::Rule));
+        let anchor_block =
+            self.document.blocks.len() as u32 + u32::from(starts_block && pending_block);
+        if let Some(id) = tag.id {
+            self.add_anchor_at(id, anchor_block)?;
+        }
+        if tag.name == "a" {
+            if let Some(name) = tag.anchor_name {
+                self.add_anchor_at(name, anchor_block)?;
+            }
+        }
         match tag.name {
             "title" => {
                 self.close_block()?;
@@ -670,6 +708,36 @@ impl Builder {
                 // this has never heard of.
             }
         }
+        Ok(())
+    }
+
+    fn add_anchor_at(&mut self, name: &str, block_index: u32) -> Result<(), Error> {
+        if name.is_empty() || name.len() > MAX_ANCHOR_NAME_BYTES {
+            return Ok(());
+        }
+        if self.document.anchors.iter().any(|a| a.name == name) {
+            return Ok(());
+        }
+        if self.document.anchors.len() >= MAX_ANCHORS
+            || self
+                .document
+                .anchors
+                .iter()
+                .map(|a| a.name.capacity())
+                .sum::<usize>()
+                + name.len()
+                > MAX_ANCHOR_BYTES
+        {
+            return Err(Error::TooManyAnchors);
+        }
+        memory::push(
+            &mut self.document.anchors,
+            Anchor {
+                name: memory::string_from(name)?,
+                text_offset: self.document.text.len() as u32,
+                block_index,
+            },
+        )?;
         Ok(())
     }
 
@@ -1436,5 +1504,16 @@ mod tests {
         assert_eq!(stats.items, document.blocks().len() + document.runs().len());
         assert!(stats.input_bytes > 0);
         assert!(stats.owned_bytes > 0);
+    }
+
+    #[test]
+    fn ids_and_legacy_names_are_anchors_and_first_duplicate_wins() {
+        let document = parse(
+            b"<h1 id='x'>one</h1><p id='x'>two</p><a name='old'>three</a><div name='no'>four</div>",
+        );
+        assert_eq!(document.anchors().len(), 2);
+        assert_eq!(document.anchors()[0].name, "x");
+        assert_eq!(document.anchors()[1].name, "old");
+        assert_eq!(document.anchors()[0].block_index, 0);
     }
 }

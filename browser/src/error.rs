@@ -28,6 +28,7 @@ pub enum Error {
     TooManyItems,
     /// Past [`crate::limits::MAX_LINKS`].
     TooManyLinks,
+    TooManyAnchors,
     /// The wrapped page came to more than [`crate::limits::MAX_LAYOUT_LINES`]
     /// lines.
     TooManyLines,
@@ -54,6 +55,7 @@ pub fn error_text(error: Error) -> &'static str {
         Error::TextTooLong => "the page has more text than this can hold",
         Error::TooManyItems => "the page has more paragraphs than this can hold",
         Error::TooManyLinks => "the page has more links than this can hold",
+        Error::TooManyAnchors => "the page has more anchors than this can hold",
         Error::TooManyLines => "the page has more lines than this can lay out",
         Error::OutOfMemory => "out of memory while reading the page",
     }
@@ -67,6 +69,7 @@ pub fn error_name(error: Error) -> &'static str {
         Error::TextTooLong => "text-limit",
         Error::TooManyItems => "item-limit",
         Error::TooManyLinks => "link-limit",
+        Error::TooManyAnchors => "anchor-limit",
         Error::TooManyLines => "line-limit",
         Error::OutOfMemory => "out-of-memory",
     }

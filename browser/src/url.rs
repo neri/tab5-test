@@ -27,6 +27,39 @@ use alloc::vec::Vec;
 use crate::limits::MAX_URL_BYTES;
 use crate::memory::{self, OutOfMemory};
 
+pub fn decode_fragment(fragment: &str) -> Result<Option<String>, OutOfMemory> {
+    let mut bytes = Vec::new();
+    let raw = fragment.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            if i + 2 >= raw.len() {
+                return Ok(None);
+            }
+            let Some(hi) = hex(raw[i + 1]) else {
+                return Ok(None);
+            };
+            let Some(lo) = hex(raw[i + 2]) else {
+                return Ok(None);
+            };
+            memory::push(&mut bytes, (hi << 4) | lo)?;
+            i += 3;
+        } else {
+            memory::push(&mut bytes, raw[i])?;
+            i += 1;
+        }
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// The schemes this recognises.
 ///
 /// All three are fetchable, and the distinction is what decides how. A
@@ -1853,5 +1886,15 @@ mod tests {
     fn manifest_lines_are_split_and_comments_dropped() {
         let text = "# a comment\n/simple.html\tok\n\n  /links/\tok  \n";
         assert_eq!(split_manifest(text), ["/simple.html\tok", "/links/\tok"]);
+    }
+
+    #[test]
+    fn fragment_decode_is_strict_and_not_form_encoding() {
+        assert_eq!(decode_fragment("a%20b").unwrap().as_deref(), Some("a b"));
+        assert_eq!(decode_fragment("%E6%97%A5").unwrap().as_deref(), Some("日"));
+        assert_eq!(decode_fragment("a+b").unwrap().as_deref(), Some("a+b"));
+        assert_eq!(decode_fragment("%").unwrap(), None);
+        assert_eq!(decode_fragment("%GG").unwrap(), None);
+        assert_eq!(decode_fragment("%ff").unwrap(), None);
     }
 }

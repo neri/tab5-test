@@ -530,9 +530,19 @@ impl Fetch {
             // Resolved against the request's own URL, so a relative
             // `Location` -- which RFC 7231 allows -- lands where the server
             // meant rather than at the site root.
-            let Ok(target) = self.url.resolve(text) else {
+            let Ok(mut target) = self.url.resolve(text) else {
                 return Outcome::Failed(BROKEN_REDIRECT.with_status(status));
             };
+            if !text.contains('#') {
+                if let Some(fragment) = self.url.fragment() {
+                    let mut reference = alloc::string::String::from("#");
+                    reference.push_str(fragment);
+                    let Ok(inherited) = target.resolve(&reference) else {
+                        return Outcome::Failed(BROKEN_REDIRECT.with_status(status));
+                    };
+                    target = inherited;
+                }
+            }
             return self.redirect_to(target, network);
         }
 
