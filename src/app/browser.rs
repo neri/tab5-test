@@ -454,8 +454,11 @@ impl Browser {
             self.viewer.draw_dirty(fb, &mut || service_link(wifi))
         }
     }
+    /// Whether a text field owns plain character keys: the address field,
+    /// or a text input or textarea, which starts editing as soon as it is
+    /// focused.
     pub fn editing(&self) -> bool {
-        self.viewer.editing.is_some()
+        self.viewer.editing.is_some() || self.viewer.form_editing.is_some()
     }
     pub fn dirty(&self) -> bool {
         self.viewer.dirty()

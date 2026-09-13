@@ -175,7 +175,7 @@ linkの選択背景・下線、table背景・罫線はviewport上下でclipし�
 | `Escape`、中止ボタン | 読み込み中は中止／アドレス欄が開いていれば閉じる／それ以外はリンク選択とstatusのメッセージを解除。**終了しません** |
 | 南京錠のタップ | セキュリティ状態の文言をstatus行へ |
 | Wi-Fiのタップ | Network settingsミニを開く。戻ると同じBrowser状態を再描画 |
-| M（URL編集中以外）／F3 | Launcherを開く |
+| M（URL欄・text input・textareaの編集中以外）／F3 | Launcherを開く |
 | Batteryのタップ | Battery detailsミニを開く |
 | `i`、`F1` | ヒープ・ソケット・履歴・ページの大きさをstatus行とUARTへ（下記） |
 | `↑` `↓` | 20 pixelスクロール |
@@ -349,7 +349,7 @@ LAN fixtureは`/cache/index.html`です。`/cache/stats.html`がpathごとの要
 
 ### システムバーとミニアプリ
 
-`M`（URL編集中以外）または`F3`でLauncherへ入る。Wi-Fi slotはNetwork settings、
+`M`（URL欄、およびfocusした時点で編集になるtext input・textareaの編集中以外）または`F3`でLauncherへ入る。text control編集中の`M`を文字として入力し、F3だけがLauncherを開く動作は2026-09-13に実機受入済み。Wi-Fi slotはNetwork settings、
 Battery slotはBattery detailsを開く。ミニ中はBrowserのhandlerも取得stepも呼ばない。
 Escape／戻る／LauncherのBrowserで同じpage・scroll・history・編集中URLへ戻る。
 LauncherのEscape／ハンバーガー再クリックは呼出元へ戻り、Consoleの選択はBrowserを終了する。
