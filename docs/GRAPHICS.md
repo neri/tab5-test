@@ -9,7 +9,9 @@
 - `fill_rect`、`stroke_rect`
 - `fill_circle`、`draw_circle`
 - `blit_rgb565`、`read_rect`
+- `blit_rgb565_scaled`
 - `draw_glyph`、`draw_text`
+- `set_vertical_clip`、`set_horizontal_clip`
 - `scroll_up`
 
 `fill`と`fill_rect`は呼び出し側から見える挙動を変えずに、内部でCPUのストア
@@ -19,6 +21,20 @@ PPA/2D-DMAへ移す」）。`scroll_up`は2D-DMAのブロックコピーで画�
 ずらすもので、コンソールのスクロールがこれを使います。いずれもDMA経路を通った
 場合はキャッシュの整合を自分で取るため、呼び出し側の`flush`／`flush_rect`は
 どちらの経路でも正しいままです。
+
+`set_vertical_clip(top, bottom)`は後続のCPU・PPA・A4・従来glyph描画を論理Yの
+`[top, bottom)`へ制限し、以前の範囲を返します。Browserはviewport描画の間だけこれを
+設定し、上下に一部だけ見える文字・選択背景・罫線がtoolbar/statusへ出ないように
+します。呼び出し側は描画後に返された範囲を復元します。この経路は2026-09-12に
+Browserの長いtable fixtureで実機確認済みです。
+
+`set_horizontal_clip(left, right)`は後続のpixel、矩形塗り、A4 glyph描画を論理Xの
+`[left, right)`へ制限します。Browserのアドレス編集はdamage矩形ごとにこれを一時設定し、
+displayが直接走査しているframebuffer上でも矩形外を先に消去しないようにします。
+
+`blit_rgb565_scaled`はrow-major RGB565を指定矩形へ最近傍拡縮し、先頭でclipされた
+表示行をsource側の対応行へずらせます。Browserのdecode済み画像がpixel scroll中にも
+同じ画像位置を保つために使います。Stage 3の実機表示は未確認です。
 
 診断用にはproductionの自動選択を通さない`diagnostic_fill_rect_with_cpu`と、cache同期を
 含まない`diagnostic_ppa_fill_rect_raw`をcrate内だけへ公開します。前者は呼び出し側が

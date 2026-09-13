@@ -18,9 +18,17 @@
 //! way to return them, and it takes `self` so that forgetting is visible at
 //! the call site rather than at the point the socket set runs dry.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::browser::cache::{self, Freshness};
 use crate::browser::document::{Document, Parser};
 use crate::browser::error::{self, Error};
-use crate::browser::limits::{MAX_DECODED_HTML_BYTES, MAX_REDIRECTS};
+use crate::browser::limits::{
+    MAX_DECODED_HTML_BYTES, MAX_HTTP_CACHE_ENTRY_BYTES, MAX_IMAGE_COMPRESSED_BYTES, MAX_REDIRECTS,
+};
+use crate::browser::memory;
+use crate::browser::request::Request;
 use crate::browser::url::{Scheme, Url};
 use crate::net::http::{self, Progress, Transaction};
 use crate::net::pins;
@@ -82,6 +90,9 @@ pub enum Outcome {
     Working,
     /// The body ended and the document was built.
     Page(Document),
+    Image(Vec<u8>),
+    /// A revalidated GET: the server confirmed the caller's stored copy.
+    NotModified,
     Failed(Failure),
 }
 
@@ -132,7 +143,7 @@ impl PageSecurity {
 #[must_use = "a Fetch owns a socket and has to be closed"]
 pub struct Fetch {
     /// The address currently being fetched, which moves with each redirect.
-    url: Url,
+    request: Request,
     /// What the hop currently open proved, once its handshake finished.
     security: Option<PageSecurity>,
     redirects: usize,
@@ -141,6 +152,8 @@ pub struct Fetch {
     /// Built only once the head says the response is one to display, so a
     /// redirect or an error status never allocates a document.
     parser: Option<Parser>,
+    image: Option<Vec<u8>>,
+    image_mode: bool,
     /// A limit the document hit, which stops the transfer through the sink.
     document_error: Option<Error>,
     /// The status of a response that is being read but is not the page that
@@ -150,6 +163,26 @@ pub struct Fetch {
     /// asked for" and "what number came back" stay one question. Cleared
     /// on every redirect: it belongs to the hop, not to the navigation.
     status: Option<u16>,
+    /// A 307/308 that would resend a POST body to another origin, kept so
+    /// the caller can ask before anything is sent there.
+    confirm_redirect: Option<(u16, Url)>,
+    /// Whether the caller keeps a cache: a storable body is copied, and
+    /// [`Fetch::take_cache_update`] says what the cache should learn.
+    use_cache: bool,
+    /// Whether `If-None-Match` went out with the first hop.
+    validated: bool,
+    /// How a storable response is to be kept, decided from its head.
+    cache_meta: Option<CacheMeta>,
+    /// The body of a storable page, copied as it arrives. Dropped, not
+    /// failed, when it outgrows an entry or memory runs short.
+    capture: Option<Vec<u8>>,
+    /// The status of the response that ended the chain, once a head came.
+    final_status: Option<u16>,
+    /// What a `304` said about the stored copy it confirmed.
+    refresh: Option<Refresh>,
+    /// Cached URLs a POST's non-error response makes stale, not yet handed
+    /// to the caller.
+    invalidations: Vec<Url>,
     /// Bytes received across every hop of this navigation.
     received: usize,
     /// The largest the parser was ever holding, for the memory budget.
@@ -164,21 +197,85 @@ impl Fetch {
     /// machinery -- there is no name to resolve, no socket to own and no
     /// status to interpret.
     pub fn start(url: Url, network: &mut Network<'_>) -> Result<Fetch, Failure> {
-        if !url.scheme().is_network() {
+        Self::start_request(Request::get(url), network)
+    }
+
+    /// A page GET for a caller with a cache. `validator` is the stored
+    /// `ETag` to send as `If-None-Match`, or `None` to ask unconditionally.
+    pub fn start_cached(
+        url: Url,
+        network: &mut Network<'_>,
+        validator: Option<String>,
+    ) -> Result<Fetch, Failure> {
+        Self::start_mode(Request::get(url), network, false, true, validator)
+    }
+
+    pub fn start_request(request: Request, network: &mut Network<'_>) -> Result<Fetch, Failure> {
+        Self::start_mode(request, network, false, false, None)
+    }
+
+    /// Continues a request whose redirect chain was paused for the reader's
+    /// confirmation, so the pause cannot reset the redirect limit.
+    pub fn start_redirected_request(
+        request: Request,
+        redirects: usize,
+        network: &mut Network<'_>,
+    ) -> Result<Fetch, Failure> {
+        // The paused hop was already counted, and a chain of exactly the
+        // limit is allowed, so only a count past it is refused.
+        if redirects > MAX_REDIRECTS {
+            return Err(REDIRECT_LIMIT);
+        }
+        let mut fetch = Self::start_mode(request, network, false, false, None)?;
+        fetch.redirects = redirects;
+        Ok(fetch)
+    }
+
+    /// An image GET for a caller with a cache, revalidating `validator`.
+    pub fn start_image_cached(
+        url: Url,
+        network: &mut Network<'_>,
+        validator: Option<String>,
+    ) -> Result<Fetch, Failure> {
+        Self::start_mode(Request::get(url), network, true, true, validator)
+    }
+
+    fn start_mode(
+        request: Request,
+        network: &mut Network<'_>,
+        image_mode: bool,
+        use_cache: bool,
+        validator: Option<String>,
+    ) -> Result<Fetch, Failure> {
+        if !request.url.scheme().is_network() {
             return Err(NOT_NETWORK);
         }
         let mut fetch = Fetch {
-            url,
+            request,
             security: None,
             redirects: 0,
             query: None,
             transaction: None,
             parser: None,
+            image: None,
+            image_mode,
             document_error: None,
             status: None,
+            confirm_redirect: None,
+            use_cache,
+            validated: false,
+            cache_meta: None,
+            capture: None,
+            final_status: None,
+            refresh: None,
+            invalidations: Vec::new(),
             received: 0,
             peak_owned: 0,
         };
+        if let Some(etag) = validator {
+            fetch.request.set_if_none_match(etag);
+            fetch.validated = fetch.request.if_none_match().is_some();
+        }
         fetch.open(network)?;
         Ok(fetch)
     }
@@ -186,7 +283,80 @@ impl Fetch {
     /// The address being fetched now, which is the last hop of a redirect
     /// chain rather than the one the caller asked for.
     pub fn url(&self) -> &Url {
-        &self.url
+        &self.request.url
+    }
+
+    pub fn method(&self) -> crate::browser::request::Method {
+        self.request.method
+    }
+
+    /// Cached URLs made stale since the last call: the target of every POST
+    /// hop that got a non-error response, and a same-origin redirect target
+    /// from one. Handed over as soon as each head arrives, so a POST that is
+    /// stopped or fails afterwards still invalidates what it changed.
+    pub fn take_invalidations(&mut self) -> Vec<Url> {
+        core::mem::take(&mut self.invalidations)
+    }
+
+    /// What the `304` behind [`Outcome::NotModified`] said about freshness.
+    pub fn refresh(&self) -> Option<Refresh> {
+        self.refresh
+    }
+
+    /// What a successfully finished fetch means for the cache. Only
+    /// meaningful after [`Outcome::Page`] or [`Outcome::Image`]; a failed
+    /// transfer teaches the cache nothing.
+    ///
+    /// A redirected fetch changes nothing: the entry that was looked up
+    /// belongs to the first URL, and what the chain ended at is not kept.
+    pub fn take_cache_update(&mut self) -> CacheUpdate {
+        if !self.use_cache || self.redirects != 0 || self.final_status.is_none() {
+            return CacheUpdate::Keep;
+        }
+        match (self.cache_meta.take(), self.capture.take()) {
+            (Some(meta), Some(body)) => CacheUpdate::Store(meta, body),
+            // A response for this URL arrived and could not be kept, so
+            // whatever was kept for it before is no longer the current one.
+            _ => CacheUpdate::Remove,
+        }
+    }
+
+    /// What is being sent on the current hop.
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
+    /// Whether the response head forbids keeping a copy of this response.
+    pub fn no_store(&self) -> bool {
+        self.transaction
+            .as_ref()
+            .and_then(Transaction::head)
+            .is_some_and(|head| head.no_store)
+    }
+
+    /// The redirected POST that stopped at [`POST_REDIRECT_CONFIRMATION`].
+    ///
+    /// Built only on request, and only after the downgrade and `file:` rules
+    /// have already accepted the target. `None` if there is none or the body
+    /// cannot be copied.
+    pub fn take_redirect_request(&mut self) -> Option<Request> {
+        let (status, target) = self.confirm_redirect.take()?;
+        let mut request = self.request.try_clone().ok()?;
+        request.redirect_to(status, target);
+        Some(request)
+    }
+
+    pub fn request_started(&self) -> bool {
+        self.transaction
+            .as_ref()
+            .is_some_and(Transaction::request_started)
+    }
+
+    pub fn response_started(&self) -> bool {
+        self.transaction
+            .as_ref()
+            .and_then(Transaction::head)
+            .is_some()
     }
 
     /// What the connection currently open proved, or `None` before a TLS
@@ -229,17 +399,17 @@ impl Fetch {
             .map_or(0, |transaction| transaction.stats().received)
     }
 
-    /// Starts the lookup or the connection for `self.url`.
+    /// Starts the lookup or the connection for `self.request.url`.
     fn open(&mut self, network: &mut Network<'_>) -> Result<(), Failure> {
         // A literal address skips the resolver entirely, which is what
         // makes a fixture server reachable on a network with no DNS.
-        match self.url.ipv4() {
+        match self.request.url.ipv4() {
             Some(octets) => {
                 let address = Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
                 self.transaction = Some(self.connect(address, network)?);
                 Ok(())
             }
-            None => match dns::Query::start(network.stack, self.url.host().as_bytes()) {
+            None => match dns::Query::start(network.stack, self.request.url.host().as_bytes()) {
                 Ok(query) => {
                     self.query = Some(query);
                     Ok(())
@@ -259,7 +429,10 @@ impl Fetch {
         address: Ipv4Address,
         network: &mut Network<'_>,
     ) -> Result<Transaction, Failure> {
-        let (Ok(target), Ok(host)) = (self.url.request_target(), self.url.host_header()) else {
+        let (Ok(target), Ok(host)) = (
+            self.request.url.request_target(),
+            self.request.url.host_header(),
+        ) else {
             return Err(OUT_OF_MEMORY);
         };
         // Every string the connection is made of comes from the same `Url`:
@@ -267,26 +440,33 @@ impl Fetch {
         // the `Host:` header is `host_header()` and the request target is
         // `request_target()`. Building any of them separately is how a
         // request ends up asking one host for another host's page.
-        let security = match self.url.scheme() {
+        let security = match self.request.url.scheme() {
             Scheme::Http => Security::Plain,
             // Refused here as well as in `start`, so that a caller added
             // later cannot turn a `file:` URL into a connection to port 0.
             Scheme::File => return Err(NOT_NETWORK),
             Scheme::Https => Security::Tls {
-                server_name: self.url.host(),
+                server_name: self.request.url.host(),
                 // The pin table is keyed by the same string that goes in
                 // SNI, so a host cannot be looked up under one name and
                 // connected to under another.
-                policy: pins::policy_for(self.url.host()),
+                policy: pins::policy_for(self.request.url.host()),
             },
         };
-        Transaction::start(
+        Transaction::start_request(
             network.stack,
             address,
-            self.url.port(),
+            self.request.url.port(),
             host.as_bytes(),
             target.as_bytes(),
-            MAX_DECODED_HTML_BYTES as u64,
+            self.request.method,
+            self.request.body(),
+            self.request.if_none_match().map(str::as_bytes),
+            if self.image_mode {
+                MAX_IMAGE_COMPRESSED_BYTES as u64
+            } else {
+                MAX_DECODED_HTML_BYTES as u64
+            },
             security,
         )
         .map_err(|error| Failure {
@@ -314,16 +494,21 @@ impl Fetch {
     ///   one that is not. Refused for the same reason.
     ///
     /// Going *up* -- `http` to `https` -- is allowed and unremarkable.
-    fn redirect_to(&mut self, target: Url, network: &mut Network<'_>) -> Outcome {
-        let from_scheme = self.url.scheme();
+    fn redirect_to(&mut self, status: u16, target: Url, network: &mut Network<'_>) -> Outcome {
+        let from_scheme = self.request.url.scheme();
         let from_security = self.security;
         if let Some(transaction) = self.transaction.take() {
             self.received += transaction.close(network.stack, network.rpc).received;
         }
         self.parser = None;
+        self.image = None;
         self.document_error = None;
         self.status = None;
         self.security = None;
+        // The validator and a copy belong to the URL that was looked up.
+        self.validated = false;
+        self.cache_meta = None;
+        self.capture = None;
 
         // Before the downgrade rules, because this one is not about
         // degrees of protection. A `Location: file:///...` is a server
@@ -343,8 +528,17 @@ impl Fetch {
         {
             return Outcome::Failed(TLS_AUTH_DOWNGRADE);
         }
+        // After the refusals, so a confirmation is only ever offered for a
+        // target the rules would have followed anyway.
+        if self.request.method == crate::browser::request::Method::Post
+            && matches!(status, 307 | 308)
+            && !self.request.url.same_origin(&target)
+        {
+            self.confirm_redirect = Some((status, target));
+            return Outcome::Failed(POST_REDIRECT_CONFIRMATION.with_status(Some(status)));
+        }
 
-        self.url = target;
+        self.request.redirect_to(status, target);
         self.redirects += 1;
         match self.open(network) {
             Ok(()) => Outcome::Working,
@@ -366,7 +560,7 @@ impl Fetch {
         let Some(transaction) = self.transaction.as_ref() else {
             return;
         };
-        self.security = match self.url.scheme() {
+        self.security = match self.request.url.scheme() {
             Scheme::Http => Some(PageSecurity::Cleartext),
             Scheme::Https => transaction.authentication().map(PageSecurity::Tls),
             // Nothing was proved about anybody, because nobody was asked.
@@ -443,12 +637,40 @@ impl Fetch {
         // Borrowed as separate fields so the sink can hold the parser while
         // `poll` holds the transaction.
         let parser = &mut self.parser;
+        let image = &mut self.image;
+        let image_mode = self.image_mode;
         let document_error = &mut self.document_error;
+        let capture = &mut self.capture;
         let mut spent = 0usize;
         let mut progress = Progress::Idle;
         while spent < BYTES_PER_STEP {
             let before = transaction.stats().received;
             let mut sink = |bytes: &[u8]| {
+                let keep = match capture.as_mut() {
+                    Some(copy) => {
+                        copy.len() + bytes.len() <= MAX_HTTP_CACHE_ENTRY_BYTES
+                            && copy.try_reserve(bytes.len()).is_ok()
+                            && {
+                                copy.extend_from_slice(bytes);
+                                true
+                            }
+                    }
+                    None => true,
+                };
+                if !keep {
+                    *capture = None;
+                }
+                if image_mode {
+                    let Some(target) = image.as_mut() else {
+                        return true;
+                    };
+                    if target.try_reserve(bytes.len()).is_err() {
+                        *document_error = Some(Error::OutOfMemory);
+                        return false;
+                    }
+                    target.extend_from_slice(bytes);
+                    return true;
+                }
                 let Some(parser) = parser.as_mut() else {
                     // No parser yet means the head has not been accepted;
                     // nothing should be arriving, and if it is, it is not
@@ -518,6 +740,9 @@ impl Fetch {
         let status = head.status;
 
         if head.is_redirect() {
+            let Some(status_code) = status else {
+                return Outcome::Failed(NOT_HTTP);
+            };
             if self.redirects >= MAX_REDIRECTS {
                 return Outcome::Failed(REDIRECT_LIMIT.with_status(status));
             }
@@ -530,11 +755,11 @@ impl Fetch {
             // Resolved against the request's own URL, so a relative
             // `Location` -- which RFC 7231 allows -- lands where the server
             // meant rather than at the site root.
-            let Ok(mut target) = self.url.resolve(text) else {
+            let Ok(mut target) = self.request.url.resolve(text) else {
                 return Outcome::Failed(BROKEN_REDIRECT.with_status(status));
             };
             if !text.contains('#') {
-                if let Some(fragment) = self.url.fragment() {
+                if let Some(fragment) = self.request.url.fragment() {
                     let mut reference = alloc::string::String::from("#");
                     reference.push_str(fragment);
                     let Ok(inherited) = target.resolve(&reference) else {
@@ -543,13 +768,47 @@ impl Fetch {
                     target = inherited;
                 }
             }
-            return self.redirect_to(target, network);
+            note_invalidation(
+                &mut self.invalidations,
+                &self.request,
+                status,
+                Some(&target),
+            );
+            return self.redirect_to(status_code, target, network);
         }
 
         if status.is_none() {
             // The first line was not a status line, so this is not an HTTP
             // response at all.
             return Outcome::Failed(NOT_HTTP);
+        }
+        note_invalidation(&mut self.invalidations, &self.request, status, None);
+        if status == Some(304) && self.redirects == 0 && self.validated {
+            // The stored copy is current. The caller reads it from the cache
+            // and gives this connection back; what the 304 says about
+            // freshness replaces what was stored.
+            self.refresh = Some(refresh_from(head));
+            return Outcome::NotModified;
+        }
+        self.final_status = status;
+        if self.use_cache && self.redirects == 0 {
+            self.cache_meta = storable_meta(head);
+        }
+        if self.image_mode {
+            if !head.is_success() {
+                return Outcome::Failed(REFUSED.with_status(status));
+            }
+            if !matches!(
+                head.media_type.as_deref(),
+                Some(b"image/png" | b"image/jpeg")
+            ) {
+                return Outcome::Failed(NOT_IMAGE.with_status(status));
+            }
+            self.image = Some(Vec::new());
+            return Outcome::Working;
+        }
+        if self.cache_meta.is_some() {
+            self.capture = Some(Vec::new());
         }
         // HTML, or text that is not HTML -- a `.txt`, a `.md`, a server's
         // own `manifest.txt`. Anything else has no reading this can give
@@ -574,9 +833,9 @@ impl Fetch {
         // Only now is a document allocated. A redirect chain, a non-HTML
         // response and a download all get this far without one.
         let built = if markup {
-            Parser::new(self.url.clone())
+            Parser::new(self.request.url.clone())
         } else {
-            Parser::plain(self.url.clone())
+            Parser::plain(self.request.url.clone())
         };
         let mut parser = match built {
             Ok(parser) => parser,
@@ -596,6 +855,23 @@ impl Fetch {
     }
 
     fn complete(&mut self) -> Outcome {
+        if self.image_mode {
+            return match self.image.take() {
+                Some(bytes) if !bytes.is_empty() => {
+                    // Copied at the end rather than as it arrives: the image
+                    // buffer already holds every byte during the transfer.
+                    if self.cache_meta.is_some() && bytes.len() <= MAX_HTTP_CACHE_ENTRY_BYTES {
+                        let mut copy = Vec::new();
+                        if copy.try_reserve_exact(bytes.len()).is_ok() {
+                            copy.extend_from_slice(&bytes);
+                            self.capture = Some(copy);
+                        }
+                    }
+                    Outcome::Image(bytes)
+                }
+                _ => Outcome::Failed(EMPTY.with_status(self.status)),
+            };
+        }
         let Some(parser) = self.parser.take() else {
             return Outcome::Failed(EMPTY.with_status(self.status));
         };
@@ -632,6 +908,114 @@ impl Fetch {
     }
 }
 
+/// What a storable response is, apart from its body.
+pub struct CacheMeta {
+    /// `ETag` as sent, or empty.
+    pub etag: String,
+    /// Lowercased media type without parameters, or empty.
+    pub media_type: String,
+    /// Lowercased charset, or empty.
+    pub charset: String,
+    /// Seconds it stays fresh from its arrival.
+    pub fresh_seconds: u64,
+    /// `Cache-Control: no-cache`: reused only after a `304`.
+    pub revalidate: bool,
+}
+
+/// What a `304` said about the stored copy it confirmed.
+#[derive(Clone, Copy)]
+pub struct Refresh {
+    /// A new lifetime from now, when the 304 carried `max-age` or `Expires`.
+    /// `None` keeps the stored lifetime.
+    pub fresh_seconds: Option<u64>,
+    pub revalidate: bool,
+}
+
+/// What a finished fetch means for the cache the caller keeps.
+pub enum CacheUpdate {
+    /// Nothing changes: the chain redirected, or the caller keeps no cache.
+    Keep,
+    /// A current, storable response to keep.
+    Store(CacheMeta, Vec<u8>),
+    /// A current response that may not or could not be kept.
+    Remove,
+}
+
+/// How the cache would keep a response, or `None` when it must not: only a
+/// `200` that is still fresh, with no `no-store`, no `Vary` beyond the fixed
+/// `Accept-Encoding`, an identity body and a declared length that fits. A
+/// `no-cache` response is kept only with a validator to confirm it by.
+fn storable_meta(head: &http::Head) -> Option<CacheMeta> {
+    if head.status != Some(200)
+        || head.no_store
+        || head.vary_blocks_cache
+        || !head.identity_encoding
+        || head
+            .content_length
+            .is_some_and(|length| length > MAX_HTTP_CACHE_ENTRY_BYTES as u64)
+    {
+        return None;
+    }
+    let fresh_seconds = cache::fresh_seconds(freshness(head))?;
+    let etag = header_text(&head.etag).unwrap_or("");
+    if head.no_cache && etag.is_empty() {
+        return None;
+    }
+    Some(CacheMeta {
+        etag: memory::string_from(etag).ok()?,
+        media_type: memory::string_from(header_text(&head.media_type).unwrap_or("")).ok()?,
+        charset: memory::string_from(header_text(&head.charset).unwrap_or("")).ok()?,
+        fresh_seconds,
+        revalidate: head.no_cache,
+    })
+}
+
+/// Records what a POST's response makes stale, following RFC 9111 4.4: on a
+/// 2xx or 3xx, the request's own URL, and a redirect target on the same
+/// origin. Memory for the list is asked for, not assumed.
+fn note_invalidation(
+    invalidations: &mut Vec<Url>,
+    request: &Request,
+    status: Option<u16>,
+    redirect_target: Option<&Url>,
+) {
+    if request.method != crate::browser::request::Method::Post
+        || !status.is_some_and(|status| (200..400).contains(&status))
+    {
+        return;
+    }
+    let same_origin = redirect_target.filter(|target| target.same_origin(&request.url));
+    for url in core::iter::once(&request.url).chain(same_origin) {
+        if invalidations.try_reserve(1).is_ok() {
+            invalidations.push(url.clone());
+        }
+    }
+}
+
+fn freshness(head: &http::Head) -> Freshness<'_> {
+    Freshness {
+        max_age: head.max_age,
+        expires: head.expires.as_deref(),
+        date: head.date.as_deref(),
+        age: head.age,
+    }
+}
+
+fn refresh_from(head: &http::Head) -> Refresh {
+    Refresh {
+        fresh_seconds: (head.max_age.is_some() || head.expires.is_some())
+            .then(|| cache::fresh_seconds(freshness(head)).unwrap_or(0)),
+        revalidate: head.no_cache,
+    }
+}
+
+/// A parsed header value as text, when it was present and valid UTF-8.
+fn header_text(bytes: &Option<Vec<u8>>) -> Option<&str> {
+    bytes
+        .as_deref()
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+}
+
 /// The failures that do not come from `net::http` or the document layer.
 ///
 /// Named as constants so the one-word `name` -- which the fixture manifest
@@ -656,6 +1040,12 @@ pub const TLS_AUTH_DOWNGRADE: Failure = Failure::new(
     "Refused to lose the pinned identity",
     "The server redirected an authenticated connection to a host this \
      firmware cannot authenticate.",
+);
+pub const POST_REDIRECT_CONFIRMATION: Failure = Failure::new(
+    "post-redirect-confirm",
+    "POST redirect needs confirmation",
+    "The server asked to resend the POST body to another origin. It was not sent \
+     without confirmation.",
 );
 pub const REDIRECT_LIMIT: Failure = Failure::new(
     "redirect-limit",
@@ -683,6 +1073,11 @@ pub const NOT_HTML: Failure = Failure::new(
     "not-html",
     "Not a page",
     "This is not HTML, and this viewer shows nothing else.",
+);
+pub const NOT_IMAGE: Failure = Failure::new(
+    "not-image",
+    "Not a supported image",
+    "The response did not declare image/png or image/jpeg.",
 );
 pub const EMPTY: Failure = Failure::new("empty", "Empty response", "The server sent no page.");
 pub const OUT_OF_MEMORY: Failure = Failure::new(

@@ -35,9 +35,11 @@
 
 use alloc::vec::Vec;
 
-use crate::document::{Block, BlockKind, Document, Marker, Run, Table};
+use crate::document::{
+    Block, BlockKind, Control, ControlKind, Document, Marker, Run, Table, TableCell,
+};
 use crate::error::Error;
-use crate::limits::MAX_LAYOUT_LINES;
+use crate::limits::{MAX_LAYOUT_LINES, PLACEHOLDER_IMAGE_HEIGHT, PLACEHOLDER_IMAGE_WIDTH};
 use crate::memory;
 
 /// One half-width advance, which is the unit indentation is measured in.
@@ -124,7 +126,17 @@ fn fit_columns(widths: &mut [u16], available: u16) {
 /// line; adding every run wholesale would make `<br>` widen a column as if
 /// the lines had been written side by side.
 fn preferred_cell_width(document: &Document, block: &Block) -> u16 {
+    // Attributes/fallback choose the desired image size first. Columns are
+    // then fitted once, so an image can use spare table width without making
+    // column measurement depend on the result of image placement.
     let mut widest = 0u16;
+    if let Some((start, end)) = block_text_span(document, block) {
+        for image in document.images().iter().filter(|image| {
+            image.button.is_none() && image.text_offset >= start && image.text_end <= end
+        }) {
+            widest = widest.max(image_size(image, u16::MAX).0);
+        }
+    }
     let mut line = 0u16;
     for run in document.block_runs(block) {
         let text = document.run_text(run);
@@ -141,6 +153,118 @@ fn preferred_cell_width(document: &Document, block: &Block) -> u16 {
         }
     }
     widest.max(line).saturating_add(TABLE_CELL_PADDING * 2)
+}
+
+/// A control box's height: one text row with padding, or a textarea's rows.
+fn control_box_height(control: Option<&Control>, line_box: u16) -> u16 {
+    let rows = control
+        .filter(|control| control.kind == ControlKind::Textarea)
+        .map_or(1, |control| u16::from(control.rows.max(1)));
+    line_box.saturating_mul(rows).saturating_add(8)
+}
+
+fn control_box_width(document: &Document, control_id: u16, control: &Control, height: u16) -> u16 {
+    if control.kind.is_checkable() {
+        return height;
+    }
+    if control.kind != ControlKind::Submit {
+        return 320;
+    }
+    let text = if control.button_element {
+        &control.display_label
+    } else if control.display_label.is_empty() {
+        if control.initial_value.is_empty() {
+            "Submit"
+        } else {
+            &control.initial_value
+        }
+    } else {
+        &control.display_label
+    };
+    let text_width = if control.button_run_count == 0 {
+        text_width(text, BODY_SCALE)
+    } else {
+        document
+            .button_runs(control)
+            .iter()
+            .map(|run| {
+                text.get(run.start as usize..run.end as usize)
+                    .map_or(0, |part| text_width_styled(part, BODY_SCALE, run.style))
+            })
+            .fold(0u16, u16::saturating_add)
+    };
+    let image_width = document
+        .images()
+        .iter()
+        .filter(|image| image.button == Some(control_id))
+        .map(|image| button_image_size(image, height.saturating_sub(8)).0)
+        .fold(0u16, u16::saturating_add);
+    text_width
+        .saturating_add(image_width)
+        .saturating_add(12)
+        .clamp(80, 320)
+}
+
+fn button_text_width_to(document: &Document, control: &Control, end: usize) -> u16 {
+    document
+        .button_runs(control)
+        .iter()
+        .map(|run| {
+            let from = run.start as usize;
+            let to = (run.end as usize).min(end);
+            if from >= to {
+                0
+            } else {
+                control
+                    .display_label
+                    .get(from..to)
+                    .map_or(0, |text| text_width_styled(text, BODY_SCALE, run.style))
+            }
+        })
+        .fold(0u16, u16::saturating_add)
+}
+
+fn button_image_size(image: &crate::document::Image, line_box: u16) -> (u16, u16) {
+    let (mut width, mut height) = image_size(image, 308);
+    if height > line_box {
+        width = ((u32::from(width) * u32::from(line_box)) / u32::from(height)).max(1) as u16;
+        height = line_box.max(1);
+    }
+    (width.min(308), height)
+}
+
+fn preferred_table_cell_width(document: &Document, cell: &TableCell, block: &Block) -> u16 {
+    let text = preferred_cell_width(document, block);
+    let start = cell.first_control as usize;
+    let end = start + cell.control_count as usize;
+    let controls = document.controls()[start..end]
+        .iter()
+        .enumerate()
+        .filter(|(_, control)| control.kind != ControlKind::Hidden)
+        .map(|(offset, control)| {
+            control_box_width(
+                document,
+                cell.first_control.saturating_add(offset as u16),
+                control,
+                28,
+            )
+        })
+        .fold(0u16, u16::saturating_add);
+    text.saturating_add(controls)
+}
+
+fn cell_has_standalone_items(document: &Document, cell: &TableCell) -> bool {
+    let start = cell.first_image as usize;
+    let end = start.saturating_add(cell.image_count as usize);
+    let standalone_image = document.images()[start..end]
+        .iter()
+        .any(|image| image.button.is_none());
+    let control_start = cell.first_control as usize;
+    let control_end = control_start.saturating_add(cell.control_count as usize);
+    standalone_image
+        || document.controls()[control_start..control_end]
+            .iter()
+            .any(|control| control.kind == ControlKind::Textarea)
 }
 
 /// The vertical part of the font's size, at scale 1.
@@ -272,6 +396,49 @@ pub struct CellBox {
     pub border: u8,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImageBox {
+    pub image: u16,
+    pub x: u16,
+    pub y: u32,
+    pub width: u16,
+    pub height: u16,
+    pub link: Option<u16>,
+    pub button: Option<u16>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ControlBox {
+    pub control: u16,
+    pub x: u16,
+    pub y: u32,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy)]
+struct PendingControl {
+    control: u16,
+    x: u16,
+    width: u16,
+    height: u16,
+}
+
+/// A viewport anchor that survives rebuilding layout with different image
+/// dimensions. `offset` keeps the same pixel within the anchored object at
+/// the top of the viewport.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReadingPosition {
+    target: ReadingTarget,
+    offset: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadingTarget {
+    Text(u32),
+    Image(u16),
+}
+
 pub struct Layout {
     lines: Vec<Line>,
     pieces: Vec<Piece>,
@@ -280,6 +447,8 @@ pub struct Layout {
     metrics: Metrics,
     anchors: Vec<(u16, usize)>,
     cells: Vec<CellBox>,
+    images: Vec<ImageBox>,
+    controls: Vec<ControlBox>,
 }
 
 impl Layout {
@@ -297,6 +466,8 @@ impl Layout {
             metrics,
             anchors: Vec::new(),
             cells: Vec::new(),
+            images: Vec::new(),
+            controls: Vec::new(),
         };
         let mut y = 0u32;
         let mut laid_tables = 0usize;
@@ -352,6 +523,7 @@ impl Layout {
                 memory::push(&mut layout.anchors, (i as u16, last))?;
             }
         }
+        layout.place_all_button_images(document)?;
         layout.height = y;
         Ok(layout)
     }
@@ -365,6 +537,97 @@ impl Layout {
     }
     pub fn cells(&self) -> &[CellBox] {
         &self.cells
+    }
+
+    pub fn images(&self) -> &[ImageBox] {
+        &self.images
+    }
+
+    pub fn controls(&self) -> &[ControlBox] {
+        &self.controls
+    }
+
+    pub fn control_at(&self, x: u16, y: u32) -> Option<u16> {
+        self.controls.iter().find_map(|control| {
+            (x >= control.x
+                && x < control.x.saturating_add(control.width)
+                && y >= control.y
+                && y < control.y.saturating_add(control.height as u32))
+            .then_some(control.control)
+        })
+    }
+
+    /// The control named by an explicit `label for=...` under this point.
+    pub fn label_control_at(&self, document: &Document, x: u16, y: u32) -> Option<u16> {
+        let end = self.lines.partition_point(|line| line.y <= y);
+        for line in self.lines[..end].iter().rev() {
+            if line.y + line.height as u32 <= y {
+                continue;
+            }
+            let Some(offset) = x.checked_sub(line.x) else {
+                continue;
+            };
+            for piece in self.pieces(line) {
+                if offset < piece.x || offset >= piece.x.saturating_add(piece.width) {
+                    continue;
+                }
+                return document.labels().iter().find_map(|label| {
+                    (piece.start < label.text_end && piece.end > label.text_start)
+                        .then_some(label.control)
+                        .flatten()
+                });
+            }
+        }
+        None
+    }
+
+    /// Captures the closest laid-out object at or above `y` by logical ID,
+    /// rather than retaining an absolute pixel coordinate.
+    pub fn reading_position(&self, y: u32) -> ReadingPosition {
+        let mut target = ReadingTarget::Text(0);
+        let mut base_y = 0;
+        for line in &self.lines {
+            if line.y > y {
+                break;
+            }
+            if let Some(piece) = self.pieces(line).first() {
+                if line.y >= base_y {
+                    target = ReadingTarget::Text(piece.start);
+                    base_y = line.y;
+                }
+            }
+        }
+        for image in &self.images {
+            if image.y <= y && image.y >= base_y {
+                target = ReadingTarget::Image(image.image);
+                base_y = image.y;
+            }
+        }
+        ReadingPosition {
+            target,
+            offset: y.saturating_sub(base_y),
+        }
+    }
+
+    /// Resolves a logical viewport anchor after layout has been rebuilt.
+    pub fn y_of_reading_position(&self, position: ReadingPosition) -> u32 {
+        let base = match position.target {
+            ReadingTarget::Image(index) => self
+                .images
+                .iter()
+                .find(|image| image.image == index)
+                .map(|image| image.y),
+            ReadingTarget::Text(offset) => self
+                .lines
+                .iter()
+                .find(|line| {
+                    self.pieces(line)
+                        .iter()
+                        .any(|piece| piece.start <= offset && offset < piece.end)
+                })
+                .map(|line| line.y),
+        };
+        base.unwrap_or(0).saturating_add(position.offset)
     }
 
     /// The pieces of one line.
@@ -412,6 +675,16 @@ impl Layout {
 
     /// The link at a document-space point, for a tap or a click.
     pub fn hit(&self, x: u16, y: u32) -> Option<u16> {
+        for image in &self.images {
+            if x >= image.x
+                && x < image.x.saturating_add(image.width)
+                && y >= image.y
+                && y < image.y.saturating_add(image.height as u32)
+                && image.link.is_some()
+            {
+                return image.link;
+            }
+        }
         // A table has several lines at the same y, one per cell.  The old
         // single-line lookup was valid only while lines occupied the whole
         // content width.
@@ -445,7 +718,30 @@ impl Layout {
                 return Some(index);
             }
         }
+        if let Some(image) = self.images.iter().find(|image| image.link == Some(link)) {
+            return Some(
+                self.lines
+                    .partition_point(|line| line.y < image.y)
+                    .min(self.lines.len().saturating_sub(1)),
+            );
+        }
         None
+    }
+
+    pub fn position_of_link(&self, link: u16) -> Option<(u32, u16)> {
+        for line in &self.lines {
+            if let Some(piece) = self
+                .pieces(line)
+                .iter()
+                .find(|piece| piece.link == Some(link))
+            {
+                return Some((line.y, line.x.saturating_add(piece.x)));
+            }
+        }
+        self.images
+            .iter()
+            .find(|image| image.link == Some(link))
+            .map(|image| (image.y, image.x))
     }
 
     /// Every link in the order it is laid out, which is the order `Tab`
@@ -454,18 +750,27 @@ impl Layout {
     /// Document order, deduplicated: a link whose text wraps across two
     /// lines is one stop, not two.
     pub fn link_order(&self) -> Result<Vec<u16>, Error> {
-        let mut order: Vec<u16> = Vec::new();
+        let mut positions: Vec<(u32, u16, u16)> = Vec::new();
         for line in &self.lines {
             for piece in self.pieces(line) {
-                let Some(link) = piece.link else {
-                    continue;
-                };
-                if order.last() == Some(&link) {
-                    continue;
+                if let Some(link) = piece.link {
+                    memory::push(
+                        &mut positions,
+                        (line.y, line.x.saturating_add(piece.x), link),
+                    )?;
                 }
-                if !order.contains(&link) {
-                    memory::push(&mut order, link)?;
-                }
+            }
+        }
+        for image in &self.images {
+            if let Some(link) = image.link {
+                memory::push(&mut positions, (image.y, image.x, link))?;
+            }
+        }
+        positions.sort_unstable();
+        let mut order: Vec<u16> = Vec::new();
+        for (_, _, link) in positions {
+            if !order.contains(&link) {
+                memory::push(&mut order, link)?;
             }
         }
         Ok(order)
@@ -476,6 +781,8 @@ impl Layout {
             + self.pieces.capacity() * core::mem::size_of::<Piece>()
             + self.anchors.capacity() * core::mem::size_of::<(u16, usize)>()
             + self.cells.capacity() * core::mem::size_of::<CellBox>()
+            + self.images.capacity() * core::mem::size_of::<ImageBox>()
+            + self.controls.capacity() * core::mem::size_of::<ControlBox>()
     }
 
     pub fn line_of_anchor(&self, document: &Document, name: &str) -> Option<usize> {
@@ -491,6 +798,52 @@ impl Layout {
     fn place_block(&mut self, document: &Document, block: &Block, top: u32) -> Result<u32, Error> {
         let (scale, indent_cells, gap_before, gap_after) = self.block_metrics(block.kind);
         let mut y = top + gap_before as u32;
+
+        if let BlockKind::Control(control) = block.kind {
+            let height = control_box_height(
+                document.controls().get(control as usize),
+                self.metrics.line_box(BODY_SCALE),
+            );
+            let width = if document
+                .controls()
+                .get(control as usize)
+                .is_some_and(|item| item.kind.is_checkable())
+            {
+                height.min(self.width).max(1)
+            } else {
+                self.width.min(320).max(80)
+            };
+            memory::push(
+                &mut self.controls,
+                ControlBox {
+                    control,
+                    x: 0,
+                    y,
+                    width,
+                    height,
+                },
+            )?;
+            return Ok(y + height as u32 + gap_after as u32);
+        }
+
+        if let Some((index, image)) = image_for_block(document, block) {
+            let (width, height) = image_size(image, self.width);
+            memory::push(
+                &mut self.images,
+                ImageBox {
+                    image: index as u16,
+                    x: 0,
+                    y,
+                    width,
+                    height,
+                    link: image.link,
+                    button: None,
+                },
+            )?;
+            return Ok(y
+                .saturating_add(height as u32)
+                .saturating_add(gap_after as u32));
+        }
 
         if block.kind == BlockKind::Rule {
             let height = self.metrics.line_box(BODY_SCALE) * RULE_LINES;
@@ -509,6 +862,9 @@ impl Layout {
         }
 
         let runs = document.block_runs(block);
+        if block.control_count != 0 {
+            return self.place_inline_block(document, block, y, gap_after);
+        }
         let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
             return Ok(top);
         };
@@ -563,6 +919,356 @@ impl Layout {
         Ok(y + gap_after as u32)
     }
 
+    fn place_inline_block(
+        &mut self,
+        document: &Document,
+        block: &Block,
+        y: u32,
+        gap_after: u16,
+    ) -> Result<u32, Error> {
+        self.place_inline_region(document, block, y, 0, self.width, gap_after)
+    }
+
+    fn place_inline_region(
+        &mut self,
+        document: &Document,
+        block: &Block,
+        y: u32,
+        origin_x: u16,
+        available: u16,
+        gap_after: u16,
+    ) -> Result<u32, Error> {
+        let runs = document.block_runs(block);
+        let controls = &document.controls()[block.first_control as usize
+            ..block.first_control as usize + block.control_count as usize];
+        let start = runs
+            .first()
+            .map(|run| run.start)
+            .or_else(|| controls.first().map(|control| control.text_offset))
+            .unwrap_or(0);
+        let end = runs
+            .last()
+            .map(|run| run.end)
+            .unwrap_or(start)
+            .max(controls.last().map_or(start, |control| control.text_offset));
+        self.place_inline_region_range(
+            document,
+            block,
+            y,
+            origin_x,
+            available,
+            gap_after,
+            start,
+            end,
+            block.first_control as usize,
+            block.first_control as usize + block.control_count as usize,
+            matches!(block.kind, BlockKind::Heading(_)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_inline_region_range(
+        &mut self,
+        document: &Document,
+        block: &Block,
+        mut y: u32,
+        origin_x: u16,
+        available: u16,
+        gap_after: u16,
+        start: u32,
+        end: u32,
+        control_start: usize,
+        control_end: usize,
+        heading: bool,
+    ) -> Result<u32, Error> {
+        let (scale, indent_cells, _, _) = self.block_metrics(block.kind);
+        let indent_amount = indent_cells * CELL_WIDTH * scale as u16;
+        let indent = origin_x.saturating_add(indent_amount);
+        let budget = available.saturating_sub(indent_amount).max(1);
+        let text_height = self.metrics.line_box(scale);
+        let runs = document.block_runs(block);
+        let controls = &document.controls()[control_start..control_end];
+        let mut cursor = start;
+        let mut line_x = 0u16;
+        let mut line_first_piece = self.pieces.len() as u32;
+        let mut pending: Vec<PendingControl> = Vec::new();
+        let mut line_has_visible = false;
+        let mut first_line = true;
+        let marker = match block.kind {
+            BlockKind::ListItem { marker, .. } => Some(marker),
+            _ => None,
+        };
+
+        for (offset, control) in controls.iter().enumerate() {
+            let stop = control.text_offset.clamp(cursor, end);
+            self.place_inline_text(
+                document,
+                runs,
+                &mut cursor,
+                stop,
+                indent,
+                budget,
+                scale,
+                text_height,
+                marker,
+                heading,
+                &mut y,
+                &mut line_x,
+                &mut line_first_piece,
+                &mut pending,
+                &mut line_has_visible,
+                &mut first_line,
+            )?;
+            let control_id = (control_start + offset).min(u16::MAX as usize) as u16;
+            if control.kind == ControlKind::Hidden {
+                continue;
+            }
+            let height = control_box_height(Some(control), self.metrics.line_box(BODY_SCALE));
+            let desired = control_box_width(document, control_id, control, height);
+            let width = desired.min(budget).max(1);
+            if line_has_visible && line_x.saturating_add(width) > budget {
+                self.finish_inline_line(
+                    indent,
+                    scale,
+                    text_height,
+                    marker,
+                    heading,
+                    &mut y,
+                    &mut line_x,
+                    &mut line_first_piece,
+                    &mut pending,
+                    &mut line_has_visible,
+                    &mut first_line,
+                )?;
+            }
+            memory::push(
+                &mut pending,
+                PendingControl {
+                    control: control_id,
+                    x: line_x,
+                    width,
+                    height,
+                },
+            )?;
+            line_x = line_x.saturating_add(width);
+            line_has_visible = true;
+        }
+        self.place_inline_text(
+            document,
+            runs,
+            &mut cursor,
+            end,
+            indent,
+            budget,
+            scale,
+            text_height,
+            marker,
+            heading,
+            &mut y,
+            &mut line_x,
+            &mut line_first_piece,
+            &mut pending,
+            &mut line_has_visible,
+            &mut first_line,
+        )?;
+        if line_has_visible {
+            self.finish_inline_line(
+                indent,
+                scale,
+                text_height,
+                marker,
+                heading,
+                &mut y,
+                &mut line_x,
+                &mut line_first_piece,
+                &mut pending,
+                &mut line_has_visible,
+                &mut first_line,
+            )?;
+        }
+        Ok(y.saturating_add(gap_after as u32))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_inline_text(
+        &mut self,
+        document: &Document,
+        runs: &[Run],
+        cursor: &mut u32,
+        end: u32,
+        indent: u16,
+        budget: u16,
+        scale: u8,
+        text_height: u16,
+        marker: Option<Marker>,
+        heading: bool,
+        y: &mut u32,
+        line_x: &mut u16,
+        line_first_piece: &mut u32,
+        pending: &mut Vec<PendingControl>,
+        line_has_visible: &mut bool,
+        first_line: &mut bool,
+    ) -> Result<(), Error> {
+        while *cursor < end {
+            if *line_x >= budget && *line_has_visible {
+                self.finish_inline_line(
+                    indent,
+                    scale,
+                    text_height,
+                    marker,
+                    heading,
+                    y,
+                    line_x,
+                    line_first_piece,
+                    pending,
+                    line_has_visible,
+                    first_line,
+                )?;
+            }
+            let Some(text) = document.text().get(*cursor as usize..end as usize) else {
+                break;
+            };
+            let remaining = budget.saturating_sub(*line_x).max(1);
+            let (line_end, next) =
+                next_line(text, 0, remaining, scale, false, *cursor as usize, runs);
+            let piece_start = self.pieces.len();
+            let count = self.push_pieces(
+                document.text(),
+                runs,
+                *cursor as usize,
+                *cursor as usize + line_end,
+                scale,
+                false,
+            )?;
+            for piece in &mut self.pieces[piece_start..] {
+                piece.x = piece.x.saturating_add(*line_x);
+            }
+            let added = self.pieces[piece_start..]
+                .iter()
+                .map(|piece| piece.width)
+                .fold(0u16, u16::saturating_add);
+            *line_x = line_x.saturating_add(added);
+            *line_has_visible |= count != 0;
+            *cursor = cursor.saturating_add(next as u32);
+            if next < text.len() {
+                self.finish_inline_line(
+                    indent,
+                    scale,
+                    text_height,
+                    marker,
+                    heading,
+                    y,
+                    line_x,
+                    line_first_piece,
+                    pending,
+                    line_has_visible,
+                    first_line,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_inline_line(
+        &mut self,
+        indent: u16,
+        scale: u8,
+        text_height: u16,
+        marker: Option<Marker>,
+        heading: bool,
+        y: &mut u32,
+        line_x: &mut u16,
+        line_first_piece: &mut u32,
+        pending: &mut Vec<PendingControl>,
+        line_has_visible: &mut bool,
+        first_line: &mut bool,
+    ) -> Result<(), Error> {
+        let height = pending
+            .iter()
+            .map(|control| control.height)
+            .fold(text_height, u16::max);
+        let text_y = y.saturating_add(u32::from(height.saturating_sub(text_height) / 2));
+        let piece_count = (self.pieces.len() as u32 - *line_first_piece) as u16;
+        self.push_line(Line {
+            y: text_y,
+            height: text_height,
+            x: indent,
+            scale,
+            first_piece: *line_first_piece,
+            piece_count,
+            marker: if *first_line { marker } else { None },
+            heading,
+            rule: false,
+        })?;
+        for control in pending.drain(..) {
+            let control_y = y.saturating_add(u32::from(height.saturating_sub(control.height) / 2));
+            memory::push(
+                &mut self.controls,
+                ControlBox {
+                    control: control.control,
+                    x: indent.saturating_add(control.x),
+                    y: control_y,
+                    width: control.width,
+                    height: control.height,
+                },
+            )?;
+        }
+        *y = y.saturating_add(height as u32);
+        *line_x = 0;
+        *line_first_piece = self.pieces.len() as u32;
+        *line_has_visible = false;
+        *first_line = false;
+        Ok(())
+    }
+
+    fn place_all_button_images(&mut self, document: &Document) -> Result<(), Error> {
+        for box_ in &self.controls {
+            let Some(control) = document.controls().get(box_.control as usize) else {
+                continue;
+            };
+            let images: Vec<_> = document
+                .images()
+                .iter()
+                .enumerate()
+                .filter(|(_, image)| image.button == Some(box_.control))
+                .collect();
+            let mut preceding_images = 0u16;
+            for (image_index, image) in images {
+                let (width, height) = button_image_size(image, self.metrics.line_box(BODY_SCALE));
+                let text_width =
+                    button_text_width_to(document, control, image.text_offset as usize);
+                let x = box_
+                    .x
+                    .saturating_add(6)
+                    .saturating_add(text_width)
+                    .saturating_add(preceding_images);
+                let y = box_
+                    .y
+                    .saturating_add(u32::from(box_.height.saturating_sub(height) / 2));
+                let visible_width = width.min(box_.x.saturating_add(box_.width).saturating_sub(x));
+                if visible_width == 0 {
+                    preceding_images = preceding_images.saturating_add(width);
+                    continue;
+                }
+                memory::push(
+                    &mut self.images,
+                    ImageBox {
+                        image: image_index as u16,
+                        x,
+                        y,
+                        width: visible_width,
+                        height,
+                        link: None,
+                        button: Some(box_.control),
+                    },
+                )?;
+                preceding_images = preceding_images.saturating_add(width);
+            }
+        }
+        Ok(())
+    }
+
     fn place_table(&mut self, document: &Document, table: &Table, top: u32) -> Result<u32, Error> {
         if table.column_count == 0 || table.row_count == 0 {
             return Ok(top);
@@ -573,12 +1279,12 @@ impl Layout {
         let mut widths = alloc::vec![CELL_WIDTH + TABLE_CELL_PADDING * 2; columns];
         for cell in cells.iter().filter(|cell| cell.colspan == 1) {
             let block = &document.blocks()[cell.block as usize];
-            let preferred = preferred_cell_width(document, block);
+            let preferred = preferred_table_cell_width(document, cell, block);
             widths[cell.column as usize] = widths[cell.column as usize].max(preferred);
         }
         for cell in cells.iter().filter(|cell| cell.colspan > 1) {
             let block = &document.blocks()[cell.block as usize];
-            let preferred = preferred_cell_width(document, block);
+            let preferred = preferred_table_cell_width(document, cell, block);
             let start = cell.column as usize;
             let end = (start + cell.colspan as usize).min(columns);
             let current: u32 = widths[start..end].iter().map(|&width| width as u32).sum();
@@ -603,14 +1309,14 @@ impl Layout {
         for cell in cells.iter().filter(|cell| cell.rowspan == 1) {
             let width = x[(cell.column + cell.colspan) as usize] - x[cell.column as usize];
             let needed = self
-                .measure_cell(document, &document.blocks()[cell.block as usize], width)
+                .measure_cell(document, cell, width)
                 .saturating_add(TABLE_CELL_PADDING * 2);
             heights[cell.row as usize] = heights[cell.row as usize].max(needed);
         }
         for cell in cells.iter().filter(|cell| cell.rowspan > 1) {
             let width = x[(cell.column + cell.colspan) as usize] - x[cell.column as usize];
             let needed = self
-                .measure_cell(document, &document.blocks()[cell.block as usize], width)
+                .measure_cell(document, cell, width)
                 .saturating_add(TABLE_CELL_PADDING * 2);
             let end = (cell.row as usize + cell.rowspan as usize).min(heights.len());
             let available: u32 = heights[cell.row as usize..end]
@@ -638,99 +1344,184 @@ impl Layout {
                 border: table.border,
             };
             memory::push(&mut self.cells, box_)?;
-            self.place_cell(document, &document.blocks()[cell.block as usize], box_)?;
+            self.place_cell(document, cell, box_)?;
         }
         Ok(*row_y.last().unwrap_or(&top) + line_height as u32 / 2)
     }
 
-    fn measure_cell(&self, document: &Document, block: &Block, width: u16) -> u16 {
-        let runs = document.block_runs(block);
-        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
-            return self.metrics.line_box(BODY_SCALE);
-        };
-        let text = document
-            .text()
-            .get(first.start as usize..last.end as usize)
-            .unwrap_or("");
+    fn measure_cell(&self, document: &Document, cell: &TableCell, width: u16) -> u16 {
+        let block = &document.blocks()[cell.block as usize];
         let budget = width.saturating_sub(TABLE_CELL_PADDING * 2);
-        let mut cursor = 0;
-        let mut lines = 0u16;
-        loop {
-            let (_, next) = next_line(
-                text,
-                cursor,
-                budget,
-                BODY_SCALE,
-                false,
-                first.start as usize,
-                runs,
-            );
-            lines = lines.saturating_add(1);
-            if next >= text.len() {
-                break;
-            }
-            cursor = next;
-        }
-        lines.saturating_mul(self.metrics.line_box(BODY_SCALE))
+        let mut scratch = Layout {
+            lines: Vec::new(),
+            pieces: Vec::new(),
+            height: 0,
+            width: budget,
+            metrics: self.metrics,
+            anchors: Vec::new(),
+            cells: Vec::new(),
+            images: Vec::new(),
+            controls: Vec::new(),
+        };
+        scratch
+            .place_cell_contents(document, cell, block, 0, 0, budget)
+            .unwrap_or(u32::from(u16::MAX))
+            .min(u32::from(u16::MAX)) as u16
     }
 
     fn place_cell(
         &mut self,
         document: &Document,
-        block: &Block,
+        cell_data: &TableCell,
         cell: CellBox,
     ) -> Result<(), Error> {
-        let runs = document.block_runs(block);
-        let line_height = self.metrics.line_box(BODY_SCALE);
-        let mut y = cell.y + TABLE_CELL_PADDING as u32;
+        let block = &document.blocks()[cell_data.block as usize];
         let x = cell.x + TABLE_CELL_PADDING;
         let budget = cell.width.saturating_sub(TABLE_CELL_PADDING * 2);
-        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
-            self.push_line(Line {
+        self.place_cell_contents(
+            document,
+            cell_data,
+            block,
+            cell.y + TABLE_CELL_PADDING as u32,
+            x,
+            budget,
+        )?;
+        Ok(())
+    }
+
+    fn place_cell_contents(
+        &mut self,
+        document: &Document,
+        cell: &TableCell,
+        block: &Block,
+        mut y: u32,
+        x: u16,
+        budget: u16,
+    ) -> Result<u32, Error> {
+        if !cell_has_standalone_items(document, cell) {
+            return self.place_inline_region_range(
+                document,
+                block,
                 y,
-                height: line_height,
                 x,
-                scale: BODY_SCALE,
-                first_piece: self.pieces.len() as u32,
-                piece_count: 0,
-                marker: None,
-                heading: cell.header,
-                rule: false,
-            })?;
-            return Ok(());
-        };
-        let span = first.start as usize..last.end as usize;
-        let text = document.text().get(span.clone()).unwrap_or("");
-        let mut cursor = 0;
+                budget,
+                0,
+                cell.text_start,
+                cell.text_end,
+                cell.first_control as usize,
+                cell.first_control as usize + cell.control_count as usize,
+                cell.header,
+            );
+        }
+
+        let line_height = self.metrics.line_box(BODY_SCALE);
+        let mut cursor = cell.text_start;
+        let mut image = cell.first_image as usize;
+        let image_end = image + cell.image_count as usize;
+        let mut control = cell.first_control as usize;
+        let control_end = control + cell.control_count as usize;
         loop {
-            let (end, next) = next_line(text, cursor, budget, BODY_SCALE, false, span.start, runs);
-            let first_piece = self.pieces.len() as u32;
-            let piece_count = self.push_pieces(
-                document.text(),
-                runs,
-                span.start + cursor,
-                span.start + end,
-                BODY_SCALE,
-                false,
-            )?;
-            self.push_line(Line {
-                y,
-                height: line_height,
-                x,
-                scale: BODY_SCALE,
-                first_piece,
-                piece_count,
-                marker: None,
-                heading: cell.header,
-                rule: false,
-            })?;
-            y += line_height as u32;
-            if next >= text.len() {
+            while image < image_end && document.images()[image].button.is_some() {
+                image += 1;
+            }
+            let image_at = document
+                .images()
+                .get(image)
+                .filter(|_| image < image_end)
+                .map_or(u32::MAX, |item| item.text_offset);
+            let textarea = (control..control_end)
+                .find(|&index| document.controls()[index].kind == ControlKind::Textarea);
+            let textarea_at =
+                textarea.map_or(u32::MAX, |index| document.controls()[index].text_offset);
+            if image_at == u32::MAX && textarea_at == u32::MAX {
                 break;
             }
-            cursor = next;
+
+            if textarea_at <= image_at {
+                let textarea = textarea.expect("textarea offset came from an index");
+                let stop = textarea_at.max(cursor);
+                y = self.place_inline_region_range(
+                    document,
+                    block,
+                    y,
+                    x,
+                    budget,
+                    0,
+                    cursor,
+                    stop,
+                    control,
+                    textarea,
+                    cell.header,
+                )?;
+                let item = &document.controls()[textarea];
+                let height = control_box_height(Some(item), line_height);
+                memory::push(
+                    &mut self.controls,
+                    ControlBox {
+                        control: textarea as u16,
+                        x,
+                        y,
+                        width: budget.min(320).max(1),
+                        height,
+                    },
+                )?;
+                y = y.saturating_add(height as u32);
+                cursor = stop;
+                control = textarea + 1;
+            } else {
+                let segment_control_start = control;
+                while control < control_end
+                    && document.controls()[control].kind != ControlKind::Textarea
+                    && document.controls()[control].text_offset <= image_at
+                {
+                    control += 1;
+                }
+                let stop = image_at.max(cursor);
+                y = self.place_inline_region_range(
+                    document,
+                    block,
+                    y,
+                    x,
+                    budget,
+                    0,
+                    cursor,
+                    stop,
+                    segment_control_start,
+                    control,
+                    cell.header,
+                )?;
+                let item = &document.images()[image];
+                let (width, height) = image_size(item, budget);
+                memory::push(
+                    &mut self.images,
+                    ImageBox {
+                        image: image as u16,
+                        x,
+                        y,
+                        width,
+                        height,
+                        link: item.link,
+                        button: None,
+                    },
+                )?;
+                y = y.saturating_add(height as u32);
+                cursor = item.text_end.max(cursor);
+                image += 1;
+            }
         }
-        Ok(())
+        self.place_inline_region_range(
+            document,
+            block,
+            y,
+            x,
+            budget,
+            0,
+            cursor,
+            cell.text_end,
+            control,
+            control_end,
+            cell.header,
+        )
     }
 
     /// Cuts `[start, end)` at the run boundaries it crosses.
@@ -815,8 +1606,61 @@ impl Layout {
             }
             BlockKind::Preformatted => (BODY_SCALE, PRE_INDENT_CELLS, half, half),
             BlockKind::Rule => (BODY_SCALE, 0, half, half),
+            BlockKind::Control(_) => (BODY_SCALE, 0, half / 2, half / 2),
         }
     }
+}
+
+fn image_for_block<'a>(
+    document: &'a Document,
+    block: &Block,
+) -> Option<(usize, &'a crate::document::Image)> {
+    let runs = document.block_runs(block);
+    let first = runs.first()?;
+    let last = runs.last()?;
+    document
+        .images()
+        .iter()
+        .enumerate()
+        .find(|(_, image)| image.text_offset == first.start && image.text_end == last.end)
+        .filter(|(_, image)| image.button.is_none())
+}
+
+fn block_text_span(document: &Document, block: &Block) -> Option<(u32, u32)> {
+    let runs = document.block_runs(block);
+    Some((runs.first()?.start, runs.last()?.end))
+}
+
+fn image_size(image: &crate::document::Image, available: u16) -> (u16, u16) {
+    let intrinsic = image.intrinsic_width.zip(image.intrinsic_height);
+    let (mut width, mut height) = match (image.width, image.height, intrinsic) {
+        (Some(width), Some(height), _) => (width, height),
+        (Some(width), None, Some((iw, ih))) => (
+            width,
+            ((u32::from(width) * u32::from(ih)) / u32::from(iw))
+                .max(1)
+                .min(u32::from(u16::MAX)) as u16,
+        ),
+        (None, Some(height), Some((iw, ih))) => (
+            ((u32::from(height) * u32::from(iw)) / u32::from(ih))
+                .max(1)
+                .min(u32::from(u16::MAX)) as u16,
+            height,
+        ),
+        (None, None, Some(dimensions)) => dimensions,
+        (width, height, None) => (
+            width.unwrap_or(PLACEHOLDER_IMAGE_WIDTH),
+            height.unwrap_or(PLACEHOLDER_IMAGE_HEIGHT),
+        ),
+    };
+    let available = available.max(1);
+    if width > available {
+        height = ((height as u32 * available as u32) / width as u32)
+            .max(1)
+            .min(u16::MAX as u32) as u16;
+        width = available;
+    }
+    (width, height)
 }
 
 /// Characters that may not begin a line.
@@ -1019,6 +1863,12 @@ mod tests {
     fn layout_of(markup: &str) -> (crate::document::Document, Layout) {
         let document = document(markup);
         let layout = Layout::build(&document, WIDTH, metrics()).unwrap();
+        (document, layout)
+    }
+
+    fn layout_of_width(markup: &str, width: u16) -> (crate::document::Document, Layout) {
+        let document = document(markup);
+        let layout = Layout::build(&document, width, metrics()).unwrap();
         (document, layout)
     }
 
@@ -1608,6 +2458,306 @@ mod tests {
             text_width("WWWW", BODY_SCALE) + TABLE_CELL_PADDING * 2
         );
         assert_eq!(first.width, preferred_cell_width(&document, block));
+    }
+
+    #[test]
+    fn image_boxes_apply_each_dimension_fallback_independently() {
+        let (_, layout) = layout_of(
+            "<img src='both' width='320' height='180'>\
+             <img src='width' width='200'>\
+             <img src='height' height='60'>\
+             <img src='neither'>",
+        );
+        assert_eq!(
+            layout
+                .images()
+                .iter()
+                .map(|image| (image.width, image.height))
+                .collect::<Vec<_>>(),
+            [(320, 180), (200, 90), (160, 60), (160, 90)]
+        );
+        assert!(layout.images().windows(2).all(|pair| pair[0].y < pair[1].y));
+    }
+
+    #[test]
+    fn image_wider_than_its_region_shrinks_with_its_ratio() {
+        let document = document("<img src='wide' width='400' height='200'>");
+        let layout = Layout::build(&document, 100, metrics()).unwrap();
+        assert_eq!(
+            (layout.images()[0].width, layout.images()[0].height),
+            (100, 50)
+        );
+    }
+
+    #[test]
+    fn intrinsic_dimensions_replace_only_unspecified_axes() {
+        let mut document = document(
+            "<img src='a'><img src='b' width='96'><img src='c' height='64'><img src='d' width='70' height='50'>",
+        );
+        for index in 0..4 {
+            assert!(document.set_image_intrinsic(index, Some((192, 128))));
+        }
+        let layout = Layout::build(&document, WIDTH, metrics()).unwrap();
+        let sizes: Vec<_> = layout
+            .images()
+            .iter()
+            .map(|image| (image.width, image.height))
+            .collect();
+        assert_eq!(sizes, [(192, 128), (96, 64), (96, 64), (70, 50)]);
+    }
+
+    #[test]
+    fn linked_image_uses_its_rectangle_for_hit_testing() {
+        let (_, layout) =
+            layout_of("<a href='/target'><img src='button' width='80' height='40'></a>");
+        let image = layout.images()[0];
+        assert_eq!(layout.hit(image.x + 79, image.y + 39), image.link);
+        assert_eq!(layout.hit(image.x + 80, image.y + 39), None);
+        assert_eq!(layout.link_order().unwrap(), [0]);
+    }
+
+    #[test]
+    fn visible_form_controls_reserve_space_and_are_hit_tested() {
+        let (document, layout) = layout_of(
+            "<p>before</p><form><input name=q value=hello><input type=hidden name=h value=x><input type=submit value=Go></form><p>after</p>",
+        );
+        assert_eq!(layout.controls().len(), 2);
+        let first = layout.controls()[0];
+        assert_eq!(layout.control_at(first.x + 1, first.y + 1), Some(0));
+        assert_eq!(layout.controls()[1].control, 2);
+        assert!(layout.lines().last().unwrap().y > layout.controls()[1].y);
+        assert_eq!(document.controls().len(), 3);
+    }
+
+    #[test]
+    fn controls_share_a_line_with_text_and_wrap_as_one_inline_flow() {
+        let (document, layout) = layout_of(
+            "<p>before <input name=q value=hello> after <input type=checkbox name=c> tail</p>",
+        );
+        let input = layout.controls()[0];
+        let checkbox = layout.controls()[1];
+        let line = layout
+            .lines()
+            .iter()
+            .find(|line| {
+                line.y < input.y + input.height as u32 && line.y + line.height as u32 > input.y
+            })
+            .unwrap();
+        let pieces = layout.pieces(line);
+        assert!(pieces.first().unwrap().width <= input.x);
+        assert!(pieces.last().unwrap().x >= input.x + input.width);
+        assert_eq!(input.y, checkbox.y);
+        assert_eq!(layout.control_at(input.x + 1, input.y + 1), Some(0));
+        assert_eq!(document.blocks()[0].control_count, 2);
+
+        let (_, narrow) = layout_of_width("<p>word<input name=q>tail</p>", 100);
+        let control = narrow.controls()[0];
+        assert!(control.y > narrow.lines()[0].y);
+        assert_eq!(control.width, 100);
+    }
+
+    #[test]
+    fn styled_button_uses_content_width_and_owns_its_scaled_image() {
+        let (document, layout) = layout_of(
+            "<p>x<button name=go><strong>Go</strong><img src=icon width=40 height=80>now</button>y</p>",
+        );
+        let button = layout.controls()[0];
+        assert!(button.width >= 80 && button.width < 320);
+        let image = layout
+            .images()
+            .iter()
+            .find(|image| image.button == Some(0))
+            .unwrap();
+        assert_eq!(image.height, metrics().line_box(BODY_SCALE));
+        assert!(image.x >= button.x + 6);
+        assert!(image.x + image.width <= button.x + button.width);
+        assert_eq!(document.images()[image.image as usize].button, Some(0));
+        assert_eq!(layout.control_at(image.x + 1, image.y + 1), Some(0));
+        assert!(layout.hit(image.x + 1, image.y + 1).is_none());
+    }
+
+    #[test]
+    fn explicit_label_text_hits_its_control() {
+        let (document, layout) =
+            layout_of("<p><label for=q>Search term</label></p><input id=q name=q value=old>");
+        let line = layout.lines()[0];
+        assert_eq!(
+            layout.label_control_at(&document, line.x + 2, line.y + 2),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn table_cell_control_uses_the_same_inline_flow_and_grows_the_row() {
+        let (document, layout) = layout_of(
+            "<form><table border=1><tr><td>before<input id=q name=q value=old>after</td><td>peer</td></tr></table></form>",
+        );
+        let control = layout
+            .controls()
+            .iter()
+            .find(|item| item.control == 0)
+            .unwrap();
+        let cell = layout.cells()[0];
+        assert!(control.x >= cell.x);
+        assert!(control.x + control.width <= cell.x + cell.width);
+        assert!(control.y >= cell.y);
+        assert!(control.y + control.height as u32 <= cell.y + cell.height);
+        let lines: Vec<_> = layout
+            .lines()
+            .iter()
+            .filter(|line| line.x >= cell.x && line.x < cell.x + cell.width)
+            .collect();
+        assert!(lines.iter().any(|line| {
+            line.y < control.y + control.height as u32 && line.y + line.height as u32 > control.y
+        }));
+        assert_eq!(layout.control_at(control.x + 1, control.y + 1), Some(0));
+        assert_eq!(document.controls()[0].name, "q");
+    }
+
+    #[test]
+    fn image_only_table_cell_grows_the_row_and_stays_inside_the_cell() {
+        let (_, layout) = layout_of(
+            "<table border='1'><tr><td>text</td><td><img src='cell' width='600' height='300'></td></tr></table>",
+        );
+        let image = layout.images()[0];
+        let cell = layout.cells()[1];
+        assert!(image.x >= cell.x + TABLE_CELL_PADDING);
+        assert!(image.x + image.width <= cell.x + cell.width - TABLE_CELL_PADDING);
+        assert!(image.y >= cell.y + TABLE_CELL_PADDING as u32);
+        assert!(image.y + image.height as u32 <= cell.y + cell.height);
+        assert!(cell.height >= image.height as u32 + TABLE_CELL_PADDING as u32 * 2);
+    }
+
+    #[test]
+    fn image_mixed_with_text_in_a_table_cell_is_stacked_in_document_order() {
+        let (document, layout) = layout_of(
+            "<table><tr><td rowspan='2'><img src='portrait' alt='portrait' width='350' height='414'><br><br><table><tr><td>nested text</td></tr></table>after image</td><td>right</td></tr><tr><td>below</td></tr></table>",
+        );
+        let image = layout.images()[0];
+        let cell = layout.cells()[0];
+        assert!(image.y >= cell.y + TABLE_CELL_PADDING as u32);
+        assert!(image.y + image.height as u32 <= cell.y + cell.height);
+        let after_line = layout
+            .lines()
+            .iter()
+            .find(|line| {
+                layout.pieces(line).iter().any(|piece| {
+                    document
+                        .text()
+                        .get(piece.start as usize..piece.end as usize)
+                        .is_some_and(|text| text.contains("after image"))
+                })
+            })
+            .unwrap();
+        assert!(after_line.y >= image.y + image.height as u32);
+        assert!(layout.all_pieces().iter().all(|piece| {
+            document
+                .text()
+                .get(piece.start as usize..piece.end as usize)
+                != Some("[portrait]")
+        }));
+    }
+
+    #[test]
+    fn controls_remain_inline_on_each_side_of_a_standalone_table_image() {
+        let (document, layout) = layout_of(
+            "<form><table><tr><td>before<input type=checkbox name=left><img src='cell' alt='skip' width='80' height='40'>after<input type=radio name=right>tail</td></tr></table></form>",
+        );
+        let image = layout.images()[0];
+        let before = layout
+            .lines()
+            .iter()
+            .find(|line| {
+                layout.pieces(line).iter().any(|piece| {
+                    document
+                        .text()
+                        .get(piece.start as usize..piece.end as usize)
+                        .is_some_and(|text| text.contains("before"))
+                })
+            })
+            .unwrap();
+        let after = layout
+            .lines()
+            .iter()
+            .find(|line| {
+                layout.pieces(line).iter().any(|piece| {
+                    document
+                        .text()
+                        .get(piece.start as usize..piece.end as usize)
+                        .is_some_and(|text| text.contains("after"))
+                })
+            })
+            .unwrap();
+        let left = layout
+            .controls()
+            .iter()
+            .find(|item| item.control == 0)
+            .unwrap();
+        let right = layout
+            .controls()
+            .iter()
+            .find(|item| item.control == 1)
+            .unwrap();
+
+        assert!(before.y < image.y);
+        assert!(left.y < image.y);
+        assert!(before.y < left.y + left.height as u32);
+        assert!(left.y < before.y + before.height as u32);
+        assert!(after.y >= image.y + image.height as u32);
+        assert!(right.y >= image.y + image.height as u32);
+        assert!(after.y < right.y + right.height as u32);
+        assert!(right.y < after.y + after.height as u32);
+        assert!(layout.all_pieces().iter().all(|piece| {
+            document
+                .text()
+                .get(piece.start as usize..piece.end as usize)
+                != Some("[skip]")
+        }));
+    }
+
+    #[test]
+    fn table_gives_an_image_its_requested_width_when_room_is_available() {
+        let (_, layout) = layout_of(
+            "<table><tr><td>label</td><td><img src='cell' width='300' height='120'></td></tr></table>",
+        );
+        let image = layout.images()[0];
+        let cell = layout.cells()[1];
+        assert_eq!((image.width, image.height), (300, 120));
+        assert_eq!(cell.width, 300 + TABLE_CELL_PADDING * 2);
+    }
+
+    #[test]
+    fn logical_reading_position_survives_an_image_height_change_above_it() {
+        let short_document =
+            document("<p>before</p><img src='same' width='100' height='40'><p>reading target</p>");
+        let tall_document =
+            document("<p>before</p><img src='same' width='100' height='240'><p>reading target</p>");
+        let short = Layout::build(&short_document, WIDTH, metrics()).unwrap();
+        let tall = Layout::build(&tall_document, WIDTH, metrics()).unwrap();
+        let short_target = short
+            .lines()
+            .iter()
+            .find(|line| {
+                short.pieces(line).iter().any(|piece| {
+                    &short_document.text()[piece.start as usize..piece.end as usize]
+                        == "reading target"
+                })
+            })
+            .unwrap()
+            .y;
+        let position = short.reading_position(short_target + 3);
+        let tall_target = tall
+            .lines()
+            .iter()
+            .find(|line| {
+                tall.pieces(line).iter().any(|piece| {
+                    &tall_document.text()[piece.start as usize..piece.end as usize]
+                        == "reading target"
+                })
+            })
+            .unwrap()
+            .y;
+        assert_eq!(tall.y_of_reading_position(position), tall_target + 3);
     }
 }
 

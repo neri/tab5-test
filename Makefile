@@ -18,14 +18,14 @@ NOTO_CJK := tools/ui-font/vendor/NotoSansCJK-Regular.ttc
 NOTO_CJK_URL := https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/OTC/NotoSansCJK-Regular.ttc
 NOTO_CJK_SHA256 := b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a
 
-.DEFAULT_GOAL := fonts
+.DEFAULT_GOAL := build
 
 .PHONY: build run update clean fonts font-sources unifont-jp dejavu noto-cjk fonts-check
 
 build: fonts
 	cargo build --release
 
-run: build
+run:
 	cargo run --release
 
 update:

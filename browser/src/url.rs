@@ -453,6 +453,28 @@ impl Url {
         self.query.as_deref()
     }
 
+    /// Returns this URL with its query replaced and fragment removed.
+    /// Used by HTML GET forms, whose successful controls replace rather
+    /// than append to the action URL's query.
+    pub fn with_query(&self, query: String) -> Result<Self, Error> {
+        let mut result = self.clone_components()?;
+        result.query = Some(query);
+        result.fragment = None;
+        if result.text_length() > MAX_URL_BYTES {
+            return Err(Error::TooLong);
+        }
+        Ok(result)
+    }
+
+    /// Returns this URL without its fragment, preserving its query.
+    /// HTTP never sends a fragment; form submission also uses the returned
+    /// value as the address of the response document.
+    pub fn without_fragment(&self) -> Result<Self, Error> {
+        let mut result = self.clone_components()?;
+        result.fragment = None;
+        Ok(result)
+    }
+
     /// Without the leading `#`.
     pub fn fragment(&self) -> Option<&str> {
         self.fragment.as_deref()
@@ -474,6 +496,12 @@ impl Url {
             && self.port == other.port
             && self.path == other.path
             && self.query == other.query
+    }
+
+    /// Scheme, host and effective port -- the boundary across which a POST
+    /// body must not be resent without the reader's approval.
+    pub fn same_origin(&self, other: &Url) -> bool {
+        self.scheme == other.scheme && self.host == other.host && self.port == other.port
     }
 
     /// The origin-form request target: path, then query. **Never** the

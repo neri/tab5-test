@@ -335,8 +335,9 @@ DMA cache同期の拒否経路は`usbcachefail`で確認します（下記）。
 
 `usbhw`は上記に続けて、[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)
 Stage 0のbaseline counterを固定書式で表示します。0の項目も必ず表示します——「counterが
-無い」と「counterが0」を区別できない書式では比較になりません。行は`Line`の80 byteで
-打ち切られるため、内訳は5桁の値でも収まる単位へ分割し、列見出しを短縮しています。
+無い」と「counterが0」を区別できない書式では比較になりません。行は当初`Line`の80 byteで
+打ち切られていたため、内訳は5桁の値でも収まる単位へ分割し、列見出しを短縮しています。現在の`Line`は
+512 byte（`LINE_BYTES`）で、コンソール幅（156桁）を超える行は折り返して表示します。
 
 `BOT:`で始まる行はcontroller全体のもので、再列挙しても続きます。
 

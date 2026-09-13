@@ -4,8 +4,9 @@
 > [`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md)
 
 `browser`コマンドで開く全画面のビューアです。**Webブラウザではありません。**
-HTTPまたはHTTPSで取得したHTMLから文章とリンクを取り出し、画面幅へ折り返して読む
-ものだけを実装してあります。CSS・JavaScript・画像はいずれもありません。TLSは
+HTTPまたはHTTPSで取得したHTMLから文章、リンク、table、form、静止画像を取り出し、
+画面幅へ折り返して読むものだけを実装してあります。CSSとJavaScriptはありません。
+`img`はPNGとbaseline JPEGを取得・decodeしてRGB565で拡縮描画します。TLSは
 ありますが、接続先の身元は確認しません（下記「未認証TLS」）。
 
 対象を狭く固定してあるのは能力不足の言い訳ではなく設計です。対象外の内容を
@@ -21,14 +22,14 @@ HTTPまたはHTTPSで取得したHTMLから文章とリンクを取り出し、�
 | HTMLと`text/plain`ほかの`text/*` | それ以外のmedia type（画像、実行形式など） |
 | HTMLの文章・見出し・リスト・リンク | CSS（`style`属性・`<style>`・外部stylesheet） |
 | 相対リンクの解決、履歴8ページ、戻る・進む | JavaScript、DOM API |
-| 再読込、リダイレクト5回まで | 画像のデコード（`img`は`alt`だけ） |
+| 再読込、リダイレクト5回まで | animated／progressive画像、SVG、video、audio |
 | UTF-8とShift_JIS（下記「文字符号化」） | それ以外の符号化（EUC-JP、ISO-2022-JPなど） |
-| chunked転送、`Content-Length`、close終端 | form送信、cookie、認証、キャッシュ |
+| chunked転送、form送信、ファイルcache | cookie、HTTP認証、client証明書 |
 | キーボード・タッチ・USBマウス | 日本語入力 |
 | 読み込み中のキャンセル | IPv6、HTTP/2、HTTP/3、WebSocket |
 
-**認証情報を送る機能を持ちません。** cookie、form送信、Basic／Bearer認証の
-いずれも無く、それはTLSが入っても変わりません。理由はTLSの中身にあります。
+**認証情報を保持する機能を持ちません。** cookie、Basic／Bearer認証、client証明書は
+無く、それはTLSが入っても変わりません。formの入力値は送信できます。
 
 ### 未認証TLS
 
@@ -147,10 +148,11 @@ font roleをMonoにします。色・強調styleとは別の軸なので、`pre`
 行が空になるときは幅どおりの位置で切ります。整った行より、必ず前へ進むことを
 優先します。`pre`は書かれたとおりに出すので禁則を適用しません。
 
-**scrollはpixelではなく行単位です。** viewport最上段は必ず行の先頭に揃い、
-下端で入りきらない行は描きません。glyph描画に上下のclipを足さずに済ませる
-ための割り切りで、代わりに下端に最大1行分の余白が出ます。行高は見出しで
-変わるので「1行スクロール」の移動量は場所によって変わります。
+**scrollは文書内のpixel offsetです。** viewportと交差する行を描き、A4文字、
+linkの選択背景・下線、table背景・罫線はviewport上下でclipします。そのため
+見出しや本文の一部が上下端に見えてもtoolbarやstatus行へはみ出しません。
+上下キーは20 px、wheelは1 detent 60 px、PageUp/Downは1画面から20 px重ねて移動します。
+この表示経路は2026-09-12に長い組み込みtable fixtureで実機確認済みです。
 
 **ページは完成したものしか表示しません。** 取得中は直前のページを出したまま
 受信量だけを更新し、本文が終わって文書が組み上がった時点で一度に差し替え
@@ -167,19 +169,23 @@ font roleをMonoにします。色・強調styleとは別の軸なので、`pre`
 | `Enter` | 選択中リンクへ移動。**未選択ならアドレス欄を開く** |
 | `Backspace`、`[`、戻るボタン | 戻る（アドレス編集中は1文字削除） |
 | `]`、進むボタン | 進む |
-| `r`、`F5`、`Ctrl+R`、再読込ボタン | 今のアドレスを取得し直す。scroll位置は保つ |
+| `r`、`F5`、`Ctrl+R`、再読込ボタン | 今のアドレスを取得し直す。scroll位置は保つ。cacheが新鮮でも使わず、`ETag`があれば再検証する。POST結果の上では再送確認を出す（下記） |
+| `R`（Shift+R） | 強制再読込。cacheを見ずに、ページと画像を必ず転送し直す |
+| `y`／`Enter`、`n`／`Escape`、status行の`Send (y)`／`Cancel (n)` | POST送信確認が出ている間だけ、送る／送らない。確認中は`Ctrl+Q`以外のキーを受け付けず、それ以外の場所のタップは「送らない」として扱ってからそのタップを処理する |
 | `Escape`、中止ボタン | 読み込み中は中止／アドレス欄が開いていれば閉じる／それ以外はリンク選択とstatusのメッセージを解除。**終了しません** |
 | 南京錠のタップ | セキュリティ状態の文言をstatus行へ |
 | Wi-Fiのタップ | Network settingsミニを開く。戻ると同じBrowser状態を再描画 |
 | M（URL編集中以外）／F3 | Launcherを開く |
 | Batteryのタップ | Battery detailsミニを開く |
 | `i`、`F1` | ヒープ・ソケット・履歴・ページの大きさをstatus行とUARTへ（下記） |
-| `↑` `↓` | 1行スクロール |
-| `PageUp` `PageDown` `Space` | 1画面スクロール（1行重ねる） |
+| `↑` `↓` | 20 pixelスクロール |
+| `PageUp` `PageDown` `Space` | 1画面スクロール（20 pixel重ねる）。checkbox／radioにfocusがあるときの`Space`はそのcontrolを切り替える |
 | `Home` `End` | 文書の先頭／末尾 |
 | `←` `→` `Home` `End` `Delete` | アドレス編集中のカーソル移動と削除 |
+| `Enter`、`↑` `↓`、`Escape`、`Tab` | textarea編集中は改行の挿入、表示行の上下移動、編集終了、次のcontrolへ。`Enter`で送信はしない |
+| `↑` `↓` `PageUp` `PageDown` `Home` `End`、`Enter`／`Space`、`Escape`、`Tab` | select一覧が開いている間は候補の移動、選択（multipleは切替）、閉じる、閉じて次のcontrolへ。一覧の外のtapは閉じるだけ |
 | タッチ／クリック | リンクの選択と移動 |
-| ホイール | Browser content上だけ3行スクロール |
+| ホイール | Browser content上だけ1 detent 60 pixelスクロール |
 
 **終了は`Ctrl+Q`です。`Escape`では終わりません。** ここに置いてあるどの
 キーボードでもいちばん押しやすい単独キーが、読んでいたページを捨てる操作を
@@ -208,7 +214,7 @@ URLの`#`以降はページ内位置です。同じ文書へのfragment付き新
 空fragment `#`と、対象が無い場合の`top`（ASCII大小文字を無視）は文書先頭です。
 対象が無ければURLと履歴は更新し、位置を変えず`fragment not found`を表示します。
 
-履歴項目は訪問URLと、その項目を離れる直前のviewport先頭行を持ちます。同じ文書の
+履歴項目は訪問URLと、その項目を離れる直前のviewportのpixel offsetを持ちます。同じ文書の
 戻る／進むは再読込もanchor再検索もせず、項目に保存した行へ戻ります。一方、新規の
 fragmentなしURL（`href=""`を含む）と明示的な再読込は従来どおり文書を読み直します。
 redirectの`Location`にfragmentが無ければ直前のfragmentを引き継ぎ、明示した`#`は
@@ -247,9 +253,16 @@ associationとDHCPが完了したら**同じGETを先頭から自動的にやり
 
 `←`／`→`でカーソルを動かし、`Home`／`End`で両端へ飛び、`Backspace`と`Delete`で
 前後の1文字を消します。表示は常にカーソルが見える位置へ追従するので、長い
-アドレスの途中を直すこともできます。caretと横scrollは比例幅のpixel測定で追従します。
-入力はASCIIだけ、長さは`MAX_URL_BYTES`
-までです。
+アドレスの途中を直すこともできます。`Ctrl+A`は全選択し、次の入力または削除で置換します。
+編集状態はformでも再利用する共通部品で、UTF-8境界を守るcaret・選択・byte上限、単一行／
+複数行、確定本文とは別の未確定文字列を持ちます。caret、選択背景、横scrollは比例幅の
+pixel測定で描画します。現在の物理キーadapterがアドレス欄へ渡す文字はASCIIだけで、長さは
+`MAX_URL_BYTES`までです。共通部品がUTF-8を保持できること自体は日本語入力手段を意味しません。
+編集中のキー操作はtoolbar全体を再描画しません。横scroll位置が変わらないcaret移動は旧・新caret、
+選択変更は旧・新選択範囲、文字の追加・削除は変更位置から右端までのdamageだけをpanelへ
+writebackします。framebufferの塗りとglyph描画にも同じ横clipを掛けるため、直接scanout中に
+damage外が一度白くなることもありません。横scrollが動いた場合だけアドレス欄の32 pixel高矩形全体を更新します。
+ボタンと南京錠は状態が変わらない限りpanelへ送り直しません。
 
 ### 漏れを見るための`i`
 
@@ -257,7 +270,7 @@ associationとDHCPが完了したら**同じGETを先頭から自動的にやり
 UARTへも書きます。
 
 ```text
-heap 21592K sockets 1 back 3 fwd 2 page 41K peak 13K
+heap 21592K sockets 1 back 3 fwd 2 post 1/2K+0K cache h4 r1 s3 p0 x0 page 41K peak 13K
 ```
 
 | 項目 | 意味 |
@@ -265,6 +278,8 @@ heap 21592K sockets 1 back 3 fwd 2 page 41K peak 13K
 | `heap` | グローバルアロケータが今渡している総量 |
 | `sockets` | socket setに入っている数。`+1 loading`が付けば取得が走っている。`-`はstackが無い |
 | `back`／`fwd` | 履歴と進む履歴の件数 |
+| `post` | 履歴に保持しているPOST結果の件数/その文書の合計KiB＋再送用に保持している要求bodyの合計KiB |
+| `cache` | Browserを開いてからのHTTP cacheの回数。`h`は通信せず使った数、`r`は`304`で確認して使った数、`s`は保存した数、`p`は期限切れ・容量不足・読み出し不能で消した数、`x`はPOSTにより無効化した数 |
 | `page` | 表示中のページの費用（文書＋layout） |
 | `peak` | 直前の取得でparserが一度に持った最大。固定予算との合否判定ではなく、同じ操作の前後差を見る診断値 |
 
@@ -279,6 +294,59 @@ heap 21592K sockets 1 back 3 fwd 2 page 41K peak 13K
 `sockets`はsocket set全体で、この画面の取り分ではありません（DHCPとDNSが
 自分のものを持っています）。前後で同じ数かどうかだけが意味を持ちます。
 
+### HTTPキャッシュ
+
+ページと画像のGET応答は、RAMディスクの`/tmp/browser-cache/`へファイルとして保存します。
+履歴（戻る・進む、POST結果の保持）は従来どおりメモリにあり、cacheとは別です。`/tmp`は起動ごとに
+作り直されるので、cacheはリセットで消えます。Browserを閉じて開き直しても、リセットまでは残ります。
+
+保存形式はURL（fragmentを除きqueryを含む）の64 bit FNV-1a hashを16進16桁の名前にし、先頭1桁の
+bucketディレクトリへ置きます。`<hash>.body`が転送符号を外した応答本文、`<hash>.meta`がkey（URL全文）・
+`ETag`・media type・charset・本文byte数・保存時刻・期限・最終利用時刻・`no-cache`・接続の安全性を
+行ごとに書いたテキストです。hashが衝突した場合はmetaのkeyが違うので不一致として扱います。時刻は
+起動からのミリ秒です。RTCは未設定のことがあり、`/tmp`はリセットで消えるため、起動からの時間で
+期限を数えられます。
+
+保存するのは、redirectを経ない`200`で、`Cache-Control: no-store`がなく、`Vary`が`Accept-Encoding`
+以外を含まず、identity符号で、1 entry 512 KiB（`MAX_HTTP_CACHE_ENTRY_BYTES`）以内の応答だけです。
+鮮度は`Cache-Control: max-age`、なければ`Expires`から応答自身の`Date`を引いた時間、どちらも
+なければ既定の1時間（`DEFAULT_CACHE_FRESHNESS_SECS`）で、`Age`を差し引きます。受信時点で期限が
+切れている応答（`max-age=0`、`Date`より前の`Expires`、日付として読めない`Expires`）は保存しません。
+`no-cache`の応答は`ETag`がある場合だけ保存し、毎回`304`で確認してから使います。保存できない応答が
+届いた場合は、そのURLの古いentryを消します。cache全体の容量上限はありません。RAMディスクの空きはshellの`df`で
+確認できます。
+
+ページを開くと、まず`/tmp/browser-cache`を引きます。期限内のentryは通信せずにファイルから読み、
+status行へ`shown from the cache; no request was sent`と表示します。この経路はネットワークがなくても
+使えます。`r`・再読込ボタンは期限内でもcacheを直接使わず、`ETag`があれば`If-None-Match`付きで取得し、
+`304`ならファイルから読んで`not modified (304): the cached copy is shown`と表示し、`304`の
+`max-age`・`Expires`で期限を更新します（なければ保存時の有効時間を今から数え直します）。`R`はcacheを
+見ずに取得し、得た`200`は保存します。画像も同じ規則で、ページが`R`で開かれた場合は画像もcacheを
+見ません。cacheファイルが読めない、本文の長さがmetaと違う場合はそのentryを消して通常の取得へ戻ります。
+
+期限切れのentryは、引いた時点で消します。加えて、Browserが何も読み込んでいない間、1分ごとに
+bucketを1つずつ見て、期限切れのentryと、metaのない本文・本文のないmeta・読めないmetaを消します。
+本文の書き込みは表示後に64 KiBずつ進め、書き込み中は次の画像の取得を待たせます。新しいページへ
+移るときは書きかけの本文を先に書き終えます。書き込みで容量不足（`no space left on volume`）が
+出た場合は、書きかけを消し、期限切れのentryと不整合なファイルを消し、それがなければ最終利用が
+最も古いentryを1つ消して、最初から書き直します。消せるものがなくなれば保存を諦めます。どの失敗も
+ページの表示を失敗させません。
+
+POSTは保存しません。POSTの応答（redirectの途中を含む各hop）が`2xx`か`3xx`だった場合は、RFC 9111
+4.4に従い、そのPOSTを送ったURLと、同じoriginへのredirect先URLのentryを消します。応答headを
+受け取った時点で対象を記録するので、その後に中止・失敗したPOSTでも無効化します。削除はcacheの
+保守処理の最初に行い、同じURLの本文を書き込み中ならその書き込みも捨てます。`Content-Location`は
+見ません。
+
+LAN fixtureは`/cache/index.html`です。`/cache/stats.html`がpathごとの要求数、`If-None-Match`付きの
+数、`200`・`304`の数を表示し、`/cache/reset`で0へ戻します。`max-age.html`（60秒）、`expires.html`
+（`Date`の30秒後）、`plain.html`（cache関連headerなし、既定1時間）、`no-cache.html`、
+`expired.html`（`max-age=0`）、`etag.html`、`no-store.html`、`vary.html`、`vary-encoding.html`、
+`large.html`（約700 KiB）、`image.html`、容量不足を起こすための`sized.html?kib=<KiB>&id=<任意>`（indexに
+400 KiB×20件、100 KiB×10件のlink）があります。このファイル保存cacheは2026-09-13に実機受入済みです。
+`counter.html`は1時間cacheされる値のページで、同じURLへのPOSTと、303で戻るPOSTの2つのformを
+持ちます。POST後に戻ると再取得され、値が増えて見えます。このPOST後の無効化は2026-09-13に実機受入済みです。
+
 ### システムバーとミニアプリ
 
 `M`（URL編集中以外）または`F3`でLauncherへ入る。Wi-Fi slotはNetwork settings、
@@ -286,7 +354,9 @@ Battery slotはBattery detailsを開く。ミニ中はBrowserのhandlerも取得
 Escape／戻る／LauncherのBrowserで同じpage・scroll・history・編集中URLへ戻る。
 LauncherのEscape／ハンバーガー再クリックは呼出元へ戻り、Consoleの選択はBrowserを終了する。
 
-進行中のHTTP GETは入る前にsocketを閉じ、URLと履歴操作を保持して復帰時に再開する。
+進行中のHTTP GETは入る前にsocketを閉じ、URLと履歴操作を保持して復帰時に再開する。POSTは
+自動再送せず、復帰後のstatus行に送信確認（未送信なら`POST was not sent`、送信後なら
+`POST result unknown`）を出す。送るかどうかは読み手が決める。
 local readは停止したVFS handleとして保持し、復帰時に処理を続ける。
 別の前景routeへ移る場合はnetwork／localとも`close_pending`で返す。
 indicatorの意味と部分更新は[`SYSTEM_BAR.md`](SYSTEM_BAR.md)にまとめてある。
@@ -304,8 +374,10 @@ Wi-Fiが落ちているときに表示側だけを確認できる唯一の文書
 | `/long` | scroll用の長い文書 |
 | `/wide` | URL上限と同じ長さの1行 |
 | `/japanese` | 半角と全角の混在、禁則、行をまたぐリンク、結合文字、未収録文字 |
+| `/italic` | 合成斜体。見出し／本文／table／link上のA4字形と、未収録文字の中空枠（16・32 pixel）、run先頭の結合文字 |
 | `/table` | caption、header、長短3列、cell内link、rowspan／colspan、空cell、不正span、多列折返し |
 | `/fragments` | fragment、anchor、履歴位置、別文書往復の実機確認。各target間は複数画面分 |
+| `/forms` | 通常本文／table cellのinline control、装飾button、button内画像失敗、編集・送信 |
 | `/empty` | 空文書 |
 
 ホスト名`built-in`はresolverに渡す前に判定します。LAN上に同名のホストが
@@ -407,10 +479,11 @@ BOMだけで、先頭1 KiBを溜める必要もありません。
 | `a href` | リンク。青＋下線、選択中は反転 |
 | `ul`、`ol`、`li` | markerと字下げ。深さは`MAX_NESTING_DEPTH`で頭打ち |
 | `hr` | 水平線 |
-| `img alt` | `[alt text]`、`alt`が無ければ`[image]` |
+| `img` | `src`、`alt`、正の`width`／`height`を画像IDへ保持し、PNG／baseline JPEGを取得・decodeする。通常本文では回り込みなしの予約領域、`button`内では内容line高へ縮小したinline画像になる |
 | `table`、`caption`、`thead`、`tbody`、`tfoot`、`tr`、`th`、`td` | 本文幅内の表。cell内折返し、見出し背景、罫線、正整数の`rowspan`／`colspan`に対応 |
+| `form`、`input`、`select`、`option`、`textarea`、`button`、`label` | GET／urlencoded POST、編集・選択・送信。`textarea`以外のvisible controlは本文とtable cellのinline flowへ参加する |
 | `strong`、`b` | 二度打ちで太く見せる |
-| `em`、`i` | 濃い赤 |
+| `em`、`i` | 行box下端を基準に右へ最大1/5行高ずらす合成斜体（16 pixel行で3 pixel）。未収録文字の中空枠も同じ角度で傾ける。`/italic`で2026-09-13に実機受入済み |
 | `code`、`kbd`、`samp`、`tt`、`var` | 緑 |
 | `script`、`style` | end tagまで読み飛ばし、内容は表示しない |
 | comment、doctype、未知の要素 | 表示しない。既知の子テキストは通常どおり |
@@ -424,8 +497,259 @@ tableは横scrollせず、列の希望幅を本文幅へ縮めてcell内で強�
 `border`は未指定または`0`なら罫線なし、値なし・空または正整数なら罫線ありです。
 太さは1〜4 pixelへ丸めます。非数値は罫線なしです。CSS由来の罫線、
 `col`／`colgroup`、nested table、`rowspan=0`の特殊意味には対応しません。
+cell内で画像と文章が混在する場合は、文章区間と画像を文書順に縦へ積み、画像のalt用
+代替文字列は画像表示時の本文から除きます。複数画像とrowspanでも画像高や文章が重ならない
+高さを先に測ります。nested tableの罫線・独立した列幅計算は引き続き対象外ですが、その中身は
+外側cellから出さず、内側の行ごとに改行し、同じ行のcellを` | `で区切るcompact textとして
+平坦化します。
 このtable描画経路はhost testとrelease buildに加え、2026-09-11に
 `http://built-in/table`とfixture serverを使ってTab5実機で確認済みです。
+その後Stage 1のpixel scroll受入用に、組み込み`table`ページを18行の長い表へ
+拡張し、2026-09-12に上下端clipとpixel scrollも実機で受入済みです。
+
+画像予約領域は本文、link内、文章と混在するtable cell内に置けます。link画像は枠全体が
+選択・touch対象です。組み込み`http://built-in/images`に寸法指定4種類、幅縮小、
+link、table cellの受入項目をまとめています。このStage 2表示はhost test済みですが、
+2026-09-12にtable cell以外を実機確認済みです。cellでは画像の希望幅も列幅計算へ加え、
+tableに余裕があれば指定300×120 pixelを維持します。全列が収まらない場合だけ比率を
+保って縮小し、4 pixelのpadding内へ収め、row外枠が画像と上下paddingを包みます。
+余裕があるのにalt文字幅まで縮んだ問題の修正を含め、2026-09-12に実機受入済みです。
+
+`file:`文書から相対参照したPNGは
+文書表示後に1件ずつ最大512 KiBまで読み、白背景へalpha合成して予約領域へ描画します。
+`tools/make_browser_image_fixture.py <mounted-directory>`で隣接する`stage3.html`と
+`stage3.png`を作れます。このlocal取得・decode・scroll・clipは2026-09-12に実機受入済みです。
+HTTP(S)文書の`image/png`も文書表示後に同じ上限とdecoderで1件ずつ取得します。同一URLは
+RGB565を共有します。LAN fixtureは`/images/stage3.html`です。複雑なtest cardを異なる2寸法で
+表示するHTTP画像経路は2026-09-12に実機受入済みです。
+JPEGはSOF0、8-bit、1または3 componentのbaselineだけを`image/jpeg`から取得し、同じRGB565
+描画経路へ接続します。progressiveや他variantは画像単位で拒否します。このJPEG経路は
+host testとrelease buildに加え、2026-09-12に実機受入済みです。
+PNGはnon-interlacedで、1 sampleが8 bit以下の定義済み形式をすべてdecodeします。グレースケールと
+パレットは1／2／4／8 bit、RGB・グレースケール＋α・RGBAは8 bitです。`tRNS`によるパレットごとの
+αと、グレースケール／RGBの透明色1色も白背景へ合成します。16 bit sampleとAdam7 interlaceは
+非対応variantです。仕様にないcolor typeとbit深度の組み合わせ、`PLTE`を欠くパレット画像、
+bit深度で表せる数を超える`PLTE`、パレット外のindex、`PLTE`より前やパレットより長い`tRNS`は
+破損として扱います。グレースケール／RGBに付いた`PLTE`とα付き形式の`tRNS`は、画素を変えない
+ので無視します。形式ごとの表示はLAN fixtureの`/images/png-formats.html`で確認できます。この低bit深度・パレット・
+`tRNS`対応は、同fixtureとGitHub上の1-bitパレットPNGで2026-09-13に実機受入済みです。
+PNG chunkのCRC-32不一致、非対応variant、破損、上限超過、OOM、取得失敗は画像枠内へ
+理由を表示し、文書と他画像は表示を続けます。CRC不一致の局所失敗表示は
+2026-09-12に実機受入済みです。
+画像のdecode後は未指定寸法をintrinsic寸法・縦横比で置き換えて再layoutします。その際は
+viewport先頭の論理的な文章位置と選択中linkを維持します。5秒のHTTP idle timeoutを避けて
+2秒ごとに届く遅延画像を使い、2026-09-12に実機受入済みです。
+親文書がPinned TLSなら画像もpin登録済みHTTPSだけを許可し、未認証接続へのidentity downgradeを
+画像取得開始前に拒否します。上限近くの640×400 RGBA fixtureも用意しています。
+640×400画像のdecode・clip、遷移中止、Wi-Fi／system bar復帰は2026-09-12に実機受入済みです。
+Pinned TLSから未認証画像への拒否は2026-09-13に実機受入済みです。この確認用にLAN fixtureの`/images/pinned.html`を
+用意しています（`no-store`で、常に実際にTLSで取得されます）。確認手順は次のとおりです。
+
+1. `tools/pins/fixture_pins.txt`のLANアドレスの2行を、fixture serverを動かすPCのIPv4へ書き換え、
+   `tools/pins/generate.py`を実行する（同じアドレスなら変更不要）
+2. `cargo run --release --features tls-fixture-pins`でpin入りbuildを書き込む
+3. PCで`python3 tools/browser_fixture_server.py --pinned-board`を起動する
+4. `browser https://<PCのIPv4>:8443/images/pinned.html`を開き、南京錠が`TLS PINNED`であることを確認する
+
+| 画像 | 期待 |
+| --- | --- |
+| 1. 同じpin済みhostのHTTPS | 表示される |
+| 2. 同じhostの平文HTTP | `HTTPS downgrade refused` |
+| 3. pinの無いhost（`tls-unpinned.invalid`） | `TLS identity downgrade refused`（通信しない） |
+| 4. 同じhostのEd25519 listener（pinと鍵が違う） | 接続失敗の表示で、画像は出ない |
+
+pinを持たない通常buildでは南京錠が`TLS UNVERIFIED`になり、3は名前解決の失敗になるので、この確認には
+使えません。確認後は`cargo run --release`で通常buildへ戻してください。fixture pinは通常buildに
+入れてはならず、`tools/pins/generate.py --check-release`で確認できます。
+
+フォームcontrolは本文のinline objectです。text inputと`select`は希望幅320 pixel、
+submit／`button`は内容幅＋左右各6 pixel（80〜320 pixel）、checkbox／radioは1行高の正方形で、
+現在行へ収まれば前後の本文と同じ行に置きます。収まらないときだけcontrol直前で折り返し、
+狭い配置先ではその全幅へ縮めます。sourceにある空白だけを通常どおり1個へ畳み、layout自身は
+control前後へ空白を足しません。`textarea`だけは複数行編集のため独立blockを維持します。
+hiddenは文書順と送信値を持ちますが表示領域を持ちません。このinline配置はhost testとrelease buildに
+加え、2026-09-13に実機受入済みです。
+disabledは薄い枠と文字で表示します。組み込み`http://built-in/forms`は複数viewport分の本文を
+control群の前後に置き、上下端でのclip、前後の本文との非重なり、初期値、hidden非表示、
+disabled、submit外観をスクロールしながら確認できます。上端を越えたcontrolも元の文書座標を
+保って描画し、viewport内へbox全体を押し戻さず、
+framebufferのvertical clipで見えている部分だけを残します。この上端clipは2026-09-13に
+実機受入済みです。Tab順序はlinkと有効なvisible controlをlayout位置の文書順に統合し、
+hiddenとdisabledを飛ばします。controlのfocusは青い枠（submitは青い面）で示します。
+checkbox／radioだけはline box全体の外枠を持たず、実際の四角／円から2 pixel空けた青い二重ringで
+focusを示します。Tab移動時は
+対象全体がviewportへ入る位置まで自動scrollします。focus順序・表示・自動scrollは
+2026-09-13に実機受入済みです。focus移動だけなら旧対象と新対象の矩形をclipに設定して通常の
+viewport rendererを再利用し、viewport全体の背景消去とwritebackを行いません。この局所再描画は
+2026-09-13に実機受入済みです。入力イベントが描画より先に複数届く場合も、最大4対象のfocus
+damageを上書きせず蓄積します。それを超える場合だけviewport全体を再描画し、過去のfocus表示を
+残しません。この複数focus damage処理は2026-09-13に実機受入済みです。text controlはTabでfocusした時点、
+またはtouchで共通
+`TextInput`の単一行編集を開始し、Escapeで現在値を保持して編集を終了、Tabで保持して次の
+focusへ進みます。q/r/[ / ]を含む印字可能ASCIIは編集中はBrowser shortcutではなく文字として
+扱います。caret移動は旧新caret、
+選択変更は旧新選択、挿入・削除は変更位置以右だけをhorizontal clipして再描画します。横scrollが
+変わるときだけcontrolのtext内側全幅を更新します。Tabから直接編集へ入る操作に加え、その他の
+編集キーと編集時の局所再描画も2026-09-13に実機受入済みです。単一行text編集中の
+Enterは現在値を
+保持してformを暗黙送信し、submitはEnterまたはtouchで送信します。GET送信は現在のtext値、
+hidden、実際に起動したsubmitだけを文書順に集め、disabledと空nameを除外します。組み込みfixtureは
+`/forms`自身へ送信し、同名`q`、空の`empty`、submitの`go`をaddress欄で確認できます。このGETの
+UI接続は2026-09-13に実機受入済みです。`button`は既定でsubmit controlとなり、`value`属性を
+送信値、要素内の空白を畳んだtextを表示ラベルとして別々に保持します。表示ラベルでは
+`strong`／`b`、`em`／`i`、`code`系の既存装飾とPNG／JPEG画像を文書順の1行で描画します。
+block tagは改行を作らず、`a`／`label`はinteractionを作りません。nested controlは要素ごと捨てます。
+画像は通常画像と同じ取得・decode・cache・再layoutを使い、button内のline高と内容幅へ縦横比を保って
+縮小します。画像自身はfocus／link／hit targetにならず、その矩形も外側buttonのtapになります。
+内容が320 pixelを越す部分はbutton内でclipします。この装飾文字・画像表示はhost testとrelease buildに
+加え、2026-09-13に成功・遅延・破損画像を含めて実機受入済みです。組み込みfixtureの
+`Apply changes`は`mode=advanced`を送り、起動していない`go=Search`は送りません。このbutton接続は
+2026-09-13に実機受入済みです。
+
+画像取得まで含む受入fixtureは`tools/browser_fixture_server.py`の
+`/forms/inline-controls.html`です。通常／装飾button、成功するchecker、2秒間隔で届くslow PNG、
+CRCを壊したPNG、table cell内button、および独立画像の前後にあるinline controlを1ページで確認できます。
+
+明示的な`label for=id`はparse完了時に対応するcontrol IDへ解決します。label文字のlayout範囲を
+tapすると、disabledでない対応controlへfocusし、textなら直接編集を開始します。対応先が後で
+宣言されるlabelも扱い、対応先なしとdisabledは操作しません。このlabel操作は2026-09-13に
+実機受入済みです。
+
+table cellは自身に含まれるtext・image・controlの文書範囲を保持します。textとcontrolは通常本文と
+同じinline配置器をcellの4 pixel padding内で使い、収まれば同じ行、収まらなければcontrol直前で
+折り返します。button内画像は独立画像として二重計上しません。row高は確定したcell幅でinline flowを
+測ってから決めるため、後続textや隣接cell、cell枠と重なりません。独立した通常画像を含むcellでは、
+その画像を従来どおり文書順の独立行に置き、画像の前後のtextとcontrolはそれぞれ共通inline配置器で
+組みます。cell内controlも通常と同じTab順序、
+label touch、編集、GET送信を使います。組み込みfixtureの`Cell query`は`cell=inside+cell`として
+送信されます。通常のtable cellにおけるinline配置とcontrol操作は2026-09-13に実機受入済みです。
+その後に追加した、独立画像を挟むcellの前後をinline配置する経路も2026-09-13に実機受入済みです。
+
+`input`の省略type、未知のtype、および専用UIをまだ実装していないtypeはHTMLのfallbackに合わせて
+Text stateとして扱い、通常の単一行text controlとして編集・GET送信します。組み込みfixtureの
+`Date fallback`は`type=date`ですが、現在はtextとして表示し、`when=現在値`を送信します。
+このinput type fallbackは2026-09-13に実機受入済みです。
+
+`input type=checkbox`と`type=radio`は、1行分の高さの正方形boxとしてinline flowに置きます。
+通常時はline box全体の四角い外枠や塗り背景を描かず、checkboxは小さい四角の枠と、checked時の
+塗りつぶし、radioは円と、checked時の内側の円で表示し、disabledは薄い色です。checkedness初期値は
+`checked`属性で、同じform ownerかつ同じ空でない`name`のradio groupでは、文書順で最後の
+`checked`だけが残ります。`value`属性が無ければ`on`を送ります。
+
+checkbox／radioもTab順序に入り、Enter、focus中の`Space`、boxのtap、`label for`の文字のtapで
+操作します。checkboxは反転し、radioは自身をcheckedにして同じgroupの他を外します。checked
+なradioを再度操作しても変わりません。表示中pageが持つchecked状態だけを変え、再描画は状態が
+変わったcontrolの矩形に限ります。送信時はcheckedでdisabledでないものだけを`name=value`として
+文書順に含めます。focus中はcheckboxなら四角、radioなら円に沿う青い二重ringを記号の外側へ描き、
+status行にもfocus中の種類とchecked状態を表示します。このfocus ringの外観は2026-09-13に
+実機受入済みです。
+
+組み込み`http://built-in/forms`のmain GET formへ、checked checkbox、未checked checkbox、
+checkedかつdisabled、`value`なし、2つとも`checked`を持つradio groupを追加しました。LAN fixtureの
+`/forms/post.html`には`Send checkable POST`を追加し、初期状態のbodyは`pick=alpha&choice=one&go=Checks`
+です。このcheckbox／radio対応は2026-09-13に実機受入済みです。
+
+`textarea`は複数行のtext controlです。内容は開始tagから終了tagまでをmarkupとして解釈しない
+raw textとして読み、文字参照だけを復号します。開始tag直後の改行1つを除き、CRLFとCRはLFへ
+揃えて初期値にします。文書本文には出しません。`rows`は正の整数だけを採用し、既定2、最大8行です。
+boxは通常のtext controlと同じ幅（最大320 pixel）で、高さは行数分です。初期値が
+`MAX_INPUT_VALUE_BYTES`（4 KiB）を超えるtextareaは収まった分だけを表示し、編集を拒否し、その
+formの送信も`a textarea's initial text is too long to submit`として拒否します。切り詰めた値は
+送りません。
+
+Tab、tap、`label for`で共通`TextInput`の複数行編集を始めます。文字幅で折り返した表示行を持ち、
+`Enter`は改行の挿入、`↑`／`↓`は表示行の移動（先頭行の上は文頭、最終行の下は文末）、`Home`／
+`End`は改行で区切った行の先頭／末尾、`Escape`は値を保持して終了、`Tab`は保持して次へ進みます。
+折り返しは語単位ではなく文字単位です。caretの行がboxの外へ出ると、box内の表示を行単位で
+scrollします。編集中の変更はtextareaのtext領域全体だけを再描画します。送信時は改行をCRLFとして
+`%0D%0A`で符号化します。この改行の正規化はform送信のすべての名前と値に適用します。
+
+組み込み`http://built-in/forms`のmain GET formへ3行の`Note (textarea)`を追加しました。初期状態の
+`Search`のqueryは下記のselect追加後の値を参照してください。
+続く`Textarea scrolling`は2行boxに4行（最後は折り返す長い行）を持ち、`Send long`で送信します。
+LAN fixtureの`/forms/post.html`の`Send textarea POST`は、初期状態でbody
+`text=line+one%0D%0Aline+two&go=Text`を送ります。このtextarea対応は2026-09-13に実機受入済みです。
+
+`select`は1行分のboxに選択中optionのlabel（multipleは`, `区切り、なければ`(none)`）と右端の▼を
+表示します。optionのlabelは要素内の文字を空白を畳んで持ち、`value`属性が無ければlabelを値に
+します。select内のoption以外の文字やtagは表示しません。`optgroup`のlabelは表示せず、
+`disabled`だけを子のoptionへ継承します。単一選択では文書順で最後の`selected`だけを残し、
+`selected`が無ければ最初の有効なoptionを選びます。`multiple`はその調整をしません。optionは
+1文書で`MAX_SELECT_OPTIONS`（4096）件、labelは`MAX_INPUT_VALUE_BYTES`までで、超えるとページを
+上限エラーにします。
+
+Tab順序に入り、Enter、focus中の`Space`、boxや`label for`のtapで一覧を開きます。一覧はboxの下
+（入らなければ上、どちらも入らなければviewport内）に最大10行で重ねて描き、それ以上は一覧内を
+scrollし、右端に位置のbarを出します。単一選択は選択を丸、multipleは四角で示します。上下キー等で
+強調行を動かし、単一選択はEnter／Space／行のtapで選んで閉じ、multipleは切り替えて開いたままに
+します。disabledのoptionは選べず、一覧を開いたまま`this option is disabled`を表示します。Escape、Tab、一覧外のtap、ホイール、page scrollで閉じます。
+一覧の開閉と移動は一覧の矩形だけをviewport rendererで再描画し、選択の変更はboxも再描画します。
+送信時は選択中かつ有効なoptionごとに`name=value`をoption順で含めます。
+
+組み込み`http://built-in/forms`のmain GET formへ、value省略とdisabled optionを含む`Color (select)`、
+disabled optgroupを含む`Tags (multiple)`を追加しました。初期状態の`Search`のqueryは
+`q=initial+value&q=hidden+duplicate&empty=&cell=inside+cell&when=2026-09-13&topic=news&size=large&
+note=first+line%0D%0Asecond+%26+%3Cb%3Eline%3C%2Fb%3E&color=Green&tag=a&go=Search`です。
+`Textarea scrolling` formには12件の`Number`を追加し、初期状態では`number=1`を送ります。LAN fixtureの
+`/forms/post.html`の`Send select POST`は、初期状態でbody`fruit=pear&many=x&many=y&go=Select`を
+送ります。このselect対応は2026-09-13に実機受入済みです。
+
+Stage 5時点ではPOSTを送信前に拒否する経路を2026-09-13に実機受入済みとしました。Stage 6以降はnetwork HTTP(S) actionに対する`application/x-www-form-urlencoded` POSTを送信できます。
+method・URL・bodyは1つの要求値として保持し、固定header、正確な`Content-Length`、48 KiBの
+encoded body上限を適用します。送信後の通信断、中止、system bar中断では自動再送せず、結果不明を
+statusへ表示します。301/302/303はGETへ変えてbodyを破棄し、307/308は同一originならPOST bodyを
+維持します。LAN fixtureは`/forms/post.html`で、応答ページにmethod、POST回数、action query、
+content-type、content-length、bodyを表示します。この通常POST UI経路は
+2026-09-13に実機受入済みです。
+
+POSTを読み手の明示操作なしに再送する経路はありません。再送が必要になりうる場面では、status行に
+送信先のscheme・host・portを示した確認を出し、`y`／`Enter`／`Send (y)`でだけ送ります。
+`n`／`Escape`／`Cancel (n)`、または他の場所のタップでは送らず、`POST was not resent`を表示します。
+
+| 場面 | 確認文 | 送らない場合 |
+| --- | --- | --- |
+| Wi-Fi断、timeout等の失敗、system bar中断で要求を送る前に止まった | `POST was not sent. Send to …?` | 元pageと入力値のまま |
+| 同じく送信開始後に止まり、応答を読めていない、または応答途中で切れた | `POST result unknown. Resend to …?` | 同上 |
+| 307/308が別originへbodyを送り直すよう求めた | `Server redirects the POST body to …?` | 送信元のpageのまま。source側の1回だけが届いている |
+| POST結果の上でreload、または保持していない結果へback/forward | `Resend POST to …?` | 表示中pageと履歴を変えない |
+
+中止ボタン／`Escape`で読み手が自分で止めた場合と、応答を受け取ったうえで表示できなかった場合
+（HTMLでない、上限超過など）は確認を出さず、理由だけを表示します。確認への「送る」は
+新しい要求として扱い、別origin redirectの確認後も、それまでに辿ったredirect回数を引き継ぎます。
+HTTPS→HTTP、Pinned TLSから未pin host、`file:`へのredirectは確認を出す前に従来どおり拒否します。
+
+POST結果（redirectでGETに変わらなかったもの）を離れると、その文書を履歴項目へ保持します。
+back/forwardで戻るときは通信せずに保持した文書から再layoutし、`POST result shown from memory;
+nothing was resent`と表示します。画像は通常どおりGETで取り直します。保持するのはparse済み
+Documentだけで、HTTP cacheとは別の予算です。
+
+| 保持対象 | 上限 |
+| --- | ---: |
+| POST結果の文書 | 2件、合計320 KiB（`MAX_RETAINED_POST_RESULTS`／`MAX_RETAINED_POST_RESULT_BYTES`） |
+| 再送用の要求body | 合計96 KiB（`MAX_RETAINED_POST_REQUEST_BYTES`） |
+
+1件で320 KiBを超える結果、`Cache-Control: no-store`付きの結果は保持しません。予算を超えると
+表示中pageから遠い履歴項目から先に文書を、次に要求bodyを捨てます。文書が無い項目へ戻ると
+再送確認になり、要求も無ければformがあったpageへGETで戻ります。どちらも無ければ移動せず
+理由を表示します。同じPOST結果内のfragment移動は従来どおり通信しません。表示中pageと
+入力値は予算のために捨てません。
+
+LAN fixtureの`/forms/post.html`には、`Cache-Control: no-store`を返す`Send no-store POST`と、
+保持予算を超える約400 KiBの結果を返す`Send large POST`を追加しました。どちらも結果から
+`form again`で離れて戻ると再送確認になり、応答のPOST回数で再送の有無を確認できます。
+これらの確認UI、保持と復元、no-store、予算超過は2026-09-13に実機受入済みです。
+
+POST redirectの確認には`/forms/post-redirects.html`を使います。301/302/303/307/308ごとに
+source POST回数と最終要求回数を独立して数え、最終method・query・Content-Type・
+Content-Length・bodyを応答本文へ表示します。同じ画面の`Try cross-origin 307`／`308`は
+plaintext listenerからTLS listener（既定8443）へ307/308を返し、別originへの送信確認を出させます。
+TLS listenerから開いた場合はHTTPへの降格として`https-downgrade`になります。カウンタを持つ
+source/result endpointはmanifest自動巡回の対象外です。このredirect UI経路（別originの確認を含む）は
+2026-09-13に実機受入済みです。
+
+組み込みfixtureの`Try POST`はnetwork actionではないため、現在は
+`POST needs a network HTTP(S) action`と表示して送信しません。form/windowの`target`は保持・適用せず、
+このBrowserの単一文書navigationだけを扱います。
 
 文字参照は数値参照（10進・16進）と`amp`・`lt`・`gt`・`quot`・`apos`・`nbsp`
 の6つだけです。**終端の`;`は必須**で、`&amp`（`;`なし）は`&amp`とそのまま

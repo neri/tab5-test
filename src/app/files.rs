@@ -116,6 +116,50 @@ fn push_sources(line: &mut Line, sources: &crate::fs::fingerprint::Sources) {
 /// reading a file. What it is for is the moment after a card has been
 /// swapped or a stick re-seated, when the question "is this still what I
 /// mounted" is the one being asked.
+/// `df`: the size, used and free space of every mount. `count` makes FAT32
+/// volumes count their FAT instead of trusting FSInfo.
+pub fn show_usage(
+    console: &mut Console,
+    framebuffer: &mut Framebuffer,
+    devices: &mut Devices,
+    vfs: &Vfs,
+    count: bool,
+) {
+    let mut any = false;
+    for mount in vfs.mounts() {
+        any = true;
+        let mut line = Line::new();
+        line.push_str(mount.point.as_str());
+        match vfs.usage(devices, mount.point.as_str(), count) {
+            Ok(usage) => {
+                let total = usage.total_bytes();
+                let used = usage.used_bytes();
+                line.push_str("  size ");
+                line.push_u64(total / 1024);
+                line.push_str(" KiB  used ");
+                line.push_u64(used / 1024);
+                line.push_str(" KiB  free ");
+                line.push_u64(usage.free_bytes() / 1024);
+                line.push_str(" KiB  ");
+                line.push_u64(if total == 0 { 0 } else { used * 100 / total });
+                line.push_str("% used  ");
+                line.push_u32(usage.cluster_bytes);
+                line.push_str("-byte clusters (");
+                line.push_str(crate::fs::vfs::usage_source_name(usage.source));
+                line.push_str(")");
+            }
+            Err(error) => {
+                line.push_str("  ");
+                line.push_str(crate::fs::vfs::error_name(error));
+            }
+        }
+        console.write_output_line(framebuffer, line.as_str());
+    }
+    if !any {
+        console.write_output_line(framebuffer, "nothing mounted");
+    }
+}
+
 pub fn verify(
     console: &mut Console,
     framebuffer: &mut Framebuffer,

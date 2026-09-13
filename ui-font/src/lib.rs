@@ -342,6 +342,14 @@ pub trait PixelSurface {
 /// glyph metrics, bearings and source outlines remain identical.
 pub const BINARY_ALPHA_THRESHOLD: u8 = 8;
 
+/// Maximum right overhang produced by the synthetic oblique painter.
+///
+/// Advances deliberately stay unchanged; callers that repaint a bounded
+/// text range only need to extend its damage rectangle by this amount.
+pub const fn oblique_overhang(line_height: usize) -> usize {
+    line_height.saturating_sub(1) / 5
+}
+
 pub fn paint_glyph<S: PixelSurface>(
     surface: &mut S,
     origin_x: isize,
@@ -351,7 +359,7 @@ pub fn paint_glyph<S: PixelSurface>(
     foreground: u16,
     background: Option<u16>,
 ) {
-    paint_glyph_inner::<S, false>(
+    paint_glyph_inner::<S, false, false>(
         surface, origin_x, origin_y, glyph, metrics, 1, foreground, background,
     );
 }
@@ -366,7 +374,25 @@ pub fn paint_glyph_scaled<S: PixelSurface>(
     foreground: u16,
     background: Option<u16>,
 ) {
-    paint_glyph_inner::<S, false>(
+    paint_glyph_inner::<S, false, false>(
+        surface, origin_x, origin_y, glyph, metrics, scale, foreground, background,
+    );
+}
+
+/// Paints an A4 glyph with a synthetic rightward slant. The top of a
+/// 16-pixel line moves three pixels and a 32-pixel line moves six; the glyph
+/// advance and line metrics do not change.
+pub fn paint_glyph_oblique_scaled<S: PixelSurface>(
+    surface: &mut S,
+    origin_x: isize,
+    origin_y: isize,
+    glyph: &Glyph,
+    metrics: LineMetrics,
+    scale: usize,
+    foreground: u16,
+    background: Option<u16>,
+) {
+    paint_glyph_inner::<S, false, true>(
         surface, origin_x, origin_y, glyph, metrics, scale, foreground, background,
     );
 }
@@ -384,7 +410,7 @@ pub fn paint_glyph_1bpp<S: PixelSurface>(
     foreground: u16,
     background: Option<u16>,
 ) {
-    paint_glyph_inner::<S, true>(
+    paint_glyph_inner::<S, true, false>(
         surface, origin_x, origin_y, glyph, metrics, 1, foreground, background,
     );
 }
@@ -399,12 +425,12 @@ pub fn paint_glyph_1bpp_scaled<S: PixelSurface>(
     foreground: u16,
     background: Option<u16>,
 ) {
-    paint_glyph_inner::<S, true>(
+    paint_glyph_inner::<S, true, false>(
         surface, origin_x, origin_y, glyph, metrics, scale, foreground, background,
     );
 }
 
-fn paint_glyph_inner<S: PixelSurface, const BINARY: bool>(
+fn paint_glyph_inner<S: PixelSurface, const BINARY: bool, const OBLIQUE: bool>(
     surface: &mut S,
     origin_x: isize,
     origin_y: isize,
@@ -432,7 +458,16 @@ fn paint_glyph_inner<S: PixelSurface, const BINARY: bool>(
             let first_y = origin_y + (glyph.y as isize + y as isize) * scale as isize;
             for offset_x in 0..scale {
                 for offset_y in 0..scale {
-                    let pixel_x = first_x + offset_x as isize;
+                    let line_y =
+                        (glyph.y as isize + y as isize) * scale as isize + offset_y as isize;
+                    let shear = if OBLIQUE && line_y >= 0 {
+                        oblique_overhang(
+                            (metrics.size as isize * scale as isize - line_y).max(1) as usize
+                        )
+                    } else {
+                        0
+                    };
+                    let pixel_x = first_x + offset_x as isize + shear as isize;
                     let pixel_y = first_y + offset_y as isize;
                     if pixel_x < 0
                         || pixel_y < 0
@@ -588,6 +623,70 @@ mod tests {
         fn write(&mut self, x: usize, y: usize, color: u16) {
             self.pixels[1 + y * self.width + x] = color;
         }
+    }
+
+    struct Canvas {
+        width: usize,
+        height: usize,
+        pixels: std::vec::Vec<u16>,
+    }
+
+    impl Canvas {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                width,
+                height,
+                pixels: std::vec![0; width * height],
+            }
+        }
+
+        fn ink_x(&self, y: usize) -> std::vec::Vec<usize> {
+            (0..self.width)
+                .filter(|&x| self.pixels[y * self.width + x] != 0)
+                .collect()
+        }
+    }
+
+    impl PixelSurface for Canvas {
+        fn width(&self) -> usize {
+            self.width
+        }
+        fn height(&self) -> usize {
+            self.height
+        }
+        fn read(&self, x: usize, y: usize) -> u16 {
+            self.pixels[y * self.width + x]
+        }
+        fn write(&mut self, x: usize, y: usize, color: u16) {
+            self.pixels[y * self.width + x] = color;
+        }
+    }
+
+    #[test]
+    fn oblique_painter_shears_rows_without_changing_metrics() {
+        assert_eq!(oblique_overhang(16), 3);
+        assert_eq!(oblique_overhang(32), 6);
+        let glyph_data = glyph(TextStyle::BODY, 'H').unwrap();
+        let metrics = line_metrics(TextStyle::BODY);
+        let mut upright = Canvas::new(32, 16);
+        let mut oblique = Canvas::new(32, 16);
+        paint_glyph(&mut upright, 4, 0, &glyph_data, metrics, 0xffff, None);
+        paint_glyph_oblique_scaled(&mut oblique, 4, 0, &glyph_data, metrics, 1, 0xffff, None);
+
+        let mut saw_shift = false;
+        for y in 0..16 {
+            let upright_x = upright.ink_x(y);
+            let oblique_x = oblique.ink_x(y);
+            let shift = oblique_overhang(16 - y);
+            let expected: std::vec::Vec<_> = upright_x.iter().map(|x| x + shift).collect();
+            assert_eq!(oblique_x, expected);
+            saw_shift |= !upright_x.is_empty() && shift != 0;
+        }
+        assert!(saw_shift);
+        assert_eq!(
+            glyph_data.advance,
+            glyph(TextStyle::BODY, 'H').unwrap().advance
+        );
     }
 
     #[test]

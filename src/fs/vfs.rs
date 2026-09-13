@@ -254,6 +254,48 @@ impl From<BlockError> for FsError {
     }
 }
 
+/// Space on a mounted volume, counted in clusters.
+#[derive(Clone, Copy, Debug)]
+pub struct Usage {
+    pub cluster_bytes: u32,
+    pub total_clusters: u32,
+    pub free_clusters: u32,
+    pub source: UsageSource,
+}
+
+/// Where a free-cluster count came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UsageSource {
+    /// Every FAT entry was read and counted.
+    Counted,
+    /// FAT32's FSInfo sector, which the writer keeps up to date.
+    FsInfo,
+    /// exFAT's allocation bitmap, counted by the library.
+    Bitmap,
+}
+
+pub fn usage_source_name(source: UsageSource) -> &'static str {
+    match source {
+        UsageSource::Counted => "counted",
+        UsageSource::FsInfo => "FSInfo",
+        UsageSource::Bitmap => "bitmap",
+    }
+}
+
+impl Usage {
+    pub fn total_bytes(&self) -> u64 {
+        u64::from(self.cluster_bytes) * u64::from(self.total_clusters)
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        u64::from(self.cluster_bytes) * u64::from(self.free_clusters.min(self.total_clusters))
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes() - self.free_bytes()
+    }
+}
+
 /// What a directory listing reports about one entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntryKind {
@@ -741,6 +783,37 @@ impl Vfs {
             }
         }
         best
+    }
+
+    /// How full the volume mounted exactly at `point` is.
+    ///
+    /// FAT32 records its free-cluster count in the FSInfo sector, and the
+    /// filesystem library keeps it current on every allocation and release,
+    /// so it is used when it is present and plausible. FAT12/16 record none,
+    /// and FSInfo can be left stale by a medium pulled mid-write or written
+    /// by a careless driver, so otherwise -- and always when `count` asks --
+    /// the FAT itself is read and every entry counted, one block at a time:
+    /// the cost is time in proportion to the FAT, never memory. exFAT's
+    /// allocation bitmap is counted by the library.
+    pub fn usage(&self, devices: &mut Devices, point: &str, count: bool) -> Result<Usage, FsError> {
+        let point = path::normalize(point)?;
+        let mount = *self
+            .mounts()
+            .find(|mount| mount.point.as_str() == point.as_str())
+            .ok_or(FsError::NotMounted)?;
+        match mount.format {
+            VolumeFormat::Fat => with_partition(devices, &mount, |device| fat_usage(device, count)),
+            VolumeFormat::Exfat => with_volume(devices, &mount, |volume| match volume {
+                AnyVolume::Exfat(volume) => Ok(Usage {
+                    cluster_bytes: u32::try_from(volume.info().bytes_per_cluster)
+                        .unwrap_or(u32::MAX),
+                    total_clusters: volume.info().cluster_count,
+                    free_clusters: volume.free_cluster_count(),
+                    source: UsageSource::Bitmap,
+                }),
+                AnyVolume::Fat(_) => Err(FsError::NotAFilesystem),
+            }),
+        }
     }
 
     /// Lists a directory, calling `out` once per entry.
@@ -1970,6 +2043,41 @@ fn with_volume<T>(
     mount: &Mount,
     body: impl FnOnce(&mut AnyVolume<'_>) -> Result<T, FsError>,
 ) -> Result<T, FsError> {
+    with_partition(devices, mount, |partition| {
+        let stream = BlockStream::new(partition);
+        let mut volume = match mount.format {
+            // Built rather than opened, so the volume stamps directory
+            // entries from the RTC instead of from the library's `no_std`
+            // default, which is a fixed 1980-01-01. See `super::clock`.
+            VolumeFormat::Fat => AnyVolume::Fat(
+                FatVolume::builder(stream)
+                    .time_provider(&clock::PROVIDER)
+                    .open()
+                    .map_err(|error| {
+                        log_driver_refusal(b"FAT", &error);
+                        FsError::NotAFilesystem
+                    })?,
+            ),
+            // No clock is configured for exFAT: nothing here writes to one,
+            // so there is no entry for a timestamp to end up in.
+            VolumeFormat::Exfat => {
+                AnyVolume::Exfat(ExFatVolume::open(stream).map_err(|error| {
+                    log_driver_refusal(b"exFAT", &error);
+                    FsError::NotAFilesystem
+                })?)
+            }
+        };
+        body(&mut volume)
+    })
+}
+
+/// The checks every operation makes of a mount before it touches the medium,
+/// then the mount's partition as a block device for `body`.
+fn with_partition<T>(
+    devices: &mut Devices,
+    mount: &Mount,
+    body: impl FnOnce(&mut dyn super::block::BlockDevice) -> Result<T, FsError>,
+) -> Result<T, FsError> {
     // A physical disconnect is free to check -- one integer -- so unlike the
     // full identity it is checked on every operation rather than only when
     // `verify` is asked for.
@@ -1999,32 +2107,208 @@ fn with_volume<T>(
             return Err(FsError::Block(BlockError::MediaChanged));
         }
         let mut partition = PartitionBlockDevice::new(device, mount.range)?;
-        let stream = BlockStream::new(&mut partition);
-        let mut volume = match mount.format {
-            // Built rather than opened, so the volume stamps directory
-            // entries from the RTC instead of from the library's `no_std`
-            // default, which is a fixed 1980-01-01. See `super::clock`.
-            VolumeFormat::Fat => AnyVolume::Fat(
-                FatVolume::builder(stream)
-                    .time_provider(&clock::PROVIDER)
-                    .open()
-                    .map_err(|error| {
-                        log_driver_refusal(b"FAT", &error);
-                        FsError::NotAFilesystem
-                    })?,
-            ),
-            // No clock is configured for exFAT: nothing here writes to one,
-            // so there is no entry for a timestamp to end up in.
-            VolumeFormat::Exfat => {
-                AnyVolume::Exfat(ExFatVolume::open(stream).map_err(|error| {
-                    log_driver_refusal(b"exFAT", &error);
-                    FsError::NotAFilesystem
-                })?)
-            }
-        };
-        body(&mut volume)
+        body(&mut partition)
     });
     outcome.ok_or(FsError::DeviceNotPresent)?
+}
+
+/// Reads a FAT volume's boot sector, then takes a FAT32 volume's free count
+/// from FSInfo unless `count` asks otherwise, or counts the free entries of
+/// the first FAT in order, one block at a time.
+fn fat_usage(device: &mut dyn super::block::BlockDevice, count: bool) -> Result<Usage, FsError> {
+    let block_bytes = device.geometry().block_bytes as usize;
+    if block_bytes < 512 {
+        return Err(FsError::NotAFilesystem);
+    }
+    let mut block = alloc::vec![0u8; block_bytes];
+    device.read_blocks(0, &mut block)?;
+    let mut sector = [0u8; 512];
+    sector.copy_from_slice(&block[..512]);
+    if !matches!(bootsector::identify(&sector), Some(VolumeKind::Fat)) {
+        return Err(FsError::NotAFilesystem);
+    }
+    let u16_at =
+        |offset: usize| u64::from(u16::from_le_bytes([sector[offset], sector[offset + 1]]));
+    let u32_at = |offset: usize| {
+        u64::from(u32::from_le_bytes([
+            sector[offset],
+            sector[offset + 1],
+            sector[offset + 2],
+            sector[offset + 3],
+        ]))
+    };
+    let bytes_per_sector = u16_at(11);
+    let sectors_per_cluster = u64::from(sector[13]);
+    let reserved_sectors = u16_at(14);
+    let fat_count = u64::from(sector[16]);
+    let root_sectors = (u16_at(17) * 32).div_ceil(bytes_per_sector);
+    let fat_sectors = if u16_at(22) != 0 {
+        u16_at(22)
+    } else {
+        u32_at(36)
+    };
+    let total_sectors = if u16_at(19) != 0 {
+        u16_at(19)
+    } else {
+        u32_at(32)
+    };
+    let data_sectors = total_sectors
+        .checked_sub(reserved_sectors + fat_count * fat_sectors + root_sectors)
+        .ok_or(FsError::NotAFilesystem)?;
+    let clusters = data_sectors / sectors_per_cluster;
+    let total_clusters = u32::try_from(clusters).map_err(|_| FsError::NotAFilesystem)?;
+    // The specification decides the FAT type by the cluster count alone.
+    let entry_bits = if clusters < 4085 {
+        12
+    } else if clusters < 65525 {
+        16
+    } else {
+        32
+    };
+    // An entry past the FAT's own length would be counted from whatever
+    // follows it, so a FAT too short for its clusters is refused.
+    if ((clusters + 2) * entry_bits).div_ceil(8) > fat_sectors * bytes_per_sector {
+        return Err(FsError::NotAFilesystem);
+    }
+    let cluster_bytes = u32::try_from(bytes_per_sector * sectors_per_cluster).unwrap_or(u32::MAX);
+    if entry_bits == 32 && !count {
+        if let Some(free) = fsinfo_free_count(device, u16_at(48), bytes_per_sector, &mut block)?
+            .filter(|free| *free <= total_clusters)
+        {
+            return Ok(Usage {
+                cluster_bytes,
+                total_clusters,
+                free_clusters: free,
+                source: UsageSource::FsInfo,
+            });
+        }
+    }
+    let mut bytes = BlockBytes::new(device, reserved_sectors * bytes_per_sector, block)?;
+    let mut free = 0u32;
+    // Entries 0 and 1 are reserved; cluster 2 is the first data cluster.
+    match entry_bits {
+        12 => {
+            bytes.skip(3)?;
+            let mut remaining = clusters;
+            while remaining > 0 {
+                let first = bytes.next()?;
+                let second = bytes.next()?;
+                if u16::from(first) | (u16::from(second & 0x0f) << 8) == 0 {
+                    free += 1;
+                }
+                remaining -= 1;
+                if remaining > 0 {
+                    let third = bytes.next()?;
+                    if (u16::from(second) >> 4) | (u16::from(third) << 4) == 0 {
+                        free += 1;
+                    }
+                    remaining -= 1;
+                }
+            }
+        }
+        16 => {
+            bytes.skip(4)?;
+            for _ in 0..clusters {
+                if u16::from_le_bytes([bytes.next()?, bytes.next()?]) == 0 {
+                    free += 1;
+                }
+            }
+        }
+        _ => {
+            bytes.skip(8)?;
+            for _ in 0..clusters {
+                let entry = u32::from_le_bytes([
+                    bytes.next()?,
+                    bytes.next()?,
+                    bytes.next()?,
+                    bytes.next()?,
+                ]);
+                if entry & 0x0fff_ffff == 0 {
+                    free += 1;
+                }
+            }
+        }
+    }
+    Ok(Usage {
+        cluster_bytes,
+        total_clusters,
+        free_clusters: free,
+        source: UsageSource::Counted,
+    })
+}
+
+/// The free-cluster count a FAT32 FSInfo sector records, or `None` when it
+/// records none: no FSInfo sector, a signature that does not match, or the
+/// `0xFFFFFFFF` that means unknown. `block` is a one-block scratch buffer.
+fn fsinfo_free_count(
+    device: &mut dyn super::block::BlockDevice,
+    sector: u64,
+    bytes_per_sector: u64,
+    block: &mut [u8],
+) -> Result<Option<u32>, FsError> {
+    if sector == 0 || sector == 0xFFFF {
+        return Ok(None);
+    }
+    let block_bytes = block.len() as u64;
+    let offset = sector * bytes_per_sector;
+    let within = (offset % block_bytes) as usize;
+    if within + 512 > block.len() {
+        return Ok(None);
+    }
+    device.read_blocks(offset / block_bytes, block)?;
+    let info = &block[within..within + 512];
+    let u32_at =
+        |at: usize| u32::from_le_bytes([info[at], info[at + 1], info[at + 2], info[at + 3]]);
+    if u32_at(0) != 0x4161_5252 || u32_at(484) != 0x6141_7272 || u32_at(508) != 0xAA55_0000 {
+        return Ok(None);
+    }
+    let free = u32_at(488);
+    Ok((free != 0xFFFF_FFFF).then_some(free))
+}
+
+/// A block device's bytes in order from an offset, read one block at a time.
+struct BlockBytes<'a> {
+    device: &'a mut dyn super::block::BlockDevice,
+    block: alloc::vec::Vec<u8>,
+    lba: u64,
+    index: usize,
+}
+
+impl<'a> BlockBytes<'a> {
+    /// `block` is a buffer of exactly one block, reused for every read.
+    fn new(
+        device: &'a mut dyn super::block::BlockDevice,
+        offset: u64,
+        mut block: alloc::vec::Vec<u8>,
+    ) -> Result<Self, FsError> {
+        let block_bytes = block.len() as u64;
+        let lba = offset / block_bytes;
+        device.read_blocks(lba, &mut block)?;
+        Ok(Self {
+            device,
+            block,
+            lba,
+            index: (offset % block_bytes) as usize,
+        })
+    }
+
+    fn next(&mut self) -> Result<u8, FsError> {
+        if self.index == self.block.len() {
+            self.lba += 1;
+            self.device.read_blocks(self.lba, &mut self.block)?;
+            self.index = 0;
+        }
+        let byte = self.block[self.index];
+        self.index += 1;
+        Ok(byte)
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), FsError> {
+        for _ in 0..count {
+            self.next()?;
+        }
+        Ok(())
+    }
 }
 
 /// The child of `parent` that `point` lies under: the first component of

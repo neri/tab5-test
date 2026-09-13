@@ -82,11 +82,25 @@ pub struct Tag<'a> {
     pub name: &'a str,
     pub href: Option<&'a str>,
     pub alt: Option<&'a str>,
+    pub src: Option<&'a str>,
+    pub width: Option<&'a str>,
+    pub height: Option<&'a str>,
     pub id: Option<&'a str>,
     pub anchor_name: Option<&'a str>,
     pub rowspan: Option<&'a str>,
     pub colspan: Option<&'a str>,
     pub border: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub method: Option<&'a str>,
+    pub input_type: Option<&'a str>,
+    pub value: Option<&'a str>,
+    pub label_for: Option<&'a str>,
+    pub disabled: bool,
+    pub checked: bool,
+    pub selected: bool,
+    pub multiple: bool,
+    /// `textarea rows`.
+    pub rows: Option<&'a str>,
     /// `<br/>`. Advisory: the document builder already knows which elements
     /// are empty, and uses this only for the ones it does not know.
     pub self_closing: bool,
@@ -141,8 +155,9 @@ enum State {
     CommentDash,
     /// Two `-` seen inside a comment.
     CommentDashDash,
-    /// Inside `script` or `style`: everything is data until the matching
-    /// end tag.
+    /// Inside `script`, `style` or `textarea`: no markup until the matching
+    /// end tag. `textarea` keeps its content as text, with character
+    /// references; the other two discard theirs.
     RawText,
     /// A `<` inside raw text, which may or may not begin the end tag.
     RawTextLessThan,
@@ -165,6 +180,7 @@ enum State {
 enum RawKind {
     Script,
     Style,
+    Textarea,
 }
 
 impl RawKind {
@@ -172,6 +188,7 @@ impl RawKind {
         match self {
             RawKind::Script => b"script",
             RawKind::Style => b"style",
+            RawKind::Textarea => b"textarea",
         }
     }
 }
@@ -187,6 +204,15 @@ enum Capture {
     Rowspan,
     Colspan,
     Border,
+    Src,
+    Width,
+    Height,
+    Action,
+    Method,
+    Type,
+    Value,
+    For,
+    Rows,
 }
 
 /// The tag being read, and the two attribute values worth keeping.
@@ -203,6 +229,19 @@ struct TagBuffer {
     rowspan: Option<Vec<u8>>,
     colspan: Option<Vec<u8>>,
     border: Option<Vec<u8>>,
+    src: Option<Vec<u8>>,
+    width: Option<Vec<u8>>,
+    height: Option<Vec<u8>>,
+    action: Option<Vec<u8>>,
+    method: Option<Vec<u8>>,
+    input_type: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+    label_for: Option<Vec<u8>>,
+    rows: Option<Vec<u8>>,
+    disabled: bool,
+    checked: bool,
+    selected: bool,
+    multiple: bool,
     attributes_seen: usize,
 }
 
@@ -221,6 +260,19 @@ impl TagBuffer {
             rowspan: None,
             colspan: None,
             border: None,
+            src: None,
+            width: None,
+            height: None,
+            action: None,
+            method: None,
+            input_type: None,
+            value: None,
+            label_for: None,
+            rows: None,
+            disabled: false,
+            checked: false,
+            selected: false,
+            multiple: false,
             attributes_seen: 0,
         }
     }
@@ -238,6 +290,19 @@ impl TagBuffer {
         self.rowspan = None;
         self.colspan = None;
         self.border = None;
+        self.src = None;
+        self.width = None;
+        self.height = None;
+        self.action = None;
+        self.method = None;
+        self.input_type = None;
+        self.value = None;
+        self.label_for = None;
+        self.rows = None;
+        self.disabled = false;
+        self.checked = false;
+        self.selected = false;
+        self.multiple = false;
         self.attributes_seen = 0;
     }
 }
@@ -264,6 +329,15 @@ pub struct Tokenizer {
     scratch_rowspan: String,
     scratch_colspan: String,
     scratch_border: String,
+    scratch_src: String,
+    scratch_width: String,
+    scratch_height: String,
+    scratch_action: String,
+    scratch_method: String,
+    scratch_type: String,
+    scratch_value: String,
+    scratch_for: String,
+    scratch_rows: String,
     scratch_name: String,
     /// Total input bytes, for [`MAX_DECODED_HTML_BYTES`].
     consumed: usize,
@@ -295,6 +369,15 @@ impl Tokenizer {
             scratch_rowspan: String::new(),
             scratch_colspan: String::new(),
             scratch_border: String::new(),
+            scratch_src: String::new(),
+            scratch_width: String::new(),
+            scratch_height: String::new(),
+            scratch_action: String::new(),
+            scratch_method: String::new(),
+            scratch_type: String::new(),
+            scratch_value: String::new(),
+            scratch_for: String::new(),
+            scratch_rows: String::new(),
             scratch_name: String::new(),
             consumed: 0,
             longest_token: 0,
@@ -350,6 +433,22 @@ impl Tokenizer {
                 .as_ref()
                 .map_or(0, |value| value.capacity())
             + self.tag.border.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.src.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.width.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.height.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.action.as_ref().map_or(0, |value| value.capacity())
+            + self.tag.method.as_ref().map_or(0, |value| value.capacity())
+            + self
+                .tag
+                .input_type
+                .as_ref()
+                .map_or(0, |value| value.capacity())
+            + self.tag.value.as_ref().map_or(0, |value| value.capacity())
+            + self
+                .tag
+                .label_for
+                .as_ref()
+                .map_or(0, |value| value.capacity())
             + self.text.capacity()
             + self.decoded.capacity()
             + self.entity.capacity()
@@ -360,6 +459,14 @@ impl Tokenizer {
             + self.scratch_rowspan.capacity()
             + self.scratch_colspan.capacity()
             + self.scratch_border.capacity()
+            + self.scratch_src.capacity()
+            + self.scratch_width.capacity()
+            + self.scratch_height.capacity()
+            + self.scratch_action.capacity()
+            + self.scratch_method.capacity()
+            + self.scratch_type.capacity()
+            + self.scratch_value.capacity()
+            + self.scratch_for.capacity()
             + self.scratch_name.capacity()
     }
 
@@ -619,6 +726,19 @@ impl Tokenizer {
             State::RawText => {
                 if byte == b'<' {
                     self.state = State::RawTextLessThan;
+                } else if self.raw == Some(RawKind::Textarea) {
+                    // A textarea's content is its initial value: text with
+                    // character references, but never markup.
+                    if byte == b'&' {
+                        self.entity.clear();
+                        memory::push(&mut self.entity, b'&')?;
+                        self.state = State::Entity {
+                            attribute: false,
+                            quote: 0,
+                        };
+                    } else {
+                        memory::push(&mut self.text, byte)?;
+                    }
                 }
                 // Everything else is discarded: `script` and `style` bodies
                 // are not displayed, and keeping them would mean holding a
@@ -630,8 +750,11 @@ impl Tokenizer {
                 } else if byte == b'<' {
                     // Stay here: `<<` inside a script still has a `<` that
                     // might start the end tag.
+                    self.keep_raw_text(b"<", 0)?;
                 } else {
+                    self.keep_raw_text(b"<", 0)?;
                     self.state = State::RawText;
+                    return Ok(Some(byte));
                 }
             }
             State::RawTextEndTagName { matched } => {
@@ -648,6 +771,7 @@ impl Tokenizer {
                     } else {
                         // Not the end tag after all -- `</scriptnot`, or a
                         // `</` inside a string.
+                        self.keep_raw_text(b"</", matched)?;
                         self.state = State::RawText;
                         return Ok(Some(byte));
                     }
@@ -658,6 +782,8 @@ impl Tokenizer {
             }
             State::RawTextEndTagRest => match byte {
                 b'>' => {
+                    // A textarea's value is complete before its end tag.
+                    self.flush_text(sink, true)?;
                     let kind = self.raw.take();
                     self.state = State::Text;
                     if let Some(kind) = kind {
@@ -668,6 +794,9 @@ impl Tokenizer {
                 byte if byte.is_ascii_whitespace() || byte == b'/' => {}
                 _ => {
                     // `</scriptx` -- the name only matched a prefix.
+                    if let Some(kind) = self.raw {
+                        self.keep_raw_text(b"</", kind.name().len())?;
+                    }
                     self.state = State::RawText;
                     return Ok(Some(byte));
                 }
@@ -697,6 +826,8 @@ impl Tokenizer {
     fn step_entity(&mut self, byte: u8, attribute: bool, quote: u8) -> Result<Option<u8>, Error> {
         let return_state = if attribute {
             State::AttributeValue { quote }
+        } else if self.raw == Some(RawKind::Textarea) {
+            State::RawText
         } else {
             State::Text
         };
@@ -742,6 +873,18 @@ impl Tokenizer {
         Ok(Some(byte))
     }
 
+    /// Puts back the bytes of a raw-text end tag candidate that turned out
+    /// not to be one: `prefix` and the first `matched` bytes of the name.
+    /// Only a textarea keeps them; script and style content is discarded.
+    fn keep_raw_text(&mut self, prefix: &[u8], matched: usize) -> Result<(), Error> {
+        let Some(kind) = self.raw.filter(|kind| *kind == RawKind::Textarea) else {
+            return Ok(());
+        };
+        memory::extend_from_slice(&mut self.text, prefix)?;
+        memory::extend_from_slice(&mut self.text, &kind.name()[..matched])?;
+        Ok(())
+    }
+
     fn emit_entity_bytes(&mut self, bytes: &[u8], attribute: bool) -> Result<(), Error> {
         if attribute {
             for &byte in bytes {
@@ -765,6 +908,22 @@ impl Tokenizer {
         if self.tag.attributes_seen > MAX_ATTRIBUTES_PER_ELEMENT {
             return;
         }
+        if self.tag.attribute_name == b"disabled" {
+            self.tag.disabled = true;
+            return;
+        }
+        if self.tag.attribute_name == b"checked" {
+            self.tag.checked = true;
+            return;
+        }
+        if self.tag.attribute_name == b"selected" {
+            self.tag.selected = true;
+            return;
+        }
+        if self.tag.attribute_name == b"multiple" {
+            self.tag.multiple = true;
+            return;
+        }
         if self.tag.attribute_name == b"href" && self.tag.href.is_none() {
             self.tag.href = Some(Vec::new());
             self.tag.capture = Capture::Href;
@@ -786,6 +945,33 @@ impl Tokenizer {
         } else if self.tag.attribute_name == b"border" && self.tag.border.is_none() {
             self.tag.border = Some(Vec::new());
             self.tag.capture = Capture::Border;
+        } else if self.tag.attribute_name == b"src" && self.tag.src.is_none() {
+            self.tag.src = Some(Vec::new());
+            self.tag.capture = Capture::Src;
+        } else if self.tag.attribute_name == b"width" && self.tag.width.is_none() {
+            self.tag.width = Some(Vec::new());
+            self.tag.capture = Capture::Width;
+        } else if self.tag.attribute_name == b"height" && self.tag.height.is_none() {
+            self.tag.height = Some(Vec::new());
+            self.tag.capture = Capture::Height;
+        } else if self.tag.attribute_name == b"action" && self.tag.action.is_none() {
+            self.tag.action = Some(Vec::new());
+            self.tag.capture = Capture::Action;
+        } else if self.tag.attribute_name == b"method" && self.tag.method.is_none() {
+            self.tag.method = Some(Vec::new());
+            self.tag.capture = Capture::Method;
+        } else if self.tag.attribute_name == b"type" && self.tag.input_type.is_none() {
+            self.tag.input_type = Some(Vec::new());
+            self.tag.capture = Capture::Type;
+        } else if self.tag.attribute_name == b"value" && self.tag.value.is_none() {
+            self.tag.value = Some(Vec::new());
+            self.tag.capture = Capture::Value;
+        } else if self.tag.attribute_name == b"for" && self.tag.label_for.is_none() {
+            self.tag.label_for = Some(Vec::new());
+            self.tag.capture = Capture::For;
+        } else if self.tag.attribute_name == b"rows" && self.tag.rows.is_none() {
+            self.tag.rows = Some(Vec::new());
+            self.tag.capture = Capture::Rows;
         }
     }
 
@@ -795,6 +981,23 @@ impl Tokenizer {
             && self.tag.border.is_none()
         {
             self.tag.border = Some(Vec::new());
+        }
+        if self.tag.attributes_seen <= MAX_ATTRIBUTES_PER_ELEMENT
+            && self.tag.attribute_name == b"disabled"
+        {
+            self.tag.disabled = true;
+        }
+        if self.tag.attributes_seen <= MAX_ATTRIBUTES_PER_ELEMENT
+            && self.tag.attribute_name == b"checked"
+        {
+            self.tag.checked = true;
+        }
+        if self.tag.attributes_seen <= MAX_ATTRIBUTES_PER_ELEMENT {
+            match self.tag.attribute_name.as_slice() {
+                b"selected" => self.tag.selected = true,
+                b"multiple" => self.tag.multiple = true,
+                _ => {}
+            }
         }
     }
 
@@ -811,6 +1014,18 @@ impl Tokenizer {
             Capture::Rowspan => (&mut self.tag.rowspan, MAX_SPAN_BYTES),
             Capture::Colspan => (&mut self.tag.colspan, MAX_SPAN_BYTES),
             Capture::Border => (&mut self.tag.border, MAX_SPAN_BYTES),
+            Capture::Src => (&mut self.tag.src, MAX_HREF_BYTES),
+            Capture::Width => (&mut self.tag.width, MAX_SPAN_BYTES),
+            Capture::Height => (&mut self.tag.height, MAX_SPAN_BYTES),
+            Capture::Action => (&mut self.tag.action, MAX_HREF_BYTES),
+            Capture::Method => (&mut self.tag.method, 16),
+            Capture::Type => (&mut self.tag.input_type, 32),
+            Capture::Value => (&mut self.tag.value, MAX_HREF_BYTES),
+            Capture::For => (
+                &mut self.tag.label_for,
+                crate::limits::MAX_ANCHOR_NAME_BYTES,
+            ),
+            Capture::Rows => (&mut self.tag.rows, MAX_SPAN_BYTES),
         };
         let Some(buffer) = buffer.as_mut() else {
             return Ok(());
@@ -862,10 +1077,53 @@ impl Tokenizer {
         if let Some(bytes) = &self.tag.border {
             push_repaired(&mut self.scratch_border, bytes)?;
         }
+        self.scratch_src.clear();
+        if let Some(bytes) = &self.tag.src {
+            push_repaired(&mut self.scratch_src, bytes)?;
+        }
+        self.scratch_width.clear();
+        if let Some(bytes) = &self.tag.width {
+            push_repaired(&mut self.scratch_width, bytes)?;
+        }
+        self.scratch_height.clear();
+        if let Some(bytes) = &self.tag.height {
+            push_repaired(&mut self.scratch_height, bytes)?;
+        }
+        self.scratch_action.clear();
+        if let Some(bytes) = &self.tag.action {
+            push_repaired(&mut self.scratch_action, bytes)?;
+        }
+        self.scratch_method.clear();
+        if let Some(bytes) = &self.tag.method {
+            push_repaired(&mut self.scratch_method, bytes)?;
+        }
+        self.scratch_type.clear();
+        if let Some(bytes) = &self.tag.input_type {
+            push_repaired(&mut self.scratch_type, bytes)?;
+        }
+        self.scratch_value.clear();
+        if let Some(bytes) = &self.tag.value {
+            push_repaired(&mut self.scratch_value, bytes)?;
+        }
+        self.scratch_for.clear();
+        if let Some(bytes) = &self.tag.label_for {
+            push_repaired(&mut self.scratch_for, bytes)?;
+        }
+        self.scratch_rows.clear();
+        if let Some(bytes) = &self.tag.rows {
+            push_repaired(&mut self.scratch_rows, bytes)?;
+        }
         sink.start_tag(Tag {
             name: &self.scratch_name,
             href: self.tag.href.as_ref().map(|_| self.scratch_href.as_str()),
             alt: self.tag.alt.as_ref().map(|_| self.scratch_alt.as_str()),
+            src: self.tag.src.as_ref().map(|_| self.scratch_src.as_str()),
+            width: self.tag.width.as_ref().map(|_| self.scratch_width.as_str()),
+            height: self
+                .tag
+                .height
+                .as_ref()
+                .map(|_| self.scratch_height.as_str()),
             id: self.tag.id.as_ref().map(|_| self.scratch_id.as_str()),
             anchor_name: self
                 .tag
@@ -887,6 +1145,32 @@ impl Tokenizer {
                 .border
                 .as_ref()
                 .map(|_| self.scratch_border.as_str()),
+            action: self
+                .tag
+                .action
+                .as_ref()
+                .map(|_| self.scratch_action.as_str()),
+            method: self
+                .tag
+                .method
+                .as_ref()
+                .map(|_| self.scratch_method.as_str()),
+            input_type: self
+                .tag
+                .input_type
+                .as_ref()
+                .map(|_| self.scratch_type.as_str()),
+            value: self.tag.value.as_ref().map(|_| self.scratch_value.as_str()),
+            label_for: self
+                .tag
+                .label_for
+                .as_ref()
+                .map(|_| self.scratch_for.as_str()),
+            disabled: self.tag.disabled,
+            checked: self.tag.checked,
+            selected: self.tag.selected,
+            multiple: self.tag.multiple,
+            rows: self.tag.rows.as_ref().map(|_| self.scratch_rows.as_str()),
             self_closing: self.tag.self_closing,
         })?;
 
@@ -895,6 +1179,7 @@ impl Tokenizer {
         self.raw = match self.tag.name.as_slice() {
             b"script" => Some(RawKind::Script),
             b"style" => Some(RawKind::Style),
+            b"textarea" => Some(RawKind::Textarea),
             _ => None,
         };
         if self.raw.is_some() && !self.tag.self_closing {
@@ -1092,6 +1377,15 @@ mod tests {
             if let Some(alt) = tag.alt {
                 event.push_str(&format!(" alt={alt}"));
             }
+            if let Some(src) = tag.src {
+                event.push_str(&format!(" src={src}"));
+            }
+            if let Some(width) = tag.width {
+                event.push_str(&format!(" width={width}"));
+            }
+            if let Some(height) = tag.height {
+                event.push_str(&format!(" height={height}"));
+            }
             if let Some(rowspan) = tag.rowspan {
                 event.push_str(&format!(" rowspan={rowspan}"));
             }
@@ -1100,6 +1394,24 @@ mod tests {
             }
             if let Some(border) = tag.border {
                 event.push_str(&format!(" border={border}"));
+            }
+            if let Some(action) = tag.action {
+                event.push_str(&format!(" action={action}"));
+            }
+            if let Some(method) = tag.method {
+                event.push_str(&format!(" method={method}"));
+            }
+            if let Some(input_type) = tag.input_type {
+                event.push_str(&format!(" type={input_type}"));
+            }
+            if let Some(value) = tag.value {
+                event.push_str(&format!(" value={value}"));
+            }
+            if let Some(label_for) = tag.label_for {
+                event.push_str(&format!(" for={label_for}"));
+            }
+            if tag.disabled {
+                event.push_str(" disabled");
             }
             if tag.self_closing {
                 event.push('/');
@@ -1227,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn only_href_and_alt_are_kept() {
+    fn only_browser_attributes_are_kept() {
         assert_eq!(
             parse(b"<a href=\"/x\" class=\"big\" id=q>t</a>"),
             [
@@ -1237,8 +1549,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse(b"<img src=\"a.png\" alt=\"a cat\">"),
-            ["<img alt=a cat>"]
+            parse(b"<img src=\"a.png\" alt=\"a cat\" width=20 height='10'>"),
+            ["<img alt=a cat src=a.png width=20 height=10>"]
         );
     }
 
@@ -1252,6 +1564,22 @@ mod tests {
         ] {
             assert_eq!(parse(markup), ["<a href=/x>"], "{markup:?}");
         }
+    }
+
+    #[test]
+    fn form_attributes_are_bounded_and_chunk_independent() {
+        let input = b"<form action='/find?a=&amp;' method=GET><label for=q>Q</label><input type=text name=q value='a &amp; b' disabled=x>";
+        assert_eq!(
+            parse(input),
+            vec![
+                "<form action=/find?a=& method=GET>",
+                "<label for=q>",
+                "text:Q",
+                "</label>",
+                "<input type=text value=a & b disabled>",
+            ]
+        );
+        assert_chunking_invisible(input);
     }
 
     #[test]

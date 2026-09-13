@@ -17,6 +17,7 @@ mod files;
 mod font_test;
 mod fswritetest;
 mod localfile;
+mod cache_store;
 mod lsusb;
 mod mbr;
 mod membench;

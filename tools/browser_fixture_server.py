@@ -29,13 +29,18 @@ produce, which is what the on-device `browsertest` walk is driven from.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import html
 import re
 import socket
 import socketserver
 import ssl
+import struct
 import sys
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -61,6 +66,23 @@ MAX_LAYOUT_LINES = 32768
 MAX_TABLE_COLUMNS = 32
 MAX_TABLE_SPAN = 32
 MAX_TABLE_BORDER = 4
+MAX_IMAGES = 64
+MAX_IMAGE_COMPRESSED_BYTES = 512 * 1024
+MAX_IMAGE_PIXELS = 1024 * 1024
+MAX_IMAGE_DECODE_WORK_BYTES = 1024 * 1024
+MAX_FORMS = 32
+MAX_FORM_CONTROLS = 256
+MAX_INPUT_VALUE_BYTES = 4096
+MAX_FORM_VALUE_BYTES = 32 * 1024
+MAX_ENCODED_REQUEST_BYTES = 48 * 1024
+MAX_SELECT_OPTIONS = 4096
+MAX_HTTP_CACHE_ENTRY_BYTES = 512 * 1024
+DEFAULT_CACHE_FRESHNESS_SECS = 3600
+MAX_CACHE_META_BYTES = 4096
+MAX_RETAINED_POST_RESULTS = 2
+MAX_RETAINED_POST_RESULT_BYTES = 320 * 1024
+MAX_RETAINED_POST_REQUEST_BYTES = 2 * 48 * 1024
+MAX_EXTENSION_OWNED_BYTES = 6 * 1024 * 1024
 
 LIMITS = {
     "MAX_HEADER_BYTES": MAX_HEADER_BYTES,
@@ -80,6 +102,23 @@ LIMITS = {
     "MAX_TABLE_COLUMNS": MAX_TABLE_COLUMNS,
     "MAX_TABLE_SPAN": MAX_TABLE_SPAN,
     "MAX_TABLE_BORDER": MAX_TABLE_BORDER,
+    "MAX_IMAGES": MAX_IMAGES,
+    "MAX_IMAGE_COMPRESSED_BYTES": MAX_IMAGE_COMPRESSED_BYTES,
+    "MAX_IMAGE_PIXELS": MAX_IMAGE_PIXELS,
+    "MAX_IMAGE_DECODE_WORK_BYTES": MAX_IMAGE_DECODE_WORK_BYTES,
+    "MAX_FORMS": MAX_FORMS,
+    "MAX_FORM_CONTROLS": MAX_FORM_CONTROLS,
+    "MAX_INPUT_VALUE_BYTES": MAX_INPUT_VALUE_BYTES,
+    "MAX_FORM_VALUE_BYTES": MAX_FORM_VALUE_BYTES,
+    "MAX_ENCODED_REQUEST_BYTES": MAX_ENCODED_REQUEST_BYTES,
+    "MAX_SELECT_OPTIONS": MAX_SELECT_OPTIONS,
+    "MAX_HTTP_CACHE_ENTRY_BYTES": MAX_HTTP_CACHE_ENTRY_BYTES,
+    "DEFAULT_CACHE_FRESHNESS_SECS": DEFAULT_CACHE_FRESHNESS_SECS,
+    "MAX_CACHE_META_BYTES": MAX_CACHE_META_BYTES,
+    "MAX_RETAINED_POST_RESULTS": MAX_RETAINED_POST_RESULTS,
+    "MAX_RETAINED_POST_RESULT_BYTES": MAX_RETAINED_POST_RESULT_BYTES,
+    "MAX_RETAINED_POST_REQUEST_BYTES": MAX_RETAINED_POST_REQUEST_BYTES,
+    "MAX_EXTENSION_OWNED_BYTES": MAX_EXTENSION_OWNED_BYTES,
 }
 
 LIMITS_RS = Path(__file__).resolve().parent.parent / "browser" / "src" / "limits.rs"
@@ -179,6 +218,15 @@ is itself part of what is being tested.</p>
   <li><a href="broken/deep-nest.html">broken/deep-nest.html</a></li>
   <li><a href="broken/huge-attribute.html">broken/huge-attribute.html</a></li>
   <li><a href="broken/bad-utf8.html">broken/bad-utf8.html</a></li>
+</ul>
+<h2>Forms</h2>
+<ul>
+  <li><a href="forms/post.html">forms/post.html</a> - direct POST</li>
+  <li><a href="forms/inline-controls.html">forms/inline-controls.html</a> - inline controls and decorated/image buttons</li>
+  <li><a href="forms/post-redirects.html">forms/post-redirects.html</a> - POST redirect rules</li>
+  <li><a href="cache/index.html">cache/index.html</a> - HTTP cache revalidation</li>
+  <li><a href="images/png-formats.html">images/png-formats.html</a> - every PNG colour type and bit depth up to 8 bits, and rejected variants</li>
+  <li><a href="images/pinned.html">images/pinned.html</a> - images from a TLS PINNED page (over the TLS listener)</li>
 </ul>
 <h2>Transfers</h2>
 <ul>
@@ -620,6 +668,7 @@ STATUS_TEXT = {
     200: "OK",
     301: "Moved Permanently",
     302: "Found",
+    303: "See Other",
     307: "Temporary Redirect",
     308: "Permanent Redirect",
     404: "Not Found",
@@ -637,13 +686,16 @@ def head(
     return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
 
 
-def html_response(body: bytes, status: int = 200) -> bytes:
+def html_response(
+    body: bytes, status: int = 200, extra: list[tuple[str, str]] | None = None
+) -> bytes:
     return (
         head(
             status,
             [
                 ("Content-Type", "text/html; charset=utf-8"),
                 ("Content-Length", str(len(body))),
+                *(extra or []),
                 ("Connection", "close"),
             ],
         )
@@ -677,6 +729,7 @@ class Request:
     path: str
     query: str
     headers: dict[str, str]
+    body: bytes
 
 
 Handler = Callable[["FixtureHandler", Request], None]
@@ -728,6 +781,665 @@ static("/pre.html", "ok", PRE)
 static("/entity.html", "ok", ENTITY)
 static("/utf8.html", "ok", UTF8)
 static("/inline.html", "ok", INLINE)
+
+POST_FORM = page(
+    "POST form",
+    "<h1>POST form acceptance</h1>"
+    "<p>The response must show one POST and the exact encoded body.</p>"
+    "<form action='/forms/post/echo?kept=1' method='post'>"
+    "<label for='post-q'>Query</label>"
+    "<input id='post-q' name='q' value='two words'>"
+    "<input type='hidden' name='q' value='hidden duplicate'>"
+    "<input type='hidden' name='empty' value=''>"
+    "<input name='off' value='disabled value' disabled>"
+    "<button name='go' value='Send'>Send POST</button>"
+    "</form>"
+    "<h2>Checkboxes and radio buttons</h2>"
+    "<form action='/forms/post/echo?kept=checkable' method='post'>"
+    "<label for='post-cb-a'>Alpha (checked)</label>"
+    "<input id='post-cb-a' type='checkbox' name='pick' value='alpha' checked>"
+    "<label for='post-cb-b'>Beta</label>"
+    "<input id='post-cb-b' type='checkbox' name='pick' value='beta'>"
+    "<label for='post-cb-on'>No value attribute</label>"
+    "<input id='post-cb-on' type='checkbox' name='flag'>"
+    "<label for='post-r-1'>One</label>"
+    "<input id='post-r-1' type='radio' name='choice' value='one' checked>"
+    "<label for='post-r-2'>Two</label>"
+    "<input id='post-r-2' type='radio' name='choice' value='two'>"
+    "<button name='go' value='Checks'>Send checkable POST</button>"
+    "</form>"
+    "<h2>Textarea</h2>"
+    "<form action='/forms/post/echo?kept=textarea' method='post'>"
+    "<label for='post-text'>Text</label>"
+    "<textarea id='post-text' name='text' rows='3'>line one\nline two</textarea>"
+    "<button name='go' value='Text'>Send textarea POST</button>"
+    "</form>"
+    "<h2>Select</h2>"
+    "<form action='/forms/post/echo?kept=select' method='post'>"
+    "<label for='post-fruit'>Fruit</label>"
+    "<select id='post-fruit' name='fruit'><option value='apple'>Apple</option>"
+    "<option value='pear' selected>Pear</option><option value='plum'>Plum</option></select>"
+    "<label for='post-many'>Many</label>"
+    "<select id='post-many' name='many' multiple><option value='x' selected>X</option>"
+    "<option value='y' selected>Y</option><option value='z'>Z</option></select>"
+    "<button name='go' value='Select'>Send select POST</button>"
+    "</form>"
+    "<h2>Not kept for history</h2>"
+    "<p>The result says Cache-Control: no-store. Back to it must ask before resending.</p>"
+    "<form action='/forms/post/echo-no-store' method='post'>"
+    "<input name='q' value='no store'>"
+    "<button name='go' value='NoStore'>Send no-store POST</button>"
+    "</form>"
+    "<h2>Too large to keep</h2>"
+    "<p>The result is larger than the retained POST result budget. Back to it must ask.</p>"
+    "<form action='/forms/post/echo-large' method='post'>"
+    "<input name='q' value='large'>"
+    "<button name='go' value='Large'>Send large POST</button>"
+    "</form>"
+    "<p><a href='/'>index</a></p>",
+)
+static("/forms/post.html", "ok", POST_FORM)
+
+POST_COUNTS: dict[str, int] = {}
+
+
+# Paragraphs of filler whose document text alone exceeds the retained POST
+# result budget, so the viewer must fall back to asking before resending.
+LARGE_POST_FILLER = "".join(
+    f"<p>filler {index:05d}: " + "x" * 96 + "</p>"
+    for index in range(MAX_RETAINED_POST_RESULT_BYTES // 96 + 64)
+)
+
+
+def post_echo(
+    self: "FixtureHandler",
+    request: Request,
+    no_store: bool = False,
+    large: bool = False,
+) -> None:
+    if request.method == "POST":
+        POST_COUNTS[request.path] = POST_COUNTS.get(request.path, 0) + 1
+    count = POST_COUNTS.get(request.path, 0)
+    body_text = request.body.decode("ascii", "backslashreplace")
+    response = page(
+        "POST result",
+        "<h1>POST result</h1>"
+        f"<p id='method'>method: {html.escape(request.method)}</p>"
+        f"<p id='count'>POST count: {count}</p>"
+        f"<p id='query'>target query: {html.escape(request.query)}</p>"
+        f"<p id='type'>content-type: {html.escape(request.headers.get('content-type', 'missing'))}</p>"
+        f"<p id='length'>content-length: {html.escape(request.headers.get('content-length', 'missing'))}</p>"
+        f"<p id='body'>body: {html.escape(body_text)}</p>"
+        f"<p id='kept'>cache-control no-store: {'yes' if no_store else 'no'}</p>"
+        "<p><a href='/forms/post.html'>form again</a></p>"
+        + (LARGE_POST_FILLER + "<p>end of large result</p>" if large else ""),
+    )
+    extra = [("Cache-Control", "no-store")] if no_store else None
+    self.send_all(html_response(response, extra=extra))
+
+
+def post_echo_no_store(self: "FixtureHandler", request: Request) -> None:
+    post_echo(self, request, no_store=True)
+
+
+def post_echo_large(self: "FixtureHandler", request: Request) -> None:
+    post_echo(self, request, large=True)
+
+
+# A POST target is intentionally absent from the GET walk manifest: walking
+# it would change the counter whose whole purpose is detecting a duplicate
+# submission.
+ROUTES["/forms/post/echo"] = post_echo
+ROUTES["/forms/post/echo-no-store"] = post_echo_no_store
+ROUTES["/forms/post/echo-large"] = post_echo_large
+
+POST_REDIRECT_FORM = page(
+    "POST redirect forms",
+    "<h1>POST redirect acceptance</h1>"
+    "<p>Each result must show one source POST and one final request.</p>"
+    + "".join(
+        f"<h2>{code}</h2>"
+        f"<form action='/forms/post/redirect/{code}?source={code}' method='post'>"
+        f"<input name='q' value='redirect {code}'>"
+        f"<button name='go' value='{code}'>Try {code}</button>"
+        "</form>"
+        for code in (301, 302, 303, 307, 308)
+    )
+    + "<h2>Cross-origin 307/308</h2>"
+    "<p>From plaintext these redirect to the TLS listener, another origin. The viewer "
+    "must ask before resending the body; cancel must leave both counts unchanged.</p>"
+    + "".join(
+        f"<form action='/forms/post/redirect/cross-{code}?source=cross-{code}' method='post'>"
+        f"<input name='q' value='cross {code}'>"
+        f"<button name='go' value='cross-{code}'>Try cross-origin {code}</button>"
+        "</form>"
+        for code in (307, 308)
+    )
+    + "<p><a href='/'>index</a></p>",
+)
+static("/forms/post-redirects.html", "ok", POST_REDIRECT_FORM)
+
+POST_REDIRECT_SOURCE_COUNTS: dict[str, int] = {}
+POST_REDIRECT_FINAL_COUNTS: dict[str, int] = {}
+
+
+def post_redirect_source(
+    self: "FixtureHandler", request: Request, code: str
+) -> None:
+    if request.method == "POST":
+        POST_REDIRECT_SOURCE_COUNTS[code] = (
+            POST_REDIRECT_SOURCE_COUNTS.get(code, 0) + 1
+        )
+    location = f"/forms/post/result/{code}?from={code}"
+    if code.startswith("cross-"):
+        if "tls" not in PORTS:
+            self.send_all(html_response(page(
+                "no TLS listener",
+                "<h1>No TLS listener</h1><p>Start the server with a TLS port.</p>",
+            ), 503))
+            return
+        location = self.other_scheme_origin(request) + location
+    self.send_all(redirect(location, int(code.removeprefix("cross-"))))
+
+
+def post_redirect_result(
+    self: "FixtureHandler", request: Request, code: str
+) -> None:
+    POST_REDIRECT_FINAL_COUNTS[code] = (
+        POST_REDIRECT_FINAL_COUNTS.get(code, 0) + 1
+    )
+    body_text = request.body.decode("ascii", "backslashreplace")
+    response = page(
+        f"POST redirect {code}",
+        f"<h1>POST redirect {code}</h1>"
+        f"<p id='method'>final method: {html.escape(request.method)}</p>"
+        f"<p id='source-count'>source POST count: {POST_REDIRECT_SOURCE_COUNTS.get(code, 0)}</p>"
+        f"<p id='final-count'>final request count: {POST_REDIRECT_FINAL_COUNTS[code]}</p>"
+        f"<p id='query'>final query: {html.escape(request.query)}</p>"
+        f"<p id='type'>content-type: {html.escape(request.headers.get('content-type', 'missing'))}</p>"
+        f"<p id='length'>content-length: {html.escape(request.headers.get('content-length', 'missing'))}</p>"
+        f"<p id='body'>body: {html.escape(body_text)}</p>"
+        "<p><a href='/forms/post-redirects.html'>redirect forms</a></p>",
+    )
+    self.send_all(html_response(response))
+
+
+def post_redirect_source_handler(code: str) -> Handler:
+    def handler(self: "FixtureHandler", request: Request) -> None:
+        post_redirect_source(self, request, code)
+
+    return handler
+
+
+def post_redirect_result_handler(code: str) -> Handler:
+    def handler(self: "FixtureHandler", request: Request) -> None:
+        post_redirect_result(self, request, code)
+
+    return handler
+
+
+# Source and result endpoints stay out of the GET manifest walk so it cannot
+# change the counters used to detect an accidental duplicate submission.
+for redirect_status in ("301", "302", "303", "307", "308", "cross-307", "cross-308"):
+    ROUTES[f"/forms/post/redirect/{redirect_status}"] = (
+        post_redirect_source_handler(redirect_status)
+    )
+    ROUTES[f"/forms/post/result/{redirect_status}"] = (
+        post_redirect_result_handler(redirect_status)
+    )
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+    )
+
+
+def checker_png() -> bytes:
+    width, height = 192, 128
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            r, g, b, a = 24 + x * 72 // width, 80 + y * 80 // height, 190 + x * 50 // width, 255
+            if (x - 148) ** 2 + (y - 28) ** 2 < 18**2:
+                r, g, b, a = 255, 210, 32, 176
+            ridge = 78 - abs(x - 62) * 3 // 5
+            ridge2 = 92 - abs(x - 132) * 2 // 5
+            if y > min(ridge, ridge2):
+                r, g, b, a = (35, 92, 64, 255) if y < 104 else (20, 48, 34, 255)
+            if y >= 112:
+                bars = ((230, 40, 50), (250, 190, 30), (40, 190, 90), (35, 110, 230), (170, 55, 210), (245, 245, 245))
+                r, g, b = bars[min(x * len(bars) // width, len(bars) - 1)]
+            if x % 32 == 0 or y % 32 == 0:
+                r, g, b, a = 255, 255, 255, 128
+            rows.extend((r, g, b, a))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(rows))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def large_png() -> bytes:
+    width, height = 640, 400
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            r = 20 + x * 200 // width
+            g = 30 + y * 190 // height
+            b = 220 - x * 120 // width
+            if (x // 40 + y // 40) % 2:
+                r = min(255, r + 25)
+                b = max(0, b - 20)
+            rows.extend((r, g, b, 255))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(rows))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+IMAGE_PAGE = page(
+    "network images",
+    "<h1>Network PNG and JPEG</h1>"
+    + "<p>before image</p>" * 12
+    + "<img src='/images/checker.png' alt='network PNG failed' width='384' height='256'>"
+    + "<img src='/images/checker.png' alt='duplicate PNG failed' width='192' height='128'>"
+    + "<img src='/images/landscape.jpg' alt='JPEG failed' width='384' height='288'>"
+    + "<img src='/images/bad-crc.png' alt='alt must not hide failure' width='320' height='96'>"
+    + "<img src='/images/slow.png' alt='slow intrinsic image'>"
+    + "<p>KEEP THIS LINE AT THE SAME SCREEN POSITION</p>"
+    + "<img src='/images/large.png' alt='large image failed' width='640' height='400'>"
+    + "<p>after image</p>" * 18,
+)
+static("/images/stage3.html", "ok", IMAGE_PAGE)
+
+INLINE_CONTROL_PAGE = page(
+    "inline controls and buttons",
+    "<h1>Inline controls and buttons</h1>"
+    "<form action='/forms/post/echo' method='post'>"
+    "<p><label for=q>Query</label> <input id=q name=q value=initial> after "
+    "<select name=choice><option selected>one</option><option>two</option></select> tail "
+    "<button name=plain value=yes>Plain</button>.</p>"
+    "<p><button name=styled value=yes><strong>Bold</strong> <em>italic</em> "
+    "<code>code</code> <div>block flattened</div> <a href=/bad>link text</a>"
+    "<input name=nested> end</button></p>"
+    "<p><button name=image value=yes>before <img src='/images/checker.png' width=80 height=40 alt=checker> after</button> "
+    "<button name=slow value=yes><img src='/images/slow.png' alt=slow> slow</button> "
+    "<button name=broken value=yes><img src='/images/bad-crc.png' alt=broken> broken</button></p>"
+    "<table border=1><tr><th>wide inline cell</th><th>peer</th></tr>"
+    "<tr><td><label for=cell>Cell</label> <input id=cell name=cell value=value> after "
+    "<button name=cell-go value=yes><strong>Go</strong><img src='/images/checker.png' width=40 height=40></button></td>"
+    "<td rowspan=3>rowspan</td></tr><tr><td>narrow <input name=narrow> tail</td></tr>"
+    "<tr><td>before <input type=checkbox name=before-image> inline"
+    "<img src='/images/checker.png' width=80 height=40 alt=standalone>"
+    "after <input type=radio name=after-image> inline</td></tr></table>"
+    "</form><p><a href='/'>index</a></p>",
+)
+static("/forms/inline-controls.html", "ok", INLINE_CONTROL_PAGE)
+
+BASELINE_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAMABADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyvRfCP3f3f6V32ieEPu/u/wBK7XRNMtvl+Su+0XTLX5fkpYbEs5+GeJa2h//Z"
+)
+
+
+@route("/images/pinned.html", "ok")
+def pinned_images_page(self: "FixtureHandler", request: Request) -> None:
+    """Images from a pinned page that must not lower its identity.
+
+    Opened over the TLS listener on a board built with `tls-fixture-pins`
+    (and this machine's address in `tools/pins/fixture_pins.txt`), the page
+    itself is TLS PINNED. Every image then has to be HTTPS to a pinned host:
+    the plaintext one and the unpinned host are refused before any request,
+    and the Ed25519 listener is a pinned host whose key does not match, so it
+    fails at the pin check. `no-store`, so the page is always really fetched
+    and never shown from the board's cache.
+    """
+    if "tls" not in PORTS:
+        body = page(
+            "no TLS listener",
+            "<h1>No TLS listener</h1><p>Start the server with a TLS port.</p>",
+        )
+        self.send_all(html_response(body, 503))
+        return
+    tls = self.origin(request, PORTS["tls"], secure=True)
+    plain = self.origin(request, PORTS["http"], secure=False)
+    ed25519 = self.origin(request, PORTS["tls"] + TLS_ED25519_OFFSET, secure=True)
+    rows = [
+        ("same pinned host over HTTPS", f"{tls}/images/checker.png", "shown"),
+        ("same host over plaintext", f"{plain}/images/checker.png", "HTTPS downgrade refused"),
+        (
+            "host with no pin",
+            "https://tls-unpinned.invalid/images/checker.png",
+            "TLS identity downgrade refused (a board without pins: a DNS failure)",
+        ),
+        (
+            "pinned host, Ed25519 key that is not the pin",
+            f"{ed25519}/images/checker.png",
+            "a connection failure, never the image",
+        ),
+    ]
+    body = page(
+        "pinned images",
+        "<h1>Images from a pinned page</h1>"
+        "<p>Tap the lock first: it must say TLS PINNED. Opened over plaintext or on "
+        "a board without pins this page proves nothing.</p>"
+        + "".join(
+            f"<h2>{index}. {html.escape(label)}</h2>"
+            f"<p>expected: {html.escape(expected)}</p>"
+            f"<p><code>{html.escape(url)}</code></p>"
+            f"<img src='{html.escape(url)}' width='192' height='128' alt='{html.escape(label)}'>"
+            for index, (label, url, expected) in enumerate(rows, 1)
+        )
+        + "<p><a href='/'>index</a></p>",
+    )
+    self.send_all(html_response(body, extra=[("Cache-Control", "no-store")]))
+
+
+@route("/images/checker.png", "download:png")
+def network_checker_png(self: "FixtureHandler", request: Request) -> None:
+    body = checker_png()
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/bad-crc.png", "download:png-bad-crc")
+def network_bad_crc_png(self: "FixtureHandler", request: Request) -> None:
+    body = bytearray(checker_png())
+    body[29] ^= 1
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/slow.png", "download:png-slow")
+def network_slow_png(self: "FixtureHandler", request: Request) -> None:
+    body = checker_png()
+    chunk = max(1, (len(body) + 4) // 5)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body[:chunk]
+    )
+    offset = chunk
+    while offset < len(body):
+        time.sleep(2)
+        end = min(offset + chunk, len(body))
+        self.send_all(body[offset:end])
+        offset = end
+
+
+@route("/images/large.png", "download:png-large")
+def network_large_png(self: "FixtureHandler", request: Request) -> None:
+    body = large_png()
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+# --- PNG colour types and bit depths --------------------------------------
+#
+# One image per format the decoder accepts, and a few it must refuse. Every
+# row cycles through filter types 0-4 so the one-byte look-back used below
+# eight bits per pixel is exercised, and the width is odd so packed rows end
+# in padding bits. Those padding bits are set to one: a decoder that reads
+# them paints a stray column at the right edge.
+
+PNG_FORMAT_WIDTH, PNG_FORMAT_HEIGHT = 99, 40
+ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def pack_png_row(samples: list[int], bit_depth: int) -> bytes:
+    if bit_depth == 16:
+        return b"".join(struct.pack(">H", sample) for sample in samples)
+    if bit_depth == 8:
+        return bytes(samples)
+    out = bytearray()
+    accumulator = bits = 0
+    for sample in samples:
+        accumulator = (accumulator << bit_depth) | sample
+        bits += bit_depth
+        while bits >= 8:
+            bits -= 8
+            out.append((accumulator >> bits) & 0xFF)
+    if bits:
+        out.append(((accumulator << (8 - bits)) | ((1 << (8 - bits)) - 1)) & 0xFF)
+    return bytes(out)
+
+
+def png_paeth(left: int, up: int, upper_left: int) -> int:
+    estimate = left + up - upper_left
+    distances = (abs(estimate - left), abs(estimate - up), abs(estimate - upper_left))
+    if distances[0] <= distances[1] and distances[0] <= distances[2]:
+        return left
+    return up if distances[1] <= distances[2] else upper_left
+
+
+def filter_png_rows(rows: list[bytes], bits_per_pixel: int) -> bytes:
+    offset = max(1, bits_per_pixel // 8)
+    out = bytearray()
+    previous = bytes(len(rows[0]))
+    for y, row in enumerate(rows):
+        kind = y % 5
+        out.append(kind)
+        for index, value in enumerate(row):
+            left = row[index - offset] if index >= offset else 0
+            up = previous[index]
+            upper_left = previous[index - offset] if index >= offset else 0
+            predictor = (0, left, up, (left + up) // 2, png_paeth(left, up, upper_left))[kind]
+            out.append((value - predictor) & 0xFF)
+        previous = row
+    return bytes(out)
+
+
+def format_png(
+    color_type: int,
+    bit_depth: int,
+    pixel: Callable[[int, int], tuple[int, ...]],
+    extra: tuple[tuple[bytes, bytes], ...] = (),
+    interlace: bool = False,
+) -> bytes:
+    width, height = PNG_FORMAT_WIDTH, PNG_FORMAT_HEIGHT
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+
+    def scanlines(xs: range, ys: range) -> bytes:
+        rows = [pack_png_row([s for x in xs for s in pixel(x, y)], bit_depth) for y in ys]
+        return filter_png_rows(rows, channels * bit_depth)
+
+    if interlace:
+        data = b"".join(
+            scanlines(range(x0, width, dx), range(y0, height, dy))
+            for x0, y0, dx, dy in ADAM7
+            if x0 < width and y0 < height
+        )
+    else:
+        data = scanlines(range(width), range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, int(interlace))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + b"".join(png_chunk(kind, body) for kind, body in extra)
+        + png_chunk(b"IDAT", zlib.compress(data))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def png_step(x: int, levels: int) -> int:
+    return x * levels // PNG_FORMAT_WIDTH
+
+
+def png_hue_palette(count: int) -> bytes:
+    out = bytearray()
+    for index in range(count):
+        sector, fraction = divmod(index * 6 * 255 // count, 255)
+        rise, fall = fraction, 255 - fraction
+        out.extend(((255, rise, 0), (fall, 255, 0), (0, 255, rise), (0, fall, 255), (rise, 0, 255), (255, 0, fall))[sector])
+    return bytes(out)
+
+
+def png_grey_bands(bit_depth: int) -> Callable[[int, int], tuple[int, ...]]:
+    levels = 1 << bit_depth
+    return lambda x, y: (png_step(x if y < PNG_FORMAT_HEIGHT // 2 else PNG_FORMAT_WIDTH - 1 - x, levels),)
+
+
+def png_palette_bands(bit_depth: int) -> Callable[[int, int], tuple[int, ...]]:
+    count = 1 << bit_depth
+    return lambda x, y: ((png_step(x, count) + y * count // (2 * PNG_FORMAT_HEIGHT)) % count,)
+
+
+# (name, format, what the screen must show, color type, bit depth, pixel, extra chunks, interlace)
+PNG_FORMATS = (
+    ("grey1", "greyscale 1-bit", "black and white halves, swapping at mid height", 0, 1, png_grey_bands(1), (), False),
+    ("grey2", "greyscale 2-bit", "4 grey bands, dark to light on top, reversed below", 0, 2, png_grey_bands(2), (), False),
+    ("grey4", "greyscale 4-bit", "16 grey bands, reversed below", 0, 4, png_grey_bands(4), (), False),
+    ("grey8", "greyscale 8-bit", "smooth grey ramp, reversed below", 0, 8, png_grey_bands(8), (), False),
+    (
+        "grey2-trns", "greyscale 2-bit + tRNS 1", "4 bands; the second is white, not dark grey",
+        0, 2, lambda x, y: (png_step(x, 4),), ((b"tRNS", b"\x00\x01"),), False,
+    ),
+    (
+        "grey8-trns", "greyscale 8-bit + tRNS 0", "light ramp with white stripes, no black",
+        0, 8, lambda x, y: (0 if x % 11 < 4 else 64 + x * 191 // PNG_FORMAT_WIDTH,), ((b"tRNS", b"\x00\x00"),), False,
+    ),
+    (
+        "palette1", "palette 1-bit", "navy and yellow 8-pixel checkerboard, no stray right column",
+        3, 1, lambda x, y: ((x // 8 + y // 8) % 2,), ((b"PLTE", bytes((20, 40, 140, 250, 210, 40))),), False,
+    ),
+    ("palette2", "palette 2-bit", "4 hue bands, shifting across two rows", 3, 2, png_palette_bands(2), ((b"PLTE", png_hue_palette(4)),), False),
+    ("palette4", "palette 4-bit", "16 hue bands, shifting down the image", 3, 4, png_palette_bands(4), ((b"PLTE", png_hue_palette(16)),), False),
+    ("palette8", "palette 8-bit", "full hue ramp, shifting down the image", 3, 8, png_palette_bands(8), ((b"PLTE", png_hue_palette(256)),), False),
+    (
+        "palette4-trns", "palette 4-bit + tRNS", "white fading to blue left to right, 16 steps",
+        3, 4, lambda x, y: (png_step(x, 16),),
+        ((b"PLTE", bytes((0, 60, 200)) * 16), (b"tRNS", bytes(index * 17 for index in range(16)))), False,
+    ),
+    (
+        "rgb8", "RGB 8-bit", "red rising left to right, green rising downwards",
+        2, 8, lambda x, y: (x * 255 // (PNG_FORMAT_WIDTH - 1), y * 255 // (PNG_FORMAT_HEIGHT - 1), 128), (), False,
+    ),
+    (
+        "rgb8-trns", "RGB 8-bit + tRNS red", "grey; left square white, right square red",
+        2, 8, lambda x, y: ((255, 0, 0) if 10 <= x < 40 and 10 <= y < 30 else (254, 0, 0) if 60 <= x < 90 and 10 <= y < 30 else (90, 90, 90)),
+        ((b"tRNS", struct.pack(">HHH", 255, 0, 0)),), False,
+    ),
+    (
+        "grey-alpha8", "greyscale + alpha 8-bit", "white fading to black left to right",
+        4, 8, lambda x, y: (0, x * 255 // (PNG_FORMAT_WIDTH - 1)), (), False,
+    ),
+    (
+        "rgba8", "RGBA 8-bit", "white fading to green left to right",
+        6, 8, lambda x, y: (0, 150, 60, x * 255 // (PNG_FORMAT_WIDTH - 1)), (), False,
+    ),
+    ("grey16", "greyscale 16-bit", "unsupported image", 0, 16, lambda x, y: (x * 65535 // PNG_FORMAT_WIDTH,), (), False),
+    (
+        "palette1-adam7", "palette 1-bit, Adam7", "unsupported image",
+        3, 1, lambda x, y: ((x // 8 + y // 8) % 2,), ((b"PLTE", bytes((20, 40, 140, 250, 210, 40))),), True,
+    ),
+    ("rgb4", "RGB 4-bit (undefined)", "broken image", 2, 4, lambda x, y: (1, 2, 3), (), False),
+    ("palette2-no-plte", "palette 2-bit without PLTE", "broken image", 3, 2, png_palette_bands(2), (), False),
+    (
+        "palette2-index", "palette 2-bit, index past PLTE", "broken image",
+        3, 2, png_palette_bands(2), ((b"PLTE", png_hue_palette(2)),), False,
+    ),
+)
+
+PNG_FORMAT_BODIES = {
+    name: format_png(color_type, bit_depth, pixel, extra, interlace)
+    for name, _, _, color_type, bit_depth, pixel, extra, interlace in PNG_FORMATS
+}
+
+
+def png_format_handler(body: bytes) -> Handler:
+    def handler(self: "FixtureHandler", request: Request) -> None:
+        self.send_all(
+            head(
+                200,
+                [
+                    ("Content-Type", "image/png"),
+                    ("Content-Length", str(len(body))),
+                    ("Connection", "close"),
+                ],
+            )
+            + body
+        )
+
+    return handler
+
+
+for _name, _body in PNG_FORMAT_BODIES.items():
+    route(f"/images/formats/{_name}.png", f"download:png-{_name}")(png_format_handler(_body))
+
+static(
+    "/images/png-formats.html",
+    "ok",
+    page(
+        "PNG formats",
+        "<h1>PNG colour types and bit depths</h1>"
+        "<p>Each image is 99x40, drawn at 198x80. Transparency composites over white.</p>"
+        "<table border='1'><tr><th>Format</th><th>Expected</th><th>Image</th></tr>"
+        + "".join(
+            f"<tr><td>{html.escape(label)}</td><td>{html.escape(expected)}</td>"
+            f"<td><img src='/images/formats/{name}.png' alt='{html.escape(name)}' width='198' height='80'></td></tr>"
+            for name, label, expected, *_ in PNG_FORMATS
+        )
+        + "</table><p><a href='/'>index</a></p>",
+    ),
+)
+
+
+@route("/images/landscape.jpg", "download:jpeg")
+def network_baseline_jpeg(self: "FixtureHandler", request: Request) -> None:
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/jpeg"),
+                ("Content-Length", str(len(BASELINE_JPEG))),
+                ("Connection", "close"),
+            ],
+        )
+        + BASELINE_JPEG
+    )
 static("/image.html", "ok", IMAGE)
 static("/rule.html", "ok", RULE)
 static("/script.html", "ok", SCRIPT)
@@ -1341,6 +2053,390 @@ def require_user_agent(self: "FixtureHandler", request: Request) -> None:
     self.send_all(html_response(body, 200))
 
 
+# --- HTTP cache --------------------------------------------------------------
+#
+# Every endpoint counts what it received, and `/cache/stats.html` (no-store,
+# no validator) shows the counters. None of them is in the GET manifest: the
+# walk would change the counts the acceptance check reads.
+
+STATUS_TEXT.setdefault(304, "Not Modified")
+CACHE_COUNTS: dict[str, dict[str, int]] = {}
+CACHE_STATE = {"version": 1}
+CACHE_PATHS = (
+    "/cache/counter.html",
+    "/cache/max-age.html",
+    "/cache/expires.html",
+    "/cache/plain.html",
+    "/cache/no-cache.html",
+    "/cache/expired.html",
+    "/cache/etag.html",
+    "/cache/no-store.html",
+    "/cache/vary.html",
+    "/cache/vary-encoding.html",
+    "/cache/large.html",
+    "/cache/image.png",
+)
+
+
+def send_conditional(
+    self: "FixtureHandler",
+    request: Request,
+    body: bytes,
+    content_type: str,
+    etag: str,
+    extra: tuple[tuple[str, str], ...] = (),
+) -> None:
+    from email.utils import formatdate
+
+    counter = request.target if request.path == "/cache/sized.html" else request.path
+    counts = CACHE_COUNTS.setdefault(
+        counter, {"requests": 0, "conditional": 0, "200": 0, "304": 0}
+    )
+    extra = (("Date", formatdate(usegmt=True)), *extra)
+    counts["requests"] += 1
+    offered = request.headers.get("if-none-match")
+    if offered is not None:
+        counts["conditional"] += 1
+    if offered == etag:
+        counts["304"] += 1
+        self.send_all(head(304, [("ETag", etag), *extra, ("Connection", "close")]))
+        return
+    counts["200"] += 1
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", content_type),
+                ("Content-Length", str(len(body))),
+                ("ETag", etag),
+                *extra,
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+def cache_page(title: str, text: str, filler: str = "") -> bytes:
+    return page(
+        title,
+        f"<h1>{html.escape(title)}</h1>{text}"
+        f"<p id='served'>served at {time.strftime('%H:%M:%S')}</p>"
+        "<p><a href='/cache/stats.html'>counters</a> | "
+        "<a href='/cache/index.html'>cache fixtures</a></p>" + filler,
+    )
+
+
+CACHE_INDEX = page(
+    "HTTP cache fixtures",
+    "<h1>HTTP cache fixtures</h1>"
+    "<p>Open a page, go to the counters and come back, or reload with r (revalidate) "
+    "or R (forced). A page shown from the cache keeps its served-at time; a fresh one "
+    "is not requested at all.</p><ul>"
+    "<li><a href='/cache/counter.html'>counter.html</a> - cached for an hour; a POST to "
+    "it, or a POST answered with a 303 to it, must make the next visit fetch it again</li>"
+    "<li><a href='/cache/max-age.html'>max-age.html</a> - max-age=60: no request for "
+    "60 s, then purged and fetched again</li>"
+    "<li><a href='/cache/expires.html'>expires.html</a> - Expires 30 s after Date</li>"
+    "<li><a href='/cache/plain.html'>plain.html</a> - no cache headers: fresh for the "
+    "default hour</li>"
+    "<li><a href='/cache/no-cache.html'>no-cache.html</a> - every use is a 304</li>"
+    "<li><a href='/cache/expired.html'>expired.html</a> - max-age=0: never kept</li>"
+    "<li><a href='/cache/etag.html'>etag.html</a> - default hour; r: 304, R: 200</li>"
+    "<li>sized.html - distinct 400 KiB pages, fresh for an hour; open them one after "
+    "another to fill /tmp and force a purge: "
+    + " ".join(
+        f"<a href='/cache/sized.html?kib=400&amp;id={ident}'>{ident}</a>"
+        for ident in range(1, 21)
+    )
+    + " | 100 KiB: "
+    + " ".join(
+        f"<a href='/cache/sized.html?kib=100&amp;id={ident}'>{ident}</a>"
+        for ident in range(1, 11)
+    )
+    + "</li>"
+    "<li><a href='/cache/bump'>bump</a> - change etag.html's version</li>"
+    "<li><a href='/cache/no-store.html'>no-store.html</a> - never conditional</li>"
+    "<li><a href='/cache/vary.html'>vary.html</a> - Vary: User-Agent, never conditional</li>"
+    "<li><a href='/cache/vary-encoding.html'>vary-encoding.html</a> - "
+    "Vary: Accept-Encoding, conditional</li>"
+    "<li><a href='/cache/large.html'>large.html</a> - over one entry, never conditional</li>"
+    "<li><a href='/cache/image.html'>image.html</a> - the image is revalidated</li>"
+    "<li><a href='/cache/stats.html'>stats.html</a> - counters</li>"
+    "<li><a href='/cache/reset'>reset</a> - clear the counters</li>"
+    "</ul><p><a href='/'>index</a></p>",
+)
+
+
+def cache_index(self: "FixtureHandler", request: Request) -> None:
+    self.send_all(html_response(CACHE_INDEX))
+
+
+def cache_etag(self: "FixtureHandler", request: Request) -> None:
+    version = CACHE_STATE["version"]
+    send_conditional(
+        self,
+        request,
+        cache_page(f"ETag version {version}", "<p>Revalidated with If-None-Match.</p>"),
+        "text/html; charset=utf-8",
+        f'"etag-v{version}"',
+    )
+
+
+def cache_max_age(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("max-age=60", "<p>Fresh for 60 seconds.</p>"),
+        "text/html; charset=utf-8",
+        '"max-age"',
+        (("Cache-Control", "max-age=60"),),
+    )
+
+
+def cache_expires(self: "FixtureHandler", request: Request) -> None:
+    from email.utils import formatdate
+
+    send_conditional(
+        self,
+        request,
+        cache_page("Expires", "<p>Expires 30 seconds after its Date.</p>"),
+        "text/html; charset=utf-8",
+        '"expires"',
+        (("Expires", formatdate(time.time() + 30, usegmt=True)),),
+    )
+
+
+def cache_plain(self: "FixtureHandler", request: Request) -> None:
+    body = cache_page("no cache headers", "<p>No ETag, no Cache-Control.</p>")
+    counts = CACHE_COUNTS.setdefault(
+        request.path, {"requests": 0, "conditional": 0, "200": 0, "304": 0}
+    )
+    counts["requests"] += 1
+    counts["200"] += 1
+    if request.headers.get("if-none-match") is not None:
+        counts["conditional"] += 1
+    self.send_all(html_response(body))
+
+
+def cache_no_cache(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("no-cache", "<p>Stored, but every use must be confirmed.</p>"),
+        "text/html; charset=utf-8",
+        '"no-cache"',
+        (("Cache-Control", "no-cache"),),
+    )
+
+
+def cache_expired(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("max-age=0", "<p>Stale on arrival.</p>"),
+        "text/html; charset=utf-8",
+        '"expired"',
+        (("Cache-Control", "max-age=0"),),
+    )
+
+
+def cache_sized(self: "FixtureHandler", request: Request) -> None:
+    from urllib.parse import parse_qs
+
+    query = parse_qs(request.query)
+    try:
+        kib = max(1, min(int(query.get("kib", ["400"])[0]), 500))
+    except ValueError:
+        kib = 400
+    ident = html.escape(query.get("id", ["1"])[0])
+    filler = "<p>" + "z" * (kib * 1024) + "</p>"
+    send_conditional(
+        self,
+        request,
+        cache_page(f"sized {kib} KiB id {ident}", "<p>Fresh for an hour.</p>", filler),
+        "text/html; charset=utf-8",
+        f'"sized-{kib}-{ident}"',
+        (("Cache-Control", "max-age=3600"),),
+    )
+
+
+CACHE_COUNTER = {"value": 0, "posts": 0}
+
+
+def cache_counter(self: "FixtureHandler", request: Request) -> None:
+    if request.method == "POST":
+        CACHE_COUNTER["value"] += 1
+        CACHE_COUNTER["posts"] += 1
+        body = page(
+            "counter updated",
+            f"<h1>Counter updated to {CACHE_COUNTER['value']}</h1>"
+            "<p>This POST went to counter.html itself.</p>"
+            "<p><a href='/cache/counter.html'>back to the counter</a> | "
+            "<a href='/cache/stats.html'>counters</a></p>",
+        )
+        self.send_all(html_response(body))
+        return
+    value = CACHE_COUNTER["value"]
+    send_conditional(
+        self,
+        request,
+        cache_page(
+            f"counter {value}",
+            f"<p id='value'>counter value: {value} (POSTs so far: {CACHE_COUNTER['posts']})</p>"
+            "<form action='/cache/counter.html' method='post'>"
+            "<button name='go' value='same'>POST to this URL</button></form>"
+            "<form action='/cache/counter-prg' method='post'>"
+            "<button name='go' value='prg'>POST, then 303 back here</button></form>"
+            "<p><a href='/cache/plain.html'>another page</a> (then Backspace back here)</p>",
+        ),
+        "text/html; charset=utf-8",
+        f'"counter-{value}"',
+        (("Cache-Control", "max-age=3600"),),
+    )
+
+
+def cache_counter_prg(self: "FixtureHandler", request: Request) -> None:
+    if request.method == "POST":
+        CACHE_COUNTER["value"] += 1
+        CACHE_COUNTER["posts"] += 1
+    self.send_all(redirect("/cache/counter.html", 303))
+
+
+def cache_bump(self: "FixtureHandler", request: Request) -> None:
+    CACHE_STATE["version"] += 1
+    self.send_all(redirect("/cache/stats.html", 303))
+
+
+def cache_no_store(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("no-store", "<p>Cache-Control: no-store with an ETag.</p>"),
+        "text/html; charset=utf-8",
+        '"no-store"',
+        (("Cache-Control", "no-store"),),
+    )
+
+
+def cache_vary(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("Vary: User-Agent", "<p>Cannot be matched to a later request.</p>"),
+        "text/html; charset=utf-8",
+        '"vary"',
+        (("Vary", "User-Agent"),),
+    )
+
+
+def cache_vary_encoding(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("Vary: Accept-Encoding", "<p>The client sends a fixed value.</p>"),
+        "text/html; charset=utf-8",
+        '"vary-encoding"',
+        (("Vary", "Accept-Encoding"),),
+    )
+
+
+LARGE_CACHE_FILLER = "".join(
+    f"<p>cache filler {index:05d}: " + "y" * 96 + "</p>" for index in range(6000)
+)
+
+
+def cache_large(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(
+        self,
+        request,
+        cache_page("large", "<p>Larger than one cache entry.</p>", LARGE_CACHE_FILLER),
+        "text/html; charset=utf-8",
+        '"large"',
+    )
+
+
+def make_cache_png() -> bytes:
+    width = height = 32
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            rows += bytes((x * 8, y * 8, 160))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(bytes(rows)))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+CACHE_PNG = make_cache_png()
+CACHE_IMAGE_PAGE = page(
+    "cache image",
+    "<h1>Cached image</h1><p><img src='/cache/image.png' width='128' height='128' "
+    "alt='cache image'></p><p><a href='/cache/stats.html'>counters</a> | "
+    "<a href='/cache/index.html'>cache fixtures</a></p>",
+)
+
+
+def cache_image_page(self: "FixtureHandler", request: Request) -> None:
+    self.send_all(html_response(CACHE_IMAGE_PAGE, extra=[("Cache-Control", "no-store")]))
+
+
+def cache_image(self: "FixtureHandler", request: Request) -> None:
+    send_conditional(self, request, CACHE_PNG, "image/png", '"png-v1"')
+
+
+def cache_stats(self: "FixtureHandler", request: Request) -> None:
+    rows = "".join(
+        f"<tr><td>{path}</td>"
+        + "".join(
+            f"<td>{CACHE_COUNTS.get(path, {}).get(key, 0)}</td>"
+            for key in ("requests", "conditional", "200", "304")
+        )
+        + "</tr>"
+        for path in (*CACHE_PATHS, *sorted(key for key in CACHE_COUNTS if key.startswith("/cache/sized")))
+    )
+    body = page(
+        "cache counters",
+        "<h1>Cache counters</h1>"
+        f"<p>etag.html version: {CACHE_STATE['version']}</p>"
+        "<table border='1'><tr><th>path</th><th>requests</th><th>If-None-Match</th>"
+        f"<th>200</th><th>304</th></tr>{rows}</table>"
+        "<p><a href='/cache/index.html'>cache fixtures</a> | "
+        "<a href='/cache/reset'>reset</a></p>",
+    )
+    self.send_all(html_response(body, extra=[("Cache-Control", "no-store")]))
+
+
+def cache_reset(self: "FixtureHandler", request: Request) -> None:
+    CACHE_COUNTS.clear()
+    CACHE_COUNTER.update(value=0, posts=0)
+    self.send_all(redirect("/cache/stats.html", 303))
+
+
+ROUTES["/cache/index.html"] = cache_index
+ROUTES["/cache/etag.html"] = cache_etag
+ROUTES["/cache/counter.html"] = cache_counter
+ROUTES["/cache/counter-prg"] = cache_counter_prg
+ROUTES["/cache/max-age.html"] = cache_max_age
+ROUTES["/cache/expires.html"] = cache_expires
+ROUTES["/cache/plain.html"] = cache_plain
+ROUTES["/cache/no-cache.html"] = cache_no_cache
+ROUTES["/cache/expired.html"] = cache_expired
+ROUTES["/cache/sized.html"] = cache_sized
+ROUTES["/cache/bump"] = cache_bump
+ROUTES["/cache/no-store.html"] = cache_no_store
+ROUTES["/cache/vary.html"] = cache_vary
+ROUTES["/cache/vary-encoding.html"] = cache_vary_encoding
+ROUTES["/cache/large.html"] = cache_large
+ROUTES["/cache/image.html"] = cache_image_page
+ROUTES["/cache/image.png"] = cache_image
+ROUTES["/cache/stats.html"] = cache_stats
+ROUTES["/cache/reset"] = cache_reset
+
+
 @route("/manifest.txt", "text")
 def manifest(self: "FixtureHandler", request: Request) -> None:
     """The walk's contract, written for the connection that asked for it.
@@ -1639,7 +2735,8 @@ class FixtureHandler(socketserver.BaseRequestHandler):
                 raise ValueError("not an HTTP request")
             if len(buffer) > 64 * 1024:
                 raise ValueError("request head too long")
-        head_text = buffer.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        head_bytes, body = buffer.split(b"\r\n\r\n", 1)
+        head_text = head_bytes.decode("latin-1")
         lines = head_text.split("\r\n")
         fields = lines[0].split(" ")
         if len(fields) < 2:
@@ -1651,7 +2748,18 @@ class FixtureHandler(socketserver.BaseRequestHandler):
             name, separator, value = line.partition(":")
             if separator:
                 headers[name.strip().lower()] = value.strip()
-        return Request(method, target, path, query, headers)
+        length_text = headers.get("content-length", "0")
+        if not length_text.isascii() or not length_text.isdigit():
+            raise ValueError("invalid content length")
+        content_length = int(length_text)
+        if content_length > MAX_ENCODED_REQUEST_BYTES:
+            raise ValueError("request body too long")
+        while len(body) < content_length:
+            data = self.request.recv(min(4096, content_length - len(body)))
+            if not data:
+                raise ValueError("truncated request body")
+            body += data
+        return Request(method, target, path, query, headers, body[:content_length])
 
     def send_all(self, data: bytes) -> None:
         self.request.sendall(data)

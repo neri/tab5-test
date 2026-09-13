@@ -120,6 +120,55 @@ pub const MAX_ATTRIBUTES_PER_ELEMENT: usize = 16;
 /// document built to fire it.
 pub const MAX_LAYOUT_LINES: usize = 32768;
 
+// Browser extension budgets.  Compressed bytes and decoded pixels are
+// deliberately separate: a tiny, adversarial PNG can describe a very large
+// output and must be refused before its dimensions are multiplied.
+pub const MAX_IMAGES: usize = 64;
+pub const MAX_IMAGE_COMPRESSED_BYTES: usize = 512 * 1024;
+pub const MAX_IMAGE_WIDTH: u32 = 1280;
+pub const MAX_IMAGE_HEIGHT: u32 = 1280;
+pub const MAX_IMAGE_PIXELS: usize = 1024 * 1024;
+pub const MAX_IMAGE_DECODE_WORK_BYTES: usize = 1024 * 1024;
+pub const PLACEHOLDER_IMAGE_WIDTH: u16 = 160;
+pub const PLACEHOLDER_IMAGE_HEIGHT: u16 = 90;
+
+pub const MAX_FORMS: usize = 32;
+pub const MAX_FORM_CONTROLS: usize = 256;
+pub const MAX_INPUT_VALUE_BYTES: usize = 4096;
+pub const MAX_FORM_VALUE_BYTES: usize = 32 * 1024;
+pub const MAX_ENCODED_REQUEST_BYTES: usize = 48 * 1024;
+/// `option` elements across every `select` of one page. Each keeps a label
+/// and a value, both bounded by [`MAX_INPUT_VALUE_BYTES`].
+pub const MAX_SELECT_OPTIONS: usize = 4096;
+
+/// One cached response body. The cache itself lives in files on the RAM
+/// disk and has no total bound of its own: a write that finds the volume
+/// full purges entries and retries. Only this body -- captured while it
+/// arrives, then written out -- is ever held in memory.
+pub const MAX_HTTP_CACHE_ENTRY_BYTES: usize = 512 * 1024;
+/// How long a response with no `max-age` and no usable `Expires` stays
+/// fresh.
+pub const DEFAULT_CACHE_FRESHNESS_SECS: usize = 3600;
+/// One cache entry's metadata file: the key, the validator and a few
+/// numbers.
+pub const MAX_CACHE_META_BYTES: usize = 4096;
+
+/// POST results kept so back/forward can show them again without resending.
+///
+/// Separate from the HTTP cache: these are history state, never reused for
+/// a new request. Only the parsed document is kept (layout and decoded
+/// images are rebuilt), and a result larger than the byte budget is not kept
+/// at all. Requests kept for an explicit resend have their own body budget,
+/// two full-size encoded requests.
+pub const MAX_RETAINED_POST_RESULTS: usize = 2;
+pub const MAX_RETAINED_POST_RESULT_BYTES: usize = 320 * 1024;
+pub const MAX_RETAINED_POST_REQUEST_BYTES: usize = 2 * 48 * 1024;
+
+/// Aggregate extension-owned memory outside the existing Document/Layout
+/// accounting.  Every cache/image/form allocation must reserve against this
+/// budget before growing its own buffer.
+pub const MAX_EXTENSION_OWNED_BYTES: usize = 6 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +182,32 @@ mod tests {
     #[test]
     fn text_cannot_exceed_input() {
         assert!(MAX_TEXT_BYTES <= MAX_DECODED_HTML_BYTES);
+    }
+
+    #[test]
+    fn extension_limits_fit_the_aggregate_budget() {
+        // One active compressed image, its decoder workspace and decoded
+        // RGB565 pixels may coexist with one cache body in memory and all
+        // form values.
+        let active_image = MAX_IMAGE_COMPRESSED_BYTES
+            + MAX_IMAGE_DECODE_WORK_BYTES
+            + MAX_IMAGE_PIXELS * core::mem::size_of::<u16>();
+        let history = MAX_RETAINED_POST_RESULT_BYTES + MAX_RETAINED_POST_REQUEST_BYTES;
+        assert!(
+            active_image + MAX_HTTP_CACHE_ENTRY_BYTES + MAX_FORM_VALUE_BYTES + history
+                <= MAX_EXTENSION_OWNED_BYTES
+        );
+        assert!(MAX_ENCODED_REQUEST_BYTES <= MAX_RETAINED_POST_REQUEST_BYTES);
+        assert!(MAX_URL_BYTES + 256 + 512 <= MAX_CACHE_META_BYTES);
+        assert!(MAX_INPUT_VALUE_BYTES <= MAX_FORM_VALUE_BYTES);
+        assert!(MAX_FORM_VALUE_BYTES <= MAX_ENCODED_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn image_dimensions_cannot_overflow_the_pixel_limit() {
+        let largest_declared = (MAX_IMAGE_WIDTH as usize)
+            .checked_mul(MAX_IMAGE_HEIGHT as usize)
+            .expect("dimension product");
+        assert!(MAX_IMAGE_PIXELS <= largest_declared);
     }
 }

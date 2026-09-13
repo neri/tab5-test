@@ -56,9 +56,19 @@ pub const YELLOW: u16 = 0xFFE0;
 
 pub struct Framebuffer {
     memory: Psram,
+    clip_left: usize,
+    clip_right: usize,
+    clip_top: usize,
+    clip_bottom: usize,
 }
 
-struct UiSurface(*mut u16);
+struct UiSurface {
+    pointer: *mut u16,
+    clip_left: usize,
+    clip_right: usize,
+    clip_top: usize,
+    clip_bottom: usize,
+}
 
 impl tab5_ui_font::PixelSurface for UiSurface {
     fn width(&self) -> usize {
@@ -70,18 +80,45 @@ impl tab5_ui_font::PixelSurface for UiSurface {
     }
 
     fn read(&self, x: usize, y: usize) -> u16 {
-        unsafe { self.0.add(native_offset(x, y)).read_volatile() }
+        unsafe { self.pointer.add(native_offset(x, y)).read_volatile() }
     }
 
     fn write(&mut self, x: usize, y: usize, color: u16) {
-        unsafe { self.0.add(native_offset(x, y)).write_volatile(color) }
+        if x >= self.clip_left && x < self.clip_right && y >= self.clip_top && y < self.clip_bottom
+        {
+            unsafe { self.pointer.add(native_offset(x, y)).write_volatile(color) }
+        }
     }
 }
 
 impl Framebuffer {
     pub fn new(memory: Psram) -> Option<Self> {
         memory.framebuffer()?;
-        Some(Self { memory })
+        Some(Self {
+            memory,
+            clip_left: 0,
+            clip_right: WIDTH,
+            clip_top: 0,
+            clip_bottom: HEIGHT,
+        })
+    }
+
+    /// Restricts subsequent drawing to a horizontal band. Returns the old
+    /// band so a caller can restore it after painting a viewport.
+    pub fn set_vertical_clip(&mut self, top: usize, bottom: usize) -> (usize, usize) {
+        let old = (self.clip_top, self.clip_bottom);
+        self.clip_top = top.min(HEIGHT);
+        self.clip_bottom = bottom.min(HEIGHT).max(self.clip_top);
+        old
+    }
+
+    /// Restricts subsequent drawing horizontally. Used by small GUI damage
+    /// repairs so the live scanout never observes a larger clear first.
+    pub fn set_horizontal_clip(&mut self, left: usize, right: usize) -> (usize, usize) {
+        let old = (self.clip_left, self.clip_right);
+        self.clip_left = left.min(WIDTH);
+        self.clip_right = right.min(WIDTH).max(self.clip_left);
+        old
     }
 
     pub fn address(&self) -> Option<u32> {
@@ -129,7 +166,8 @@ impl Framebuffer {
     }
 
     pub fn draw_pixel(&mut self, x: usize, y: usize, color: u16) {
-        if x >= WIDTH || y >= HEIGHT {
+        if x < self.clip_left || x >= self.clip_right || y < self.clip_top || y >= self.clip_bottom
+        {
             return;
         }
         let Some(pointer) = self.memory.framebuffer() else {
@@ -174,6 +212,14 @@ impl Framebuffer {
     /// Fills a logical rectangle, by DMA once the rectangle is big enough to
     /// be worth setting one up.
     pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: u16) {
+        let clipped_x = x.max(self.clip_left);
+        let clipped_right = x.saturating_add(width).min(self.clip_right);
+        let width = clipped_right.saturating_sub(clipped_x);
+        let x = clipped_x;
+        let clipped_y = y.max(self.clip_top);
+        let clipped_bottom = y.saturating_add(height).min(self.clip_bottom);
+        let height = clipped_bottom.saturating_sub(clipped_y);
+        let y = clipped_y;
         if width.saturating_mul(height) >= PPA_FILL_MIN_PIXELS
             && self.ppa_fill_rect(x, y, width, height, color)
         {
@@ -322,6 +368,55 @@ impl Framebuffer {
         true
     }
 
+    /// Nearest-neighbour RGB565 blit into a differently sized rectangle.
+    /// The destination obeys the active vertical clip just like text and
+    /// fills, so browser images cannot paint into its toolbar or status bar.
+    pub fn blit_rgb565_scaled(
+        &mut self,
+        x: usize,
+        y: usize,
+        source_width: usize,
+        source_height: usize,
+        destination_width: usize,
+        destination_height: usize,
+        pixels: &[u16],
+        first_display_row: usize,
+    ) -> bool {
+        if source_width == 0
+            || source_height == 0
+            || destination_width == 0
+            || destination_height == 0
+            || pixels.len() < source_width.saturating_mul(source_height)
+        {
+            return false;
+        }
+        let Some(pointer) = self.memory.framebuffer() else {
+            return false;
+        };
+        if first_display_row >= destination_height {
+            return true;
+        }
+        let x_end = x.saturating_add(destination_width).min(WIDTH);
+        let y_start = y.max(self.clip_top);
+        let y_end = y
+            .saturating_add(destination_height - first_display_row)
+            .min(self.clip_bottom)
+            .min(HEIGHT);
+        for destination_y in y_start..y_end {
+            let source_y =
+                (first_display_row + destination_y - y) * source_height / destination_height;
+            for destination_x in x..x_end {
+                let source_x = (destination_x - x) * source_width / destination_width;
+                unsafe {
+                    pointer
+                        .add(native_offset(destination_x, destination_y))
+                        .write_volatile(pixels[source_y * source_width + source_x]);
+                }
+            }
+        }
+        true
+    }
+
     /// Copies a logical rectangle back out of the framebuffer, the exact
     /// counterpart of `blit_rgb565`: same clipping against the right and
     /// bottom edges, same `image_width` row stride in `pixels`. Reading a
@@ -399,11 +494,14 @@ impl Framebuffer {
             return;
         };
         let scale = scale.max(1);
+        let original_y = y;
+        let y = y.max(self.clip_top);
+        let source_skip = y.saturating_sub(original_y);
         // Clip the box's pixel rows once. Increasing logical Y is increasing
         // native address, so this is also the length of each column's run.
         let run = y
             .saturating_add(font::HEIGHT * scale)
-            .min(HEIGHT)
+            .min(self.clip_bottom)
             .saturating_sub(y);
         if run == 0 {
             return;
@@ -412,6 +510,7 @@ impl Framebuffer {
             pointer,
             x,
             y,
+            source_skip,
             run,
             columns: &glyph.columns,
             width: glyph.width(),
@@ -496,7 +595,21 @@ impl Framebuffer {
         foreground: u16,
         background: Option<u16>,
     ) -> usize {
-        self.draw_ui_text_inner::<false>(x, y, text, style, foreground, background)
+        self.draw_ui_text_inner::<false>(x, y, text, style, foreground, background, false)
+    }
+
+    /// Draws normal-UI text with a synthetic oblique transform while keeping
+    /// the same advances used by measurement and hit testing.
+    pub fn draw_ui_text_oblique(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        style: font::UiTextStyle,
+        foreground: u16,
+        background: Option<u16>,
+    ) -> usize {
+        self.draw_ui_text_inner::<false>(x, y, text, style, foreground, background, true)
     }
 
     /// Diagnostic-only counterpart to `draw_ui_text`: it uses the exact same
@@ -510,7 +623,7 @@ impl Framebuffer {
         foreground: u16,
         background: Option<u16>,
     ) -> usize {
-        self.draw_ui_text_inner::<true>(x, y, text, style, foreground, background)
+        self.draw_ui_text_inner::<true>(x, y, text, style, foreground, background, false)
     }
 
     fn draw_ui_text_inner<const BINARY: bool>(
@@ -521,6 +634,7 @@ impl Framebuffer {
         style: font::UiTextStyle,
         foreground: u16,
         background: Option<u16>,
+        oblique: bool,
     ) -> usize {
         let origin_x = x;
         let (mut cursor_x, mut cursor_y) = (x, y);
@@ -542,7 +656,7 @@ impl Framebuffer {
                 let glyph = tab5_ui_font::glyph(style, character)
                     .expect("validated UI Latin glyph is missing");
                 self.draw_ui_glyph::<BINARY>(
-                    cursor_x, cursor_y, &glyph, style, foreground, background,
+                    cursor_x, cursor_y, &glyph, style, foreground, background, oblique,
                 );
                 cursor_x = cursor_x.saturating_add(glyph.advance as usize);
                 previous_advance = 0;
@@ -554,13 +668,14 @@ impl Framebuffer {
                 if glyph.advance == 0 {
                     if previous_advance == 0 {
                         let replacement = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
-                        self.draw_glyph(
+                        self.draw_fallback_glyph(
                             cursor_x,
                             cursor_y,
                             &replacement,
                             style.fallback_scale(),
                             foreground,
                             background,
+                            oblique,
                         );
                         previous_advance = replacement.advance as usize * style.fallback_scale();
                         cursor_x = cursor_x.saturating_add(previous_advance);
@@ -576,6 +691,7 @@ impl Framebuffer {
                             scale,
                             foreground,
                             None,
+                            oblique,
                         );
                     }
                 } else {
@@ -590,6 +706,7 @@ impl Framebuffer {
                         scale,
                         foreground,
                         background,
+                        oblique,
                     );
                     previous_advance = glyph.advance as usize * scale;
                     cursor_x = cursor_x.saturating_add(previous_advance);
@@ -602,33 +719,85 @@ impl Framebuffer {
             if glyph.advance == 0 {
                 if previous_advance == 0 {
                     let replacement = font::glyph_or_replacement(char::REPLACEMENT_CHARACTER);
-                    self.draw_glyph(
+                    self.draw_fallback_glyph(
                         cursor_x,
                         cursor_y,
                         &replacement,
                         scale,
                         foreground,
                         background,
+                        oblique,
                     );
                     previous_advance = replacement.advance as usize * scale;
                     cursor_x = cursor_x.saturating_add(previous_advance);
                 } else {
-                    self.draw_glyph(
+                    self.draw_fallback_glyph(
                         cursor_x.saturating_sub(previous_advance),
                         cursor_y,
                         &glyph,
                         scale,
                         foreground,
                         None,
+                        oblique,
                     );
                 }
             } else {
-                self.draw_glyph(cursor_x, cursor_y, &glyph, scale, foreground, background);
+                self.draw_fallback_glyph(
+                    cursor_x, cursor_y, &glyph, scale, foreground, background, oblique,
+                );
                 previous_advance = glyph.advance as usize * scale;
                 cursor_x = cursor_x.saturating_add(previous_advance);
             }
         }
         widest.max(cursor_x.saturating_sub(origin_x))
+    }
+
+    /// Draws a fixed-cell fallback glyph for UI text, sheared like
+    /// `tab5_ui_font::paint_glyph_oblique_scaled` when `oblique` is set.
+    ///
+    /// The fixed-cell painter has no per-row offset, so each band of rows
+    /// that shares one shift is drawn under a narrowed vertical clip. The
+    /// shift depends only on the row's distance from the cell bottom, which
+    /// keeps these glyphs aligned with neighbouring A4 glyphs.
+    fn draw_fallback_glyph(
+        &mut self,
+        x: usize,
+        y: usize,
+        glyph: &font::Glyph,
+        scale: usize,
+        foreground: u16,
+        background: Option<u16>,
+        oblique: bool,
+    ) {
+        if !oblique {
+            self.draw_glyph(x, y, glyph, scale, foreground, background);
+            return;
+        }
+        let height = font::HEIGHT * scale.max(1);
+        let (clip_top, clip_bottom) = (self.clip_top, self.clip_bottom);
+        let mut row = 0;
+        while row < height {
+            let shift = tab5_ui_font::oblique_overhang(height - row);
+            let mut band_end = row + 1;
+            while band_end < height && tab5_ui_font::oblique_overhang(height - band_end) == shift {
+                band_end += 1;
+            }
+            self.clip_top = clip_top.max(y.saturating_add(row));
+            self.clip_bottom = clip_bottom
+                .min(y.saturating_add(band_end))
+                .max(self.clip_top);
+            self.draw_glyph(
+                x.saturating_add(shift),
+                y,
+                glyph,
+                scale,
+                foreground,
+                background,
+            );
+            row = band_end;
+        }
+        self.clip_top = clip_top;
+        self.clip_bottom = clip_bottom;
     }
 
     /// Normal GUI policy: proportional DejaVu Sans for Latin and the 16 pixel
@@ -685,6 +854,7 @@ impl Framebuffer {
         style: font::UiTextStyle,
         foreground: u16,
         background: Option<u16>,
+        oblique: bool,
     ) {
         self.draw_ui_glyph_scaled::<BINARY>(
             x,
@@ -694,6 +864,7 @@ impl Framebuffer {
             1,
             foreground,
             background,
+            oblique,
         );
     }
 
@@ -706,13 +877,31 @@ impl Framebuffer {
         scale: usize,
         foreground: u16,
         background: Option<u16>,
+        oblique: bool,
     ) {
         let Some(pointer) = self.memory.framebuffer() else {
             return;
         };
-        let mut surface = UiSurface(pointer);
+        let mut surface = UiSurface {
+            pointer,
+            clip_left: self.clip_left,
+            clip_right: self.clip_right,
+            clip_top: self.clip_top,
+            clip_bottom: self.clip_bottom,
+        };
         if BINARY {
             tab5_ui_font::paint_glyph_1bpp_scaled(
+                &mut surface,
+                x as isize,
+                y as isize,
+                glyph,
+                metrics,
+                scale,
+                foreground,
+                background,
+            );
+        } else if oblique {
+            tab5_ui_font::paint_glyph_oblique_scaled(
                 &mut surface,
                 x as isize,
                 y as isize,
@@ -779,9 +968,9 @@ impl Framebuffer {
         color: u16,
     ) -> bool {
         let x_start = x.min(WIDTH);
-        let y_start = y.min(HEIGHT);
+        let y_start = y.max(self.clip_top).min(HEIGHT);
         let x_end = x.saturating_add(width).min(WIDTH);
-        let y_end = y.saturating_add(height).min(HEIGHT);
+        let y_end = y.saturating_add(height).min(self.clip_bottom).min(HEIGHT);
         if x_start >= x_end || y_start >= y_end {
             return false;
         }
@@ -1033,6 +1222,8 @@ struct WideGlyph<'a> {
     pointer: *mut u16,
     x: usize,
     y: usize,
+    /// Pixel rows clipped from the top of the source glyph box.
+    source_skip: usize,
     /// Height of the box in pixels, already clipped to the screen. Increasing
     /// logical Y is increasing native address, so this is also the length of
     /// each column's contiguous native run.
@@ -1077,16 +1268,19 @@ impl WideGlyph<'_> {
                     continue;
                 };
                 for row in 0..font::HEIGHT {
-                    let start = row * self.scale;
-                    if start >= self.run {
-                        break;
+                    let source_start = row * self.scale;
+                    let source_end = source_start + self.scale;
+                    let start = source_start.saturating_sub(self.source_skip);
+                    let end = source_end.saturating_sub(self.source_skip).min(self.run);
+                    if start >= end {
+                        continue;
                     }
                     let color = if bits & (1 << row) != 0 {
                         self.foreground
                     } else {
                         background
                     };
-                    for index in start..(start + self.scale).min(self.run) {
+                    for index in start..end {
                         unsafe { base.add(index).write_volatile(color) };
                     }
                 }
@@ -1113,11 +1307,14 @@ impl WideGlyph<'_> {
                     if bits & (1 << row) == 0 {
                         continue;
                     }
-                    let start = row * self.scale;
-                    if start >= self.run {
-                        break;
+                    let source_start = row * self.scale;
+                    let source_end = source_start + self.scale;
+                    let start = source_start.saturating_sub(self.source_skip);
+                    let end = source_end.saturating_sub(self.source_skip).min(self.run);
+                    if start >= end {
+                        continue;
                     }
-                    for index in start..(start + self.scale).min(self.run) {
+                    for index in start..end {
                         unsafe { base.add(index).write_volatile(self.foreground) };
                     }
                 }

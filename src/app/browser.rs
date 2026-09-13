@@ -16,15 +16,9 @@
 //!  y=720  └───────────────────────────────────────────────┘
 //! ```
 //!
-//! **Scrolling moves by whole lines, not by pixels.** The topmost drawn
-//! line always starts exactly at the top of the viewport, and a line that
-//! would not fit at the bottom is not drawn at all. That is a real
-//! difference from a desktop browser -- there is no half-line at either
-//! edge -- and it is worth it: the alternative is clipping every glyph
-//! against two horizontal edges, in a font renderer that currently clips
-//! against the panel and nothing else. Line heights vary (headings are
-//! larger), so "scroll by one line" moves by different amounts in different
-//! parts of a page, which reads perfectly naturally.
+//! Scrolling is a document-space pixel offset. Glyphs and table geometry are
+//! clipped to the viewport, so a line may be partly visible at either edge
+//! without painting over the toolbar or status band.
 //!
 //! The padlock says what the connection this page came off actually
 //! proved, which is not the same question as what its address asked for.
@@ -60,23 +54,36 @@
 //! drawing order it documents is obeyed exactly: lift the cursor, draw what
 //! changed, put the cursor back, write back the union.
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::theme::{self, BACKGROUND as WHITE, TEXT as BLACK};
-use crate::browser::document::{Document, Marker, Parser, STYLE_BOLD, STYLE_CODE, STYLE_ITALIC};
+use crate::browser::document::{
+    ControlKind, Document, Marker, Parser, STYLE_BOLD, STYLE_CODE, STYLE_ITALIC,
+};
 use crate::browser::error::{self, Error};
+use crate::browser::form;
+use crate::browser::image::{DecodeError, DecodedImage, decode, png_chunk_crc};
 use crate::browser::layout::{Layout, Line, Metrics};
-use crate::browser::limits::{MAX_HISTORY, MAX_URL_BYTES};
+use crate::browser::limits::{
+    MAX_HISTORY, MAX_INPUT_VALUE_BYTES, MAX_RETAINED_POST_REQUEST_BYTES,
+    MAX_RETAINED_POST_RESULT_BYTES, MAX_RETAINED_POST_RESULTS, MAX_URL_BYTES,
+};
 use crate::browser::memory;
+use crate::browser::request::{Method as RequestMethod, Request as HttpRequest};
+use crate::browser::text_input::{self, Mode as TextInputMode, TextInput};
 use crate::browser::url::{self, Url};
 use crate::framebuffer::{Framebuffer, HEIGHT, WIDTH};
 use crate::input::{InputManager, Key};
+use crate::net::pins;
+use crate::net::tls::Authentication;
 
 use crate::{tick, uart};
 
+use super::cache_store::{self, CacheRead, CacheWrite, WriteProgress};
 use super::fetch::{self, Fetch, Network, Outcome as FetchOutcome};
-use super::localfile::{LocalRead, Started};
+use super::localfile::{ImageOutcome, ImageRead, LocalRead, Started};
 use super::wifi_manager::Manager as WifiManager;
 
 use crate::fs::vfs::Vfs;
@@ -218,11 +225,6 @@ const TEXT_COLOR: u16 = BLACK;
 /// Pure blue on white, which the panel renders cleanly at this size.
 const LINK_COLOR: u16 = theme::ACCENT;
 const CODE_COLOR: u16 = theme::CODE;
-/// Dark red. A grey was tried first and could not be told from black at
-/// this size: two near-blacks in a bitmap font read as a rendering fault
-/// rather than as emphasis. Emphasis has to differ in hue, not in
-/// brightness.
-const ITALIC_COLOR: u16 = theme::EMPHASIS;
 const RULE_COLOR: u16 = theme::BORDER;
 const CHROME_BACKGROUND: u16 = theme::BUTTON_FACE;
 const CHROME_TEXT: u16 = BLACK;
@@ -243,9 +245,22 @@ const DISABLED_COLOR: u16 = theme::BORDER;
 /// The address field while it is being edited.
 const EDIT_BACKGROUND: u16 = WHITE;
 const EDIT_CARET: u16 = theme::ACCENT;
+const EDIT_SELECTION: u16 = theme::SUBTLE;
 
-/// Lines one wheel detent scrolls.
-const WHEEL_LINES: i32 = 3;
+/// The two buttons a POST resend question puts at the right of the status
+/// line. Keys answer it as well (`y`/Enter, `n`/Escape).
+/// The open select list: rows as tall as a text control, at most this many
+/// before it scrolls.
+const POPUP_ROW_HEIGHT: usize = CELL_HEIGHT + 8;
+const POPUP_MAX_ROWS: usize = 10;
+
+const CONFIRM_BUTTON_WIDTH: usize = 112;
+const CONFIRM_CANCEL_LEFT: usize = WIDTH - MARGIN - CONFIRM_BUTTON_WIDTH;
+const CONFIRM_SEND_LEFT: usize = CONFIRM_CANCEL_LEFT - 8 - CONFIRM_BUTTON_WIDTH;
+
+/// Keyboard and wheel movement in document pixels.
+const SCROLL_STEP: i32 = 20;
+const WHEEL_STEP: i32 = 60;
 
 /// Drawn lines between two chances for the C6 link to be read.
 ///
@@ -262,6 +277,76 @@ const FLUSH_BAND_WIDTH: usize = 128;
 pub struct Browser {
     viewer: Viewer,
     pending: Option<Pending>,
+    local_image: Option<LocalImagePending>,
+    network_image: Option<NetworkImagePending>,
+    next_image: usize,
+    /// The file-backed HTTP cache's work in progress and counters.
+    cache: CacheState,
+    cache_image: Option<CacheImagePending>,
+    /// The page now loading was a forced reload, so its images skip the
+    /// cache as well.
+    images_bypass_cache: bool,
+}
+
+/// The HTTP cache work this screen owns between frames.
+struct CacheState {
+    /// At most one body on its way to the RAM disk.
+    write: Option<CacheWrite>,
+    /// The bucket the expiry sweep does next, while one is running.
+    sweep_bucket: Option<u8>,
+    next_sweep_ms: u64,
+    /// Entries a POST made stale, removed at the next maintenance step.
+    invalidations: Vec<Url>,
+    stats: cache_store::Stats,
+}
+
+impl CacheState {
+    fn new() -> Self {
+        Self {
+            write: None,
+            sweep_bucket: None,
+            next_sweep_ms: 0,
+            invalidations: Vec::new(),
+            stats: cache_store::Stats::default(),
+        }
+    }
+}
+
+/// How often expired cache entries are looked for while the Browser is idle.
+const CACHE_SWEEP_INTERVAL_MS: u64 = 60_000;
+
+struct CacheImagePending {
+    image: usize,
+    read: CacheRead,
+}
+
+struct LocalImagePending {
+    image: usize,
+    read: ImageRead,
+}
+struct NetworkImagePending {
+    image: usize,
+    fetch: Fetch,
+}
+
+fn decode_failure(error: DecodeError) -> &'static str {
+    match error {
+        DecodeError::Unsupported => "unsupported image",
+        DecodeError::Malformed => "broken image",
+        DecodeError::TooLarge => "image too large",
+        DecodeError::OutOfMemory => "image out of memory",
+    }
+}
+
+fn shared_decoded_image(page: &Page, image: usize, url: &Url) -> Option<Rc<DecodedImage>> {
+    (0..image).find_map(|candidate| {
+        let same = page.document.images()[candidate]
+            .source
+            .as_ref()
+            .is_some_and(|source| source == url);
+        same.then(|| page.decoded_images[candidate].clone())
+            .flatten()
+    })
 }
 impl Browser {
     pub fn new(start: Option<Url>, wifi: &mut WifiManager) -> Option<Self> {
@@ -275,6 +360,12 @@ impl Browser {
         Some(Self {
             viewer,
             pending: None,
+            local_image: None,
+            network_image: None,
+            next_image: 0,
+            cache: CacheState::new(),
+            cache_image: None,
+            images_bypass_cache: false,
         })
     }
     pub fn key(&mut self, key: Key, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
@@ -289,13 +380,17 @@ impl Browser {
         match action {
             Action::Continue => {}
             Action::Cancel => stop_pending(&mut self.viewer, &mut self.pending, wifi, vfs),
-            Action::Report => report_state(&mut self.viewer, &self.pending, wifi),
+            Action::Report => {
+                report_state(&mut self.viewer, &self.pending, wifi, &self.cache.stats)
+            }
             Action::Leave => return true,
         }
         false
     }
     pub fn wheel(&mut self, amount: i32) {
-        self.viewer.scroll_by(-amount * WHEEL_LINES);
+        self.viewer.close_select();
+        self.viewer
+            .scroll_by_pixels(-amount.saturating_mul(WHEEL_STEP));
     }
     pub fn bar_target(&self, x: usize) -> tab5_system_ui::Rect {
         tab5_system_ui::browser_target(x, self.editing())
@@ -309,21 +404,47 @@ impl Browser {
             .is_some_and(Pending::is_network_transfer)
         {
             let active = self.pending.take().expect("pending transfer");
-            let navigation = Navigation {
-                url: active.navigation.url.clone(),
-                restore: active.navigation.restore,
-                how: active.navigation.how,
-            };
-            close_pending(active, wifi, vfs);
-            self.pending = Some(Pending {
-                navigation,
-                source: Source::WaitingForNetwork,
-            });
+            if active.is_post() {
+                end_post(active, &mut self.viewer, wifi, vfs, PostEnd::Interrupted);
+            } else {
+                let navigation = Navigation {
+                    url: active.navigation.url.clone(),
+                    restore: active.navigation.restore,
+                    how: active.navigation.how,
+                    bypass_cache: active.navigation.bypass_cache,
+                };
+                close_pending(active, wifi, vfs);
+                self.pending = Some(Pending {
+                    navigation,
+                    source: Source::WaitingForNetwork,
+                    post: None,
+                });
+            }
+        }
+        if let Some(active) = self.network_image.take() {
+            self.next_image = self.next_image.min(active.image);
+            if let Some(mut link) = raw_network(wifi) {
+                active.fetch.close(&mut link);
+            }
         }
     }
     pub fn close(&mut self, wifi: &mut WifiManager, vfs: &mut Vfs) {
         if let Some(active) = self.pending.take() {
             close_pending(active, wifi, vfs);
+        }
+        if let Some(active) = self.local_image.take() {
+            active.read.close(vfs);
+        }
+        if let Some(active) = self.network_image.take() {
+            if let Some(mut link) = raw_network(wifi) {
+                active.fetch.close(&mut link);
+            }
+        }
+        if let Some(active) = self.cache_image.take() {
+            active.read.close(vfs);
+        }
+        if let Some(write) = self.cache.write.take() {
+            write.abandon(vfs);
         }
     }
     pub fn draw(&mut self, fb: &mut Framebuffer, wifi: &mut WifiManager, full: bool) -> bool {
@@ -346,6 +467,14 @@ impl Browser {
         vfs: &mut Vfs,
         mut ram_disk: Option<&mut RamBlockDevice>,
     ) {
+        if self.network_image.is_some() && !network_is_addressed(wifi) {
+            if let Some(active) = self.network_image.take() {
+                self.next_image = self.next_image.min(active.image);
+                if let Some(mut link) = raw_network(wifi) {
+                    active.fetch.close(&mut link);
+                }
+            }
+        }
         // A managed connection can disappear between two page-fetch steps.
         // Its old socket belongs to the old stack and cannot survive, but a
         // GET can: keep the navigation and restart it once reassociation and
@@ -365,18 +494,53 @@ impl Browser {
         // abandoned first: the newest request is the one they meant, and
         // this is also what makes "cancel, then fetch something else"
         // work without a state in between.
-        if let Some(navigation) = self.viewer.take_request() {
-            if let Some(active) = self.pending.take() {
+        if let Some(requested) = self.viewer.take_request() {
+            self.images_bypass_cache = matches!(
+                &requested,
+                Requested::Navigation(navigation) if navigation.bypass_cache
+            );
+            if let Some(mut active) = self.pending.take() {
+                // An abandoned history resend returns its entry before the
+                // new navigation settles the stacks.
+                if let Some(post) = active.post.take() {
+                    self.viewer
+                        .put_back_entry(post.entry, active.navigation.how);
+                }
                 close_pending(active, wifi, vfs);
             }
-            self.pending = begin(
-                &mut self.viewer,
-                navigation,
-                wifi,
-                vfs,
-                ram_disk.as_deref_mut(),
-                input,
-            );
+            if let Some(active) = self.local_image.take() {
+                active.read.close(vfs);
+            }
+            if let Some(active) = self.network_image.take() {
+                if let Some(mut link) = raw_network(wifi) {
+                    active.fetch.close(&mut link);
+                }
+            }
+            if let Some(active) = self.cache_image.take() {
+                active.read.close(vfs);
+            }
+            // A body still being written is finished before the next page
+            // can capture another, so at most one is ever held in memory.
+            self.finish_cache_write(vfs, ram_disk.as_deref_mut(), input);
+            self.next_image = 0;
+            self.pending = match requested {
+                Requested::Navigation(navigation) => begin(
+                    &mut self.viewer,
+                    navigation,
+                    wifi,
+                    vfs,
+                    ram_disk.as_deref_mut(),
+                    input,
+                    &mut self.cache.stats,
+                ),
+                Requested::Submission(submission) => {
+                    begin_submission(&mut self.viewer, submission, wifi)
+                }
+                Requested::Restore(entry, how) => {
+                    self.viewer.restore_post(entry, how);
+                    None
+                }
+            };
         }
 
         // `Source::WaitingForNetwork` owns no socket. It deliberately stays
@@ -397,6 +561,7 @@ impl Browser {
                     vfs,
                     ram_disk.as_deref_mut(),
                     input,
+                    &mut self.cache.stats,
                 );
             } else if !network_is_recovering(wifi) {
                 let active = self.pending.take().expect("network wait is self.pending");
@@ -422,6 +587,15 @@ impl Browser {
                         };
                         Some(read.step(vfs, &mut devices))
                     }
+                    Source::Cache(read) => {
+                        let mut sd = SdSlot::new();
+                        let mut devices = Devices {
+                            ram: ram_disk.as_deref_mut(),
+                            sd: &mut sd,
+                            usb: input.usb_host_mut(),
+                        };
+                        Some(read.step(vfs, &mut devices))
+                    }
                     // Handled just above: it either remains waiting, becomes
                     // a network transfer, or becomes a no-network failure.
                     Source::WaitingForNetwork => None,
@@ -430,14 +604,22 @@ impl Browser {
                     self.viewer
                         .update_loading(active.received(), active.security());
                 }
+                if let Source::Network(fetch) = &mut active.source {
+                    for url in fetch.take_invalidations() {
+                        if self.cache.invalidations.try_reserve(1).is_ok() {
+                            self.cache.invalidations.push(url);
+                        }
+                    }
+                }
                 outcome
             }
             None => None,
         };
         match outcome {
             None | Some(FetchOutcome::Working) => {}
+            Some(FetchOutcome::Image(_)) => unreachable!("page fetch returned image mode"),
             Some(FetchOutcome::Page(document)) => {
-                if let Some(active) = self.pending.take() {
+                if let Some(mut active) = self.pending.take() {
                     // The final address, which is the last hop of a
                     // redirect chain rather than the one that was asked
                     // for -- so the toolbar and the base for this page's
@@ -446,10 +628,27 @@ impl Browser {
                     let security = active.security();
                     let status = active.status();
                     let peak = active.peak_owned();
+                    let request_method = active.method();
+                    let post = active.landed_post();
+                    let from_cache = match &mut active.source {
+                        Source::Network(fetch) => {
+                            let mut sd = SdSlot::new();
+                            let mut devices = Devices {
+                                ram: ram_disk.as_deref_mut(),
+                                sd: &mut sd,
+                                usb: input.usb_host_mut(),
+                            };
+                            note_fetch_cache(fetch, &mut self.cache, vfs, &mut devices);
+                            None
+                        }
+                        Source::Cache(read) => Some(read.revalidated()),
+                        _ => None,
+                    };
                     let navigation = Navigation {
                         url: landed.clone(),
                         restore: active.navigation.restore,
                         how: active.navigation.how,
+                        bypass_cache: active.navigation.bypass_cache,
                     };
                     close_pending(active, wifi, vfs);
                     self.viewer.show_document(
@@ -459,7 +658,71 @@ impl Browser {
                         security,
                         status,
                         peak,
+                        request_method,
+                        post,
                     );
+                    match from_cache {
+                        Some(true) => self
+                            .viewer
+                            .say("not modified (304): the cached copy is shown"),
+                        Some(false) => self.viewer.say("shown from the cache; no request was sent"),
+                        None => {}
+                    }
+                    self.next_image = 0;
+                }
+            }
+            Some(FetchOutcome::NotModified) => {
+                if let Some(active) = self.pending.take() {
+                    let Pending {
+                        source, navigation, ..
+                    } = active;
+                    let refresh = match &source {
+                        Source::Network(fetch) => fetch.refresh(),
+                        _ => None,
+                    };
+                    close_source(source, wifi, vfs);
+                    let now = tick::now_ms();
+                    let mut sd = SdSlot::new();
+                    let mut devices = Devices {
+                        ram: ram_disk.as_deref_mut(),
+                        sd: &mut sd,
+                        usb: input.usb_host_mut(),
+                    };
+                    let read = match cache_store::find(vfs, &mut devices, &navigation.url) {
+                        Some(mut hit) => {
+                            cache_store::refresh(&mut hit.record, refresh, now);
+                            let _ = cache_store::update_record(vfs, &mut devices, &hit);
+                            let read = CacheRead::start(
+                                vfs,
+                                &mut devices,
+                                &navigation.url,
+                                &hit,
+                                false,
+                                true,
+                            );
+                            if read.is_none() {
+                                cache_store::remove_hit(vfs, &mut devices, &hit);
+                            }
+                            read
+                        }
+                        None => None,
+                    };
+                    match read {
+                        Some(read) => {
+                            self.cache.stats.revalidated += 1;
+                            self.pending = Some(Pending {
+                                source: Source::Cache(read),
+                                navigation,
+                                post: None,
+                            });
+                        }
+                        // The copy the server confirmed is gone or cannot be
+                        // read: fetch the page whole instead.
+                        None => self.viewer.request(Navigation {
+                            bypass_cache: true,
+                            ..navigation
+                        }),
+                    }
                 }
             }
             Some(FetchOutcome::Failed(failure)) => {
@@ -469,11 +732,38 @@ impl Browser {
                     // before deciding whether this is a page failure or an
                     // automatically recoverable Wi-Fi interruption.
                     service_link(wifi);
-                    if active.is_network_transfer()
+                    if matches!(active.source, Source::Cache(_)) {
+                        // An unreadable cache file is not the page failing:
+                        // the entry goes and the page is fetched whole.
+                        let Pending {
+                            source, navigation, ..
+                        } = active;
+                        close_source(source, wifi, vfs);
+                        let mut sd = SdSlot::new();
+                        let mut devices = Devices {
+                            ram: ram_disk.as_deref_mut(),
+                            sd: &mut sd,
+                            usb: input.usb_host_mut(),
+                        };
+                        cache_store::remove(vfs, &mut devices, &navigation.url);
+                        self.cache.stats.purged += 1;
+                        self.viewer.request(Navigation {
+                            bypass_cache: true,
+                            ..navigation
+                        });
+                    } else if active.is_network_transfer()
                         && !network_is_addressed(wifi)
                         && network_is_recovering(wifi)
                     {
                         suspend_or_fail(active, &mut self.viewer, &mut self.pending, wifi, vfs);
+                    } else if active.is_post() {
+                        end_post(
+                            active,
+                            &mut self.viewer,
+                            wifi,
+                            vfs,
+                            PostEnd::Failed(failure),
+                        );
                     } else {
                         let url = active.landed();
                         let how = active.navigation.how;
@@ -483,6 +773,421 @@ impl Browser {
                 }
             }
         }
+        if self.pending.is_none() {
+            self.step_local_images(vfs, ram_disk.as_deref_mut(), input);
+            self.step_network_images(wifi, vfs, ram_disk.as_deref_mut(), input);
+        }
+        self.step_cache_maintenance(vfs, ram_disk.as_deref_mut(), input);
+    }
+
+    /// Advances the cache's own work: the body being written, and otherwise,
+    /// while nothing else is loading, the periodic expiry sweep one bucket
+    /// at a time.
+    fn step_cache_maintenance(
+        &mut self,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        input: &mut InputManager,
+    ) {
+        let now = tick::now_ms();
+        let mut sd = SdSlot::new();
+        let mut devices = Devices {
+            ram: ram_disk,
+            sd: &mut sd,
+            usb: input.usb_host_mut(),
+        };
+        // What a POST changed goes first, including a body of it still
+        // being written, so no later lookup can find the old response.
+        for url in core::mem::take(&mut self.cache.invalidations) {
+            if self
+                .cache
+                .write
+                .as_ref()
+                .is_some_and(|write| write.is_for(&url))
+                && let Some(write) = self.cache.write.take()
+            {
+                write.abandon(vfs);
+            }
+            if cache_store::remove(vfs, &mut devices, &url) {
+                self.cache.stats.invalidated += 1;
+            }
+        }
+        if let Some(write) = self.cache.write.as_mut() {
+            match write.step(vfs, &mut devices, now, &mut self.cache.stats) {
+                WriteProgress::Working => {}
+                WriteProgress::Stored | WriteProgress::NotKept => self.cache.write = None,
+            }
+            return;
+        }
+        if self.pending.is_some() || self.network_image.is_some() || self.cache_image.is_some() {
+            return;
+        }
+        match self.cache.sweep_bucket {
+            None if now >= self.cache.next_sweep_ms => self.cache.sweep_bucket = Some(0),
+            None => {}
+            Some(bucket) => {
+                self.cache.stats.purged +=
+                    cache_store::sweep_bucket(vfs, &mut devices, bucket, now, None);
+                self.cache.sweep_bucket =
+                    (bucket + 1 < crate::browser::cache::BUCKET_COUNT).then_some(bucket + 1);
+                if self.cache.sweep_bucket.is_none() {
+                    self.cache.next_sweep_ms = now.saturating_add(CACHE_SWEEP_INTERVAL_MS);
+                }
+            }
+        }
+    }
+
+    /// Runs a pending cache write to its end in one call. Bounded: a whole
+    /// entry is a handful of steps, and each purge retry removes something.
+    fn finish_cache_write(
+        &mut self,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        input: &mut InputManager,
+    ) {
+        let Some(mut write) = self.cache.write.take() else {
+            return;
+        };
+        let mut sd = SdSlot::new();
+        let mut devices = Devices {
+            ram: ram_disk,
+            sd: &mut sd,
+            usb: input.usb_host_mut(),
+        };
+        for _ in 0..256 {
+            match write.step(vfs, &mut devices, tick::now_ms(), &mut self.cache.stats) {
+                WriteProgress::Working => {}
+                WriteProgress::Stored | WriteProgress::NotKept => return,
+            }
+        }
+        write.abandon(vfs);
+    }
+
+    /// Steps an image being read from the cache. True while one is.
+    fn step_cache_image(&mut self, vfs: &mut Vfs, devices: &mut Devices) -> bool {
+        let Some(active) = self.cache_image.as_mut() else {
+            return false;
+        };
+        let outcome = active.read.step(vfs, devices);
+        if matches!(outcome, FetchOutcome::Working) {
+            return true;
+        }
+        let Some(active) = self.cache_image.take() else {
+            return false;
+        };
+        active.read.close(vfs);
+        match outcome {
+            FetchOutcome::Image(bytes) => {
+                match decode(&bytes) {
+                    Ok(decoded) => {
+                        let _ = self
+                            .viewer
+                            .install_decoded_image(active.image, Rc::new(decoded));
+                    }
+                    Err(error) => {
+                        self.viewer.page.image_failures[active.image] = Some(decode_failure(error));
+                    }
+                }
+                self.viewer.dirty.viewport = true;
+            }
+            _ => {
+                // An unreadable entry goes, and the image is fetched whole.
+                if let Some(url) = self
+                    .viewer
+                    .page
+                    .document
+                    .images()
+                    .get(active.image)
+                    .and_then(|image| image.source.clone())
+                {
+                    cache_store::remove(vfs, devices, &url);
+                    self.cache.stats.purged += 1;
+                }
+                self.next_image = self.next_image.min(active.image);
+            }
+        }
+        false
+    }
+
+    fn step_local_images(
+        &mut self,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        input: &mut InputManager,
+    ) {
+        let mut sd = SdSlot::new();
+        let mut devices = Devices {
+            ram: ram_disk,
+            sd: &mut sd,
+            usb: input.usb_host_mut(),
+        };
+        if self.local_image.is_none() {
+            while self.next_image < self.viewer.page.document.images().len() {
+                let image = self.next_image;
+                self.next_image += 1;
+                let Some(url) = self.viewer.page.document.images()[image].source.clone() else {
+                    continue;
+                };
+                if let Some(shared) = shared_decoded_image(&self.viewer.page, image, &url) {
+                    let _ = self.viewer.install_decoded_image(image, shared);
+                    continue;
+                }
+                if url.scheme() != crate::browser::url::Scheme::File {
+                    self.next_image -= 1;
+                    break;
+                }
+                if self.viewer.page.visit_url.scheme() != crate::browser::url::Scheme::File {
+                    self.viewer.page.image_failures[image] = Some("local image refused");
+                    self.viewer.dirty.viewport = true;
+                    self.viewer.say("a network page cannot open a local image");
+                    continue;
+                }
+                match ImageRead::start(&url, vfs, &mut devices) {
+                    Ok(read) => {
+                        self.local_image = Some(LocalImagePending { image, read });
+                        break;
+                    }
+                    Err(_) => {
+                        self.viewer.page.image_failures[image] = Some("image open failed");
+                        self.viewer.dirty.viewport = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        let outcome = self
+            .local_image
+            .as_mut()
+            .map(|active| active.read.step(vfs, &mut devices));
+        match outcome {
+            Some(ImageOutcome::Working) | None => {}
+            Some(ImageOutcome::Complete(bytes)) => {
+                if let Some(active) = self.local_image.take() {
+                    active.read.close(vfs);
+                    match decode(&bytes) {
+                        Ok(decoded) => {
+                            let _ = self
+                                .viewer
+                                .install_decoded_image(active.image, Rc::new(decoded));
+                        }
+                        Err(error) => {
+                            self.viewer.page.image_failures[active.image] =
+                                Some(decode_failure(error));
+                        }
+                    }
+                    self.viewer.dirty.viewport = true;
+                }
+            }
+            Some(ImageOutcome::Failed(failure)) => {
+                if let Some(active) = self.local_image.take() {
+                    self.viewer.page.image_failures[active.image] = Some(failure.headline);
+                    self.viewer.dirty.viewport = true;
+                    active.read.close(vfs);
+                }
+                self.viewer.say(failure.detail);
+            }
+        }
+    }
+
+    fn step_network_images(
+        &mut self,
+        wifi: &mut WifiManager,
+        vfs: &mut Vfs,
+        ram_disk: Option<&mut RamBlockDevice>,
+        input: &mut InputManager,
+    ) {
+        if self.local_image.is_some() {
+            return;
+        }
+        let mut sd = SdSlot::new();
+        let mut devices = Devices {
+            ram: ram_disk,
+            sd: &mut sd,
+            usb: input.usb_host_mut(),
+        };
+        if self.step_cache_image(vfs, &mut devices) {
+            return;
+        }
+        // A body still on its way to the RAM disk holds memory; the next
+        // image waits for it rather than capturing a second one.
+        if self.network_image.is_none() && self.cache.write.is_some() {
+            return;
+        }
+        if self.network_image.is_none() {
+            while self.next_image < self.viewer.page.document.images().len() {
+                let image = self.next_image;
+                let Some(url) = self.viewer.page.document.images()[image].source.clone() else {
+                    self.next_image += 1;
+                    continue;
+                };
+                if let Some(shared) = shared_decoded_image(&self.viewer.page, image, &url) {
+                    let _ = self.viewer.install_decoded_image(image, shared);
+                    self.next_image += 1;
+                    continue;
+                }
+                if !url.scheme().is_network() {
+                    return;
+                }
+                if self.viewer.page.visit_url.scheme() == crate::browser::url::Scheme::Https
+                    && url.scheme() == crate::browser::url::Scheme::Http
+                {
+                    self.viewer.page.image_failures[image] = Some("HTTPS downgrade refused");
+                    self.viewer.dirty.viewport = true;
+                    self.viewer.say("refused an HTTPS image downgrade");
+                    self.next_image += 1;
+                    continue;
+                }
+                if self.viewer.page.security
+                    == Some(fetch::PageSecurity::Tls(Authentication::Pinned))
+                    && !(url.scheme() == crate::browser::url::Scheme::Https
+                        && pins::is_pinned(url.host()))
+                {
+                    self.viewer.page.image_failures[image] = Some("TLS identity downgrade refused");
+                    self.viewer.dirty.viewport = true;
+                    self.next_image += 1;
+                    continue;
+                }
+                let now = tick::now_ms();
+                let hit = if self.images_bypass_cache {
+                    None
+                } else {
+                    cache_store::lookup(vfs, &mut devices, &url, now, &mut self.cache.stats)
+                };
+                let mut validator = None;
+                if let Some(mut hit) = hit {
+                    if hit.record.reusable_without_request(now) {
+                        if let Some(read) =
+                            CacheRead::start(vfs, &mut devices, &url, &hit, true, false)
+                        {
+                            hit.record.used_ms = now;
+                            let _ = cache_store::update_record(vfs, &mut devices, &hit);
+                            self.cache.stats.hits += 1;
+                            self.next_image += 1;
+                            self.cache_image = Some(CacheImagePending { image, read });
+                            break;
+                        }
+                        cache_store::remove_hit(vfs, &mut devices, &hit);
+                        self.cache.stats.purged += 1;
+                    } else if !hit.record.etag.is_empty() {
+                        validator = memory::string_from(&hit.record.etag).ok();
+                    }
+                }
+                let Some(mut network) = addressed_network(wifi) else {
+                    return;
+                };
+                self.next_image += 1;
+                match Fetch::start_image_cached(url, &mut network, validator) {
+                    Ok(fetch) => {
+                        self.network_image = Some(NetworkImagePending { image, fetch });
+                        break;
+                    }
+                    Err(failure) => {
+                        self.viewer.page.image_failures[image] = Some(failure.headline);
+                        self.viewer.dirty.viewport = true;
+                        self.viewer.say(failure.detail);
+                    }
+                }
+            }
+        }
+        let outcome = {
+            let Some(active) = self.network_image.as_mut() else {
+                return;
+            };
+            let Some(mut network) = addressed_network(wifi) else {
+                return;
+            };
+            active.fetch.step(&mut network)
+        };
+        match outcome {
+            FetchOutcome::Working => {}
+            FetchOutcome::Image(bytes) => {
+                if let Some(mut active) = self.network_image.take() {
+                    note_fetch_cache(&mut active.fetch, &mut self.cache, vfs, &mut devices);
+                    if let Some(mut network) = raw_network(wifi) {
+                        active.fetch.close(&mut network);
+                    }
+                    match decode(&bytes) {
+                        Ok(decoded) => {
+                            let _ = self
+                                .viewer
+                                .install_decoded_image(active.image, Rc::new(decoded));
+                        }
+                        Err(error) => {
+                            self.viewer.page.image_failures[active.image] =
+                                Some(decode_failure(error));
+                        }
+                    }
+                    self.viewer.dirty.viewport = true;
+                }
+            }
+            FetchOutcome::NotModified => {
+                if let Some(active) = self.network_image.take() {
+                    let refresh = active.fetch.refresh();
+                    let url = active.fetch.url().clone();
+                    if let Some(mut network) = raw_network(wifi) {
+                        active.fetch.close(&mut network);
+                    }
+                    let now = tick::now_ms();
+                    match cache_store::find(vfs, &mut devices, &url) {
+                        Some(mut hit) => {
+                            cache_store::refresh(&mut hit.record, refresh, now);
+                            let _ = cache_store::update_record(vfs, &mut devices, &hit);
+                            match CacheRead::start(vfs, &mut devices, &url, &hit, true, true) {
+                                Some(read) => {
+                                    self.cache.stats.revalidated += 1;
+                                    self.cache_image = Some(CacheImagePending {
+                                        image: active.image,
+                                        read,
+                                    });
+                                }
+                                None => {
+                                    cache_store::remove_hit(vfs, &mut devices, &hit);
+                                    self.next_image = self.next_image.min(active.image);
+                                }
+                            }
+                        }
+                        None => self.next_image = self.next_image.min(active.image),
+                    }
+                }
+            }
+            FetchOutcome::Failed(failure) => {
+                if let Some(active) = self.network_image.take() {
+                    self.viewer.page.image_failures[active.image] = Some(failure.headline);
+                    self.viewer.dirty.viewport = true;
+                    if let Some(mut network) = raw_network(wifi) {
+                        active.fetch.close(&mut network);
+                    }
+                }
+                self.viewer.say(failure.detail);
+            }
+            FetchOutcome::Page(_) => unreachable!("image fetch returned document mode"),
+        }
+    }
+}
+
+/// Tells the cache what a finished network fetch learned: a body to write,
+/// or an entry that is no longer the current response.
+fn note_fetch_cache(
+    fetch: &mut Fetch,
+    cache: &mut CacheState,
+    vfs: &mut Vfs,
+    devices: &mut Devices,
+) {
+    match fetch.take_cache_update() {
+        fetch::CacheUpdate::Store(meta, body) => {
+            match CacheWrite::new(fetch.url(), meta, body, fetch.security(), tick::now_ms()) {
+                Some(write) => {
+                    if let Some(previous) = cache.write.replace(write) {
+                        previous.abandon(vfs);
+                    }
+                }
+                None => cache.stats.not_kept += 1,
+            }
+        }
+        fetch::CacheUpdate::Remove => {
+            cache_store::remove(vfs, devices, fetch.url());
+        }
+        fetch::CacheUpdate::Keep => {}
     }
 }
 
@@ -491,13 +1196,18 @@ impl Browser {
 /// One function for both so that every site that abandons a read returns
 /// the right thing without having to know which kind it had.
 fn close_pending(pending: Pending, wifi: &mut WifiManager, vfs: &mut Vfs) {
-    match pending.source {
+    close_source(pending.source, wifi, vfs);
+}
+
+fn close_source(source: Source, wifi: &mut WifiManager, vfs: &mut Vfs) {
+    match source {
         Source::Network(fetch) => {
             if let Some(mut link) = raw_network(wifi) {
                 fetch.close(&mut link);
             }
         }
         Source::Local(read) => read.close(vfs),
+        Source::Cache(read) => read.close(vfs),
         Source::WaitingForNetwork => {}
     }
 }
@@ -511,21 +1221,20 @@ fn suspend_or_fail(
     wifi: &mut WifiManager,
     vfs: &mut Vfs,
 ) {
-    let Pending { source, navigation } = pending;
-    match source {
-        Source::Network(fetch) => {
-            if let Some(mut link) = raw_network(wifi) {
-                fetch.close(&mut link);
-            }
-        }
-        Source::Local(read) => read.close(vfs),
-        Source::WaitingForNetwork => {}
+    if pending.is_post() {
+        end_post(pending, viewer, wifi, vfs, PostEnd::Interrupted);
+        return;
     }
+    let Pending {
+        source, navigation, ..
+    } = pending;
+    close_source(source, wifi, vfs);
     if network_is_recovering(wifi) {
         viewer.wait_for_network(&navigation.url);
         *slot = Some(Pending {
             source: Source::WaitingForNetwork,
             navigation,
+            post: None,
         });
     } else {
         let url = navigation.url.clone();
@@ -548,7 +1257,12 @@ fn suspend_or_fail(
 /// `sockets` is the whole set, not this screen's share of it: DHCP and DNS
 /// hold their own. What matters is that it is the same number before and
 /// after, not what the number is.
-fn report_state(viewer: &mut Viewer, pending: &Option<Pending>, wifi: &mut WifiManager) {
+fn report_state(
+    viewer: &mut Viewer,
+    pending: &Option<Pending>,
+    wifi: &mut WifiManager,
+    cache: &cache_store::Stats,
+) {
     let sockets = raw_network(wifi).map(|network| network.stack.sockets_mut().iter().count());
     let mut line = Summary::new();
     line.push("heap ");
@@ -565,6 +1279,23 @@ fn report_state(viewer: &mut Viewer, pending: &Option<Pending>, wifi: &mut WifiM
     line.push_usize(viewer.history.len());
     line.push(" fwd ");
     line.push_usize(viewer.forward.len());
+    let (results, result_bytes, request_bytes) = viewer.retained_post();
+    line.push(" post ");
+    line.push_usize(results);
+    line.push("/");
+    line.push_usize(result_bytes / 1024);
+    line.push("K+");
+    line.push_usize(request_bytes / 1024);
+    line.push("K cache h");
+    line.push_usize(cache.hits);
+    line.push(" r");
+    line.push_usize(cache.revalidated);
+    line.push(" s");
+    line.push_usize(cache.stored);
+    line.push(" p");
+    line.push_usize(cache.purged);
+    line.push(" x");
+    line.push_usize(cache.invalidated);
     line.push(" page ");
     line.push_usize(viewer.page_owned_bytes() / 1024);
     line.push("K peak ");
@@ -590,9 +1321,115 @@ fn stop_pending(
     let Some(active) = pending.take() else {
         return;
     };
+    if active.is_post() {
+        end_post(active, viewer, wifi, vfs, PostEnd::Stopped);
+        return;
+    }
     close_pending(active, wifi, vfs);
     viewer.finish_loading();
     viewer.say("stopped");
+}
+
+/// How a POST that did not land came to an end.
+enum PostEnd {
+    /// The reader stopped it. Nothing is offered: they chose this.
+    Stopped,
+    /// Wi-Fi loss, a system bar suspension, or a transport failure the
+    /// manager is recovering from.
+    Interrupted,
+    Failed(fetch::Failure),
+}
+
+/// Ends a POST without resending it.
+///
+/// Whatever happened, the request is never sent again by itself. When a
+/// resend could be what the reader wants -- the result is unknown, nothing
+/// was sent, or a redirect asks for the body to go to another origin -- the
+/// copy is offered as a question, and only an explicit yes sends it. A
+/// history entry taken for a resend goes back onto its stack otherwise.
+fn end_post(
+    mut pending: Pending,
+    viewer: &mut Viewer,
+    wifi: &mut WifiManager,
+    vfs: &mut Vfs,
+    end: PostEnd,
+) {
+    let started = pending.request_started();
+    let uncertain = started && !pending.response_started();
+    let redirect = match (&end, &mut pending.source) {
+        (PostEnd::Failed(failure), Source::Network(fetch))
+            if failure.name == fetch::POST_REDIRECT_CONFIRMATION.name =>
+        {
+            Some((fetch.take_redirect_request(), fetch.redirects() + 1))
+        }
+        _ => None,
+    };
+    let copy = match &pending.source {
+        Source::Network(fetch) if redirect.is_none() => fetch.request().try_clone().ok(),
+        _ => None,
+    };
+    let Pending {
+        source,
+        navigation,
+        post,
+    } = pending;
+    close_source(source, wifi, vfs);
+    viewer.finish_loading();
+    let (origin, entry) = post.map_or((None, None), |post| (post.source, post.entry));
+
+    let lost = if uncertain {
+        "POST interrupted; result unknown and not resent"
+    } else if started {
+        "POST response interrupted; not resent"
+    } else {
+        "POST was not sent"
+    };
+    let (offer, message) = match end {
+        PostEnd::Stopped => (
+            None,
+            if uncertain {
+                "POST stopped; result unknown and not resent"
+            } else if started {
+                "POST response stopped; not resent"
+            } else {
+                "POST stopped before sending"
+            },
+        ),
+        PostEnd::Failed(_) if redirect.is_some() => match redirect {
+            Some((Some(request), redirects)) => {
+                (Some((request, redirects, ConfirmReason::Redirect)), "")
+            }
+            _ => (None, "POST redirect to another origin was not followed"),
+        },
+        // The server answered, and its answer could not be shown. A resend
+        // offer would suggest the first one did not arrive.
+        PostEnd::Failed(failure) if started && !uncertain => (None, failure.detail),
+        PostEnd::Failed(_) | PostEnd::Interrupted => {
+            let reason = if started {
+                ConfirmReason::Unknown
+            } else {
+                ConfirmReason::NotSent
+            };
+            (copy.map(|request| (request, 0, reason)), lost)
+        }
+    };
+    match offer {
+        Some((request, redirects, reason)) => viewer.ask(
+            Submission {
+                request,
+                how: navigation.how,
+                restore: navigation.restore,
+                source: origin,
+                entry,
+                redirects,
+            },
+            reason,
+        ),
+        None => {
+            viewer.put_back_entry(entry, navigation.how);
+            viewer.say(message);
+        }
+    }
 }
 
 /// Reads whatever the C6 has waiting.
@@ -649,6 +1486,7 @@ fn begin(
     vfs: &mut Vfs,
     ram_disk: Option<&mut RamBlockDevice>,
     input: &mut InputManager,
+    cache: &mut cache_store::Stats,
 ) -> Option<Pending> {
     let navigation = match viewer.page_navigation(navigation) {
         Some(navigation) => navigation,
@@ -664,11 +1502,48 @@ fn begin(
     if !navigation.url.scheme().is_network() {
         return begin_local(viewer, navigation, vfs, ram_disk, input);
     }
+    // A fresh entry is shown without asking anybody, so it works without a
+    // network as well. A reload always asks; a forced one does not look.
+    let now = tick::now_ms();
+    let mut sd = SdSlot::new();
+    let mut devices = Devices {
+        ram: ram_disk,
+        sd: &mut sd,
+        usb: input.usb_host_mut(),
+    };
+    let hit = if navigation.bypass_cache {
+        None
+    } else {
+        cache_store::lookup(vfs, &mut devices, &navigation.url, now, cache)
+    };
+    let mut validator = None;
+    if let Some(mut hit) = hit {
+        if navigation.how != Direction::Reload && hit.record.reusable_without_request(now) {
+            if let Some(read) =
+                CacheRead::start(vfs, &mut devices, &navigation.url, &hit, false, false)
+            {
+                hit.record.used_ms = now;
+                let _ = cache_store::update_record(vfs, &mut devices, &hit);
+                cache.hits += 1;
+                viewer.begin_loading(&navigation.url);
+                return Some(Pending {
+                    source: Source::Cache(read),
+                    navigation,
+                    post: None,
+                });
+            }
+            cache_store::remove_hit(vfs, &mut devices, &hit);
+            cache.purged += 1;
+        } else if !hit.record.etag.is_empty() {
+            validator = memory::string_from(&hit.record.etag).ok();
+        }
+    }
     if !network_is_addressed(wifi) && network_is_recovering(wifi) {
         viewer.wait_for_network(&navigation.url);
         return Some(Pending {
             source: Source::WaitingForNetwork,
             navigation,
+            post: None,
         });
     }
     let mut network = addressed_network(wifi);
@@ -676,16 +1551,68 @@ fn begin(
         viewer.show_failure(&navigation.url, fetch::NO_NETWORK, navigation.how);
         return None;
     };
-    match Fetch::start(navigation.url.clone(), network) {
+    match Fetch::start_cached(navigation.url.clone(), network, validator) {
         Ok(fetch) => {
             viewer.begin_loading(&navigation.url);
             Some(Pending {
                 source: Source::Network(fetch),
                 navigation,
+                post: None,
             })
         }
         Err(failure) => {
-            viewer.show_failure(&navigation.url, failure, navigation.how);
+            viewer.finish_loading();
+            viewer.say(failure.detail);
+            None
+        }
+    }
+}
+
+/// Starts a POST: a form's own submission, or a resend the reader confirmed.
+///
+/// Failing to start leaves the page and its input values where they are.
+fn begin_submission(
+    viewer: &mut Viewer,
+    submission: Submission,
+    wifi: &mut WifiManager,
+) -> Option<Pending> {
+    let Submission {
+        request,
+        how,
+        restore,
+        source,
+        entry,
+        redirects,
+    } = submission;
+    let navigation = Navigation {
+        url: request.url.clone(),
+        restore,
+        how,
+        bypass_cache: false,
+    };
+    if !request.url.scheme().is_network() || request.url.host() == builtin::HOST {
+        viewer.put_back_entry(entry, how);
+        viewer.say("POST needs a network HTTP(S) action");
+        return None;
+    }
+    let mut network = addressed_network(wifi);
+    let Some(network) = network.as_mut() else {
+        viewer.put_back_entry(entry, how);
+        viewer.say("no network: POST was not sent");
+        return None;
+    };
+    match Fetch::start_redirected_request(request, redirects, network) {
+        Ok(fetch) => {
+            viewer.begin_loading(fetch.url());
+            Some(Pending {
+                source: Source::Network(fetch),
+                navigation,
+                post: Some(PostContext { source, entry }),
+            })
+        }
+        Err(failure) => {
+            viewer.put_back_entry(entry, how);
+            viewer.say(failure.detail);
             None
         }
     }
@@ -715,11 +1642,21 @@ fn begin_local(
             Some(Pending {
                 source: Source::Local(read),
                 navigation,
+                post: None,
             })
         }
         Ok(Started::Page(document)) => {
             let landed = navigation.url.clone();
-            viewer.show_document(document, &navigation, landed, None, None, 0);
+            viewer.show_document(
+                document,
+                &navigation,
+                landed,
+                None,
+                None,
+                0,
+                RequestMethod::Get,
+                None,
+            );
             None
         }
         Err(failure) => {
@@ -736,12 +1673,62 @@ fn begin_local(
 /// positions, which is why they live here and not there.
 struct Navigation {
     url: Url,
-    /// The line to put at the top once the page is up. Non-zero when going
+    /// The document pixel to put at the top once the page is up. Non-zero when going
     /// back or forward, which are re-fetches -- history keeps a scroll
     /// position but never a document -- and when reloading, which is the
     /// same page and should not jump to the top of it.
-    restore: usize,
+    restore: u32,
     how: Direction,
+    /// Fetch without the cached copy's validator: the forced reload.
+    bypass_cache: bool,
+}
+
+enum Requested {
+    Navigation(Navigation),
+    Submission(Submission),
+    /// A kept POST result, shown again without any request.
+    Restore(HistoryEntry, Direction),
+}
+
+/// A POST to send, and what it replaces when it lands.
+struct Submission {
+    request: HttpRequest,
+    how: Direction,
+    restore: u32,
+    /// The page the form was on: where a POST result that can be neither
+    /// shown from memory nor resent falls back to.
+    source: Option<Url>,
+    /// A history entry taken off its stack for this resend, returned to it
+    /// if nothing lands.
+    entry: Option<HistoryEntry>,
+    /// Redirects already followed, when this continues a chain that paused
+    /// for confirmation.
+    redirects: usize,
+}
+
+/// Why the reader is being asked before a POST is sent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfirmReason {
+    /// Reload, back or forward onto a result that was not kept.
+    Resend,
+    /// Sending started and no response was read.
+    Unknown,
+    /// Nothing was sent.
+    NotSent,
+    /// A 307/308 asked for the body to go to another origin.
+    Redirect,
+}
+
+/// A POST waiting for the reader's yes or no.
+struct Confirmation {
+    submission: Submission,
+    reason: ConfirmReason,
+}
+
+/// What a POST in flight carries besides its request.
+struct PostContext {
+    source: Option<Url>,
+    entry: Option<HistoryEntry>,
 }
 
 /// Which of the four ways a navigation started, which is the only thing
@@ -765,6 +1752,7 @@ impl Navigation {
             url,
             restore: 0,
             how: Direction::Fresh,
+            bypass_cache: false,
         }
     }
 }
@@ -779,11 +1767,15 @@ impl Navigation {
 struct Pending {
     source: Source,
     navigation: Navigation,
+    /// Set for a POST only.
+    post: Option<PostContext>,
 }
 
 enum Source {
     Network(Fetch),
     Local(LocalRead),
+    /// A body from the HTTP cache: fresh, or just confirmed by a `304`.
+    Cache(CacheRead),
     /// Reassociation and DHCP are in progress. Owns no socket; the navigation
     /// is restarted from its original URL once a new addressed stack exists.
     WaitingForNetwork,
@@ -798,7 +1790,7 @@ impl Pending {
     fn landed(&self) -> Url {
         match &self.source {
             Source::Network(fetch) => fetch.url().clone(),
-            Source::Local(_) => self.navigation.url.clone(),
+            Source::Local(_) | Source::Cache(_) => self.navigation.url.clone(),
             Source::WaitingForNetwork => self.navigation.url.clone(),
         }
     }
@@ -807,6 +1799,7 @@ impl Pending {
     fn security(&self) -> Option<fetch::PageSecurity> {
         match &self.source {
             Source::Network(fetch) => fetch.security(),
+            Source::Cache(read) => read.security(),
             Source::Local(_) | Source::WaitingForNetwork => None,
         }
     }
@@ -814,7 +1807,7 @@ impl Pending {
     fn status(&self) -> Option<u16> {
         match &self.source {
             Source::Network(fetch) => fetch.status(),
-            Source::Local(_) | Source::WaitingForNetwork => None,
+            Source::Local(_) | Source::Cache(_) | Source::WaitingForNetwork => None,
         }
     }
 
@@ -822,6 +1815,7 @@ impl Pending {
         match &self.source {
             Source::Network(fetch) => fetch.received(),
             Source::Local(read) => read.received(),
+            Source::Cache(read) => read.received(),
             Source::WaitingForNetwork => 0,
         }
     }
@@ -830,7 +1824,15 @@ impl Pending {
         match &self.source {
             Source::Network(fetch) => fetch.peak_owned(),
             Source::Local(read) => read.peak_owned(),
+            Source::Cache(read) => read.peak_owned(),
             Source::WaitingForNetwork => 0,
+        }
+    }
+
+    fn method(&self) -> RequestMethod {
+        match &self.source {
+            Source::Network(fetch) => fetch.method(),
+            Source::Local(_) | Source::Cache(_) | Source::WaitingForNetwork => RequestMethod::Get,
         }
     }
 
@@ -840,6 +1842,40 @@ impl Pending {
 
     fn is_waiting_for_network(&self) -> bool {
         matches!(self.source, Source::WaitingForNetwork)
+    }
+
+    /// What a landed POST result needs to be kept or resent later.
+    ///
+    /// `None` for a GET, including a POST that a 301/302/303 turned into one:
+    /// that result is an ordinary page and history re-fetches it.
+    fn landed_post(&mut self) -> Option<PagePost> {
+        let Source::Network(fetch) = &self.source else {
+            return None;
+        };
+        if fetch.method() != RequestMethod::Post {
+            return None;
+        }
+        let context = self.post.take();
+        Some(PagePost {
+            request: fetch.request().try_clone().ok(),
+            source: context.and_then(|context| context.source),
+            keep: !fetch.no_store(),
+        })
+    }
+
+    fn is_post(&self) -> bool {
+        matches!(
+            &self.source,
+            Source::Network(fetch) if fetch.method() == RequestMethod::Post
+        )
+    }
+
+    fn request_started(&self) -> bool {
+        matches!(&self.source, Source::Network(fetch) if fetch.request_started())
+    }
+
+    fn response_started(&self) -> bool {
+        matches!(&self.source, Source::Network(fetch) if fetch.response_started())
     }
 }
 
@@ -866,10 +1902,167 @@ enum Action {
 /// and the viewport is most of the screen. A `Tab` that only moves the
 /// focus repaints two of them; a pointer that only moves repaints none.
 #[derive(Default, Clone, Copy)]
+struct DamageRect {
+    x: usize,
+    width: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ViewportDamage {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Default, Clone, Copy)]
+struct AddressDamage {
+    rects: [DamageRect; 4],
+}
+
+#[derive(Clone, Copy)]
+struct AddressVisual {
+    first: usize,
+    caret_x: usize,
+    selection: Option<(usize, usize)>,
+}
+
+impl AddressDamage {
+    fn add(&mut self, x: usize, width: usize) {
+        let left = x.max(ADDRESS_LEFT.saturating_sub(4));
+        let right = x.saturating_add(width).min(ADDRESS_RIGHT.saturating_add(4));
+        if left >= right {
+            return;
+        }
+        for rect in &mut self.rects {
+            if rect.width == 0 {
+                *rect = DamageRect {
+                    x: left,
+                    width: right - left,
+                };
+                return;
+            }
+            let rect_right = rect.x + rect.width;
+            if left <= rect_right && right >= rect.x {
+                let merged_left = left.min(rect.x);
+                let merged_right = right.max(rect_right);
+                rect.x = merged_left;
+                rect.width = merged_right - merged_left;
+                return;
+            }
+        }
+        self.rects[0] = DamageRect {
+            x: ADDRESS_LEFT.saturating_sub(4),
+            width: ADDRESS_RIGHT - ADDRESS_LEFT + 8,
+        };
+        for rect in &mut self.rects[1..] {
+            *rect = DamageRect::default();
+        }
+    }
+
+    fn full(&mut self) {
+        self.rects = [DamageRect::default(); 4];
+        self.rects[0] = DamageRect {
+            x: ADDRESS_LEFT.saturating_sub(4),
+            width: ADDRESS_RIGHT - ADDRESS_LEFT + 8,
+        };
+    }
+
+    fn is_dirty(self) -> bool {
+        self.rects[0].width != 0
+    }
+}
+
+#[derive(Default, Clone, Copy)]
 struct Dirty {
     toolbar: bool,
+    address: AddressDamage,
+    focus: [Option<FocusTarget>; 4],
+    control: ControlDamage,
+    /// The open select list's rectangle, old and new together, repainted
+    /// through the viewport renderer like a focus change.
+    popup: Option<ViewportDamage>,
     viewport: bool,
     status: bool,
+}
+
+impl Dirty {
+    fn full() -> Self {
+        Dirty {
+            toolbar: true,
+            address: AddressDamage::default(),
+            focus: [None; 4],
+            control: ControlDamage::default(),
+            popup: None,
+            viewport: true,
+            status: true,
+        }
+    }
+
+    fn focus_change(&mut self, before: Option<FocusTarget>, after: Option<FocusTarget>) {
+        for target in [before, after].into_iter().flatten() {
+            if self.focus.contains(&Some(target)) {
+                continue;
+            }
+            if let Some(slot) = self.focus.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(target);
+            } else {
+                // Several input events can arrive before the next frame.
+                // Once every bounded damage slot is occupied, a full
+                // viewport repaint is the only way to guarantee that no
+                // earlier focus highlight survives.
+                self.focus = [None; 4];
+                self.viewport = true;
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct ControlDamage {
+    control: Option<u16>,
+    rects: [DamageRect; 4],
+}
+
+impl ControlDamage {
+    fn add(&mut self, control: u16, left: usize, right: usize, x: usize, width: usize) {
+        if self.control != Some(control) {
+            self.control = Some(control);
+            self.rects = [DamageRect::default(); 4];
+        }
+        let left = x.max(left);
+        let right = x.saturating_add(width).min(right);
+        if left >= right {
+            return;
+        }
+        for rect in &mut self.rects {
+            if rect.width == 0 {
+                *rect = DamageRect {
+                    x: left,
+                    width: right - left,
+                };
+                return;
+            }
+            let rect_right = rect.x + rect.width;
+            if left <= rect_right && right >= rect.x {
+                let merged_left = left.min(rect.x);
+                let merged_right = right.max(rect_right);
+                rect.x = merged_left;
+                rect.width = merged_right - merged_left;
+                return;
+            }
+        }
+        self.rects = [DamageRect::default(); 4];
+        self.rects[0] = DamageRect {
+            x: left,
+            width: right - left,
+        };
+    }
+
+    fn is_dirty(self) -> bool {
+        self.control.is_some() && self.rects[0].width != 0
+    }
 }
 
 /// One displayed page. Replaced wholesale on every navigation, which is
@@ -877,6 +2070,7 @@ struct Dirty {
 struct Page {
     document: Document,
     visit_url: Url,
+    request_method: RequestMethod,
     /// What the connection this page came off proved, or `None` for a page
     /// that never crossed a network -- a built-in page, or this viewer's
     /// own error page. `None` is displayed from the scheme instead, which
@@ -891,13 +2085,41 @@ struct Page {
     /// that reloading retries what actually went wrong.
     error: bool,
     layout: Layout,
-    /// Index of the topmost drawn line.
-    first_line: usize,
-    /// Position within `order`, not a link index.
+    /// Document-space pixel at the top of the viewport.
+    scroll_y: u32,
+    /// Position within `order`, not a link or control index.
     focus: Option<usize>,
-    /// Links in the order they are laid out, which is the order `Tab`
-    /// visits them.
-    order: Vec<u16>,
+    /// Enabled interactive objects in visual document order.
+    order: Vec<FocusTarget>,
+    /// Decode results by Document image ID. Duplicate source sharing is
+    /// introduced with the fetch job; this stable index keeps drawing and
+    /// layout independent of how bytes arrived.
+    decoded_images: Vec<Option<Rc<DecodedImage>>>,
+    /// Stable, image-local failure labels. A failed image keeps its layout
+    /// box and never turns the whole document into an error page.
+    image_failures: Vec<Option<&'static str>>,
+    control_values: Vec<String>,
+    /// Checkedness of checkboxes and radio buttons, by control ID.
+    control_checked: Vec<bool>,
+    /// Selectedness of select options, by option ID.
+    option_selected: Vec<bool>,
+    /// Set when this page is the result of a POST.
+    post: Option<PagePost>,
+}
+
+/// What a POST result page knows about the request that produced it.
+struct PagePost {
+    /// A copy for an explicit resend, or `None` if it could not be made.
+    request: Option<HttpRequest>,
+    source: Option<Url>,
+    /// False when the response said `Cache-Control: no-store`.
+    keep: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusTarget {
+    Link(u16),
+    Control(u16),
 }
 
 /// The toolbar's buttons, left to right.
@@ -937,7 +2159,26 @@ enum Stack {
 /// anybody minding.
 struct HistoryEntry {
     url: Url,
-    line: usize,
+    scroll_y: u32,
+    method: RequestMethod,
+    /// Set for a POST result only. Going back to one never re-fetches it as
+    /// a GET: it is shown from `result`, resent after confirmation from
+    /// `request`, or left for `source`, in that order.
+    post: Option<PostEntry>,
+}
+
+struct PostEntry {
+    request: Option<HttpRequest>,
+    source: Option<Url>,
+    result: Option<RetainedResult>,
+}
+
+/// A POST result's document, kept within `MAX_RETAINED_POST_RESULT_BYTES`.
+/// Its layout and images are rebuilt when it is shown again.
+struct RetainedResult {
+    document: Document,
+    security: Option<fetch::PageSecurity>,
+    bytes: usize,
 }
 
 /// The address field while it is being typed into.
@@ -949,41 +2190,7 @@ struct HistoryEntry {
 /// address, and wrong here, where the common action is changing the end of
 /// the one already showing and retyping it on a thumb keyboard is the
 /// expensive part.
-struct Editing {
-    /// ASCII only -- non-ASCII is never accepted -- so a byte offset and a
-    /// character offset are the same number, which is what lets the caret
-    /// be a single `usize`.
-    text: String,
-    caret: usize,
-}
-
-impl Editing {
-    fn insert(&mut self, character: char) {
-        if self.text.len() >= MAX_URL_BYTES {
-            return;
-        }
-        self.caret = self.caret.min(self.text.len());
-        self.text.insert(self.caret, character);
-        self.caret += 1;
-    }
-
-    /// Deletes the character before the caret.
-    fn backspace(&mut self) {
-        if self.caret == 0 || self.caret > self.text.len() {
-            return;
-        }
-        self.caret -= 1;
-        self.text.remove(self.caret);
-    }
-
-    /// Deletes the character at the caret.
-    fn delete(&mut self) {
-        if self.caret >= self.text.len() {
-            return;
-        }
-        self.text.remove(self.caret);
-    }
-}
+type Editing = TextInput;
 
 /// What the toolbar shows while a page is arriving.
 struct Loading {
@@ -1009,13 +2216,17 @@ struct Viewer {
     /// returning to a page the reader has already left behind.
     forward: Vec<HistoryEntry>,
     editing: Option<Editing>,
+    form_editing: Option<FormEditing>,
+    /// A POST resend question, answered from the status line.
+    confirm: Option<Confirmation>,
+    select_popup: Option<SelectPopup>,
     loading: Option<Loading>,
     /// A sentence for the status line. Takes priority over the focused
     /// link's target, because it is only ever set as the answer to
     /// something the reader just did.
     message: Option<String>,
     /// A navigation waiting for the loop to act on it.
-    request: Option<Navigation>,
+    request: Option<Requested>,
     /// How far down the viewport the last repaint actually drew.
     ///
     /// A repaint has to erase what the previous one left, and nothing more.
@@ -1045,6 +2256,43 @@ struct Viewer {
     dirty: Dirty,
 }
 
+/// An open select list, anchored below or above its box in document space.
+struct SelectPopup {
+    control: u16,
+    /// Highlighted option, counted from the select's first option.
+    highlight: usize,
+    /// First option shown.
+    top: usize,
+    rows: usize,
+    x: u16,
+    y: u32,
+    width: u16,
+}
+
+fn popup_height(rows: usize) -> usize {
+    rows * POPUP_ROW_HEIGHT + 2
+}
+
+fn union_damage(a: ViewportDamage, b: ViewportDamage) -> ViewportDamage {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    ViewportDamage {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+struct FormEditing {
+    control: u16,
+    input: TextInput,
+    /// First displayed row of a textarea being edited.
+    top_row: usize,
+}
+
 impl Viewer {
     fn new() -> Result<Viewer, Error> {
         let page = load_builtin(builtin::HOME)?;
@@ -1053,6 +2301,9 @@ impl Viewer {
             history: Vec::new(),
             forward: Vec::new(),
             editing: None,
+            form_editing: None,
+            confirm: None,
+            select_popup: None,
             loading: None,
             message: None,
             request: None,
@@ -1061,6 +2312,10 @@ impl Viewer {
             last_peak: 0,
             dirty: Dirty {
                 toolbar: true,
+                address: AddressDamage::default(),
+                focus: [None; 4],
+                control: ControlDamage::default(),
+                popup: None,
                 viewport: true,
                 status: true,
             },
@@ -1068,7 +2323,13 @@ impl Viewer {
     }
 
     fn dirty(&self) -> bool {
-        self.dirty.toolbar || self.dirty.viewport || self.dirty.status
+        self.dirty.toolbar
+            || self.dirty.address.is_dirty()
+            || self.dirty.focus.iter().any(Option::is_some)
+            || self.dirty.control.is_dirty()
+            || self.dirty.popup.is_some()
+            || self.dirty.viewport
+            || self.dirty.status
     }
 
     /// What the page on screen costs: its document and its layout.
@@ -1080,12 +2341,302 @@ impl Viewer {
         self.page.document.stats().owned_bytes + self.page.layout.owned_bytes()
     }
 
-    fn take_request(&mut self) -> Option<Navigation> {
+    fn take_request(&mut self) -> Option<Requested> {
         self.request.take()
     }
 
     fn request(&mut self, navigation: Navigation) {
-        self.request = Some(navigation);
+        self.drop_confirmation();
+        self.request = Some(Requested::Navigation(navigation));
+    }
+
+    fn submit_request(&mut self, request: HttpRequest) {
+        self.drop_confirmation();
+        let source = self.page.visit_url.clone();
+        self.request = Some(Requested::Submission(Submission {
+            request,
+            how: Direction::Fresh,
+            restore: 0,
+            source: Some(source),
+            entry: None,
+            redirects: 0,
+        }));
+    }
+
+    // --- POST resend and retention ------------------------------------
+
+    /// Puts a POST resend question on the status line.
+    fn ask(&mut self, submission: Submission, reason: ConfirmReason) {
+        self.drop_confirmation();
+        self.close_select();
+        if self.editing.take().is_some() {
+            self.dirty.address.full();
+        }
+        self.finish_form_editing();
+        self.confirm = Some(Confirmation { submission, reason });
+        self.dirty.status = true;
+    }
+
+    fn accept_confirmation(&mut self) {
+        let Some(confirmation) = self.confirm.take() else {
+            return;
+        };
+        self.dirty.status = true;
+        self.request = Some(Requested::Submission(confirmation.submission));
+    }
+
+    fn cancel_confirmation(&mut self) {
+        let Some(confirmation) = self.confirm.take() else {
+            return;
+        };
+        let reason = confirmation.reason;
+        self.put_back_submission(confirmation.submission);
+        self.say(if reason == ConfirmReason::Redirect {
+            "POST was not sent to the other origin"
+        } else {
+            "POST was not resent"
+        });
+    }
+
+    /// Withdraws an open question without saying anything, because what
+    /// replaces it says something itself.
+    fn drop_confirmation(&mut self) {
+        if let Some(confirmation) = self.confirm.take() {
+            self.put_back_submission(confirmation.submission);
+            self.dirty.status = true;
+        }
+    }
+
+    fn put_back_submission(&mut self, submission: Submission) {
+        let Submission {
+            request,
+            how,
+            mut entry,
+            ..
+        } = submission;
+        if let Some(post) = entry.as_mut().and_then(|entry| entry.post.as_mut()) {
+            post.request = Some(request);
+        }
+        self.put_back_entry(entry, how);
+    }
+
+    /// Returns an entry taken for a back/forward resend to where it was.
+    fn put_back_entry(&mut self, entry: Option<HistoryEntry>, how: Direction) {
+        let Some(entry) = entry else {
+            return;
+        };
+        let stack = match how {
+            Direction::Back => &mut self.history,
+            Direction::Forward => &mut self.forward,
+            Direction::Fresh | Direction::Reload => return,
+        };
+        if stack.len() >= MAX_HISTORY {
+            stack.remove(0);
+        }
+        let _ = memory::push(stack, entry);
+        self.enforce_post_budget();
+    }
+
+    /// Replaces the page on screen, keeping a POST result being left for
+    /// history when the budget allows.
+    fn replace_page(&mut self, page: Page, how: Direction) {
+        self.drop_confirmation();
+        self.select_popup = None;
+        let left = core::mem::replace(&mut self.page, page);
+        self.retain_post_result(left, how);
+    }
+
+    /// Attaches a POST result's document to the history entry that
+    /// `settle_history` just made for it.
+    fn retain_post_result(&mut self, left: Page, how: Direction) {
+        if left.error || left.request_method != RequestMethod::Post {
+            return;
+        }
+        if !left.post.as_ref().is_some_and(|post| post.keep) {
+            return;
+        }
+        let stack = match how {
+            Direction::Fresh | Direction::Forward => &mut self.history,
+            Direction::Back => &mut self.forward,
+            Direction::Reload => return,
+        };
+        let Some(entry) = stack.last_mut() else {
+            return;
+        };
+        if entry.url != left.visit_url {
+            return;
+        }
+        let Some(post) = entry.post.as_mut() else {
+            return;
+        };
+        let bytes = left.document.stats().owned_bytes;
+        if bytes > MAX_RETAINED_POST_RESULT_BYTES {
+            return;
+        }
+        post.result = Some(RetainedResult {
+            document: left.document,
+            security: left.security,
+            bytes,
+        });
+        self.enforce_post_budget();
+    }
+
+    /// Kept POST results and request bodies: count, result bytes, body bytes.
+    fn retained_post(&self) -> (usize, usize, usize) {
+        let mut totals = (0, 0, 0);
+        for entry in self.history.iter().chain(self.forward.iter()) {
+            let Some(post) = entry.post.as_ref() else {
+                continue;
+            };
+            if let Some(result) = &post.result {
+                totals.0 += 1;
+                totals.1 += result.bytes;
+            }
+            if let Some(request) = &post.request {
+                totals.2 += request.body().len();
+            }
+        }
+        totals
+    }
+
+    /// Drops kept results, then kept requests, farthest from the page on
+    /// screen first, until the retention budgets hold.
+    ///
+    /// Dropping only degrades what back/forward can do -- a dropped result
+    /// asks before resending, a dropped request returns to the form -- and
+    /// never touches the page on screen or an input value.
+    fn enforce_post_budget(&mut self) {
+        loop {
+            let (results, result_bytes, request_bytes) = self.retained_post();
+            let over_results = results > MAX_RETAINED_POST_RESULTS
+                || result_bytes > MAX_RETAINED_POST_RESULT_BYTES;
+            let over_requests = request_bytes > MAX_RETAINED_POST_REQUEST_BYTES;
+            if !over_results && !over_requests {
+                return;
+            }
+            let mut farthest: Option<(usize, bool, usize)> = None;
+            for (forward, stack) in [(false, &self.history), (true, &self.forward)] {
+                for (index, entry) in stack.iter().enumerate() {
+                    let holds = entry.post.as_ref().is_some_and(|post| {
+                        if over_results {
+                            post.result.is_some()
+                        } else {
+                            post.request.is_some()
+                        }
+                    });
+                    let distance = stack.len() - index;
+                    if holds && farthest.is_none_or(|(most, _, _)| distance > most) {
+                        farthest = Some((distance, forward, index));
+                    }
+                }
+            }
+            let Some((_, forward, index)) = farthest else {
+                return;
+            };
+            let stack = if forward {
+                &mut self.forward
+            } else {
+                &mut self.history
+            };
+            if let Some(post) = stack[index].post.as_mut() {
+                if over_results {
+                    post.result = None;
+                } else {
+                    post.request = None;
+                }
+            }
+        }
+    }
+
+    /// Shows a kept POST result again. Nothing is sent.
+    fn restore_post(&mut self, mut entry: HistoryEntry, how: Direction) {
+        let Some(mut post) = entry.post.take() else {
+            return;
+        };
+        let Some(result) = post.result.take() else {
+            entry.post = Some(post);
+            self.return_to(entry, how);
+            return;
+        };
+        match build_page(result.document) {
+            Ok(mut page) => {
+                page.security = result.security;
+                page.request_method = RequestMethod::Post;
+                page.visit_url = entry.url.clone();
+                page.post = Some(PagePost {
+                    request: post.request.take(),
+                    source: post.source.take(),
+                    keep: true,
+                });
+                self.settle_history(how);
+                self.replace_page(page, how);
+                self.form_editing = None;
+                self.scroll_to(entry.scroll_y);
+                self.loading = None;
+                self.dirty = Dirty::full();
+                self.say("POST result shown from memory; nothing was resent");
+            }
+            // The document went into the failed layout. What is left is the
+            // same as a result that was never kept.
+            Err(_) => {
+                entry.post = Some(post);
+                self.return_to(entry, how);
+            }
+        }
+    }
+
+    /// Goes back or forward to an entry that has already left its stack.
+    fn return_to(&mut self, mut entry: HistoryEntry, how: Direction) {
+        let internal = self.page.request_method == entry.method
+            && self.page.document.url().same_document(&entry.url);
+        if entry.method != RequestMethod::Post || internal {
+            self.request(Navigation {
+                url: entry.url,
+                restore: entry.scroll_y,
+                how,
+                bypass_cache: false,
+            });
+            return;
+        }
+        let Some(post) = entry.post.as_mut() else {
+            self.put_back_entry(Some(entry), how);
+            self.say("POST result was not kept and cannot be resent");
+            return;
+        };
+        if post.result.is_some() {
+            self.drop_confirmation();
+            self.request = Some(Requested::Restore(entry, how));
+            return;
+        }
+        if let Some(request) = post.request.take() {
+            let source = post.source.clone();
+            let restore = entry.scroll_y;
+            self.ask(
+                Submission {
+                    request,
+                    how,
+                    restore,
+                    source,
+                    entry: Some(entry),
+                    redirects: 0,
+                },
+                ConfirmReason::Resend,
+            );
+            return;
+        }
+        if let Some(source) = post.source.take() {
+            // Neither the result nor the request survived: the form it came
+            // from is the one place left to go.
+            self.request(Navigation {
+                url: source,
+                restore: 0,
+                how,
+                bypass_cache: false,
+            });
+            return;
+        }
+        self.put_back_entry(Some(entry), how);
+        self.say("POST result was not kept and cannot be resent");
     }
 
     /// Sets the status line. Silently keeps the old one if the allocation
@@ -1170,13 +2721,18 @@ impl Viewer {
         security: Option<fetch::PageSecurity>,
         status: Option<u16>,
         peak_owned: usize,
+        request_method: RequestMethod,
+        post: Option<PagePost>,
     ) {
         match build_page(document) {
             Ok(mut page) => {
                 page.security = security;
+                page.request_method = request_method;
+                page.post = post;
                 self.settle_history(navigation.how);
                 page.visit_url = landed;
-                self.page = page;
+                self.replace_page(page, navigation.how);
+                self.form_editing = None;
                 // Through `scroll_to` rather than assigned, so a remembered
                 // position past the end of a page that has since got
                 // shorter lands on the last screen instead of below it.
@@ -1185,6 +2741,10 @@ impl Viewer {
                 self.message = None;
                 self.dirty = Dirty {
                     toolbar: true,
+                    address: AddressDamage::default(),
+                    focus: [None; 4],
+                    control: ControlDamage::default(),
+                    popup: None,
                     viewport: true,
                     status: true,
                 };
@@ -1217,13 +2777,18 @@ impl Viewer {
         match load_builtin(page) {
             Ok(loaded) => {
                 self.settle_history(navigation.how);
-                self.page = loaded;
+                self.replace_page(loaded, navigation.how);
+                self.form_editing = None;
                 self.page.visit_url = navigation.url.clone();
                 self.scroll_to(navigation.restore);
                 self.loading = None;
                 self.message = None;
                 self.dirty = Dirty {
                     toolbar: true,
+                    address: AddressDamage::default(),
+                    focus: [None; 4],
+                    control: ControlDamage::default(),
+                    popup: None,
                     viewport: true,
                     status: true,
                 };
@@ -1269,10 +2834,15 @@ impl Viewer {
         }
         match error_page(url, headline, detail, status) {
             Ok(page) => {
-                self.page = page;
+                self.replace_page(page, how);
+                self.form_editing = None;
                 self.message = None;
                 self.dirty = Dirty {
                     toolbar: true,
+                    address: AddressDamage::default(),
+                    focus: [None; 4],
+                    control: ControlDamage::default(),
+                    popup: None,
                     viewport: true,
                     status: true,
                 };
@@ -1297,9 +2867,27 @@ impl Viewer {
 
     /// Moves the page now on screen onto one of the two stacks.
     fn push_current(&mut self, stack: Stack) {
+        // The result document itself is attached by `retain_post_result`
+        // once the page has actually been replaced; this copies only what
+        // survives a fragment navigation within the same result as well.
+        let post = self
+            .page
+            .post
+            .as_ref()
+            .filter(|_| self.page.request_method == RequestMethod::Post)
+            .map(|post| PostEntry {
+                request: post
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.try_clone().ok()),
+                source: post.source.clone(),
+                result: None,
+            });
         let entry = HistoryEntry {
             url: self.page.visit_url.clone(),
-            line: self.page.first_line,
+            scroll_y: self.page.scroll_y,
+            method: self.page.request_method,
+            post,
         };
         let stack = match stack {
             Stack::History => &mut self.history,
@@ -1311,6 +2899,7 @@ impl Viewer {
             stack.remove(0);
         }
         let _ = memory::push(stack, entry);
+        self.enforce_post_budget();
     }
 
     /// What a landed navigation does to the two stacks.
@@ -1333,27 +2922,21 @@ impl Viewer {
     }
 
     fn go_back(&mut self) {
+        self.drop_confirmation();
         let Some(entry) = self.history.pop() else {
             self.say("nothing to go back to");
             return;
         };
-        self.request(Navigation {
-            url: entry.url,
-            restore: entry.line,
-            how: Direction::Back,
-        });
+        self.return_to(entry, Direction::Back);
     }
 
     fn go_forward(&mut self) {
+        self.drop_confirmation();
         let Some(entry) = self.forward.pop() else {
             self.say("nothing to go forward to");
             return;
         };
-        self.request(Navigation {
-            url: entry.url,
-            restore: entry.line,
-            how: Direction::Forward,
-        });
+        self.return_to(entry, Direction::Forward);
     }
 
     /// Fetches the address showing again, keeping the reader's place.
@@ -1362,12 +2945,38 @@ impl Viewer {
     /// is that the page may have changed under a reader who is partway
     /// down it. On an error page this retries what failed, which works
     /// because an error page's address is the address that failed.
-    fn reload(&mut self) {
+    /// `force` fetches without the cached copy's validator.
+    fn reload(&mut self, force: bool) {
+        if self.page.request_method == RequestMethod::Post {
+            // Never a GET of the same address, and never sent without a yes.
+            let post = self.page.post.as_ref();
+            let source = post.and_then(|post| post.source.clone());
+            let copy = post
+                .and_then(|post| post.request.as_ref())
+                .map(HttpRequest::try_clone);
+            match (copy, source) {
+                (Some(Ok(request)), source) => self.ask(
+                    Submission {
+                        request,
+                        how: Direction::Reload,
+                        restore: self.page.scroll_y,
+                        source,
+                        entry: None,
+                        redirects: 0,
+                    },
+                    ConfirmReason::Resend,
+                ),
+                (_, Some(source)) => self.request(Navigation::fresh(source)),
+                (_, None) => self.say("POST result cannot be reloaded: the request was not kept"),
+            }
+            return;
+        }
         let url = self.page.visit_url.clone();
         self.request(Navigation {
             url,
-            restore: self.page.first_line,
+            restore: self.page.scroll_y,
             how: Direction::Reload,
+            bypass_cache: force,
         });
     }
 
@@ -1415,7 +3024,8 @@ impl Viewer {
             .layout
             .line_of_anchor(&self.page.document, &decoded)
         {
-            self.scroll_to(line);
+            let y = self.page.layout.lines().get(line).map_or(0, |line| line.y);
+            self.scroll_to(y);
         } else if decoded.eq_ignore_ascii_case("top") {
             self.scroll_to(0);
         } else {
@@ -1434,6 +3044,22 @@ impl Viewer {
         if key == Key::Control(b'q') {
             return Action::Leave;
         }
+        // An open resend question takes every other key, so that nothing
+        // typed can send a POST except its own answer.
+        if self.confirm.is_some() {
+            match key {
+                Key::Ascii(b'y' | b'Y' | b'\r' | b'\n') => self.accept_confirmation(),
+                Key::Escape | Key::Ascii(b'n' | b'N') => self.cancel_confirmation(),
+                _ => {}
+            }
+            return Action::Continue;
+        }
+        if self.select_popup.is_some() {
+            return self.handle_select_key(key);
+        }
+        if self.form_editing.is_some() {
+            return self.handle_form_editing_key(key);
+        }
         if self.editing.is_some() {
             return self.handle_editing_key(key);
         }
@@ -1449,8 +3075,9 @@ impl Viewer {
                     return Action::Cancel;
                 }
                 if self.page.focus.is_some() {
+                    let before = self.focused_target();
                     self.page.focus = None;
-                    self.dirty.viewport = true;
+                    self.dirty.focus_change(before, None);
                     self.dirty.status = true;
                 }
                 self.clear_message();
@@ -1460,21 +3087,39 @@ impl Viewer {
             // fallback. Free to bind because nothing outside the address
             // field takes typed text, and it is what every pager does.
             Key::Ascii(b'q') | Key::Ascii(b'Q') => return Action::Leave,
-            Key::ArrowDown => self.scroll_by(1),
-            Key::ArrowUp => self.scroll_by(-1),
-            Key::PageDown => self.scroll_by(self.lines_per_screen()),
-            Key::PageUp => self.scroll_by(-self.lines_per_screen()),
+            Key::ArrowDown => self.scroll_by_pixels(SCROLL_STEP),
+            Key::ArrowUp => self.scroll_by_pixels(-SCROLL_STEP),
+            Key::PageDown => self.scroll_by_pixels(self.page_step()),
+            Key::PageUp => self.scroll_by_pixels(-self.page_step()),
             Key::Home => self.scroll_to(0),
-            Key::End => self.scroll_to(self.last_top_line()),
-            // Space pages down, the way every reader does.
-            Key::Ascii(b' ') => self.scroll_by(self.lines_per_screen()),
+            Key::End => self.scroll_to(self.max_scroll_y()),
+            // Space pages down, the way every reader does -- except on a
+            // focused checkbox or radio button, which it activates as in
+            // every other browser.
+            Key::Ascii(b' ') => match self.focused_control() {
+                Some(control)
+                    if self
+                        .page
+                        .document
+                        .controls()
+                        .get(control as usize)
+                        .is_some_and(|item| {
+                            item.kind.is_checkable() || item.kind == ControlKind::Select
+                        }) =>
+                {
+                    self.activate_control(control)
+                }
+                _ => self.scroll_by_pixels(self.page_step()),
+            },
             Key::Ascii(b'\t') => self.focus_next(),
             Key::Ascii(b'\r') | Key::Ascii(b'\n') => {
                 // Enter on a selected link follows it; Enter with nothing
                 // selected is "where do you want to go?". That is one key
                 // doing two things, but they are never both available: a
                 // reader who has not pressed Tab has nothing to follow.
-                if self.page.focus.is_some() {
+                if let Some(control) = self.focused_control() {
+                    self.activate_control(control);
+                } else if self.page.focus.is_some() {
                     self.follow_focused();
                 } else {
                     self.start_editing();
@@ -1489,9 +3134,10 @@ impl Viewer {
             // CardKB v1.1 has no Ctrl key, and outside the address field
             // nothing here takes typed text. The other two are what a
             // desktop keyboard's reader will try first.
-            Key::Ascii(b'r') | Key::Ascii(b'R') | Key::Control(b'r') | Key::Function(5) => {
-                self.reload()
-            }
+            Key::Ascii(b'r') | Key::Control(b'r') | Key::Function(5) => self.reload(false),
+            // Shift+R: the forced reload, which does not ask the server to
+            // confirm the cached copy and so always transfers the page.
+            Key::Ascii(b'R') => self.reload(true),
             // The numbers behind "does this leak". Asked for rather than
             // logged: the per-page UART line this replaces printed on every
             // navigation, which made the log unreadable and still did not
@@ -1509,36 +3155,88 @@ impl Viewer {
     }
 
     fn handle_editing_key(&mut self, key: Key) -> Action {
+        let before = self.address_visual();
         let Some(editing) = self.editing.as_mut() else {
             return Action::Continue;
         };
-        // Every arm below changes what the field looks like, so the toolbar
-        // is marked once here rather than in each of them.
-        self.dirty.toolbar = true;
+        // Editing changes only the address rectangle. Buttons and the lock
+        // stay in the framebuffer and are not sent to the panel again.
+        let mut changed_at = None;
         match key {
             // Escape cancels the edit rather than leaving the browser: one
             // key, and the field being open says which it means.
             Key::Escape => {
                 self.editing = None;
                 self.clear_message();
+                self.dirty.address.full();
             }
             Key::Ascii(b'\r') | Key::Ascii(b'\n') => {
-                let text = core::mem::take(&mut editing.text);
+                let text = editing.take_text();
                 self.editing = None;
                 self.navigate_to_text(&text);
+                self.dirty.address.full();
             }
-            Key::Ascii(0x08) => editing.backspace(),
+            Key::Ascii(0x08) => {
+                changed_at = editing
+                    .selection()
+                    .map(|selection| selection.start)
+                    .or_else(|| {
+                        editing.text()[..editing.caret()]
+                            .char_indices()
+                            .next_back()
+                            .map(|(at, _)| at)
+                    });
+                if !editing.backspace() {
+                    changed_at = None;
+                }
+            }
             // A keyboard that sends DEL for its backspace key is the common
             // case; one that has a separate forward-delete sends
             // `Key::Delete`. Both are handled, and neither guesses.
-            Key::Ascii(0x7F) => editing.backspace(),
-            Key::Delete => editing.delete(),
-            Key::ArrowLeft => editing.caret = editing.caret.saturating_sub(1),
-            Key::ArrowRight => editing.caret = (editing.caret + 1).min(editing.text.len()),
-            Key::Home => editing.caret = 0,
-            Key::End => editing.caret = editing.text.len(),
-            Key::Ascii(byte) if (0x20..0x7F).contains(&byte) => editing.insert(byte as char),
-            _ => self.dirty.toolbar = false,
+            Key::Ascii(0x7F) => {
+                changed_at = editing
+                    .selection()
+                    .map(|selection| selection.start)
+                    .or_else(|| {
+                        editing.text()[..editing.caret()]
+                            .char_indices()
+                            .next_back()
+                            .map(|(at, _)| at)
+                    });
+                if !editing.backspace() {
+                    changed_at = None;
+                }
+            }
+            Key::Delete => {
+                changed_at = Some(
+                    editing
+                        .selection()
+                        .map_or(editing.caret(), |selection| selection.start),
+                );
+                if !editing.delete() {
+                    changed_at = None;
+                }
+            }
+            Key::ArrowLeft => editing.move_left(false),
+            Key::ArrowRight => editing.move_right(false),
+            Key::Home => editing.move_home(false),
+            Key::End => editing.move_end(false),
+            Key::Control(b'a') => editing.select_all(),
+            Key::Ascii(byte) if (0x20..0x7F).contains(&byte) => {
+                changed_at = Some(
+                    editing
+                        .selection()
+                        .map_or(editing.caret(), |selection| selection.start),
+                );
+                if !editing.insert_char(byte as char) {
+                    changed_at = None;
+                }
+            }
+            _ => return Action::Continue,
+        }
+        if self.editing.is_some() {
+            let after = self.address_visual();
+            self.damage_address_change(before, after, changed_at);
         }
         Action::Continue
     }
@@ -1550,12 +3248,553 @@ impl Viewer {
         // The address that is showing, with the caret after it. Changing
         // the end of an address is the usual reason to open this at all.
         let text = self.page.visit_url.to_text().unwrap_or_default();
-        let caret = text.len();
-        self.editing = Some(Editing { text, caret });
+        self.editing = Some(TextInput::new(
+            text,
+            MAX_URL_BYTES,
+            TextInputMode::SingleLine,
+        ));
         self.page.focus = None;
         self.say("edit the address; Enter goes, Escape cancels");
-        self.dirty.toolbar = true;
+        self.dirty.address.full();
         self.dirty.viewport = true;
+    }
+
+    fn start_form_editing(&mut self) {
+        let Some(control) = self.focused_control() else {
+            return;
+        };
+        let Some(definition) = self.page.document.controls().get(control as usize) else {
+            return;
+        };
+        let multiline = definition.kind == ControlKind::Textarea;
+        if !(definition.kind == ControlKind::Text || multiline) || definition.disabled {
+            self.say("submit is not connected yet");
+            return;
+        }
+        if definition.value_overflow {
+            self.say("this textarea's initial text is too long to edit");
+            return;
+        }
+        let value = self
+            .page
+            .control_values
+            .get(control as usize)
+            .map(String::as_str)
+            .unwrap_or(&definition.initial_value);
+        let Ok(value) = memory::string_from(value) else {
+            self.say("not enough memory to edit this field");
+            return;
+        };
+        self.form_editing = Some(FormEditing {
+            control,
+            input: TextInput::new(
+                value,
+                MAX_INPUT_VALUE_BYTES,
+                if multiline {
+                    TextInputMode::MultiLine
+                } else {
+                    TextInputMode::SingleLine
+                },
+            ),
+            top_row: 0,
+        });
+        self.keep_textarea_caret_visible();
+        self.say(if multiline {
+            "editing textarea; Enter adds a line, Escape finishes, Tab moves on"
+        } else {
+            "editing text input; Enter submits, Escape finishes"
+        });
+        self.dirty.focus_change(
+            Some(FocusTarget::Control(control)),
+            Some(FocusTarget::Control(control)),
+        );
+    }
+
+    fn activate_control(&mut self, control: u16) {
+        let Some(definition) = self.page.document.controls().get(control as usize) else {
+            return;
+        };
+        match definition.kind {
+            ControlKind::Text | ControlKind::Textarea => self.start_form_editing(),
+            ControlKind::Submit if !definition.disabled => {
+                self.submit_form(control, Some(control as usize))
+            }
+            ControlKind::Checkbox | ControlKind::Radio if !definition.disabled => {
+                self.toggle_control(control)
+            }
+            ControlKind::Select if !definition.disabled => self.open_select(control),
+            _ => self.say("this control cannot be activated"),
+        }
+    }
+
+    /// Opens a select's list below its box, or above it when there is no
+    /// room below, with the (first) selected option highlighted.
+    fn open_select(&mut self, control: u16) {
+        let Some(definition) = self.page.document.controls().get(control as usize) else {
+            return;
+        };
+        let count = definition.option_count as usize;
+        if count == 0 {
+            self.say("this list has no options");
+            return;
+        }
+        let first = definition.first_option as usize;
+        let multiple = definition.multiple;
+        self.scroll_focus_into_view();
+        let Some(item) = self
+            .page
+            .layout
+            .controls()
+            .iter()
+            .find(|item| item.control == control)
+            .copied()
+        else {
+            return;
+        };
+        let rows = count.min(POPUP_MAX_ROWS);
+        let height = popup_height(rows) as u32;
+        let width = item.width.max(240).min(PAGE_WIDTH as u16);
+        let x = item.x.min(PAGE_WIDTH as u16 - width);
+        let view_top = self.page.scroll_y;
+        let view_bottom = view_top.saturating_add(VIEWPORT_HEIGHT as u32);
+        let below = item.y.saturating_add(item.height as u32);
+        let y = if below.saturating_add(height) <= view_bottom {
+            below
+        } else if item.y >= view_top.saturating_add(height) {
+            item.y - height
+        } else {
+            view_bottom.saturating_sub(height).max(view_top)
+        };
+        let highlight = (0..count)
+            .find(|offset| {
+                self.page
+                    .option_selected
+                    .get(first + offset)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .unwrap_or(0);
+        self.select_popup = Some(SelectPopup {
+            control,
+            highlight,
+            top: highlight.saturating_sub(rows - 1),
+            rows,
+            x,
+            y,
+            width,
+        });
+        self.damage_popup();
+        self.say(if multiple {
+            "Up/Down move, Space or Enter toggles, Escape closes"
+        } else {
+            "Up/Down move, Enter chooses, Escape closes"
+        });
+    }
+
+    fn damage_popup(&mut self) {
+        let Some(popup) = &self.select_popup else {
+            return;
+        };
+        let Some(rect) = self.viewport_damage(
+            MARGIN + popup.x as usize,
+            popup.y,
+            popup.width as usize,
+            popup_height(popup.rows) as u32,
+        ) else {
+            return;
+        };
+        self.dirty.popup = Some(match self.dirty.popup {
+            Some(old) => union_damage(old, rect),
+            None => rect,
+        });
+    }
+
+    /// Closes the list, repainting what it covered and its select's box.
+    fn close_select(&mut self) {
+        if self.select_popup.is_none() {
+            return;
+        }
+        self.damage_popup();
+        if let Some(popup) = self.select_popup.take() {
+            self.dirty
+                .focus_change(Some(FocusTarget::Control(popup.control)), None);
+        }
+        self.clear_message();
+    }
+
+    fn handle_select_key(&mut self, key: Key) -> Action {
+        let Some(popup) = self.select_popup.as_ref() else {
+            return Action::Continue;
+        };
+        let control = popup.control;
+        let rows = popup.rows;
+        let highlight = popup.highlight;
+        let Some(definition) = self.page.document.controls().get(control as usize) else {
+            self.close_select();
+            return Action::Continue;
+        };
+        let count = definition.option_count as usize;
+        let multiple = definition.multiple;
+        let last = count.saturating_sub(1);
+        let target = match key {
+            Key::Escape => {
+                self.close_select();
+                return Action::Continue;
+            }
+            Key::Ascii(b'\t') => {
+                self.close_select();
+                self.focus_next();
+                return Action::Continue;
+            }
+            Key::Ascii(b'\r' | b'\n' | b' ') => {
+                // A disabled option leaves the list open, so the reason stays
+                // on the status line instead of being cleared by the close.
+                if self.choose_highlighted() && !multiple {
+                    self.close_select();
+                }
+                return Action::Continue;
+            }
+            Key::ArrowUp => highlight.saturating_sub(1),
+            Key::ArrowDown => (highlight + 1).min(last),
+            Key::PageUp => highlight.saturating_sub(rows),
+            Key::PageDown => (highlight + rows).min(last),
+            Key::Home => 0,
+            Key::End => last,
+            _ => return Action::Continue,
+        };
+        self.highlight_option(target);
+        Action::Continue
+    }
+
+    fn highlight_option(&mut self, target: usize) {
+        let Some(popup) = self.select_popup.as_mut() else {
+            return;
+        };
+        if popup.highlight == target {
+            return;
+        }
+        popup.highlight = target;
+        popup.top = popup
+            .top
+            .min(target)
+            .max((target + 1).saturating_sub(popup.rows));
+        self.damage_popup();
+    }
+
+    /// Chooses the highlighted option. Returns whether it was chosen.
+    fn choose_highlighted(&mut self) -> bool {
+        let Some(popup) = self.select_popup.as_ref() else {
+            return false;
+        };
+        let control = popup.control;
+        let Some(first) = self
+            .page
+            .document
+            .controls()
+            .get(control as usize)
+            .map(|item| item.first_option as usize)
+        else {
+            return false;
+        };
+        if form::choose_option(
+            &self.page.document,
+            &mut self.page.option_selected,
+            control as usize,
+            first + popup.highlight,
+        ) {
+            self.damage_popup();
+            self.dirty
+                .focus_change(Some(FocusTarget::Control(control)), None);
+            true
+        } else {
+            self.say("this option is disabled");
+            false
+        }
+    }
+
+    /// A tap while the list is open: a row chooses it, anywhere else closes
+    /// the list and does nothing more.
+    fn click_select_popup(&mut self, x: usize, y: usize) {
+        let Some(popup) = self.select_popup.as_ref() else {
+            return;
+        };
+        let left = MARGIN + popup.x as usize;
+        let screen_top = VIEWPORT_TOP as i64 + popup.y as i64 - self.page.scroll_y as i64 + 1;
+        let offset_y = y as i64 - screen_top;
+        let row = (offset_y >= 0).then(|| offset_y as usize / POPUP_ROW_HEIGHT);
+        let inside = (left..left + popup.width as usize).contains(&x)
+            && (VIEWPORT_TOP..VIEWPORT_BOTTOM).contains(&y);
+        let multiple = self
+            .page
+            .document
+            .controls()
+            .get(popup.control as usize)
+            .is_some_and(|item| item.multiple);
+        let count = self
+            .page
+            .document
+            .controls()
+            .get(popup.control as usize)
+            .map_or(0, |item| item.option_count as usize);
+        match row.filter(|row| inside && *row < popup.rows) {
+            Some(row) if popup.top + row < count => {
+                let target = popup.top + row;
+                self.highlight_option(target);
+                // A disabled option leaves the list open, so the reason stays
+                // on the status line instead of being cleared by the close.
+                if self.choose_highlighted() && !multiple {
+                    self.close_select();
+                }
+            }
+            _ => self.close_select(),
+        }
+    }
+
+    /// Toggles a checkbox or selects a radio button, repainting only the
+    /// controls whose checkedness changed.
+    fn toggle_control(&mut self, control: u16) {
+        let mut changed = [None; 4];
+        let mut overflow = false;
+        let activated = form::activate_checkable(
+            &self.page.document,
+            &mut self.page.control_checked,
+            control as usize,
+            |id| match changed.iter_mut().find(|slot| slot.is_none()) {
+                Some(slot) => *slot = Some(id as u16),
+                None => overflow = true,
+            },
+        );
+        if !activated {
+            self.say("this control cannot be activated");
+            return;
+        }
+        if overflow {
+            self.dirty.viewport = true;
+        }
+        for id in changed.into_iter().flatten() {
+            self.dirty
+                .focus_change(Some(FocusTarget::Control(id)), None);
+        }
+        self.clear_message();
+        self.dirty.status = true;
+    }
+
+    fn finish_form_editing(&mut self) {
+        let Some(mut editing) = self.form_editing.take() else {
+            return;
+        };
+        if let Some(value) = self.page.control_values.get_mut(editing.control as usize) {
+            *value = editing.input.take_text();
+        }
+        self.clear_message();
+        self.dirty.focus_change(
+            Some(FocusTarget::Control(editing.control)),
+            Some(FocusTarget::Control(editing.control)),
+        );
+    }
+
+    fn submit_form(&mut self, control: u16, activated_submit: Option<usize>) {
+        let Some(form_index) = self
+            .page
+            .document
+            .controls()
+            .get(control as usize)
+            .and_then(|control| control.form)
+        else {
+            self.say("this control has no form");
+            return;
+        };
+        match form::submit(
+            &self.page.document,
+            form_index as usize,
+            &self.page.control_values,
+            &self.page.control_checked,
+            &self.page.option_selected,
+            activated_submit,
+        ) {
+            Ok(request) if request.method == RequestMethod::Get => {
+                self.request(Navigation::fresh(request.url))
+            }
+            Ok(request) => self.submit_request(request),
+            Err(form::Error::TooLong) => self.say("form result URL is too long"),
+            Err(form::Error::OutOfMemory) => self.say("not enough memory to submit form"),
+            Err(form::Error::NoSuchForm) => self.say("form no longer exists"),
+            Err(form::Error::UnsupportedMethod) => self.say("this form method is unsupported"),
+            Err(form::Error::ValueOverflow) => {
+                self.say("a textarea's initial text is too long to submit")
+            }
+        }
+    }
+
+    fn handle_form_editing_key(&mut self, key: Key) -> Action {
+        if self
+            .form_editing
+            .as_ref()
+            .is_some_and(|editing| editing.input.mode() == TextInputMode::MultiLine)
+        {
+            return self.handle_textarea_key(key);
+        }
+        let before = self.form_visual();
+        let mut changed_at = None;
+        let Some(editing) = self.form_editing.as_mut() else {
+            return Action::Continue;
+        };
+        match key {
+            Key::Escape => {
+                self.finish_form_editing();
+                return Action::Continue;
+            }
+            Key::Ascii(b'\r') | Key::Ascii(b'\n') => {
+                let control = editing.control;
+                self.finish_form_editing();
+                self.submit_form(control, None);
+                return Action::Continue;
+            }
+            Key::Ascii(b'\t') => {
+                self.finish_form_editing();
+                self.focus_next();
+                return Action::Continue;
+            }
+            Key::Ascii(0x08) | Key::Ascii(0x7f) => {
+                changed_at = editing
+                    .input
+                    .selection()
+                    .map(|selection| selection.start)
+                    .or_else(|| {
+                        editing.input.text()[..editing.input.caret()]
+                            .char_indices()
+                            .next_back()
+                            .map(|(at, _)| at)
+                    });
+                if !editing.input.backspace() {
+                    changed_at = None;
+                }
+            }
+            Key::Delete => {
+                changed_at = Some(
+                    editing
+                        .input
+                        .selection()
+                        .map_or(editing.input.caret(), |selection| selection.start),
+                );
+                if !editing.input.delete() {
+                    changed_at = None;
+                }
+            }
+            Key::ArrowLeft => editing.input.move_left(false),
+            Key::ArrowRight => editing.input.move_right(false),
+            Key::Home => editing.input.move_home(false),
+            Key::End => editing.input.move_end(false),
+            Key::Control(b'a') => editing.input.select_all(),
+            Key::Ascii(byte) if (0x20..0x7f).contains(&byte) => {
+                changed_at = Some(
+                    editing
+                        .input
+                        .selection()
+                        .map_or(editing.input.caret(), |selection| selection.start),
+                );
+                if !editing.input.insert_char(byte as char) {
+                    changed_at = None;
+                }
+            }
+            _ => return Action::Continue,
+        }
+        let after = self.form_visual();
+        self.damage_form_change(before, after, changed_at);
+        Action::Continue
+    }
+
+    /// Keys while a textarea is edited. Enter is a line break rather than a
+    /// submission, and the arrows move between displayed rows. Every change
+    /// repaints the text area of the box: a line break or a wrap moves
+    /// everything after it, so a narrower damage rectangle buys little.
+    fn handle_textarea_key(&mut self, key: Key) -> Action {
+        let Some(control) = self.form_editing.as_ref().map(|editing| editing.control) else {
+            return Action::Continue;
+        };
+        let Some((left, right)) = self.form_text_bounds(control) else {
+            return Action::Continue;
+        };
+        let Some(editing) = self.form_editing.as_mut() else {
+            return Action::Continue;
+        };
+        let measure = |text: &str| crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY);
+        match key {
+            Key::Escape => {
+                self.finish_form_editing();
+                return Action::Continue;
+            }
+            Key::Ascii(b'\t') => {
+                self.finish_form_editing();
+                self.focus_next();
+                return Action::Continue;
+            }
+            Key::Ascii(b'\r') | Key::Ascii(b'\n') => {
+                editing.input.insert_char('\n');
+            }
+            Key::Ascii(0x08) | Key::Ascii(0x7f) => {
+                editing.input.backspace();
+            }
+            Key::Delete => {
+                editing.input.delete();
+            }
+            Key::ArrowLeft => editing.input.move_left(false),
+            Key::ArrowRight => editing.input.move_right(false),
+            Key::ArrowUp | Key::ArrowDown => {
+                let width = right.saturating_sub(left).saturating_sub(2);
+                if let Ok(rows) = text_input::wrap_rows(editing.input.text(), width, measure) {
+                    editing
+                        .input
+                        .move_row(&rows, key == Key::ArrowDown, false, measure);
+                }
+            }
+            Key::Home => editing.input.move_home(false),
+            Key::End => editing.input.move_end(false),
+            Key::Control(b'a') => editing.input.select_all(),
+            Key::Ascii(byte) if (0x20..0x7f).contains(&byte) => {
+                editing.input.insert_char(byte as char);
+            }
+            _ => return Action::Continue,
+        }
+        self.keep_textarea_caret_visible();
+        self.dirty
+            .control
+            .add(control, left, right, left, right - left);
+        Action::Continue
+    }
+
+    /// Scrolls a textarea being edited so the caret's row is inside its box.
+    fn keep_textarea_caret_visible(&mut self) {
+        let Some(control) = self.form_editing.as_ref().map(|editing| editing.control) else {
+            return;
+        };
+        let Some((left, right)) = self.form_text_bounds(control) else {
+            return;
+        };
+        let visible = self
+            .page
+            .document
+            .controls()
+            .get(control as usize)
+            .map_or(1, |item| usize::from(item.rows.max(1)));
+        let Some(editing) = self.form_editing.as_mut() else {
+            return;
+        };
+        if editing.input.mode() != TextInputMode::MultiLine {
+            return;
+        }
+        let width = right.saturating_sub(left).saturating_sub(2);
+        let Ok(rows) = text_input::wrap_rows(editing.input.text(), width, |text| {
+            crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
+        }) else {
+            return;
+        };
+        let row = text_input::row_of(&rows, editing.input.caret());
+        editing.top_row = editing
+            .top_row
+            .min(rows.len().saturating_sub(visible))
+            .min(row)
+            .max((row + 1).saturating_sub(visible));
     }
 
     /// Takes what was typed and turns it into a navigation.
@@ -1610,6 +3849,27 @@ impl Viewer {
     /// gives a running transfer's socket back, and a second copy of it
     /// behind the button is a second place to forget.
     fn click(&mut self, x: usize, y: usize) -> Action {
+        if self.form_editing.is_some() {
+            self.finish_form_editing();
+        }
+        if self.select_popup.is_some() {
+            self.click_select_popup(x, y);
+            return Action::Continue;
+        }
+        if self.confirm.is_some() {
+            if y >= VIEWPORT_BOTTOM {
+                if (CONFIRM_SEND_LEFT..CONFIRM_SEND_LEFT + CONFIRM_BUTTON_WIDTH).contains(&x) {
+                    self.accept_confirmation();
+                } else if (CONFIRM_CANCEL_LEFT..CONFIRM_CANCEL_LEFT + CONFIRM_BUTTON_WIDTH)
+                    .contains(&x)
+                {
+                    self.cancel_confirmation();
+                }
+                return Action::Continue;
+            }
+            // Anywhere else is a no, and then whatever that tap means.
+            self.cancel_confirmation();
+        }
         if y < TOOLBAR_HEIGHT {
             return self.click_toolbar(x);
         }
@@ -1619,28 +3879,93 @@ impl Viewer {
         if self.editing.is_some() {
             self.editing = None;
             self.clear_message();
-            self.dirty.toolbar = true;
+            self.dirty.address.full();
         }
-        let Some(top) = self.top_offset() else {
-            return Action::Continue;
-        };
-        let document_y = top + (y - VIEWPORT_TOP) as u32;
+        let document_y = self.page.scroll_y + (y - VIEWPORT_TOP) as u32;
         let Some(document_x) = x.checked_sub(MARGIN) else {
             return Action::Continue;
         };
+        if let Some(control) = self.page.layout.control_at(document_x as u16, document_y)
+            && self
+                .page
+                .document
+                .controls()
+                .get(control as usize)
+                .is_some_and(|item| !item.disabled)
+        {
+            let kind = self.page.document.controls()[control as usize].kind;
+            let before = self.focused_target();
+            self.page.focus = self
+                .page
+                .order
+                .iter()
+                .position(|item| *item == FocusTarget::Control(control));
+            self.clear_message();
+            self.dirty
+                .focus_change(before, Some(FocusTarget::Control(control)));
+            self.dirty.status = true;
+            if matches!(kind, ControlKind::Text | ControlKind::Textarea) {
+                self.start_form_editing();
+            } else if kind == ControlKind::Submit
+                || kind == ControlKind::Select
+                || kind.is_checkable()
+            {
+                self.activate_control(control);
+            }
+            return Action::Continue;
+        }
+        if let Some(control) =
+            self.page
+                .layout
+                .label_control_at(&self.page.document, document_x as u16, document_y)
+            && self
+                .page
+                .document
+                .controls()
+                .get(control as usize)
+                .is_some_and(|item| !item.disabled)
+        {
+            let kind = self.page.document.controls()[control as usize].kind;
+            let before = self.focused_target();
+            self.page.focus = self
+                .page
+                .order
+                .iter()
+                .position(|item| *item == FocusTarget::Control(control));
+            self.clear_message();
+            self.scroll_focus_into_view();
+            self.dirty
+                .focus_change(before, Some(FocusTarget::Control(control)));
+            self.dirty.status = true;
+            if matches!(kind, ControlKind::Text | ControlKind::Textarea) {
+                self.start_form_editing();
+            } else if kind.is_checkable() || kind == ControlKind::Select {
+                // A label activates its checkbox or radio button, which is
+                // most of what a label next to one is for.
+                self.activate_control(control);
+            }
+            return Action::Continue;
+        }
         match self.page.layout.hit(document_x as u16, document_y) {
             Some(link) => {
-                self.page.focus = self.page.order.iter().position(|&index| index == link);
+                let before = self.focused_target();
+                self.page.focus = self
+                    .page
+                    .order
+                    .iter()
+                    .position(|item| *item == FocusTarget::Link(link));
                 self.clear_message();
-                self.dirty.viewport = true;
+                self.dirty
+                    .focus_change(before, Some(FocusTarget::Link(link)));
                 self.dirty.status = true;
                 self.follow_focused();
             }
             None => {
                 if self.page.focus.is_some() {
+                    let before = self.focused_target();
                     self.page.focus = None;
                     self.clear_message();
-                    self.dirty.viewport = true;
+                    self.dirty.focus_change(before, None);
                     self.dirty.status = true;
                 }
             }
@@ -1692,7 +4017,7 @@ impl Viewer {
             // something is arriving it stops it, and otherwise it fetches
             // the address again.
             Button::Reload if self.loading.is_some() => return Action::Cancel,
-            Button::Reload => self.reload(),
+            Button::Reload => self.reload(false),
         }
         Action::Continue
     }
@@ -1703,27 +4028,40 @@ impl Viewer {
         let Some(editing) = self.editing.as_mut() else {
             return;
         };
-        editing.text.clear();
-        editing.caret = 0;
-        self.dirty.toolbar = true;
+        editing.clear();
+        self.dirty.address.full();
     }
 
     fn focus_next(&mut self) {
         if self.page.order.is_empty() {
-            self.say("this page has no links");
+            self.say("this page has no interactive items");
             return;
         }
+        let before = self.focused_target();
         self.page.focus = Some(match self.page.focus {
             Some(position) => (position + 1) % self.page.order.len(),
             None => 0,
         });
         self.clear_message();
         self.scroll_focus_into_view();
-        self.dirty.viewport = true;
+        self.dirty.focus_change(before, self.focused_target());
         self.dirty.status = true;
+        if self.focused_control().is_some_and(|control| {
+            self.page
+                .document
+                .controls()
+                .get(control as usize)
+                .is_some_and(|item| matches!(item.kind, ControlKind::Text | ControlKind::Textarea))
+        }) {
+            self.start_form_editing();
+        }
     }
 
     fn follow_focused(&mut self) {
+        if self.focused_control().is_some() {
+            self.say("control editing is not connected yet");
+            return;
+        }
         let Some(link) = self.focused_link() else {
             self.say("no link selected; press Tab");
             return;
@@ -1736,122 +4074,149 @@ impl Viewer {
     }
 
     fn focused_link(&self) -> Option<u16> {
-        self.page.order.get(self.page.focus?).copied()
+        match self.page.order.get(self.page.focus?)? {
+            FocusTarget::Link(link) => Some(*link),
+            FocusTarget::Control(_) => None,
+        }
+    }
+
+    fn focused_target(&self) -> Option<FocusTarget> {
+        self.page
+            .focus
+            .and_then(|position| self.page.order.get(position))
+            .copied()
+    }
+
+    fn focused_control(&self) -> Option<u16> {
+        match self.page.order.get(self.page.focus?)? {
+            FocusTarget::Control(control) => Some(*control),
+            FocusTarget::Link(_) => None,
+        }
     }
 
     // --- scrolling ----------------------------------------------------
 
     /// The document-space y of the top of the viewport.
     fn top_offset(&self) -> Option<u32> {
-        Some(self.page.layout.lines().get(self.page.first_line)?.y)
+        (!self.page.layout.lines().is_empty()).then_some(self.page.scroll_y)
     }
 
-    /// How many lines a page-sized jump moves.
-    ///
-    /// Measured from the current position rather than from an average line
-    /// height, because a page of headings and a page of prose hold very
-    /// different numbers of lines.
-    fn lines_per_screen(&self) -> i32 {
-        let Some(top) = self.top_offset() else {
-            return 1;
-        };
-        let range = self.page.layout.visible(top, VIEWPORT_HEIGHT as u32);
-        // One line of overlap, so the reader keeps their place across a
-        // page turn.
-        let lines = self.page.layout.lines();
-        let mut count = 0usize;
-        let mut previous = None;
-        for line in &lines[range] {
-            if previous != Some(line.y) {
-                count += 1;
-                previous = Some(line.y);
-            }
-        }
-        count.saturating_sub(1).max(1) as i32
+    /// A page turn leaves one normal body row as visual overlap.
+    fn page_step(&self) -> i32 {
+        (VIEWPORT_HEIGHT as i32 - SCROLL_STEP).max(SCROLL_STEP)
     }
 
-    fn scroll_by(&mut self, lines: i32) {
-        let all = self.page.layout.lines();
-        if all.is_empty() {
-            return;
-        }
-        let mut target = self.page.first_line.min(all.len() - 1);
-        if lines > 0 {
-            for _ in 0..lines {
-                let y = all[target].y;
-                target = all.partition_point(|line| line.y <= y).min(all.len() - 1);
-            }
+    fn scroll_by_pixels(&mut self, pixels: i32) {
+        let target = if pixels < 0 {
+            self.page.scroll_y.saturating_sub(pixels.unsigned_abs())
         } else {
-            for _ in 0..lines.unsigned_abs() {
-                let y = all[target].y;
-                let first = all.partition_point(|line| line.y < y);
-                if first == 0 {
-                    target = 0;
-                    break;
-                }
-                let previous_y = all[first - 1].y;
-                target = all.partition_point(|line| line.y < previous_y);
-            }
-        }
+            self.page.scroll_y.saturating_add(pixels as u32)
+        };
         self.scroll_to(target);
     }
 
-    fn scroll_to(&mut self, line: usize) {
-        let lines = self.page.layout.lines();
-        let line = line.min(self.last_top_line());
-        let line = lines
-            .get(line)
-            .map(|target| lines.partition_point(|candidate| candidate.y < target.y))
-            .unwrap_or(0);
-        if line != self.page.first_line {
-            self.page.first_line = line;
+    fn scroll_to(&mut self, y: u32) {
+        let y = y.min(self.max_scroll_y());
+        if y != self.page.scroll_y {
+            // The list is anchored to where its box was on screen.
+            self.select_popup = None;
+            self.page.scroll_y = y;
             self.dirty.viewport = true;
             self.dirty.toolbar = true;
         }
     }
 
-    /// The furthest the page can scroll: the topmost line that still leaves
-    /// the document's last line on screen.
-    ///
-    /// Computed by walking back from the end rather than by dividing the
-    /// height, because line heights vary.
-    fn last_top_line(&self) -> usize {
-        let lines = self.page.layout.lines();
-        let Some(last) = lines.last() else {
-            return 0;
-        };
-        let bottom = last.y + last.height as u32;
-        let mut index = lines.len() - 1;
-        while index > 0 {
-            let candidate = lines[index - 1];
-            if bottom.saturating_sub(candidate.y) > VIEWPORT_HEIGHT as u32 {
-                break;
+    fn install_decoded_image(
+        &mut self,
+        image: usize,
+        decoded: Rc<DecodedImage>,
+    ) -> Result<(), Error> {
+        let reading = self.page.layout.reading_position(self.page.scroll_y);
+        // A new layout can move the select box the open list belongs to.
+        self.select_popup = None;
+        let focused = self
+            .page
+            .focus
+            .and_then(|position| self.page.order.get(position))
+            .copied();
+        let previous = self
+            .page
+            .document
+            .images()
+            .get(image)
+            .map(|image| (image.intrinsic_width, image.intrinsic_height));
+        self.page
+            .document
+            .set_image_intrinsic(image, Some((decoded.width.max(1), decoded.height.max(1))));
+        let layout = match Layout::build(
+            &self.page.document,
+            PAGE_WIDTH as u16,
+            Metrics {
+                glyph_height: CELL_HEIGHT as u16,
+                line_gap_percent: crate::browser::layout::LINE_GAP_PERCENT,
+            },
+        ) {
+            Ok(layout) => layout,
+            Err(error) => {
+                if let Some((width, height)) = previous {
+                    self.page
+                        .document
+                        .set_image_intrinsic(image, width.zip(height));
+                }
+                return Err(error);
             }
-            index -= 1;
-        }
-        index
+        };
+        let order = focus_order(&self.page.document, &layout)?;
+        self.page.scroll_y = layout
+            .y_of_reading_position(reading)
+            .min(layout.height().saturating_sub(VIEWPORT_HEIGHT as u32));
+        self.page.layout = layout;
+        self.page.order = order;
+        self.page.focus =
+            focused.and_then(|target| self.page.order.iter().position(|item| *item == target));
+        self.page.decoded_images[image] = Some(decoded);
+        self.dirty.viewport = true;
+        Ok(())
+    }
+
+    fn max_scroll_y(&self) -> u32 {
+        self.page
+            .layout
+            .height()
+            .saturating_sub(VIEWPORT_HEIGHT as u32)
     }
 
     fn scroll_focus_into_view(&mut self) {
-        let Some(link) = self.focused_link() else {
-            return;
+        let target = match self.page.order.get(self.page.focus.unwrap_or(usize::MAX)) {
+            Some(FocusTarget::Link(link)) => {
+                let Some(line) = self.page.layout.line_of_link(*link) else {
+                    return;
+                };
+                let line = self.page.layout.lines()[line];
+                (line.y, line.height as u32)
+            }
+            Some(FocusTarget::Control(control)) => {
+                let Some(control) = self
+                    .page
+                    .layout
+                    .controls()
+                    .iter()
+                    .find(|item| item.control == *control)
+                else {
+                    return;
+                };
+                (control.y, control.height as u32)
+            }
+            None => return,
         };
-        let Some(line) = self.page.layout.line_of_link(link) else {
-            return;
-        };
-        if line < self.page.first_line {
-            self.scroll_to(line);
+        if target.0 < self.page.scroll_y {
+            self.scroll_to(target.0);
             return;
         }
-        let Some(top) = self.top_offset() else {
-            return;
-        };
-        let range = self.page.layout.visible(top, VIEWPORT_HEIGHT as u32);
-        // `visible` includes a line that only partly fits; a focused link
-        // on it would be invisible, so it counts as off screen.
-        if line + 1 >= range.end {
-            let target = line.saturating_sub(self.lines_per_screen().max(1) as usize - 1);
-            self.scroll_to(target.max(line.saturating_sub(4)));
+        let viewport_bottom = self.page.scroll_y.saturating_add(VIEWPORT_HEIGHT as u32);
+        let target_bottom = target.0.saturating_add(target.1);
+        if target_bottom > viewport_bottom {
+            self.scroll_to(target_bottom.saturating_sub(VIEWPORT_HEIGHT as u32));
         }
     }
 
@@ -1864,6 +4229,10 @@ impl Viewer {
         let gap_ok = framebuffer.flush_rect(0, TOOLBAR_HEIGHT, WIDTH, CONTENT_GAP);
         self.dirty = Dirty {
             toolbar: true,
+            address: AddressDamage::default(),
+            focus: [None; 4],
+            control: ControlDamage::default(),
+            popup: None,
             viewport: true,
             status: true,
         };
@@ -1892,6 +4261,15 @@ impl Viewer {
                 tab5_system_ui::APP.width,
                 TOOLBAR_HEIGHT,
             );
+        } else if dirty.address.is_dirty() {
+            for rect in dirty.address.rects {
+                if rect.width != 0 {
+                    let old_clip = framebuffer.set_horizontal_clip(rect.x, rect.x + rect.width);
+                    self.draw_address_area(framebuffer);
+                    framebuffer.set_horizontal_clip(old_clip.0, old_clip.1);
+                    ok &= framebuffer.flush_rect(rect.x, FIELD_TOP, rect.width, FIELD_HEIGHT);
+                }
+            }
         }
         if dirty.viewport {
             let started = tick::now_ms();
@@ -1904,6 +4282,23 @@ impl Viewer {
                     b"BROWSER: slowest viewport repaint so far, ms=",
                     elapsed as u32,
                 );
+            }
+        } else {
+            for target in dirty.focus.into_iter().flatten() {
+                ok &= self.draw_focus_damage(framebuffer, service, target);
+            }
+            if dirty.control.is_dirty() {
+                ok &= self.draw_control_damage(framebuffer, service, dirty.control);
+            }
+            if let Some(rect) = dirty.popup {
+                let old_horizontal =
+                    framebuffer.set_horizontal_clip(rect.x, rect.x.saturating_add(rect.width));
+                let old_vertical =
+                    framebuffer.set_vertical_clip(rect.y, rect.y.saturating_add(rect.height));
+                self.draw_viewport(framebuffer, service);
+                framebuffer.set_vertical_clip(old_vertical.0, old_vertical.1);
+                framebuffer.set_horizontal_clip(old_horizontal.0, old_horizontal.1);
+                ok &= framebuffer.flush_rect(rect.x, rect.y, rect.width, rect.height);
             }
         }
         if dirty.status {
@@ -1936,6 +4331,17 @@ impl Viewer {
         let (lock, color, _) = self.security_state();
         draw_lock(framebuffer, ICON_LEFT, lock, color);
 
+        self.draw_address_area(framebuffer);
+    }
+
+    fn draw_address_area(&self, framebuffer: &mut Framebuffer) {
+        framebuffer.fill_rect(
+            ADDRESS_LEFT.saturating_sub(4),
+            FIELD_TOP,
+            ADDRESS_RIGHT - ADDRESS_LEFT + 8,
+            FIELD_HEIGHT,
+            CHROME_BACKGROUND,
+        );
         match (&self.editing, &self.loading) {
             (Some(editing), _) => self.draw_address_field(framebuffer, editing),
             (None, Some(loading)) => draw_clipped(
@@ -1958,6 +4364,174 @@ impl Viewer {
                     );
                 }
             }
+        }
+    }
+
+    fn address_visual(&self) -> Option<AddressVisual> {
+        let editing = self.editing.as_ref()?;
+        let text_budget = CLEAR_LEFT.saturating_sub(8 + ADDRESS_LEFT);
+        let first = editing.visible_start(text_budget.saturating_sub(2), |text| {
+            crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
+        });
+        let measure_from_first = |at: usize| {
+            crate::font::ui_text_width(
+                &editing.text()[first..at.max(first)],
+                crate::font::UiTextStyle::BODY,
+            )
+            .min(text_budget)
+        };
+        let selection = editing.selection().and_then(|selection| {
+            let start = measure_from_first(selection.start);
+            let end = measure_from_first(selection.end);
+            (start < end).then_some((ADDRESS_LEFT + start, ADDRESS_LEFT + end))
+        });
+        Some(AddressVisual {
+            first,
+            caret_x: ADDRESS_LEFT + measure_from_first(editing.caret()),
+            selection,
+        })
+    }
+
+    fn damage_address_change(
+        &mut self,
+        before: Option<AddressVisual>,
+        after: Option<AddressVisual>,
+        changed_at: Option<usize>,
+    ) {
+        let (Some(before), Some(after)) = (before, after) else {
+            self.dirty.address.full();
+            return;
+        };
+        if before.first != after.first {
+            self.dirty.address.full();
+            return;
+        }
+        if let Some(changed_at) = changed_at {
+            if changed_at < after.first {
+                self.dirty.address.full();
+            } else {
+                let x = ADDRESS_LEFT
+                    + crate::font::ui_text_width(
+                        &self.editing.as_ref().unwrap().text()[after.first..changed_at],
+                        crate::font::UiTextStyle::BODY,
+                    );
+                self.dirty.address.add(x, ADDRESS_RIGHT.saturating_sub(x));
+            }
+            return;
+        }
+        self.dirty.address.add(before.caret_x, 2);
+        self.dirty.address.add(after.caret_x, 2);
+        if let Some((left, right)) = before.selection {
+            self.dirty.address.add(left, right - left);
+        }
+        if let Some((left, right)) = after.selection {
+            self.dirty.address.add(left, right - left);
+        }
+    }
+
+    fn form_text_bounds(&self, control: u16) -> Option<(usize, usize)> {
+        let item = self
+            .page
+            .layout
+            .controls()
+            .iter()
+            .find(|item| item.control == control)?;
+        let left = MARGIN + item.x as usize + 6;
+        Some((left, left + item.width.saturating_sub(12) as usize))
+    }
+
+    fn form_visual(&self) -> Option<AddressVisual> {
+        let editing = self.form_editing.as_ref()?;
+        let (left, right) = self.form_text_bounds(editing.control)?;
+        let budget = right.saturating_sub(left);
+        let first = editing
+            .input
+            .visible_start(budget.saturating_sub(2), |text| {
+                crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
+            });
+        let measure_from_first = |at: usize| {
+            crate::font::ui_text_width(
+                &editing.input.text()[first..at.max(first)],
+                crate::font::UiTextStyle::BODY,
+            )
+            .min(budget)
+        };
+        let selection = editing.input.selection().and_then(|selection| {
+            let start = measure_from_first(selection.start);
+            let end = measure_from_first(selection.end);
+            (start < end).then_some((left + start, left + end))
+        });
+        Some(AddressVisual {
+            first,
+            caret_x: left + measure_from_first(editing.input.caret()),
+            selection,
+        })
+    }
+
+    fn damage_form_change(
+        &mut self,
+        before: Option<AddressVisual>,
+        after: Option<AddressVisual>,
+        changed_at: Option<usize>,
+    ) {
+        let Some(control) = self.form_editing.as_ref().map(|editing| editing.control) else {
+            return;
+        };
+        let Some((left, right)) = self.form_text_bounds(control) else {
+            return;
+        };
+        let (Some(before), Some(after)) = (before, after) else {
+            self.dirty
+                .control
+                .add(control, left, right, left, right - left);
+            return;
+        };
+        if before.first != after.first {
+            self.dirty
+                .control
+                .add(control, left, right, left, right - left);
+            return;
+        }
+        if let Some(changed_at) = changed_at {
+            if changed_at < after.first {
+                self.dirty
+                    .control
+                    .add(control, left, right, left, right - left);
+            } else {
+                let x = left
+                    + crate::font::ui_text_width(
+                        &self.form_editing.as_ref().unwrap().input.text()[after.first..changed_at],
+                        crate::font::UiTextStyle::BODY,
+                    );
+                self.dirty
+                    .control
+                    .add(control, left, right, x, right.saturating_sub(x));
+            }
+            return;
+        }
+        self.dirty
+            .control
+            .add(control, left, right, before.caret_x, 2);
+        self.dirty
+            .control
+            .add(control, left, right, after.caret_x, 2);
+        if let Some((selection_left, selection_right)) = before.selection {
+            self.dirty.control.add(
+                control,
+                left,
+                right,
+                selection_left,
+                selection_right - selection_left,
+            );
+        }
+        if let Some((selection_left, selection_right)) = after.selection {
+            self.dirty.control.add(
+                control,
+                left,
+                right,
+                selection_left,
+                selection_right - selection_left,
+            );
         }
     }
 
@@ -2067,30 +4641,42 @@ impl Viewer {
             EDIT_BACKGROUND,
         );
         let text_budget = CLEAR_LEFT.saturating_sub(8 + ADDRESS_LEFT);
-        // Follow the caret by measured pixels. URL input is ASCII, so walking
-        // byte offsets is also walking character boundaries.
-        let mut first = editing.caret.min(editing.text.len());
-        while first > 0 {
-            let candidate = first - 1;
-            let width = crate::font::ui_text_width(
-                &editing.text[candidate..editing.caret],
-                crate::font::UiTextStyle::BODY,
-            );
-            if width + 2 > text_budget {
-                break;
+        let first = editing.visible_start(text_budget.saturating_sub(2), |text| {
+            crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
+        });
+        if let Some(selection) = editing.selection() {
+            let visible_start = selection.start.max(first);
+            let visible_end = selection.end.max(first);
+            if visible_start < visible_end {
+                let selection_x = crate::font::ui_text_width(
+                    &editing.text()[first..visible_start],
+                    crate::font::UiTextStyle::BODY,
+                )
+                .min(text_budget);
+                let selection_width = crate::font::ui_text_width(
+                    &editing.text()[visible_start..visible_end],
+                    crate::font::UiTextStyle::BODY,
+                )
+                .min(text_budget.saturating_sub(selection_x));
+                framebuffer.fill_rect(
+                    ADDRESS_LEFT + selection_x,
+                    CHROME_TEXT_Y,
+                    selection_width,
+                    CELL_HEIGHT * CHROME_SCALE,
+                    EDIT_SELECTION,
+                );
             }
-            first = candidate;
         }
         draw_clipped(
             framebuffer,
             ADDRESS_LEFT,
             CHROME_TEXT_Y,
-            &editing.text[first..],
+            &editing.text()[first..],
             text_budget,
             BLACK,
         );
         let caret_x = crate::font::ui_text_width(
-            &editing.text[first..editing.caret],
+            &editing.text()[first..editing.caret()],
             crate::font::UiTextStyle::BODY,
         );
         framebuffer.fill_rect(
@@ -2109,7 +4695,7 @@ impl Viewer {
         //
         // Grey rather than black when there is nothing to clear, so that
         // the button says whether it will do anything before it is pressed.
-        let color = if editing.text.is_empty() {
+        let color = if editing.text().is_empty() {
             DISABLED_COLOR
         } else {
             CHROME_TEXT
@@ -2128,6 +4714,10 @@ impl Viewer {
     fn draw_status(&self, framebuffer: &mut Framebuffer) {
         framebuffer.fill_rect(0, VIEWPORT_BOTTOM, WIDTH, STATUS_HEIGHT, CHROME_BACKGROUND);
         let budget = WIDTH - 2 * MARGIN;
+        if let Some(confirmation) = &self.confirm {
+            draw_confirmation(framebuffer, confirmation);
+            return;
+        }
         if let Some(loading) = &self.loading
             && self.message.is_none()
         {
@@ -2179,7 +4769,184 @@ impl Viewer {
                 budget,
                 CHROME_TEXT,
             );
+        } else if let Some(control) = self.focused_control()
+            && let Some(control) = self.page.document.controls().get(control as usize)
+        {
+            let checked = self
+                .page
+                .control_checked
+                .get(self.focused_control().unwrap_or(u16::MAX) as usize)
+                .copied()
+                .unwrap_or(false);
+            let text = match (control.kind, checked) {
+                (ControlKind::Text, _) => "text input",
+                (ControlKind::Textarea, _) => "textarea",
+                (ControlKind::Select, _) => "list; Enter or Space opens it",
+                (ControlKind::Submit, _) => "submit button",
+                (ControlKind::Checkbox, true) => "checkbox, checked; Space or Enter toggles",
+                (ControlKind::Checkbox, false) => "checkbox, not checked; Space or Enter toggles",
+                (ControlKind::Radio, true) => "radio button, selected",
+                (ControlKind::Radio, false) => "radio button, not selected; Space or Enter selects",
+                _ => "form control",
+            };
+            draw_clipped(
+                framebuffer,
+                MARGIN,
+                STATUS_TEXT_Y,
+                text,
+                budget,
+                CHROME_TEXT,
+            );
         }
+    }
+
+    fn viewport_damage(
+        &self,
+        x: usize,
+        document_y: u32,
+        width: usize,
+        height: u32,
+    ) -> Option<ViewportDamage> {
+        let document_bottom = document_y.saturating_add(height);
+        let viewport_bottom = self.page.scroll_y.saturating_add(VIEWPORT_HEIGHT as u32);
+        let visible_top = document_y.max(self.page.scroll_y);
+        let visible_bottom = document_bottom.min(viewport_bottom);
+        if visible_top >= visible_bottom {
+            return None;
+        }
+        let x = x.min(WIDTH);
+        let right = x.saturating_add(width).min(WIDTH);
+        (x < right).then_some(ViewportDamage {
+            x,
+            y: VIEWPORT_TOP + (visible_top - self.page.scroll_y) as usize,
+            width: right - x,
+            height: (visible_bottom - visible_top) as usize,
+        })
+    }
+
+    fn focus_damage_rects(&self, target: FocusTarget) -> Result<Vec<ViewportDamage>, Error> {
+        let mut rects = Vec::new();
+        match target {
+            FocusTarget::Control(control) => {
+                if let Some(item) = self
+                    .page
+                    .layout
+                    .controls()
+                    .iter()
+                    .find(|item| item.control == control)
+                    && let Some(rect) = self.viewport_damage(
+                        MARGIN + item.x as usize,
+                        item.y,
+                        item.width as usize,
+                        item.height as u32,
+                    )
+                {
+                    memory::push(&mut rects, rect)?;
+                }
+            }
+            FocusTarget::Link(link) => {
+                for line in self.page.layout.lines() {
+                    for piece in self.page.layout.pieces(line) {
+                        if piece.link == Some(link)
+                            && let Some(rect) = self.viewport_damage(
+                                MARGIN + line.x as usize + piece.x as usize,
+                                line.y,
+                                piece.width as usize
+                                    + italic_overhang(piece.style, line.scale as usize),
+                                line.height as u32,
+                            )
+                        {
+                            memory::push(&mut rects, rect)?;
+                        }
+                    }
+                }
+                for image in self.page.layout.images() {
+                    if image.link == Some(link)
+                        && let Some(rect) = self.viewport_damage(
+                            MARGIN + image.x as usize,
+                            image.y,
+                            image.width as usize,
+                            image.height as u32,
+                        )
+                    {
+                        memory::push(&mut rects, rect)?;
+                    }
+                }
+            }
+        }
+        Ok(rects)
+    }
+
+    /// Reuses the ordinary viewport renderer under a rectangle clip. This
+    /// preserves one source of truth for link/control appearance while
+    /// avoiding both the full background clear and the full writeback on a
+    /// focus move.
+    fn draw_focus_damage(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        service: &mut dyn FnMut(),
+        target: FocusTarget,
+    ) -> bool {
+        let Ok(rects) = self.focus_damage_rects(target) else {
+            let height = self.draw_viewport(framebuffer, service);
+            return flush_viewport(framebuffer, height, service);
+        };
+        let mut ok = true;
+        for rect in rects {
+            let old_horizontal =
+                framebuffer.set_horizontal_clip(rect.x, rect.x.saturating_add(rect.width));
+            let old_vertical =
+                framebuffer.set_vertical_clip(rect.y, rect.y.saturating_add(rect.height));
+            self.draw_viewport(framebuffer, service);
+            framebuffer.set_vertical_clip(old_vertical.0, old_vertical.1);
+            framebuffer.set_horizontal_clip(old_horizontal.0, old_horizontal.1);
+            ok &= framebuffer.flush_rect(rect.x, rect.y, rect.width, rect.height);
+        }
+        ok
+    }
+
+    fn draw_control_damage(
+        &mut self,
+        framebuffer: &mut Framebuffer,
+        service: &mut dyn FnMut(),
+        damage: ControlDamage,
+    ) -> bool {
+        let Some(control) = damage.control else {
+            return true;
+        };
+        let Some(item) = self
+            .page
+            .layout
+            .controls()
+            .iter()
+            .find(|item| item.control == control)
+            .copied()
+        else {
+            return true;
+        };
+        let Some(vertical) = self.viewport_damage(
+            MARGIN + item.x as usize,
+            item.y,
+            item.width as usize,
+            item.height as u32,
+        ) else {
+            return true;
+        };
+        let mut ok = true;
+        for rect in damage.rects {
+            if rect.width == 0 {
+                continue;
+            }
+            let old_horizontal =
+                framebuffer.set_horizontal_clip(rect.x, rect.x.saturating_add(rect.width));
+            let old_vertical = framebuffer
+                .set_vertical_clip(vertical.y, vertical.y.saturating_add(vertical.height));
+            self.draw_viewport(framebuffer, service);
+            framebuffer.set_vertical_clip(old_vertical.0, old_vertical.1);
+            framebuffer.set_horizontal_clip(old_horizontal.0, old_horizontal.1);
+            ok &= framebuffer.flush_rect(rect.x, vertical.y, rect.width, vertical.height);
+        }
+        ok
     }
 
     /// Repaints the whole viewport.
@@ -2194,6 +4961,15 @@ impl Viewer {
     /// Repaints the viewport and returns how many rows of it were touched,
     /// which is what has to be written back.
     fn draw_viewport(&mut self, framebuffer: &mut Framebuffer, service: &mut dyn FnMut()) -> usize {
+        // A focus-only repaint installs a smaller outer clip before calling
+        // this same renderer. Intersect it with the viewport instead of
+        // replacing it, so all paint (including the background erase) stays
+        // inside the changed object's rectangle.
+        let inherited_clip = framebuffer.set_vertical_clip(VIEWPORT_TOP, VIEWPORT_BOTTOM);
+        framebuffer.set_vertical_clip(
+            inherited_clip.0.max(VIEWPORT_TOP),
+            inherited_clip.1.min(VIEWPORT_BOTTOM),
+        );
         // Everything this repaint will draw, and everything the last one
         // left behind. Below that the viewport is already background and
         // clearing it again is a megabyte of PSRAM traffic for no change.
@@ -2205,6 +4981,7 @@ impl Viewer {
         // for; that wait is the single longest part of the repaint.
         service();
         let Some(top) = self.top_offset() else {
+            framebuffer.set_vertical_clip(inherited_clip.0, inherited_clip.1);
             return height;
         };
         // Table geometry is painted before its text.  Cell outlines rather
@@ -2261,25 +5038,579 @@ impl Viewer {
                 RULE_COLOR,
             );
         }
+        for control_box in self.page.layout.controls() {
+            let bottom = control_box.y.saturating_add(control_box.height as u32);
+            let viewport_bottom = top.saturating_add(VIEWPORT_HEIGHT as u32);
+            if bottom <= top || control_box.y >= viewport_bottom {
+                continue;
+            }
+            let Some(control) = self
+                .page
+                .document
+                .controls()
+                .get(control_box.control as usize)
+            else {
+                continue;
+            };
+            let screen_x = MARGIN + control_box.x as usize;
+            // Keep the control's original screen position when its top has
+            // scrolled above the viewport.  `saturating_sub` on document
+            // coordinates would instead pin the whole box to VIEWPORT_TOP,
+            // repainting the clipped-away portion over newer content.  A
+            // visible control can be above `top` by less than its own bounded
+            // height, so this subtraction remains within the chrome above
+            // the viewport; the active framebuffer clip then discards it.
+            let screen_y = if control_box.y >= top {
+                VIEWPORT_TOP + (control_box.y - top) as usize
+            } else {
+                VIEWPORT_TOP.saturating_sub((top - control_box.y) as usize)
+            };
+            if control.kind.is_checkable() {
+                let checked = self
+                    .page
+                    .control_checked
+                    .get(control_box.control as usize)
+                    .copied()
+                    .unwrap_or(control.checked);
+                let ink = if control.disabled {
+                    DISABLED_COLOR
+                } else {
+                    TEXT_COLOR
+                };
+                let extent = control_box.width.min(control_box.height) as usize;
+                let size = extent.saturating_sub(12);
+                let center_x = screen_x + control_box.width as usize / 2;
+                let center_y = screen_y + control_box.height as usize / 2;
+                let radius = size / 2;
+                if self.focused_control() == Some(control_box.control) {
+                    // Checkables do not use the line-box-sized control frame:
+                    // it reads as a second checkbox, and makes a radio look
+                    // square.  Keep the hit box unchanged, but put a two-pixel
+                    // focus halo around the actual symbol with a clear gap.
+                    let max_focus_radius = extent.saturating_sub(2) / 2;
+                    let mut previous_radius = radius;
+                    for desired_radius in [radius.saturating_add(3), radius.saturating_add(4)] {
+                        let focus_radius = desired_radius.min(max_focus_radius);
+                        if focus_radius <= previous_radius {
+                            continue;
+                        }
+                        previous_radius = focus_radius;
+                        if control.kind == ControlKind::Radio {
+                            framebuffer.draw_circle(center_x, center_y, focus_radius, LINK_COLOR);
+                        } else {
+                            framebuffer.stroke_rect(
+                                center_x.saturating_sub(focus_radius),
+                                center_y.saturating_sub(focus_radius),
+                                focus_radius.saturating_mul(2),
+                                focus_radius.saturating_mul(2),
+                                LINK_COLOR,
+                            );
+                        }
+                    }
+                }
+                if control.kind == ControlKind::Radio {
+                    framebuffer.draw_circle(center_x, center_y, radius, ink);
+                    if checked {
+                        framebuffer.fill_circle(center_x, center_y, size / 4, ink);
+                    }
+                } else {
+                    let left = center_x.saturating_sub(radius);
+                    let top = center_y.saturating_sub(radius);
+                    framebuffer.stroke_rect(left, top, size, size, ink);
+                    if checked {
+                        framebuffer.fill_rect(
+                            left + 3,
+                            top + 3,
+                            size.saturating_sub(6),
+                            size.saturating_sub(6),
+                            ink,
+                        );
+                    }
+                }
+                continue;
+            }
+            let face = if control.kind == ControlKind::Submit {
+                if self.focused_control() == Some(control_box.control) {
+                    LINK_COLOR
+                } else {
+                    CHROME_BACKGROUND
+                }
+            } else {
+                EDIT_BACKGROUND
+            };
+            framebuffer.fill_rect(
+                screen_x,
+                screen_y,
+                control_box.width as usize,
+                control_box.height as usize,
+                face,
+            );
+            framebuffer.stroke_rect(
+                screen_x,
+                screen_y,
+                control_box.width as usize,
+                control_box.height as usize,
+                if self.focused_control() == Some(control_box.control) {
+                    LINK_COLOR
+                } else if control.disabled {
+                    DISABLED_COLOR
+                } else {
+                    RULE_COLOR
+                },
+            );
+            let text_left = screen_x + 6;
+            let text_y = screen_y + 4;
+            let text_budget = control_box.width.saturating_sub(12) as usize;
+            if control.kind == ControlKind::Select {
+                let ink = if control.disabled {
+                    DISABLED_COLOR
+                } else {
+                    TEXT_COLOR
+                };
+                let first = control.first_option as usize;
+                let style = crate::font::UiTextStyle::BODY;
+                let end = text_left + text_budget.saturating_sub(18);
+                let mut cursor = text_left;
+                let mut any = false;
+                for (offset, option) in self
+                    .page
+                    .document
+                    .control_options(control)
+                    .iter()
+                    .enumerate()
+                {
+                    let selected = self
+                        .page
+                        .option_selected
+                        .get(first + offset)
+                        .copied()
+                        .unwrap_or(option.selected);
+                    if !selected || cursor >= end {
+                        continue;
+                    }
+                    if any {
+                        draw_clipped(framebuffer, cursor, text_y, ", ", end - cursor, ink);
+                        cursor += crate::font::ui_text_width(", ", style);
+                        if cursor >= end {
+                            continue;
+                        }
+                    }
+                    draw_clipped(
+                        framebuffer,
+                        cursor,
+                        text_y,
+                        &option.label,
+                        end - cursor,
+                        ink,
+                    );
+                    cursor += crate::font::ui_text_width(&option.label, style);
+                    any = true;
+                }
+                if !any {
+                    draw_clipped(
+                        framebuffer,
+                        text_left,
+                        text_y,
+                        "(none)",
+                        end - text_left,
+                        DISABLED_COLOR,
+                    );
+                }
+                let arrow_x = screen_x + control_box.width as usize - 18;
+                let arrow_y = text_y + 5;
+                for step in 0..5 {
+                    framebuffer.fill_rect(arrow_x + step, arrow_y + step, 10 - 2 * step, 1, ink);
+                }
+                continue;
+            }
+            if control.kind == ControlKind::Textarea {
+                let editing = self
+                    .form_editing
+                    .as_ref()
+                    .filter(|editing| editing.control == control_box.control);
+                let value = match editing {
+                    Some(editing) => editing.input.text(),
+                    None => self
+                        .page
+                        .control_values
+                        .get(control_box.control as usize)
+                        .map(String::as_str)
+                        .unwrap_or(&control.initial_value),
+                };
+                let visible = usize::from(control.rows.max(1));
+                draw_textarea(
+                    framebuffer,
+                    value,
+                    editing,
+                    visible,
+                    text_left,
+                    text_y,
+                    text_budget,
+                    (control_box.height as usize).saturating_sub(8) / visible,
+                    if control.disabled {
+                        DISABLED_COLOR
+                    } else {
+                        TEXT_COLOR
+                    },
+                );
+                continue;
+            }
+            if let Some(editing) = self
+                .form_editing
+                .as_ref()
+                .filter(|editing| editing.control == control_box.control)
+            {
+                let first = editing
+                    .input
+                    .visible_start(text_budget.saturating_sub(2), |text| {
+                        crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
+                    });
+                if let Some(selection) = editing.input.selection() {
+                    let visible_start = selection.start.max(first);
+                    let visible_end = selection.end.max(first);
+                    if visible_start < visible_end {
+                        let selection_x = crate::font::ui_text_width(
+                            &editing.input.text()[first..visible_start],
+                            crate::font::UiTextStyle::BODY,
+                        )
+                        .min(text_budget);
+                        let selection_width = crate::font::ui_text_width(
+                            &editing.input.text()[visible_start..visible_end],
+                            crate::font::UiTextStyle::BODY,
+                        )
+                        .min(text_budget.saturating_sub(selection_x));
+                        framebuffer.fill_rect(
+                            text_left + selection_x,
+                            text_y,
+                            selection_width,
+                            CELL_HEIGHT,
+                            EDIT_SELECTION,
+                        );
+                    }
+                }
+                draw_clipped(
+                    framebuffer,
+                    text_left,
+                    text_y,
+                    &editing.input.text()[first..],
+                    text_budget,
+                    TEXT_COLOR,
+                );
+                let caret_x = crate::font::ui_text_width(
+                    &editing.input.text()[first..editing.input.caret()],
+                    crate::font::UiTextStyle::BODY,
+                );
+                framebuffer.fill_rect(text_left + caret_x, text_y, 2, CELL_HEIGHT, EDIT_CARET);
+            } else {
+                let value = self
+                    .page
+                    .control_values
+                    .get(control_box.control as usize)
+                    .map(String::as_str)
+                    .unwrap_or(&control.initial_value);
+                if control.kind == ControlKind::Submit && control.button_run_count != 0 {
+                    let focused = self.focused_control() == Some(control_box.control);
+                    let right = text_left.saturating_add(text_budget);
+                    let old_clip = framebuffer.set_horizontal_clip(text_left, right);
+                    let button_images: Vec<_> = self
+                        .page
+                        .document
+                        .images()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, image)| image.button == Some(control_box.control))
+                        .collect();
+                    let mut x = text_left;
+                    for run in self.page.document.button_runs(control) {
+                        let mut cursor = run.start as usize;
+                        for (image_index, image) in &button_images {
+                            let offset = image.text_offset as usize;
+                            if offset < cursor || offset >= run.end as usize {
+                                continue;
+                            }
+                            if let Some(text) = control.display_label.get(cursor..offset) {
+                                let ink = if focused {
+                                    WHITE
+                                } else if control.disabled {
+                                    DISABLED_COLOR
+                                } else {
+                                    piece_color(run.style, false)
+                                };
+                                draw_text_run(
+                                    framebuffer,
+                                    x,
+                                    text_y,
+                                    text,
+                                    1,
+                                    ink,
+                                    run.style & STYLE_BOLD != 0,
+                                    run.style & STYLE_CODE != 0,
+                                    run.style & STYLE_ITALIC != 0,
+                                );
+                                x = x.saturating_add(crate::font::ui_text_width(
+                                    text,
+                                    crate::font::UiTextStyle::new(
+                                        if run.style & STYLE_CODE != 0 {
+                                            crate::font::UiFace::Mono
+                                        } else {
+                                            crate::font::UiFace::Sans
+                                        },
+                                        16,
+                                    ),
+                                ));
+                            }
+                            if let Some(box_) = self
+                                .page
+                                .layout
+                                .images()
+                                .iter()
+                                .find(|box_| box_.image as usize == *image_index)
+                            {
+                                x = x.saturating_add(box_.width as usize);
+                            }
+                            cursor = offset;
+                        }
+                        if let Some(text) = control.display_label.get(cursor..run.end as usize) {
+                            let ink = if focused {
+                                WHITE
+                            } else if control.disabled {
+                                DISABLED_COLOR
+                            } else {
+                                piece_color(run.style, false)
+                            };
+                            draw_text_run(
+                                framebuffer,
+                                x,
+                                text_y,
+                                text,
+                                1,
+                                ink,
+                                run.style & STYLE_BOLD != 0,
+                                run.style & STYLE_CODE != 0,
+                                run.style & STYLE_ITALIC != 0,
+                            );
+                            x = x.saturating_add(crate::font::ui_text_width(
+                                text,
+                                crate::font::UiTextStyle::new(
+                                    if run.style & STYLE_CODE != 0 {
+                                        crate::font::UiFace::Mono
+                                    } else {
+                                        crate::font::UiFace::Sans
+                                    },
+                                    16,
+                                ),
+                            ));
+                        }
+                    }
+                    framebuffer.set_horizontal_clip(old_clip.0, old_clip.1);
+                    continue;
+                }
+                let shown = if control.kind == ControlKind::Submit && control.button_element {
+                    control.display_label.as_str()
+                } else if control.kind == ControlKind::Submit && !control.display_label.is_empty() {
+                    control.display_label.as_str()
+                } else if control.kind == ControlKind::Submit && value.is_empty() {
+                    "Submit"
+                } else {
+                    value
+                };
+                draw_clipped(
+                    framebuffer,
+                    text_left,
+                    text_y,
+                    shown,
+                    text_budget,
+                    if self.focused_control() == Some(control_box.control)
+                        && control.kind == ControlKind::Submit
+                    {
+                        WHITE
+                    } else if control.disabled {
+                        DISABLED_COLOR
+                    } else {
+                        TEXT_COLOR
+                    },
+                );
+            }
+        }
         let focused = self.focused_link();
-        for (drawn, line) in self.page.layout.lines()[self.page.first_line..]
-            .iter()
-            .enumerate()
-        {
+        for image_box in self.page.layout.images() {
+            let bottom = image_box.y.saturating_add(image_box.height as u32);
+            let viewport_bottom = top.saturating_add(VIEWPORT_HEIGHT as u32);
+            if bottom <= top || image_box.y >= viewport_bottom {
+                continue;
+            }
+            let screen_x = MARGIN + image_box.x as usize;
+            let visible_top = image_box.y.max(top);
+            let screen_y = VIEWPORT_TOP + (visible_top - top) as usize;
+            let visible_height = bottom.min(viewport_bottom) - visible_top;
+            let selected = image_box.link.is_some() && image_box.link == focused;
+            let in_button = image_box.button.is_some();
+            let background = if selected {
+                LINK_COLOR
+            } else {
+                CHROME_BACKGROUND
+            };
+            let foreground = if selected
+                || image_box
+                    .button
+                    .is_some_and(|control| self.focused_control() == Some(control))
+            {
+                WHITE
+            } else {
+                TEXT_COLOR
+            };
+            if !in_button {
+                framebuffer.fill_rect(
+                    screen_x,
+                    screen_y,
+                    image_box.width as usize,
+                    visible_height as usize,
+                    background,
+                );
+            }
+            let decoded = self
+                .page
+                .decoded_images
+                .get(image_box.image as usize)
+                .and_then(Option::as_ref);
+            if let Some(decoded) = decoded {
+                framebuffer.blit_rgb565_scaled(
+                    screen_x,
+                    screen_y,
+                    decoded.width as usize,
+                    decoded.height as usize,
+                    image_box.width as usize,
+                    image_box.height as usize,
+                    &decoded.pixels,
+                    (visible_top - image_box.y) as usize,
+                );
+            }
+            if !in_button && image_box.y >= top {
+                framebuffer.stroke_rect(
+                    screen_x,
+                    screen_y,
+                    image_box.width as usize,
+                    image_box.height as usize,
+                    if image_box.link.is_some() {
+                        LINK_COLOR
+                    } else {
+                        RULE_COLOR
+                    },
+                );
+            }
+            let alt = self.page.image_failures[image_box.image as usize].unwrap_or_else(|| {
+                self.page
+                    .document
+                    .images()
+                    .get(image_box.image as usize)
+                    .map(|image| image.alt.as_str())
+                    .filter(|alt| !alt.is_empty())
+                    .unwrap_or("image pending")
+            });
+            if decoded.is_none() && image_box.y >= top {
+                framebuffer.draw_gui_text_clipped(
+                    screen_x.saturating_add(4),
+                    screen_y.saturating_add(4),
+                    alt,
+                    image_box.width.saturating_sub(8) as usize,
+                    1,
+                    foreground,
+                    None,
+                );
+            }
+        }
+        let visible = self.page.layout.visible(top, VIEWPORT_HEIGHT as u32);
+        for (drawn, line) in self.page.layout.lines()[visible].iter().enumerate() {
             if drawn % LINES_PER_SERVICE == 0 && drawn > 0 {
                 service();
             }
-            let offset = (line.y - top) as usize;
-            // A line that does not fit entirely is not drawn: there is no
-            // vertical clipping in the glyph renderer, and half a line of
-            // text spilling into the status bar would be worse than a
-            // margin at the bottom.
-            if offset + line.height as usize > VIEWPORT_HEIGHT {
-                break;
-            }
-            self.draw_line(framebuffer, line, VIEWPORT_TOP + offset, focused);
+            let screen_y = (VIEWPORT_TOP as i64 + line.y as i64 - top as i64) as usize;
+            self.draw_line(framebuffer, line, screen_y, focused);
         }
+        let popup_bottom = self.draw_select_popup(framebuffer, top);
+        // A list reaching below the page's last line must still be erased
+        // by the repaint that closes it.
+        self.painted_bottom = self.painted_bottom.max(popup_bottom);
+        framebuffer.set_vertical_clip(inherited_clip.0, inherited_clip.1);
         height
+    }
+
+    /// Draws the open select list on top of the page. Returns its screen
+    /// bottom, or zero when none is open.
+    fn draw_select_popup(&self, framebuffer: &mut Framebuffer, top: u32) -> usize {
+        let Some(popup) = &self.select_popup else {
+            return 0;
+        };
+        let Some(control) = self.page.document.controls().get(popup.control as usize) else {
+            return 0;
+        };
+        let options = self.page.document.control_options(control);
+        let first = control.first_option as usize;
+        let width = popup.width as usize;
+        let height = popup_height(popup.rows);
+        let screen_x = MARGIN + popup.x as usize;
+        let screen_y = if popup.y >= top {
+            VIEWPORT_TOP + (popup.y - top) as usize
+        } else {
+            VIEWPORT_TOP.saturating_sub((top - popup.y) as usize)
+        };
+        framebuffer.fill_rect(screen_x, screen_y, width, height, EDIT_BACKGROUND);
+        framebuffer.stroke_rect(screen_x, screen_y, width, height, LINK_COLOR);
+        for row in 0..popup.rows {
+            let index = popup.top + row;
+            let Some(option) = options.get(index) else {
+                break;
+            };
+            let y = screen_y + 1 + row * POPUP_ROW_HEIGHT;
+            let highlighted = index == popup.highlight;
+            if highlighted {
+                framebuffer.fill_rect(
+                    screen_x + 1,
+                    y,
+                    width.saturating_sub(2),
+                    POPUP_ROW_HEIGHT,
+                    LINK_COLOR,
+                );
+            }
+            let ink = if highlighted {
+                WHITE
+            } else if option.disabled {
+                DISABLED_COLOR
+            } else {
+                TEXT_COLOR
+            };
+            let selected = self
+                .page
+                .option_selected
+                .get(first + index)
+                .copied()
+                .unwrap_or(option.selected);
+            let mark_x = screen_x + 8;
+            let mark_y = y + (POPUP_ROW_HEIGHT - 10) / 2;
+            if control.multiple {
+                framebuffer.stroke_rect(mark_x, mark_y, 10, 10, ink);
+                if selected {
+                    framebuffer.fill_rect(mark_x + 2, mark_y + 2, 6, 6, ink);
+                }
+            } else if selected {
+                framebuffer.fill_circle(mark_x + 5, mark_y + 5, 4, ink);
+            }
+            draw_clipped(
+                framebuffer,
+                screen_x + 26,
+                y + 4,
+                &option.label,
+                width.saturating_sub(40),
+                ink,
+            );
+        }
+        if options.len() > popup.rows {
+            let track = height.saturating_sub(2);
+            let thumb_y = screen_y + 1 + popup.top * track / options.len();
+            let thumb = (popup.rows * track / options.len()).max(4);
+            framebuffer.fill_rect(screen_x + width - 6, thumb_y, 4, thumb, RULE_COLOR);
+        }
+        screen_y + height
     }
 
     /// The screen y just past the last line this page will draw.
@@ -2291,15 +5622,13 @@ impl Viewer {
         let Some(top) = self.top_offset() else {
             return VIEWPORT_TOP;
         };
-        let mut bottom = VIEWPORT_TOP;
-        for line in &self.page.layout.lines()[self.page.first_line..] {
-            let offset = (line.y - top) as usize;
-            if offset + line.height as usize > VIEWPORT_HEIGHT {
-                break;
-            }
-            bottom = VIEWPORT_TOP + offset + line.height as usize;
-        }
-        bottom
+        VIEWPORT_TOP
+            + self
+                .page
+                .layout
+                .height()
+                .saturating_sub(top)
+                .min(VIEWPORT_HEIGHT as u32) as usize
     }
 
     fn draw_line(
@@ -2334,13 +5663,9 @@ impl Viewer {
             let is_link = piece.link.is_some();
             let is_focused = is_link && piece.link == focused;
             let color = if is_focused {
-                framebuffer.fill_rect(
-                    x,
-                    screen_y,
-                    piece.width as usize,
-                    line.height as usize,
-                    LINK_COLOR,
-                );
+                let focus_width =
+                    piece.width as usize + italic_overhang(piece.style, line.scale as usize);
+                framebuffer.fill_rect(x, screen_y, focus_width, line.height as usize, LINK_COLOR);
                 WHITE
             } else {
                 piece_color(piece.style, is_link)
@@ -2354,6 +5679,7 @@ impl Viewer {
                 color,
                 line.heading || piece.style & STYLE_BOLD != 0,
                 piece.mono,
+                piece.style & STYLE_ITALIC != 0,
             );
             if is_link && !is_focused {
                 // Underlined as well as coloured: colour alone is not an
@@ -2498,16 +5824,20 @@ fn piece_color(style: u8, is_link: bool) -> u16 {
         return LINK_COLOR;
     }
     // Checked in order of how much the distinction matters when several
-    // apply at once: code is a different kind of text and italic is
-    // emphasis. Bold is not here at all -- it keeps the plain text colour
-    // and is drawn heavier instead, see `draw_text_run`.
+    // apply at once: code is a different kind of text. Bold and italic are
+    // shape changes handled by `draw_text_run`.
     if style & STYLE_CODE != 0 {
         CODE_COLOR
-    } else if style & STYLE_ITALIC != 0 {
-        ITALIC_COLOR
     } else {
         TEXT_COLOR
     }
+}
+
+fn italic_overhang(style: u8, scale: usize) -> usize {
+    if style & STYLE_ITALIC == 0 {
+        return 0;
+    }
+    tab5_ui_font::oblique_overhang(CELL_HEIGHT.saturating_mul(scale))
 }
 
 /// Draws one run of page text.
@@ -2526,6 +5856,7 @@ fn draw_text_run(
     color: u16,
     bold: bool,
     mono: bool,
+    italic: bool,
 ) {
     let face = if mono {
         crate::font::UiFace::Mono
@@ -2533,14 +5864,21 @@ fn draw_text_run(
         crate::font::UiFace::Sans
     };
     let style = crate::font::UiTextStyle::new(face, if scale >= 2 { 32 } else { 16 });
-    framebuffer.draw_ui_text(x, y, text, style, color, None);
+    let draw = |framebuffer: &mut Framebuffer, x| {
+        if italic {
+            framebuffer.draw_ui_text_oblique(x, y, text, style, color, None);
+        } else {
+            framebuffer.draw_ui_text(x, y, text, style, color, None);
+        }
+    };
+    draw(framebuffer, x);
     if bold {
         // Struck twice, one pixel apart. The font has one weight, so bold
         // has to be synthesised or dropped -- and dropping it means `<b>`
         // renders as nothing at all. One physical pixel rather than one
         // glyph pixel (`scale`): at scale 2 a full-cell offset would smear
         // into the next column.
-        framebuffer.draw_ui_text(x + 1, y, text, style, color, None);
+        draw(framebuffer, x + 1);
     }
 }
 
@@ -2589,6 +5927,106 @@ fn draw_clipped(
     }
 }
 
+/// A textarea's text: wrapped rows from the edit's scroll position, with the
+/// selection and caret when it is being edited.
+#[allow(clippy::too_many_arguments)]
+fn draw_textarea(
+    framebuffer: &mut Framebuffer,
+    text: &str,
+    editing: Option<&FormEditing>,
+    visible: usize,
+    left: usize,
+    top: usize,
+    budget: usize,
+    row_height: usize,
+    ink: u16,
+) {
+    let measure = |text: &str| crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY);
+    let Ok(rows) = text_input::wrap_rows(text, budget.saturating_sub(2), measure) else {
+        return;
+    };
+    let first = editing.map_or(0, |editing| {
+        editing.top_row.min(rows.len().saturating_sub(1))
+    });
+    let caret = editing.map(|editing| editing.input.caret());
+    let caret_row = caret.map(|caret| text_input::row_of(&rows, caret));
+    let selection = editing.and_then(|editing| editing.input.selection());
+    for (index, row) in rows.iter().enumerate().skip(first).take(visible) {
+        let y = top + (index - first) * row_height;
+        if let Some(selection) = &selection {
+            let start = selection.start.clamp(row.start, row.end);
+            let end = selection.end.clamp(row.start, row.end);
+            if start < end {
+                let x = measure(&text[row.start..start]).min(budget);
+                let width = measure(&text[start..end]).min(budget - x);
+                framebuffer.fill_rect(left + x, y, width, CELL_HEIGHT, EDIT_SELECTION);
+            }
+        }
+        draw_clipped(framebuffer, left, y, &text[row.clone()], budget, ink);
+        if let (Some(caret), Some(caret_row)) = (caret, caret_row)
+            && caret_row == index
+        {
+            let x = measure(&text[row.start..caret.clamp(row.start, row.end)]).min(budget);
+            framebuffer.fill_rect(left + x, y, 2, CELL_HEIGHT, EDIT_CARET);
+        }
+    }
+}
+
+/// The resend question and its two buttons, across the status line.
+fn draw_confirmation(framebuffer: &mut Framebuffer, confirmation: &Confirmation) {
+    let url = &confirmation.submission.request.url;
+    let mut text = Summary::new();
+    text.push(match confirmation.reason {
+        ConfirmReason::Resend => "Resend POST to ",
+        ConfirmReason::Unknown => "POST result unknown. Resend to ",
+        ConfirmReason::NotSent => "POST was not sent. Send to ",
+        ConfirmReason::Redirect => "Server redirects the POST body to ",
+    });
+    text.push(url.scheme().as_str());
+    text.push("://");
+    text.push(url.host());
+    if !url.has_default_port() {
+        text.push(":");
+        text.push_usize(url.port() as usize);
+    }
+    text.push("?");
+    draw_clipped(
+        framebuffer,
+        MARGIN,
+        STATUS_TEXT_Y,
+        text.as_str(),
+        CONFIRM_SEND_LEFT - 8 - MARGIN,
+        MESSAGE_COLOR,
+    );
+    let style = crate::font::UiTextStyle::BODY;
+    for (left, label, face, ink) in [
+        (
+            CONFIRM_SEND_LEFT,
+            "Send (y)",
+            theme::ACCENT,
+            theme::ON_ACCENT,
+        ),
+        (CONFIRM_CANCEL_LEFT, "Cancel (n)", WHITE, CHROME_TEXT),
+    ] {
+        framebuffer.fill_rect(
+            left,
+            VIEWPORT_BOTTOM + 3,
+            CONFIRM_BUTTON_WIDTH,
+            STATUS_HEIGHT - 6,
+            face,
+        );
+        let width = crate::font::ui_text_width(label, style);
+        framebuffer.draw_ui_text(
+            left + CONFIRM_BUTTON_WIDTH.saturating_sub(width) / 2,
+            STATUS_TEXT_Y,
+            label,
+            style,
+            ink,
+            None,
+        );
+    }
+}
+
 /// Builds a page from a finished document.
 fn build_page(document: Document) -> Result<Page, Error> {
     let layout = Layout::build(
@@ -2599,28 +6037,141 @@ fn build_page(document: Document) -> Result<Page, Error> {
             line_gap_percent: crate::browser::layout::LINE_GAP_PERCENT,
         },
     )?;
-    let order = layout.link_order()?;
+    let order = focus_order(&document, &layout)?;
     let visit_url = document.url().clone();
+    let decoded_images = core::iter::repeat_with(|| None)
+        .take(document.images().len())
+        .collect();
+    let image_failures = core::iter::repeat_n(None, document.images().len()).collect();
+    let mut control_values = Vec::new();
+    for control in document.controls() {
+        memory::push(
+            &mut control_values,
+            memory::string_from(&control.initial_value)?,
+        )?;
+    }
+    let mut control_checked = Vec::new();
+    for control in document.controls() {
+        memory::push(&mut control_checked, control.checked)?;
+    }
+    let mut option_selected = Vec::new();
+    for option in document.options() {
+        memory::push(&mut option_selected, option.selected)?;
+    }
     Ok(Page {
         document,
         visit_url,
+        request_method: RequestMethod::Get,
         security: None,
         error: false,
         layout,
-        first_line: 0,
+        scroll_y: 0,
         // Nothing is focused until the reader asks: an automatically
         // focused first link looks like something is already selected, and
         // `Enter` would then follow a link nobody chose.
         focus: None,
         order,
+        decoded_images,
+        image_failures,
+        control_values,
+        control_checked,
+        option_selected,
+        post: None,
     })
+}
+
+/// Interleaves links and enabled visible controls by their laid-out
+/// position.  IDs remain owned by Document/Layout; this is only the small
+/// navigation list that Tab walks.
+fn focus_order(document: &Document, layout: &Layout) -> Result<Vec<FocusTarget>, Error> {
+    let mut positioned: Vec<(u32, u16, usize, FocusTarget)> = Vec::new();
+    for (sequence, link) in layout.link_order()?.into_iter().enumerate() {
+        let (mut y, x) = layout.position_of_link(link).unwrap_or((0, 0));
+        if let Some(line) = layout
+            .line_of_link(link)
+            .and_then(|line| layout.lines().get(line))
+        {
+            for control in layout.controls() {
+                if control.y < line.y.saturating_add(line.height as u32)
+                    && control.y.saturating_add(control.height as u32) > line.y
+                {
+                    y = y.min(control.y);
+                }
+            }
+        }
+        memory::push(&mut positioned, (y, x, sequence, FocusTarget::Link(link)))?;
+    }
+    let link_count = positioned.len();
+    for control_box in layout.controls() {
+        let Some(control) = document.controls().get(control_box.control as usize) else {
+            continue;
+        };
+        if control.disabled
+            || !matches!(
+                control.kind,
+                ControlKind::Text
+                    | ControlKind::Textarea
+                    | ControlKind::Select
+                    | ControlKind::Submit
+                    | ControlKind::Checkbox
+                    | ControlKind::Radio
+            )
+        {
+            continue;
+        }
+        memory::push(
+            &mut positioned,
+            (
+                control_box.y,
+                control_box.x,
+                link_count + control_box.control as usize,
+                FocusTarget::Control(control_box.control),
+            ),
+        )?;
+    }
+    positioned.sort_unstable_by_key(|item| (item.0, item.1, item.2));
+    let mut order = Vec::new();
+    for (_, _, _, target) in positioned {
+        memory::push(&mut order, target)?;
+    }
+    Ok(order)
 }
 
 fn load_builtin(page: &builtin::Page) -> Result<Page, Error> {
     let url = Url::parse(page.url)?;
     let mut parser = Parser::new(url)?;
     page.write(&mut parser)?;
-    build_page(parser.finish()?)
+    let mut loaded = build_page(parser.finish()?)?;
+    // Built-in pages are `const` references and may be promoted at distinct
+    // addresses at different use sites, so identity must be their stable URL.
+    if page.url == builtin::IMAGES.url {
+        let decoded = decode_builtin_png().map(Rc::new);
+        for slot in &mut loaded.decoded_images {
+            *slot = decoded.clone();
+        }
+    }
+    Ok(loaded)
+}
+
+fn decode_builtin_png() -> Option<DecodedImage> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&png_chunk_crc(kind, data).to_be_bytes());
+    };
+    chunk(b"IHDR", &[0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
+    chunk(
+        b"IDAT",
+        &[
+            0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x0c, 0x81, 0x34, 0x08, 0x30, 0x00,
+            0x00, 0x48, 0xc9, 0x08, 0xf8,
+        ],
+    );
+    chunk(b"IEND", &[]);
+    decode(&bytes).ok()
 }
 
 /// The viewer's own page for a failure.
@@ -2760,6 +6311,7 @@ mod builtin {
         LongDocument,
         WideLine,
         FragmentDocument,
+        TableDocument,
     }
 
     impl Page {
@@ -2779,6 +6331,7 @@ mod builtin {
                 Body::LongDocument => write_long(parser),
                 Body::WideLine => write_wide(parser),
                 Body::FragmentDocument => write_fragments(parser),
+                Body::TableDocument => write_table(parser),
             }
         }
     }
@@ -2821,6 +6374,46 @@ mod builtin {
         Ok(())
     }
 
+    fn write_table(parser: &mut Parser) -> Result<(), Error> {
+        parser.feed(
+            b"<title>table acceptance</title><h1>Table acceptance</h1>\
+              <p>This page is deliberately taller than the viewport. Scroll through the table and check partially visible text, backgrounds, rules, and links at both edges.</p>\
+              <table border='1'><caption>Browser table fixture (border=1)</caption>\
+              <thead><tr><th>Row</th><th>ASCII / Japanese</th><th>Long value</th></tr></thead><tbody>",
+        )?;
+        for row in 1..=18 {
+            parser.feed(b"<tr><td>")?;
+            feed_decimal(parser, row)?;
+            parser.feed(b"</td><td>scroll checkpoint ")?;
+            parser.feed("日本語".as_bytes())?;
+            parser.feed(b"</td><td>This deliberately long cell wraps inside its column so that each table row has enough height for pixel clipping.</td></tr>")?;
+        }
+        parser.feed(
+            b"<tr><th rowspan='2'>rowspan header</th><td colspan='2'>A colspan cell with a <a href='/'>link back home</a>.</td></tr>\
+              <tr><td>left after rowspan</td><td>right after rowspan</td></tr>\
+              <tr><td></td><td colspan='2' rowspan='2'>Both spans: this text wraps while occupying two columns and two rows.</td></tr>\
+              <tr><td>empty-neighbour</td></tr>\
+              <tr><td rowspan='0'>zero means one</td><td colspan='oops'>invalid means one</td><td>omitted end tags\
+              </tbody></table>\
+              <h2>No border, many narrow columns</h2><table border='0'><tr><th>A</th><th>B</th><th>C</th><th>D</th><th>E</th><th>F</th><th>G</th><th>H</th></tr>\
+              <tr><td>alpha wraps</td><td>bravo wraps</td><td>Japanese</td><td>delta</td><td>echo echo</td><td>foxtrot</td><td>golf</td><td>hotel</td></tr></table>\
+              <p><a href='/'>Home</a></p>",
+        )
+    }
+
+    fn feed_decimal(parser: &mut Parser, mut value: usize) -> Result<(), Error> {
+        let mut digits = [0u8; 20];
+        let mut position = digits.len();
+        loop {
+            position -= 1;
+            digits[position] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                return parser.feed(&digits[position..]);
+            }
+        }
+    }
+
     fn write_fragments(parser: &mut Parser) -> Result<(), Error> {
         parser.feed(
             b"<title>fragment navigation</title><h1 id='top-heading'>Fragment navigation</h1>\
@@ -2851,7 +6444,8 @@ mod builtin {
              <p>This is a hypertext viewer, not a web browser. It fetches HTML \
              and plain text over HTTP or HTTPS, reads files off this device with \
              <code>file:</code>, and shows the text and the links in it. There \
-             is no CSS, no JavaScript and no images, and an HTTPS connection \
+             is no CSS, no JavaScript and no image download or decoding; img \
+             elements reserve an outlined region, and an HTTPS connection \
              proves who answered only where a pin matches -- the padlock at \
              the top says which, and says it in words if you tap it.</p>\
              <h2>Driving it</h2>\
@@ -2869,7 +6463,7 @@ mod builtin {
              forward again, and <b>r</b> fetches this page again -- the three \
              buttons at the top left do the same, and the third one stops a \
              page that is still arriving</li>\
-             <li><b>Up</b> and <b>Down</b> scroll a line, <b>Page Up</b> and \
+             <li><b>Up</b> and <b>Down</b> scroll 20 pixels, <b>Page Up</b> and \
              <b>Page Down</b> a screen, <b>Home</b> and <b>End</b> the whole \
              document</li>\
              <li><b>Space</b> is another Page Down</li>\
@@ -2892,7 +6486,9 @@ mod builtin {
              <li><a href=\"/long\">A long document, for scrolling</a></li>\
              <li><a href=\"/wide\">One line as long as a URL may be</a></li>\
              <li><a href=\"/japanese\">Japanese text, mixed widths</a></li>\
+             <li><a href=\"/italic\">Italic acceptance: headings and hollow boxes</a></li>\
              <li><a href=\"/table\">Table layout acceptance page</a></li>\
+             <li><a href=\"/images\">Image layout acceptance page</a></li>\
              <li><a href=\"/fragments\">Fragment navigation acceptance</a></li>\
              <li><a href=\"/empty\">A document with nothing in it</a></li>\
              </ul>\
@@ -2947,8 +6543,9 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
              <p>Non-ASCII is drawn from the same font: \u{65e5}\u{672c}\u{8a9e}. \
              Only what the subset leaves out becomes a box -- see the \
              <a href=\"/japanese\">Japanese page</a>.</p>\
-             <p>An image is its alt text: <img src=\"x.png\" alt=\"a red \
-             square\"> and one without: <img src=\"y.png\">.</p>\
+             <p>Images currently reserve outlined regions rather than being \
+             downloaded: <img src=\"x.png\" alt=\"a red square\"> and one \
+             without alt text: <img src=\"y.png\">.</p>\
              <p><a href=\"https://example.invalid/\">An https link</a> is \
              recognised and refused rather than downgraded.</p>\
              <p><a href=\"/\">Home</a></p>",
@@ -3014,6 +6611,55 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
         ),
     };
 
+    /// Synthetic italic next to upright text, for the paths the oblique
+    /// painter takes: A4 Latin and Japanese at body and heading size, and
+    /// the fixed-cell hollow boxes drawn for characters no font covers.
+    ///
+    /// The boxes are sheared band by band under a narrowed vertical clip, so
+    /// they are shown at both 16 and 32 pixels, beside A4 glyphs whose slant
+    /// they must match, and at the start of a run where a lone combining
+    /// mark becomes a box too.
+    pub const ITALIC: &Page = &Page {
+        url: "http://built-in/italic",
+        body: Body::Fixed(
+            "<title>italic acceptance</title>\
+             <h1>Upright H|l <em>Italic H|l</em></h1>\
+             <h1>Box <em>\u{1F600}\u{20BB7}\u{FDFD}</em> end</h1>\
+             <h1><em>A\u{1F600}B</em> <em>\u{65E5}\u{20BB7}\u{672C}</em></h1>\
+             <h2>\u{65E5}\u{672C}\u{8A9E} <em>\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{659C}\u{4F53}</em></h2>\
+             <h3>Small heading <em>italic, double struck \u{1F600}</em></h3>\
+             <h2>Body text</h2>\
+             <p>Upright: H|l ||||| \u{65E5}\u{672C}\u{8A9E}</p>\
+             <p>Italic: <em>H|l ||||| \u{65E5}\u{672C}\u{8A9E}</em></p>\
+             <p>Upright boxes: \u{1F600}\u{20BB7}\u{FDFD} | \
+             italic boxes: <em>\u{1F600}\u{20BB7}\u{FDFD}</em></p>\
+             <p>Mixed: <em>A\u{1F600}B \u{65E5}\u{20BB7}\u{672C} |\u{FDFD}|</em> -- the box slant \
+             must continue the letters on either side.</p>\
+             <p>Leading combining marks: <em>\u{3099}x</em> <em>\u{301}y</em> -- \
+             each starts its run and becomes a slanted box.</p>\
+             <p>Combined: <em>\u{304B}\u{3099} e\u{301}</em></p>\
+             <p>Bold italic: <b><em>Bold H|l \u{1F600} \u{65E5}\u{672C}</em></b></p>\
+             <p>Code italic: <code><em>mono H|l \u{1F600}</em></code></p>\
+             <h2>Links</h2>\
+             <p>Tab through these and back; no blue or ink may remain at the \
+             slanted right edge.</p>\
+             <p><a href='/'><em>italic link \u{1F600}</em></a>next \
+             <a href='/'><em>\u{20BB7}\u{FDFD}</em></a>|</p>\
+             <h1><a href='/'><em>Heading link \u{1F600}</em></a>|</h1>\
+             <h2>Table</h2>\
+             <table border='1'><tr><th><em>Header \u{1F600}</em></th>\
+             <th>Upright \u{1F600}</th></tr>\
+             <tr><td><em>Cell H|l \u{20BB7}</em></td><td>Cell H|l \u{20BB7}</td></tr></table>\
+             <h2>Wrapping</h2>\
+             <p><em>This italic paragraph is long enough to wrap at the right \
+             margin, with boxes \u{1F600}\u{20BB7}\u{FDFD} and \u{65E5}\u{672C}\u{8A9E} \
+             spread through it, so the slant can be checked against the \
+             margin and against the line below it. Keep reading past the \
+             edge of the screen \u{1F600} to see the next line start.</em></p>\
+             <p><a href='/'>Home</a></p>",
+        ),
+    };
+
     pub const EMPTY: &Page = &Page {
         url: "http://built-in/empty",
         body: Body::Fixed(
@@ -3024,20 +6670,26 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
     /// Flash-resident acceptance page: it exercises tables with Wi-Fi off.
     pub const TABLE: &Page = &Page {
         url: "http://built-in/table",
+        body: Body::TableDocument,
+    };
+
+    /// Flash-resident Stage 2 acceptance page. The sources deliberately do
+    /// not exist yet: this stage verifies reserved geometry and interaction
+    /// before image fetching and decoding are introduced.
+    pub const IMAGES: &Page = &Page {
+        url: "http://built-in/images",
         body: Body::Fixed(
-            "<title>table acceptance</title><h1>Table acceptance</h1>\
-             <p>Caption, headers, mixed 日本語 and ASCII, spans, empty cells, and a link.</p>\
-             <table border='1'><caption>Browser table fixture (border=1)</caption>\
-             <thead><tr><th>Item</th><th>ASCII / 日本語</th><th>Long value</th></tr></thead>\
-             <tbody><tr><td>one</td><td>short 日本語</td><td>This deliberately long cell must wrap inside its column.</td></tr>\
-             <tr><th rowspan='2'>rowspan header</th><td colspan='2'>A colspan cell with a <a href='/'>link back home</a>.</td></tr>\
-             <tr><td>left after rowspan</td><td>right after rowspan</td></tr>\
-             <tr><td></td><td colspan='2' rowspan='2'>Both spans: this text wraps while occupying two columns and two rows.</td></tr>\
-             <tr><td>empty-neighbour</td></tr>\
-             <tr><td rowspan='0'>zero means one</td><td colspan='oops'>invalid means one</td><td>omitted end tags\
-             </tbody></table>\
-             <h2>No border, many narrow columns</h2><table border='0'><tr><th>A</th><th>B</th><th>C</th><th>D</th><th>E</th><th>F</th><th>G</th><th>H</th></tr>\
-             <tr><td>alpha wraps</td><td>bravo wraps</td><td>日本語</td><td>delta</td><td>echo echo</td><td>foxtrot</td><td>golf</td><td>hotel</td></tr></table>\
+            "<title>image layout acceptance</title><h1>Image layout acceptance</h1>\
+             <p>Each outlined region is a pending image. Their labels and sizes exercise all four width/height cases.</p>\
+             <h2>Both dimensions: 320 by 180</h2><img src='/missing-both.png' alt='both 320 x 180' width='320' height='180'>\
+             <h2>Width only: 200 by default 90</h2><img src='/missing-width.png' alt='width only 200 x 90' width='200'>\
+             <h2>Height only: default 160 by 60</h2><img src='/missing-height.png' alt='height only 160 x 60' height='60'>\
+             <h2>No dimensions: default 160 by 90</h2><img src='/missing-default.png' alt='default 160 x 90'>\
+             <h2>Too wide: proportional shrink</h2><img src='/missing-wide.png' alt='wide 1280 x 400 shrunk to content width' width='1280' height='400'>\
+             <h2>Linked image</h2><p>Tab selects the next outlined region; Enter and touch should return home.</p>\
+             <a href='/'><img src='/missing-link.png' alt='linked image back home' width='240' height='80'></a>\
+             <h2>Image in a table cell</h2><table border='1'><tr><th>Text cell</th><th>Image cell</th></tr>\
+             <tr><td>The row must grow to contain its neighbour.</td><td><img src='/missing-cell.png' alt='cell image' width='300' height='120'></td></tr></table>\
              <p><a href='/'>Home</a></p>",
         ),
     };
@@ -3045,6 +6697,109 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
     pub const FRAGMENTS: &Page = &Page {
         url: "http://built-in/fragments",
         body: Body::FragmentDocument,
+    };
+
+    pub const FORMS: &Page = &Page {
+        url: "http://built-in/forms",
+        body: Body::Fixed(
+            "<title>form layout acceptance</title><h1>Form layout acceptance</h1>\
+             <p>Scroll down to bring the controls into the viewport.</p>\
+             <p>Before 1: the controls must remain below this paragraph.</p>\
+             <p>Before 2: no control border should leak into the status bar.</p>\
+             <p>Before 3: scrolling should reveal each control from the bottom edge.</p>\
+             <p>Before 4: this deliberately makes the fixture taller than the screen.</p>\
+             <p>Before 5: keep scrolling until the Query field appears.</p>\
+             <p>Before 6: the visible controls follow this paragraph.</p>\
+             <p>Before 7: extra space keeps the controls well below the first viewport.</p>\
+             <p>Before 8: every paragraph participates in normal document layout.</p>\
+             <p>Before 9: continue scrolling through the upper test region.</p>\
+             <p>Before 10: no control pixels should be visible yet.</p>\
+             <p>Before 11: the page should move without disturbing browser chrome.</p>\
+             <p>Before 12: this line extends the approach to the controls.</p>\
+             <p>Before 13: the Query label is still farther down the document.</p>\
+             <p>Before 14: partial text lines should clip normally at both edges.</p>\
+             <p>Before 15: keep moving toward the form section.</p>\
+             <p>Before 16: the control group begins after two more paragraphs.</p>\
+             <p>Before 17: this is the penultimate upper spacer paragraph.</p>\
+             <p>Before 18: the controls follow immediately after this line.</p>\
+             <form action='/forms' method='get'>\
+             <p><label for='inline-q'>Inline</label> <input id='inline-q' name='inline' value='same row'> after\
+             <select name='inline-select'><option selected>One</option><option>Two</option></select> tail\
+             <button name='styled' value='yes'>plain <strong>bold</strong> <em>italic</em> <code>code</code></button>.</p>\
+             <p>Button image failure: <button name='image-button' value='tap'>Go <img src='/missing-button.png' alt='missing' width='80' height='40'> now</button> after.</p>\
+             <label for='q'>Query</label><input id='q' name='q' value='initial value'>\
+             <input type='hidden' name='q' value='hidden duplicate'>\
+             <input type='hidden' name='empty' value=''>\
+             <input name='off' value='disabled value' disabled>\
+             <table border='1'><tr><td><label for='cell-q'>Cell query</label>\
+             <input id='cell-q' name='cell' value='inside cell'> after\
+             <button name='cell-go' value='yes'><strong>Cell</strong> button</button></td>\
+             <td>Neighbour cell</td></tr></table>\
+             <label for='date-fallback'>Date fallback</label>\
+             <input id='date-fallback' type='date' name='when' value='2026-09-13'>\
+             <h2>Checkboxes and radio buttons</h2>\
+             <label for='cb-news'>News (checked)</label>\
+             <input id='cb-news' type='checkbox' name='topic' value='news' checked>\
+             <label for='cb-sport'>Sport</label>\
+             <input id='cb-sport' type='checkbox' name='topic' value='sport'>\
+             <label for='cb-off'>Disabled but checked</label>\
+             <input id='cb-off' type='checkbox' name='topic' value='off' checked disabled>\
+             <label for='cb-agree'>No value attribute</label>\
+             <input id='cb-agree' type='checkbox' name='agree'>\
+             <label for='size-small'>Small (checked first)</label>\
+             <input id='size-small' type='radio' name='size' value='small' checked>\
+             <label for='size-large'>Large (checked last, wins)</label>\
+             <input id='size-large' type='radio' name='size' value='large' checked>\
+             <label for='note'>Note (textarea)</label>\
+             <textarea id='note' name='note' rows='3'>\nfirst line\nsecond &amp; <b>line</b></textarea>\
+             <label for='color'>Color (select)</label>\
+             <select id='color' name='color'><option value='red'>Red</option>\
+             <option selected>Green</option><option value='blue' disabled>Blue (disabled)</option></select>\
+             <label for='tags'>Tags (multiple)</label>\
+             <select id='tags' name='tag' multiple><optgroup label='Group'>\
+             <option value='a' selected>Alpha</option><option value='b'>Beta</option></optgroup>\
+             <optgroup label='Off' disabled><option value='c' selected>Gamma (disabled group)</option>\
+             </optgroup><option>Delta &amp; more</option></select>\
+             <input type='submit' name='go' value='Search'>\
+             <button name='mode' value='advanced'>Apply <strong>changes</strong></button></form>\
+             <h2>Textarea scrolling</h2>\
+             <form action='/forms' method='get'>\
+             <textarea name='long' rows='2'>row 1\nrow 2\nrow 3\nrow 4 is a long line that has to wrap \
+             inside the box because it is much wider than three hundred and twenty pixels</textarea>\
+             <label for='number'>Number (12 options, list scrolls)</label>\
+             <select id='number' name='number'><option>1</option><option>2</option><option>3</option>\
+             <option>4</option><option>5</option><option>6</option><option>7</option><option>8</option>\
+             <option>9</option><option>10</option><option>11</option><option>12</option></select>\
+             <input type='submit' name='go2' value='Send long'></form>\
+             <h2>Rejected form</h2>\
+             <form action='/forms' method='post'>\
+             <input type='submit' name='post' value='Try POST'></form>\
+             <p>After 1: this text must start below the Search button.</p>\
+             <p>After 2: scroll until the controls leave through the top edge.</p>\
+             <p>After 3: partially visible controls must be clipped at that edge.</p>\
+             <p>After 4: the toolbar and status bar must remain unchanged.</p>\
+             <p>After 5: no stale border should remain after a control disappears.</p>\
+             <p>After 6: hidden still occupies no visible row.</p>\
+             <p>After 7: disabled remains visibly lighter than Query.</p>\
+             <p>After 8: Search keeps its button appearance while scrolling.</p>\
+             <p>After 9: all following text remains in normal document flow.</p>\
+             <p>After 10: reaching this line confirms the page can scroll far enough.</p>\
+             <p>After 11: the controls should now be far above the viewport.</p>\
+             <p>After 12: no stale control pixels should remain on this text.</p>\
+             <p>After 13: continue through the lower test region.</p>\
+             <p>After 14: ordinary paragraphs continue to reserve their line height.</p>\
+             <p>After 15: scrolling remains available well beyond the form.</p>\
+             <p>After 16: browser chrome should remain stable throughout.</p>\
+             <p>After 17: this extra distance exposes delayed redraw artifacts.</p>\
+             <p>After 18: text should remain readable after repeated scrolling.</p>\
+             <p>After 19: continue toward the bottom of the fixture.</p>\
+             <p>After 20: the form remains part of the same document flow.</p>\
+             <p>After 21: this line is another full viewport below the controls.</p>\
+             <p>After 22: no hidden input row should appear in the document.</p>\
+             <p>After 23: continue scrolling to verify the complete range.</p>\
+             <p>After 24: the final marker follows this paragraph.</p>\
+             <p>End of the long form layout acceptance fixture.</p><p><a href='/'>Home</a></p>",
+        ),
     };
 
     /// The built-in page at `path`, if there is one.
@@ -3055,9 +6810,12 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
             "/long" => Some(LONG),
             "/wide" => Some(WIDE),
             "/japanese" => Some(JAPANESE),
+            "/italic" => Some(ITALIC),
             "/table" => Some(TABLE),
+            "/images" => Some(IMAGES),
             "/empty" => Some(EMPTY),
             "/fragments" => Some(FRAGMENTS),
+            "/forms" => Some(FORMS),
             _ => None,
         }
     }

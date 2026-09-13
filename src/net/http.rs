@@ -34,11 +34,12 @@ use alloc::vec::Vec;
 use smoltcp::wire::Ipv4Address;
 
 use crate::browser::memory::{self, OutOfMemory};
+use crate::browser::request::{self, Method};
 use crate::net::Stack;
 use crate::net::tls;
 use crate::net::transport::{self, Security, Transport};
-use crate::wifi::Rpc;
 use crate::tick;
+use crate::wifi::Rpc;
 
 /// How long the transfer may stall before it is called dead.
 const IDLE_TIMEOUT_MS: u64 = 5000;
@@ -103,6 +104,8 @@ pub enum Error {
     /// The caller stopped it.
     Cancelled,
     OutOfMemory,
+    /// A request value could have introduced another request or header.
+    InvalidRequest,
     Local,
 }
 
@@ -138,6 +141,7 @@ pub fn error_text(error: Error) -> &'static str {
         Error::SinkRefused => "the transfer was abandoned",
         Error::Cancelled => "cancelled",
         Error::OutOfMemory => "out of memory during the transfer",
+        Error::InvalidRequest => "the request contained an unsafe header value",
         Error::Local => "a local socket operation failed",
     }
 }
@@ -155,6 +159,7 @@ pub fn error_name(error: Error) -> &'static str {
         Error::SinkRefused => "sink-refused",
         Error::Cancelled => "cancelled",
         Error::OutOfMemory => "out-of-memory",
+        Error::InvalidRequest => "invalid-request",
         Error::Local => "local",
     }
 }
@@ -182,6 +187,29 @@ pub struct Head {
     pub media_type: Option<Vec<u8>>,
     /// The `charset` parameter, lowercased.
     pub charset: Option<Vec<u8>>,
+    /// `Cache-Control` carried a `no-store` directive. The response may be
+    /// shown but no copy of it may be kept for later.
+    pub no_store: bool,
+    /// `ETag`, when it was present, printable and at most 256 bytes.
+    pub etag: Option<Vec<u8>>,
+    /// `Vary` named something other than `Accept-Encoding`, which this
+    /// client sends as a fixed value. A response that varies on anything
+    /// else, or on `*`, cannot be matched to a later request and is not
+    /// stored.
+    pub vary_blocks_cache: bool,
+    /// `Cache-Control: no-cache`: a stored copy may only be reused after the
+    /// server confirms it.
+    pub no_cache: bool,
+    /// `Cache-Control: max-age` in seconds, the smallest when repeated. An
+    /// unreadable value counts as zero, which makes the response stale.
+    pub max_age: Option<u64>,
+    /// `Age` in seconds.
+    pub age: Option<u64>,
+    /// `Date` as sent, when it is short enough to be a date.
+    pub date: Option<Vec<u8>>,
+    /// `Expires` as sent. Present but too long to be a date is kept empty,
+    /// which the cache reads as already expired.
+    pub expires: Option<Vec<u8>>,
     /// The status line and headers, without the blank line that ends them.
     pub raw: Vec<u8>,
 }
@@ -380,7 +408,35 @@ impl Transaction {
         max_body: u64,
         security: Security<'_>,
     ) -> Result<Transaction, Error> {
-        let request = build_request(host, target)?;
+        Self::start_request(
+            stack,
+            address,
+            port,
+            host,
+            target,
+            Method::Get,
+            &[],
+            None,
+            max_body,
+            security,
+        )
+    }
+
+    /// Opens a connection and queues a bounded GET or urlencoded POST.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_request(
+        stack: &mut Stack,
+        address: Ipv4Address,
+        port: u16,
+        host: &[u8],
+        target: &[u8],
+        method: Method,
+        body: &[u8],
+        if_none_match: Option<&[u8]>,
+        max_body: u64,
+        security: Security<'_>,
+    ) -> Result<Transaction, Error> {
+        let request = build_request(method, body, host, target, if_none_match)?;
         let transport = Transport::connect(stack, address, port, security)?;
         let now = tick::now_ms();
         Ok(Transaction {
@@ -410,6 +466,11 @@ impl Transaction {
         self.transport
             .as_ref()
             .is_some_and(Transport::closed_without_notify)
+    }
+
+    /// Whether any request byte has been handed to the transport.
+    pub fn request_started(&self) -> bool {
+        self.sent != 0
     }
 
     /// The TLS counters, for a caller reporting them. `None` for plaintext.
@@ -484,9 +545,9 @@ impl Transaction {
             Err(error) => return self.fail(error.into()),
         }
         if self.sent >= self.request.len() {
-            // No body follows a GET, so the request is finished the moment
-            // its last byte is handed over. The TLS engine needs telling;
-            // the plaintext one does not care.
+            // The encoded request includes any POST body, so reaching its
+            // end means both head and body have been handed over. The TLS
+            // engine needs telling; the plaintext one does not care.
             transport.finish_request();
             self.state = State::Head;
         } else if tick::now_ms().saturating_sub(self.last_progress_ms) > transport::WRITE_STALL_MS {
@@ -747,10 +808,7 @@ impl Transaction {
                 }
             }
         }
-        let done = matches!(
-            &self.state,
-            State::Body(Framing::Chunked(Chunked::Done))
-        );
+        let done = matches!(&self.state, State::Body(Framing::Chunked(Chunked::Done)));
         Ok((delivered, done))
     }
 
@@ -982,6 +1040,14 @@ fn parse_head(raw: Vec<u8>) -> Result<Head, Error> {
         location: None,
         media_type: None,
         charset: None,
+        no_store: false,
+        etag: None,
+        vary_blocks_cache: false,
+        no_cache: false,
+        max_age: None,
+        age: None,
+        date: None,
+        expires: None,
         raw: Vec::new(),
     };
     for line in raw.split(|&byte| byte == b'\n').skip(1) {
@@ -999,10 +1065,57 @@ fn parse_head(raw: Vec<u8>) -> Result<Head, Error> {
             // does not know would be a body it cannot frame either way.
             head.chunked = !value.eq_ignore_ascii_case(b"identity");
         } else if name.eq_ignore_ascii_case(b"content-encoding") {
-            head.identity_encoding =
-                value.is_empty() || value.eq_ignore_ascii_case(b"identity");
+            head.identity_encoding = value.is_empty() || value.eq_ignore_ascii_case(b"identity");
         } else if name.eq_ignore_ascii_case(b"location") {
             head.location = Some(owned(value)?);
+        } else if name.eq_ignore_ascii_case(b"etag") {
+            head.etag = (!value.is_empty()
+                && value.len() <= 256
+                && value.iter().all(|byte| (0x21..=0x7e).contains(byte)))
+            .then(|| owned(value))
+            .transpose()?;
+        } else if name.eq_ignore_ascii_case(b"vary") {
+            head.vary_blocks_cache |= value.split(|&byte| byte == b',').any(|field| {
+                let field = trim_ascii(field);
+                !field.is_empty() && !field.eq_ignore_ascii_case(b"accept-encoding")
+            });
+        } else if name.eq_ignore_ascii_case(b"cache-control") {
+            // Repeated headers accumulate: any `no-store` or `no-cache` wins,
+            // and the smallest `max-age` is the one that holds.
+            for directive in value.split(|&byte| byte == b',') {
+                let directive = trim_ascii(directive);
+                let (name, argument) = match directive.iter().position(|&byte| byte == b'=') {
+                    Some(equals) => (
+                        trim_ascii(&directive[..equals]),
+                        Some(trim_ascii(&directive[equals + 1..])),
+                    ),
+                    None => (directive, None),
+                };
+                if name.eq_ignore_ascii_case(b"no-store") {
+                    head.no_store = true;
+                } else if name.eq_ignore_ascii_case(b"no-cache") {
+                    head.no_cache = true;
+                } else if name.eq_ignore_ascii_case(b"max-age") {
+                    let argument = argument.map(|argument| {
+                        argument
+                            .strip_prefix(b"\"")
+                            .and_then(|inner| inner.strip_suffix(b"\""))
+                            .unwrap_or(argument)
+                    });
+                    let seconds = argument.and_then(parse_u64).unwrap_or(0);
+                    head.max_age = Some(head.max_age.map_or(seconds, |old| old.min(seconds)));
+                }
+            }
+        } else if name.eq_ignore_ascii_case(b"age") {
+            head.age = parse_u64(value);
+        } else if name.eq_ignore_ascii_case(b"date") {
+            head.date = (value.len() <= 64).then(|| owned(value)).transpose()?;
+        } else if name.eq_ignore_ascii_case(b"expires") {
+            head.expires = Some(if value.len() <= 64 {
+                owned(value)?
+            } else {
+                Vec::new()
+            });
         } else if name.eq_ignore_ascii_case(b"content-type") {
             let (media, charset) = split_content_type(value);
             head.media_type = Some(lowercased(media)?);
@@ -1120,18 +1233,25 @@ fn parse_status(headers: &[u8]) -> Option<u16> {
 /// The target and the host come from a `browser::url::Url`, which has
 /// already refused CR, LF, space and every control character -- so nothing
 /// here can add a line to the request.
-fn build_request(host: &[u8], target: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut request = Vec::new();
-    let length = target.len() + host.len() + USER_AGENT.len() + 96;
-    request.try_reserve_exact(length).map_err(|_| Error::OutOfMemory)?;
-    request.extend_from_slice(b"GET ");
-    request.extend_from_slice(target);
-    request.extend_from_slice(b" HTTP/1.0\r\nHost: ");
-    request.extend_from_slice(host);
-    request.extend_from_slice(b"\r\nUser-Agent: ");
-    request.extend_from_slice(USER_AGENT.as_bytes());
-    request.extend_from_slice(b"\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
-    Ok(request)
+fn build_request(
+    method: Method,
+    body: &[u8],
+    host: &[u8],
+    target: &[u8],
+    if_none_match: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    request::encode_http10_parts(
+        method,
+        body,
+        host,
+        target,
+        USER_AGENT.as_bytes(),
+        if_none_match,
+    )
+    .map_err(|error| match error {
+        request::Error::TooLong | request::Error::InvalidHeadValue => Error::InvalidRequest,
+        request::Error::OutOfMemory => Error::OutOfMemory,
+    })
 }
 
 /// What this firmware calls itself to a server.

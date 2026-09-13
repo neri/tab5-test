@@ -32,14 +32,15 @@
     - `src/app/network_settings.rs`: Network settingsミニの一覧、password、確認、処理待ち状態と短いhandler
     - `src/app/wifi_manager/gui.rs`: 管理器を借りるGUI操作の段階実行。要求token付き完了通知、
       scan／ON・OFF／接続置換／association後の保存・DHCP／forget。画面を呼ばない
-    - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル
+    - `src/app/shell.rs`: `console.rs`から渡されたコマンドラインを解析・実行する簡易シェル。
+      各コマンドの出力行は共通の`Line`（`LINE_BYTES` = 512 byte、超えた分は文字単位で落とす）で組み立てる
     - `src/app/lsusb.rs`: `lsusb`コマンドの表示。ハブを介したツリー（全interfaceを含む）と、
       指定デバイスの主要な記述子。`UsbHost`のデバイスレコードを読むだけで、
       文字列記述子の取得以外はバスへ何も出さない
     - `src/app/mbr.rs`: SDカードとUSB Mass Storageで共用するMBRパーティション表示。
       読み終えたセクタをそのまま整形する`sdmbr`／`usbmbr`専用の古い表示で、
       判定は行わない
-    - `src/app/files.rs`: `mount`／`umount`／`mounts`／`fsverify`／`cd`／`ls`／`cat`／
+    - `src/app/files.rs`: `mount`／`umount`／`mounts`／`df`／`fsverify`／`cd`／`ls`／`cat`／
       `write`／`append`／`mkdir`／`rm`／`rmdir`／`mv`／`fill`／`fsopen`／
       `fsread`／`fsclose`の表示。`ls`の並べ替えと桁詰めもここで、
       ソートのためにエントリを一度全部集める。ボリュームを実際に取り付ける
@@ -80,6 +81,8 @@
       それ以外はplain text）を決めて16 KiBずつ読む。`fetch.rs`と同じ
       start／step／closeの形で、`Failure`と`Outcome`を共有する。VFSの
       ファイルハンドルを所有するので`close`が必須（[`BROWSER.md`](BROWSER.md)）
+    - `src/app/cache_store.rs`: HTTP cacheのファイル側。entryの検索と期限切れの削除、本文の段階的な
+      読み出し（`CacheRead`）と書き込み（`CacheWrite`）、容量不足時と定期のpurge
     - `src/app/browsertest.rs`: `hs`（1回の取得を数値で報告）と`bt`（fixture serverの
       `/manifest.txt`を巡回して期待値と突き合わせ）の診断
     - `src/app/pointer.rs`: 通常GUI hostが使うマウスカーソル。下地の退避・
@@ -124,8 +127,19 @@
   U+FFFD置換、入力上限の計数は要るため
 - `browser/src/document.rs`: 文書モデル。DOMではなく、本文1本の`String`と
   それへのbyte範囲を持つ`Run`／`Block`／`Link`のflat arena
-- `browser/src/layout.rs`: 折返しレイアウト。行・piece・当たり判定・リンク順序。
+- `browser/src/layout.rs`: 折返しレイアウト。行・piece・画像領域・当たり判定・リンク順序と、再layoutをまたぐ論理読み位置。
+- `browser/src/image.rs`: PNG/JPEG headerの逐次寸法調査とdecode前の寸法上限判定。
+  non-interlacedで1 sampleが8 bit以下のPNG（グレースケール、パレット、RGB、α付き、`tRNS`）を
+  白背景へ合成してRGB565へdecodeする。
   文書全体のbitmapは作らない
+- `browser/src/text_input.rs`: URLやformから独立したUTF-8編集状態。caret・選択・byte上限、
+  単一行／複数行、文字列確定と未確定文字列を分けて保持し、共通font測定による横scroll位置を返す
+- `browser/src/form.rs`: 順序と同名fieldを保つ名前・値pair列から、上限付きUTF-8
+  `application/x-www-form-urlencoded` query／POST bodyを生成するpure処理
+- `browser/src/request.rs`: method・URL・上限付きbodyを一体で保持し、固定headerと正確な
+  `Content-Length`を持つHTTP/1.0要求へ変換するpure処理
+- `browser/src/cache.rs`: HTTP cacheのpure部分。URLのkeyとhash、`/tmp/browser-cache`以下の
+  ファイル名、metaファイルの形式、`max-age`・`Expires`からの鮮度計算とHTTP日付の解析、purge順
 - `browser/src/limits.rs`・`browser/src/error.rs`・`browser/src/memory.rs`:
   上限の一覧、共通エラー、失敗を返す確保（`try_reserve`）
 - `src/gpio.rs`: GPIO/IO_MUXのピン単位操作（オープンドレイン設定、プッシュプル出力設定、low/release/level）とGPIO Matrixの入出力ルーティング（`configure_c6_sdio_pins`はSDMMCスロット1をGPIO8..13へ配線する）
@@ -233,7 +247,8 @@
     - `src/fs/path.rs`: 絶対パスの正規化、長さと文字の検査、FAT流の名前比較、
       シェルのカレントディレクトリと相対パスの連結（`join`）
     - `src/fs/vfs.rs`: マウント表、パス解決、ファイルハンドル、ディレクトリ列挙、
-      `metadata`と`create_dir`。マウントはファイルシステムを保持せず、操作のたびに
+      `metadata`と`create_dir`、`df`の空き容量（`usage`。FAT32はFSInfo、FAT12/16と`-c`はFAT走査、
+      exFATは割り当てbitmap）。マウントはファイルシステムを保持せず、操作のたびに
       開き直す（[FILESYSTEM.md](FILESYSTEM.md)）
 - `src/net.rs`・`src/net/`: smoltcpによるIPv4。`usb.rs`・`wifi.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけ。プロトコル層を自前実装しない唯一の層で、
@@ -251,7 +266,7 @@
       smoltcpの`auto-icmp-echo-reply`が行うのでここにはない
     - `src/net/tftp.rs`: TFTP読み出しクライアント（RFC 1350、512 byteロックステップ、
       オプション拡張なし）とCRC-32
-    - `src/net/http.rs`: TCP確認用の最小HTTP/1.0 GET
+    - `src/net/http.rs`: GETとurlencoded POSTを扱う中断可能なHTTP/1.0 transaction
 - `src/usb.rs`・`src/usb/`: USB-Aホスト。`lcd.rs`/`lcd/st7121.rs`と同じ
   「親ファイルがサブモジュールを`mod`宣言し、実体は`src/usb/`以下」という構成。
   親の`usb.rs`はサブモジュール宣言と、他ファイルが使う型・関数の再エクスポート

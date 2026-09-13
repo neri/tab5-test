@@ -18,10 +18,11 @@
 //! and a confirmation none of which exist.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::browser::document::{Document, Parser};
 use crate::browser::error::{self, Error};
-use crate::browser::limits::MAX_DECODED_HTML_BYTES;
+use crate::browser::limits::{MAX_DECODED_HTML_BYTES, MAX_IMAGE_COMPRESSED_BYTES};
 use crate::browser::memory;
 use crate::browser::url::Url;
 use crate::fs::Devices;
@@ -160,6 +161,63 @@ pub enum Started {
     Reading(LocalRead),
     /// A directory, listed and finished in one go.
     Page(Document),
+}
+
+/// A bounded raw local image read. It deliberately does not share
+/// `LocalRead`'s text parser: image bytes must reach the decoder unchanged.
+#[must_use = "an ImageRead owns a file handle and has to be closed"]
+pub struct ImageRead {
+    handle: FileHandle,
+    bytes: Vec<u8>,
+}
+
+pub enum ImageOutcome {
+    Working,
+    Complete(Vec<u8>),
+    Failed(Failure),
+}
+
+impl ImageRead {
+    pub fn start(url: &Url, vfs: &mut Vfs, devices: &mut Devices) -> Result<Self, Failure> {
+        let metadata = vfs
+            .metadata(devices, url.path())
+            .map_err(|error| failure(error, NOT_FOUND))?;
+        if metadata.kind != EntryKind::File {
+            return Err(NOT_FOUND);
+        }
+        if metadata.size > MAX_IMAGE_COMPRESSED_BYTES as u64 {
+            return Err(TOO_LARGE);
+        }
+        let handle = vfs
+            .open(devices, url.path(), OpenMode::Read)
+            .map_err(|error| failure(error, NOT_FOUND))?;
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(metadata.size as usize).is_err() {
+            vfs.close(handle);
+            return Err(OUT_OF_MEMORY);
+        }
+        Ok(Self { handle, bytes })
+    }
+
+    pub fn step(&mut self, vfs: &mut Vfs, devices: &mut Devices) -> ImageOutcome {
+        let mut buffer = [0u8; BYTES_PER_STEP];
+        let count = match vfs.read(devices, &self.handle, &mut buffer) {
+            Ok(count) => count,
+            Err(error) => return ImageOutcome::Failed(failure(error, READ_FAILED)),
+        };
+        if count == 0 {
+            return ImageOutcome::Complete(core::mem::take(&mut self.bytes));
+        }
+        if self.bytes.len().saturating_add(count) > MAX_IMAGE_COMPRESSED_BYTES {
+            return ImageOutcome::Failed(TOO_LARGE);
+        }
+        self.bytes.extend_from_slice(&buffer[..count]);
+        ImageOutcome::Working
+    }
+
+    pub fn close(self, vfs: &mut Vfs) {
+        vfs.close(self.handle);
+    }
 }
 
 /// The parser for a file, chosen by what its name ends in.

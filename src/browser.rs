@@ -20,4 +20,6 @@
 // `document::Parser`, which is the pairing that has any meaning: a token
 // stream with no document builder behind it is not something the firmware
 // has a use for, and re-exporting it would invite one.
-pub use tab5_browser::{document, error, layout, limits, memory, url};
+pub use tab5_browser::{
+    cache, document, error, form, image, layout, limits, memory, request, text_input, url,
+};

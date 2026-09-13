@@ -1055,6 +1055,10 @@ fn visit(
                     );
                 }
             }
+            FetchOutcome::Image(_) => unreachable!("browsertest starts a document fetch"),
+            FetchOutcome::NotModified => {
+                unreachable!("browsertest sends no validator, so no 304 is answered for it")
+            }
             FetchOutcome::Page(document) => {
                 let received = fetch.received();
                 let peak = fetch.peak_owned();

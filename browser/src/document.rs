@@ -39,8 +39,9 @@ use crate::encoding::Decoder;
 use crate::error::Error;
 use crate::html::{self, Tag, Tokenizer};
 use crate::limits::{
-    MAX_ANCHOR_BYTES, MAX_ANCHOR_NAME_BYTES, MAX_ANCHORS, MAX_ITEMS, MAX_LINK_URL_BYTES, MAX_LINKS,
-    MAX_NESTING_DEPTH, MAX_TEXT_BYTES,
+    MAX_ANCHOR_BYTES, MAX_ANCHOR_NAME_BYTES, MAX_ANCHORS, MAX_IMAGE_HEIGHT, MAX_IMAGE_WIDTH,
+    MAX_IMAGES, MAX_INPUT_VALUE_BYTES, MAX_ITEMS, MAX_LINK_URL_BYTES, MAX_LINKS, MAX_NESTING_DEPTH,
+    MAX_TEXT_BYTES,
 };
 use crate::memory;
 use crate::url::Url;
@@ -79,6 +80,8 @@ pub enum BlockKind {
     Preformatted,
     /// `hr`. Has no runs.
     Rule,
+    /// A visible form control. The index addresses `Document::controls`.
+    Control(u16),
 }
 
 /// What stands at the front of a list item.
@@ -109,6 +112,10 @@ pub struct Block {
     /// Index into [`Document::runs`].
     pub first_run: u32,
     pub run_count: u32,
+    /// Controls occurring in this block, in document order. Hidden controls
+    /// are included but consume no layout space.
+    pub first_control: u16,
+    pub control_count: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,6 +146,12 @@ pub struct TableRow {
 pub struct TableCell {
     pub table: u16,
     pub block: u32,
+    pub text_start: u32,
+    pub text_end: u32,
+    pub first_image: u16,
+    pub image_count: u16,
+    pub first_control: u16,
+    pub control_count: u16,
     pub row: u16,
     pub column: u8,
     pub rowspan: u8,
@@ -160,6 +173,133 @@ pub struct Anchor {
     pub name: String,
     pub text_offset: u32,
     pub block_index: u32,
+}
+
+/// One `img` occurrence. Pixels arrive later; this preserves identity and
+/// layout inputs without retaining the source markup.
+pub struct Image {
+    pub source: Option<Url>,
+    pub alt: String,
+    pub width: Option<u16>,
+    pub height: Option<u16>,
+    pub intrinsic_width: Option<u16>,
+    pub intrinsic_height: Option<u16>,
+    pub text_offset: u32,
+    pub text_end: u32,
+    pub link: Option<u16>,
+    /// A button owning this image. Such an image is laid out inside the
+    /// button rather than as an independent document image.
+    pub button: Option<u16>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ButtonRun {
+    /// Byte offsets into the owning control's `display_label`.
+    pub start: u16,
+    pub end: u16,
+    pub style: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormMethod {
+    Get,
+    Post,
+    Unsupported,
+}
+
+pub struct Form {
+    pub action: Url,
+    pub method: FormMethod,
+    pub first_control: u32,
+    pub control_count: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ControlKind {
+    Text,
+    Hidden,
+    Submit,
+    Checkbox,
+    Radio,
+    Textarea,
+    Select,
+    Unsupported,
+}
+
+impl ControlKind {
+    /// Checkbox and radio: a control whose state is a checkedness rather
+    /// than an edited value.
+    pub fn is_checkable(self) -> bool {
+        matches!(self, Self::Checkbox | Self::Radio)
+    }
+}
+
+pub struct Control {
+    pub form: Option<u16>,
+    pub kind: ControlKind,
+    pub name: String,
+    pub initial_value: String,
+    /// Visible button text. Empty for input controls, whose value is shown.
+    pub display_label: String,
+    /// Distinguishes `<button></button>` from an `<input type=submit>` with
+    /// no value; only the latter receives the conventional `Submit` label.
+    pub button_element: bool,
+    pub first_button_run: u32,
+    pub button_run_count: u16,
+    pub element_id: String,
+    pub disabled: bool,
+    /// Initial checkedness of a checkbox or radio button. For a radio group
+    /// only the last `checked` in document order stays set.
+    pub checked: bool,
+    /// Visible rows of a textarea, 1..=`MAX_TEXTAREA_ROWS`. Zero otherwise.
+    pub rows: u8,
+    /// A textarea whose initial content was longer than
+    /// `MAX_INPUT_VALUE_BYTES`. `initial_value` holds only the part that fit,
+    /// so the control cannot be edited and its form refuses to submit rather
+    /// than send a cut value.
+    pub value_overflow: bool,
+    /// A select's options: `Document::options()[first_option..]`, then
+    /// `option_count` of them.
+    pub first_option: u32,
+    pub option_count: u16,
+    /// A select that allows more than one selected option.
+    pub multiple: bool,
+    pub text_offset: u32,
+}
+
+/// One `option` of a select.
+pub struct SelectOption {
+    pub control: u16,
+    /// The text between the tags, with whitespace collapsed.
+    pub label: String,
+    /// `value`, or the label when the attribute is missing.
+    pub value: String,
+    /// Initial selectedness after HTML's rules: in a single select exactly
+    /// one enabled option when there is any, the last `selected` winning.
+    pub selected: bool,
+    /// The option's own `disabled`, or its `optgroup`'s.
+    pub disabled: bool,
+}
+
+/// Rows a textarea shows when `rows` is missing or invalid, as in HTML.
+pub const DEFAULT_TEXTAREA_ROWS: u8 = 2;
+/// The most rows a textarea box may take; taller ones scroll inside.
+pub const MAX_TEXTAREA_ROWS: u8 = 8;
+
+/// Which element produced a control.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlElement<'a> {
+    Input(Option<&'a str>),
+    Button(&'a str),
+    Textarea(Option<&'a str>),
+    Select { multiple: bool },
+}
+
+pub struct Label {
+    pub control: Option<u16>,
+    pub text_start: u32,
+    pub text_end: u32,
+    target_id: String,
 }
 
 /// What one page cost, for the UART line and the memory budget.
@@ -185,9 +325,15 @@ pub struct Document {
     blocks: Vec<Block>,
     links: Vec<Link>,
     anchors: Vec<Anchor>,
+    images: Vec<Image>,
     tables: Vec<Table>,
     table_rows: Vec<TableRow>,
     table_cells: Vec<TableCell>,
+    forms: Vec<Form>,
+    controls: Vec<Control>,
+    button_runs: Vec<ButtonRun>,
+    options: Vec<SelectOption>,
+    labels: Vec<Label>,
     stats: Stats,
 }
 
@@ -221,6 +367,20 @@ impl Document {
     pub fn anchors(&self) -> &[Anchor] {
         &self.anchors
     }
+    pub fn images(&self) -> &[Image] {
+        &self.images
+    }
+    pub fn set_image_intrinsic(&mut self, index: usize, dimensions: Option<(u16, u16)>) -> bool {
+        let Some(image) = self.images.get_mut(index) else {
+            return false;
+        };
+        let (width, height) = dimensions
+            .map(|(width, height)| (Some(width.max(1)), Some(height.max(1))))
+            .unwrap_or((None, None));
+        image.intrinsic_width = width;
+        image.intrinsic_height = height;
+        true
+    }
     pub fn tables(&self) -> &[Table] {
         &self.tables
     }
@@ -229,6 +389,31 @@ impl Document {
     }
     pub fn table_cells(&self) -> &[TableCell] {
         &self.table_cells
+    }
+    pub fn forms(&self) -> &[Form] {
+        &self.forms
+    }
+    pub fn controls(&self) -> &[Control] {
+        &self.controls
+    }
+    pub fn button_runs(&self, control: &Control) -> &[ButtonRun] {
+        let start = control.first_button_run as usize;
+        self.button_runs
+            .get(start..start + control.button_run_count as usize)
+            .unwrap_or(&[])
+    }
+    pub fn options(&self) -> &[SelectOption] {
+        &self.options
+    }
+    /// The options belonging to one select; empty for any other control.
+    pub fn control_options(&self, control: &Control) -> &[SelectOption] {
+        let start = control.first_option as usize;
+        self.options
+            .get(start..start + control.option_count as usize)
+            .unwrap_or(&[])
+    }
+    pub fn labels(&self) -> &[Label] {
+        &self.labels
     }
 
     pub fn stats(&self) -> Stats {
@@ -270,9 +455,47 @@ impl Document {
             + links
             + self.anchors.capacity() * core::mem::size_of::<Anchor>()
             + anchors
+            + self.images.capacity() * core::mem::size_of::<Image>()
+            + self
+                .images
+                .iter()
+                .map(|image| {
+                    image.alt.capacity() + image.source.as_ref().map_or(0, Url::owned_bytes)
+                })
+                .sum::<usize>()
             + self.tables.capacity() * core::mem::size_of::<Table>()
             + self.table_rows.capacity() * core::mem::size_of::<TableRow>()
             + self.table_cells.capacity() * core::mem::size_of::<TableCell>()
+            + self.forms.capacity() * core::mem::size_of::<Form>()
+            + self
+                .forms
+                .iter()
+                .map(|form| form.action.owned_bytes())
+                .sum::<usize>()
+            + self.controls.capacity() * core::mem::size_of::<Control>()
+            + self.button_runs.capacity() * core::mem::size_of::<ButtonRun>()
+            + self
+                .controls
+                .iter()
+                .map(|control| {
+                    control.name.capacity()
+                        + control.initial_value.capacity()
+                        + control.display_label.capacity()
+                        + control.element_id.capacity()
+                })
+                .sum::<usize>()
+            + self.options.capacity() * core::mem::size_of::<SelectOption>()
+            + self
+                .options
+                .iter()
+                .map(|option| option.label.capacity() + option.value.capacity())
+                .sum::<usize>()
+            + self.labels.capacity() * core::mem::size_of::<Label>()
+            + self
+                .labels
+                .iter()
+                .map(|label| label.target_id.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -402,6 +625,7 @@ struct Builder {
     /// with nothing in it never becomes one.
     open_kind: Option<BlockKind>,
     open_first_run: u32,
+    open_first_control: u16,
     /// The run being extended.
     run_open: bool,
     run_start: u32,
@@ -421,6 +645,50 @@ struct Builder {
     at_block_start: bool,
     link_url_bytes: usize,
     table: Option<TableBuild>,
+    form: Option<u16>,
+    button: Option<ButtonBuild>,
+    textarea: Option<TextareaBuild>,
+    select: Option<SelectBuild>,
+    label: Option<LabelBuild>,
+}
+
+struct SelectBuild {
+    control: u16,
+    /// Inside a disabled `optgroup`.
+    group_disabled: bool,
+    option: Option<OptionBuild>,
+}
+
+struct OptionBuild {
+    index: usize,
+    text: String,
+    pending_space: bool,
+    has_value: bool,
+}
+
+struct TextareaBuild {
+    control: u16,
+    text: String,
+    /// Nothing has been kept yet, so a first line break is still dropped.
+    at_start: bool,
+    /// The previous character was a CR, so an LF right after it is part of
+    /// the same line break.
+    after_cr: bool,
+    overflow: bool,
+}
+
+struct ButtonBuild {
+    control: u16,
+    text: String,
+    pending_space: bool,
+    style: u8,
+    inline: Vec<InlineFrame>,
+    suppressed_controls: u8,
+}
+
+struct LabelBuild {
+    target_id: String,
+    text_start: u32,
 }
 
 struct TableBuild {
@@ -433,6 +701,7 @@ struct TableBuild {
     open_cell: Option<OpenCell>,
     columns: u8,
     nested: u8,
+    nested_cell_in_row: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -442,6 +711,9 @@ struct OpenCell {
     rowspan: u8,
     colspan: u8,
     header: bool,
+    text_start: u32,
+    first_image: u16,
+    first_control: u16,
 }
 
 impl Builder {
@@ -455,13 +727,20 @@ impl Builder {
                 blocks: Vec::new(),
                 links: Vec::new(),
                 anchors: Vec::new(),
+                images: Vec::new(),
                 tables: Vec::new(),
                 table_rows: Vec::new(),
                 table_cells: Vec::new(),
+                forms: Vec::new(),
+                controls: Vec::new(),
+                button_runs: Vec::new(),
+                options: Vec::new(),
+                labels: Vec::new(),
                 stats: Stats::default(),
             },
             open_kind: None,
             open_first_run: 0,
+            open_first_control: 0,
             run_open: false,
             run_start: 0,
             style: 0,
@@ -474,6 +753,11 @@ impl Builder {
             at_block_start: true,
             link_url_bytes: 0,
             table: None,
+            form: None,
+            button: None,
+            textarea: None,
+            select: None,
+            label: None,
         })
     }
 
@@ -483,15 +767,35 @@ impl Builder {
             + self.document.tables.len()
             + self.document.table_rows.len()
             + self.document.table_cells.len()
+            + self.document.images.len()
+            + self.document.forms.len()
+            + self.document.controls.len()
+            + self.document.button_runs.len()
+            + self.document.options.len()
+            + self.document.labels.len()
     }
 
     fn finish(mut self, input_bytes: usize, longest_token: usize) -> Result<Document, Error> {
         // The last block is committed the same way every other one is; a
         // page that ends mid-paragraph is not a special case.
+        self.end_button();
+        self.end_textarea();
+        self.end_select()?;
+        self.end_label()?;
         if self.table.is_some() {
             self.end_table()?;
         }
         self.close_block()?;
+        for label in &mut self.document.labels {
+            label.control = self
+                .document
+                .controls
+                .iter()
+                .position(|control| {
+                    !label.target_id.is_empty() && control.element_id == label.target_id
+                })
+                .and_then(|index| u16::try_from(index).ok());
+        }
         self.document.stats = Stats {
             input_bytes,
             text_bytes: self.document.text.len(),
@@ -526,6 +830,15 @@ impl Builder {
     }
 
     fn push_text(&mut self, text: &str) -> Result<(), Error> {
+        if self.select.is_some() {
+            return self.push_option_text(text);
+        }
+        if self.textarea.is_some() {
+            return self.push_textarea_text(text);
+        }
+        if self.button.is_some() {
+            return self.push_button_text(text);
+        }
         for character in text.chars() {
             if self.preformatted {
                 self.push_preformatted(character)?;
@@ -540,6 +853,345 @@ impl Builder {
             self.flush_pending_space()?;
             self.push_character(character)?;
         }
+        Ok(())
+    }
+
+    /// Keeps a textarea's content as its initial value: whitespace as written,
+    /// every line break as LF, and the one line break right after the start
+    /// tag dropped, as HTML does.
+    fn push_textarea_text(&mut self, text: &str) -> Result<(), Error> {
+        let Some(textarea) = self.textarea.as_mut() else {
+            return Ok(());
+        };
+        for character in text.chars() {
+            let after_cr = core::mem::replace(&mut textarea.after_cr, character == '\r');
+            if character == '\n' && after_cr {
+                continue;
+            }
+            let character = if character == '\r' { '\n' } else { character };
+            if core::mem::replace(&mut textarea.at_start, false) && character == '\n' {
+                continue;
+            }
+            if textarea.overflow {
+                continue;
+            }
+            if textarea.text.len() + character.len_utf8() > MAX_INPUT_VALUE_BYTES {
+                textarea.overflow = true;
+                continue;
+            }
+            memory::push_char(&mut textarea.text, character)?;
+        }
+        Ok(())
+    }
+
+    /// Option text, collapsed like a button's label. Text in a select but
+    /// outside any option is not shown anywhere.
+    fn push_option_text(&mut self, text: &str) -> Result<(), Error> {
+        let Some(option) = self
+            .select
+            .as_mut()
+            .and_then(|select| select.option.as_mut())
+        else {
+            return Ok(());
+        };
+        for character in text.chars() {
+            if character.is_whitespace() {
+                option.pending_space |= !option.text.is_empty();
+                continue;
+            }
+            let added = character.len_utf8() + usize::from(option.pending_space);
+            if option.text.len().saturating_add(added) > MAX_INPUT_VALUE_BYTES {
+                return Err(Error::TextTooLong);
+            }
+            if option.pending_space {
+                memory::push_char(&mut option.text, ' ')?;
+                option.pending_space = false;
+            }
+            memory::push_char(&mut option.text, character)?;
+        }
+        Ok(())
+    }
+
+    fn begin_option(
+        &mut self,
+        value: Option<&str>,
+        selected: bool,
+        disabled: bool,
+    ) -> Result<(), Error> {
+        self.end_option()?;
+        let Some(select) = self.select.as_ref() else {
+            return Ok(());
+        };
+        if self.document.options.len() >= crate::limits::MAX_SELECT_OPTIONS {
+            return Err(Error::TooManyItems);
+        }
+        self.check_items(1)?;
+        let control = select.control;
+        let disabled = disabled || select.group_disabled;
+        let index = self.document.options.len();
+        memory::push(
+            &mut self.document.options,
+            SelectOption {
+                control,
+                label: String::new(),
+                value: memory::string_from(value.unwrap_or(""))?,
+                selected,
+                disabled,
+            },
+        )?;
+        if let Some(item) = self.document.controls.get_mut(control as usize) {
+            item.option_count = item.option_count.saturating_add(1);
+        }
+        if let Some(select) = self.select.as_mut() {
+            select.option = Some(OptionBuild {
+                index,
+                text: String::new(),
+                pending_space: false,
+                has_value: value.is_some(),
+            });
+        }
+        Ok(())
+    }
+
+    fn end_option(&mut self) -> Result<(), Error> {
+        let Some(option) = self.select.as_mut().and_then(|select| select.option.take()) else {
+            return Ok(());
+        };
+        let Some(item) = self.document.options.get_mut(option.index) else {
+            return Ok(());
+        };
+        if !option.has_value {
+            item.value = memory::string_from(&option.text)?;
+        }
+        item.label = option.text;
+        Ok(())
+    }
+
+    /// Closes a select and settles its initial selectedness the way HTML
+    /// does for a single-line list: the last `selected` wins, and with none
+    /// the first enabled option is selected.
+    fn end_select(&mut self) -> Result<(), Error> {
+        self.end_option()?;
+        let Some(select) = self.select.take() else {
+            return Ok(());
+        };
+        let Some(control) = self.document.controls.get(select.control as usize) else {
+            return Ok(());
+        };
+        if control.multiple {
+            return Ok(());
+        }
+        let start = control.first_option as usize;
+        let end = start + control.option_count as usize;
+        let options = &mut self.document.options[start..end];
+        let last = options.iter().rposition(|option| option.selected);
+        for (index, option) in options.iter_mut().enumerate() {
+            option.selected = Some(index) == last;
+        }
+        if last.is_none()
+            && let Some(first) = options.iter_mut().find(|option| !option.disabled)
+        {
+            first.selected = true;
+        }
+        Ok(())
+    }
+
+    fn end_textarea(&mut self) {
+        if let Some(textarea) = self.textarea.take()
+            && let Some(control) = self.document.controls.get_mut(textarea.control as usize)
+        {
+            control.initial_value = textarea.text;
+            control.value_overflow = textarea.overflow;
+        }
+    }
+
+    fn push_button_text(&mut self, text: &str) -> Result<(), Error> {
+        for character in text.chars() {
+            let Some(button) = self.button.as_mut() else {
+                return Ok(());
+            };
+            if button.suppressed_controls != 0 {
+                continue;
+            }
+            if character.is_whitespace() {
+                button.pending_space |= !button.text.is_empty();
+                continue;
+            }
+            let added = character.len_utf8() + usize::from(button.pending_space);
+            if button.text.len().saturating_add(added) > MAX_INPUT_VALUE_BYTES {
+                return Err(Error::TextTooLong);
+            }
+            if button.pending_space {
+                button.pending_space = false;
+                self.push_button_character(' ')?;
+            }
+            self.push_button_character(character)?;
+        }
+        Ok(())
+    }
+
+    fn push_button_character(&mut self, character: char) -> Result<(), Error> {
+        let (control, style, start) = {
+            let button = self.button.as_ref().ok_or(Error::TooManyItems)?;
+            (button.control, button.style, button.text.len())
+        };
+        let new_run = self
+            .document
+            .button_runs
+            .last()
+            .is_none_or(|run| run.style != style || run.end as usize != start);
+        if new_run {
+            self.check_items(1)?;
+        }
+        let button = self.button.as_mut().ok_or(Error::TooManyItems)?;
+        memory::push_char(&mut button.text, character)?;
+        let end = button.text.len() as u16;
+        if new_run {
+            memory::push(
+                &mut self.document.button_runs,
+                ButtonRun {
+                    start: start as u16,
+                    end,
+                    style,
+                },
+            )?;
+            if let Some(item) = self.document.controls.get_mut(control as usize) {
+                item.button_run_count = item.button_run_count.saturating_add(1);
+            }
+        } else if let Some(run) = self.document.button_runs.last_mut() {
+            run.end = end;
+        }
+        Ok(())
+    }
+
+    fn start_button_child(&mut self, tag: Tag<'_>) -> Result<(), Error> {
+        let suppressed = self
+            .button
+            .as_ref()
+            .is_some_and(|button| button.suppressed_controls != 0);
+        if suppressed {
+            if matches!(tag.name, "select" | "textarea" | "button")
+                && let Some(button) = self.button.as_mut()
+            {
+                button.suppressed_controls = button.suppressed_controls.saturating_add(1);
+            }
+            return Ok(());
+        }
+        if tag.name == "input" {
+            return Ok(());
+        }
+        if matches!(tag.name, "select" | "textarea" | "button") {
+            if let Some(button) = self.button.as_mut() {
+                button.suppressed_controls = 1;
+            }
+            return Ok(());
+        }
+        if tag.name == "img" {
+            return self.push_button_image(tag.src, tag.alt, tag.width, tag.height);
+        }
+        let Some(bit) = inline_style(tag.name) else {
+            return Ok(());
+        };
+        let button = self.button.as_mut().unwrap();
+        if button.inline.len() >= MAX_NESTING_DEPTH {
+            return Err(Error::TooManyItems);
+        }
+        let added = bit & !button.style;
+        let mut stored = [0; 8];
+        let bytes = tag.name.as_bytes();
+        stored[..bytes.len()].copy_from_slice(bytes);
+        memory::push(
+            &mut button.inline,
+            InlineFrame {
+                name: stored,
+                length: bytes.len() as u8,
+                added,
+                previous_link: None,
+                sets_link: false,
+            },
+        )?;
+        button.style |= bit;
+        Ok(())
+    }
+
+    fn end_button_child(&mut self, name: &str) -> Result<(), Error> {
+        if self
+            .button
+            .as_ref()
+            .is_some_and(|button| button.suppressed_controls != 0)
+        {
+            if matches!(name, "select" | "textarea" | "button")
+                && let Some(button) = self.button.as_mut()
+            {
+                button.suppressed_controls -= 1;
+            }
+            return Ok(());
+        }
+        if name == "button" || name == "form" {
+            self.end_button();
+            if name == "form" {
+                self.form = None;
+                self.close_block()?;
+            }
+            return Ok(());
+        }
+        let bytes = name.as_bytes();
+        let Some(button) = self.button.as_mut() else {
+            return Ok(());
+        };
+        let Some(index) = button
+            .inline
+            .iter()
+            .rposition(|frame| &frame.name[..frame.length as usize] == bytes)
+        else {
+            return Ok(());
+        };
+        while button.inline.len() > index {
+            if let Some(frame) = button.inline.pop() {
+                button.style &= !frame.added;
+            }
+        }
+        Ok(())
+    }
+
+    fn push_button_image(
+        &mut self,
+        src: Option<&str>,
+        alt: Option<&str>,
+        width: Option<&str>,
+        height: Option<&str>,
+    ) -> Result<(), Error> {
+        if self
+            .button
+            .as_ref()
+            .is_some_and(|button| button.pending_space)
+        {
+            if let Some(button) = self.button.as_mut() {
+                button.pending_space = false;
+            }
+            self.push_button_character(' ')?;
+        }
+        if self.document.images.len() >= MAX_IMAGES {
+            return Err(Error::TooManyItems);
+        }
+        self.check_items(1)?;
+        let button = self.button.as_ref().unwrap();
+        let source = src.and_then(|src| self.document.url.resolve(src).ok());
+        memory::push(
+            &mut self.document.images,
+            Image {
+                source,
+                alt: memory::string_from(alt.unwrap_or("").trim())?,
+                width: image_dimension(width, MAX_IMAGE_WIDTH),
+                height: image_dimension(height, MAX_IMAGE_HEIGHT),
+                intrinsic_width: None,
+                intrinsic_height: None,
+                text_offset: button.text.len() as u32,
+                text_end: button.text.len() as u32,
+                link: None,
+                button: Some(button.control),
+            },
+        )?;
         Ok(())
     }
 
@@ -640,6 +1292,7 @@ impl Builder {
         }
         self.open_kind = Some(BlockKind::Paragraph);
         self.open_first_run = self.document.runs.len() as u32;
+        self.open_first_control = self.document.controls.len() as u16;
         self.at_block_start = true;
         Ok(())
     }
@@ -676,7 +1329,13 @@ impl Builder {
         };
         let first_run = self.open_first_run;
         let run_count = self.document.runs.len() as u32 - first_run;
-        if run_count == 0 && kind != BlockKind::Rule {
+        let first_control = self.open_first_control;
+        let control_count = (self.document.controls.len() as u16).saturating_sub(first_control);
+        if run_count == 0
+            && control_count == 0
+            && kind != BlockKind::Rule
+            && !matches!(kind, BlockKind::Control(_))
+        {
             self.at_block_start = true;
             self.pending_space = false;
             return Ok(());
@@ -688,6 +1347,8 @@ impl Builder {
                 kind,
                 first_run,
                 run_count,
+                first_control,
+                control_count,
             },
         )?;
         self.at_block_start = true;
@@ -700,6 +1361,7 @@ impl Builder {
         self.close_block()?;
         self.open_kind = Some(kind);
         self.open_first_run = self.document.runs.len() as u32;
+        self.open_first_control = self.document.controls.len() as u16;
         self.at_block_start = true;
         self.pending_space = false;
         Ok(())
@@ -728,24 +1390,63 @@ impl Builder {
     // --- elements -----------------------------------------------------
 
     fn start_element(&mut self, tag: Tag<'_>) -> Result<(), Error> {
-        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
-            if tag.name == "table" {
-                if let Some(table) = self.table.as_mut() {
-                    table.nested = table.nested.saturating_add(1);
+        if self.button.is_some() {
+            return self.start_button_child(tag);
+        }
+        // Inside a select only its own structure means anything. A control
+        // that cannot be inside one ends it, as HTML's parser does.
+        if self.select.is_some() {
+            match tag.name {
+                "option" => return self.begin_option(tag.value, tag.selected, tag.disabled),
+                "optgroup" => {
+                    self.end_option()?;
+                    if let Some(select) = self.select.as_mut() {
+                        select.group_disabled = tag.disabled;
+                    }
+                    return Ok(());
                 }
-                return self.push_break();
+                "select" => return self.end_select(),
+                "input" | "textarea" => self.end_select()?,
+                _ => return Ok(()),
             }
-            if matches!(
-                tag.name,
-                "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
-            ) {
-                return self.push_break();
+        }
+        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
+            match tag.name {
+                "table" => {
+                    if let Some(table) = self.table.as_mut() {
+                        table.nested = table.nested.saturating_add(1);
+                    }
+                    return self.push_break();
+                }
+                "tr" => {
+                    if let Some(table) = self.table.as_mut() {
+                        table.nested_cell_in_row = false;
+                    }
+                    return self.push_break();
+                }
+                "td" | "th" => {
+                    let separated = self
+                        .table
+                        .as_ref()
+                        .is_some_and(|table| table.nested_cell_in_row);
+                    if let Some(table) = self.table.as_mut() {
+                        table.nested_cell_in_row = true;
+                    }
+                    return if separated {
+                        self.push_text(" | ")
+                    } else {
+                        Ok(())
+                    };
+                }
+                "thead" | "tbody" | "tfoot" | "caption" => return Ok(()),
+                _ => {}
             }
         }
         match tag.name {
             "table" => {
                 if let Some(table) = self.table.as_mut() {
                     table.nested = table.nested.saturating_add(1);
+                    table.nested_cell_in_row = false;
                     return self.push_break();
                 }
                 self.begin_table(tag.border)?;
@@ -798,6 +1499,80 @@ impl Builder {
             }
         }
         match tag.name {
+            "form" => {
+                self.begin_form(tag.action, tag.method)?;
+            }
+            "input" => {
+                let _ = self.push_control(
+                    ControlElement::Input(tag.input_type),
+                    tag.anchor_name,
+                    tag.value,
+                    tag.id,
+                    tag.disabled,
+                    tag.checked,
+                )?;
+                return Ok(());
+            }
+            "button" => {
+                if self.button.is_none() {
+                    let control = self.push_control(
+                        ControlElement::Button(tag.input_type.unwrap_or("submit")),
+                        tag.anchor_name,
+                        tag.value,
+                        tag.id,
+                        tag.disabled,
+                        false,
+                    )?;
+                    self.button = Some(ButtonBuild {
+                        control,
+                        text: String::new(),
+                        pending_space: false,
+                        style: 0,
+                        inline: Vec::new(),
+                        suppressed_controls: 0,
+                    });
+                }
+                return Ok(());
+            }
+            "select" => {
+                let control = self.push_control(
+                    ControlElement::Select {
+                        multiple: tag.multiple,
+                    },
+                    tag.anchor_name,
+                    None,
+                    tag.id,
+                    tag.disabled,
+                    false,
+                )?;
+                self.select = Some(SelectBuild {
+                    control,
+                    group_disabled: false,
+                    option: None,
+                });
+                return Ok(());
+            }
+            "textarea" => {
+                if self.textarea.is_none() {
+                    let control = self.push_control(
+                        ControlElement::Textarea(tag.rows),
+                        tag.anchor_name,
+                        None,
+                        tag.id,
+                        tag.disabled,
+                        false,
+                    )?;
+                    self.textarea = Some(TextareaBuild {
+                        control,
+                        text: String::new(),
+                        at_start: true,
+                        after_cr: false,
+                        overflow: false,
+                    });
+                }
+                return Ok(());
+            }
+            "label" => self.begin_label(tag.label_for)?,
             "title" => {
                 self.close_block()?;
                 self.in_title = true;
@@ -809,7 +1584,7 @@ impl Builder {
                 self.start_block(BlockKind::Rule)?;
                 self.close_block()?;
             }
-            "img" => self.push_image(tag.alt)?,
+            "img" => self.push_image(tag.src, tag.alt, tag.width, tag.height)?,
             "pre" => {
                 self.start_block(BlockKind::Preformatted)?;
                 self.preformatted = true;
@@ -879,18 +1654,36 @@ impl Builder {
     }
 
     fn end_element(&mut self, name: &str) -> Result<(), Error> {
-        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
-            if name == "table" {
-                if let Some(table) = self.table.as_mut() {
-                    table.nested -= 1;
+        if self.select.is_some() {
+            match name {
+                "option" => return self.end_option(),
+                "optgroup" => {
+                    self.end_option()?;
+                    if let Some(select) = self.select.as_mut() {
+                        select.group_disabled = false;
+                    }
+                    return Ok(());
                 }
-                return self.push_break();
+                "select" => return self.end_select(),
+                "form" => self.end_select()?,
+                _ => return Ok(()),
             }
-            if matches!(
-                name,
-                "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
-            ) {
-                return self.push_break();
+        }
+        if self.button.is_some() {
+            return self.end_button_child(name);
+        }
+        if self.table.as_ref().is_some_and(|table| table.nested != 0) {
+            match name {
+                "table" => {
+                    if let Some(table) = self.table.as_mut() {
+                        table.nested -= 1;
+                        table.nested_cell_in_row = false;
+                    }
+                    return self.push_break();
+                }
+                "tr" => return self.push_break(),
+                "thead" | "tbody" | "tfoot" | "td" | "th" | "caption" => return Ok(()),
+                _ => {}
             }
         }
         match name {
@@ -920,6 +1713,16 @@ impl Builder {
             _ => {}
         }
         match name {
+            "button" => {
+                self.end_button();
+            }
+            "textarea" => self.end_textarea(),
+            "label" => self.end_label()?,
+            "form" => {
+                self.end_button();
+                self.form = None;
+                self.close_block()?;
+            }
             "title" => {
                 self.in_title = false;
                 self.run_open = false;
@@ -951,6 +1754,164 @@ impl Builder {
         Ok(())
     }
 
+    fn end_button(&mut self) {
+        if let Some(button) = self.button.take()
+            && let Some(control) = self.document.controls.get_mut(button.control as usize)
+        {
+            control.display_label = button.text;
+        }
+    }
+
+    fn begin_label(&mut self, target_id: Option<&str>) -> Result<(), Error> {
+        self.end_label()?;
+        let Some(target_id) = target_id.filter(|target| !target.is_empty()) else {
+            return Ok(());
+        };
+        self.flush_pending_space()?;
+        self.close_run()?;
+        self.label = Some(LabelBuild {
+            target_id: memory::string_from(target_id)?,
+            text_start: self.document.text.len() as u32,
+        });
+        Ok(())
+    }
+
+    fn end_label(&mut self) -> Result<(), Error> {
+        let Some(label) = self.label.take() else {
+            return Ok(());
+        };
+        self.flush_pending_space()?;
+        self.close_run()?;
+        self.check_items(1)?;
+        memory::push(
+            &mut self.document.labels,
+            Label {
+                control: None,
+                text_start: label.text_start,
+                text_end: self.document.text.len() as u32,
+                target_id: label.target_id,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn begin_form(&mut self, action: Option<&str>, method: Option<&str>) -> Result<(), Error> {
+        if self.form.is_some() {
+            return Ok(());
+        }
+        self.check_items(1)?;
+        let action = self.document.url.resolve(action.unwrap_or(""))?;
+        let method = match method.unwrap_or("get") {
+            value if value.eq_ignore_ascii_case("get") => FormMethod::Get,
+            value if value.eq_ignore_ascii_case("post") => FormMethod::Post,
+            _ => FormMethod::Unsupported,
+        };
+        let index = self.document.forms.len() as u16;
+        memory::push(
+            &mut self.document.forms,
+            Form {
+                action,
+                method,
+                first_control: self.document.controls.len() as u32,
+                control_count: 0,
+            },
+        )?;
+        self.form = Some(index);
+        Ok(())
+    }
+
+    fn push_control(
+        &mut self,
+        element: ControlElement<'_>,
+        name: Option<&str>,
+        value: Option<&str>,
+        id: Option<&str>,
+        disabled: bool,
+        checked: bool,
+    ) -> Result<u16, Error> {
+        self.check_items(1)?;
+        let (kind, rows) = match element {
+            ControlElement::Input(input_type) => match input_type.unwrap_or("text") {
+                value if value.eq_ignore_ascii_case("hidden") => (ControlKind::Hidden, 0),
+                value if value.eq_ignore_ascii_case("submit") => (ControlKind::Submit, 0),
+                value if value.eq_ignore_ascii_case("checkbox") => (ControlKind::Checkbox, 0),
+                value if value.eq_ignore_ascii_case("radio") => (ControlKind::Radio, 0),
+                // HTML's input invalid-value default is the Text state. This
+                // small browser applies the same fallback to valid states
+                // whose specialised UI it does not implement yet (for example
+                // date), preserving editability and the submitted value.
+                _ => (ControlKind::Text, 0),
+            },
+            ControlElement::Button(value) if value.eq_ignore_ascii_case("submit") => {
+                (ControlKind::Submit, 0)
+            }
+            ControlElement::Button(_) => (ControlKind::Unsupported, 0),
+            ControlElement::Textarea(rows) => (ControlKind::Textarea, textarea_rows(rows)),
+            ControlElement::Select { .. } => (ControlKind::Select, 0),
+        };
+        let multiple = matches!(element, ControlElement::Select { multiple: true });
+        let button_element = matches!(element, ControlElement::Button(_));
+        let checked = checked && kind.is_checkable();
+        let name = name.unwrap_or("");
+        // Setting a radio button's checkedness clears the rest of its group,
+        // so of several `checked` in one group the last one wins.
+        if checked && kind == ControlKind::Radio && !name.is_empty() {
+            for earlier in &mut self.document.controls {
+                if earlier.kind == ControlKind::Radio
+                    && earlier.form == self.form
+                    && earlier.name == name
+                {
+                    earlier.checked = false;
+                }
+            }
+        }
+        // A checkable input without `value` submits the HTML default `on`.
+        let value = match value {
+            None if kind.is_checkable() => "on",
+            value => value.unwrap_or(""),
+        };
+        if kind == ControlKind::Textarea && self.table.is_none() {
+            self.start_block(BlockKind::Control(self.document.controls.len() as u16))?;
+        } else if kind != ControlKind::Textarea {
+            self.flush_pending_space()?;
+            self.open_block_if_needed()?;
+            self.close_run()?;
+        }
+        memory::push(
+            &mut self.document.controls,
+            Control {
+                form: self.form,
+                kind,
+                name: memory::string_from(name)?,
+                initial_value: memory::string_from(value)?,
+                display_label: String::new(),
+                button_element,
+                first_button_run: self.document.button_runs.len() as u32,
+                button_run_count: 0,
+                element_id: memory::string_from(id.unwrap_or(""))?,
+                disabled,
+                checked,
+                rows,
+                value_overflow: false,
+                first_option: self.document.options.len() as u32,
+                option_count: 0,
+                multiple,
+                text_offset: self.document.text.len() as u32,
+            },
+        )?;
+        let control_index = self.document.controls.len() as u16 - 1;
+        if let Some(form) = self
+            .form
+            .and_then(|index| self.document.forms.get_mut(index as usize))
+        {
+            form.control_count = form.control_count.saturating_add(1);
+        }
+        if kind == ControlKind::Textarea && self.table.is_none() {
+            self.close_block()?;
+        }
+        Ok(control_index)
+    }
+
     fn begin_table(&mut self, border: Option<&str>) -> Result<(), Error> {
         self.close_block()?;
         self.check_items(1)?;
@@ -976,6 +1937,7 @@ impl Builder {
             open_cell: None,
             columns: 0,
             nested: 0,
+            nested_cell_in_row: false,
         });
         Ok(())
     }
@@ -1044,9 +2006,13 @@ impl Builder {
             rowspan,
             colspan,
             header,
+            text_start: self.document.text.len() as u32,
+            first_image: self.document.images.len() as u16,
+            first_control: self.document.controls.len() as u16,
         });
         self.open_kind = Some(BlockKind::Paragraph);
         self.open_first_run = self.document.runs.len() as u32;
+        self.open_first_control = self.document.controls.len() as u16;
         self.at_block_start = true;
         self.pending_space = false;
         Ok(())
@@ -1068,6 +2034,9 @@ impl Builder {
                 kind: BlockKind::Paragraph,
                 first_run,
                 run_count,
+                first_control: cell.first_control,
+                control_count: (self.document.controls.len() as u16)
+                    .saturating_sub(cell.first_control),
             },
         )?;
         let table_index = self.table.as_ref().unwrap().index;
@@ -1076,6 +2045,13 @@ impl Builder {
             TableCell {
                 table: table_index,
                 block,
+                text_start: cell.text_start,
+                text_end: self.document.text.len() as u32,
+                first_image: cell.first_image,
+                image_count: (self.document.images.len() as u16).saturating_sub(cell.first_image),
+                first_control: cell.first_control,
+                control_count: (self.document.controls.len() as u16)
+                    .saturating_sub(cell.first_control),
                 row: cell.row,
                 column: cell.column,
                 rowspan: cell.rowspan,
@@ -1111,12 +2087,47 @@ impl Builder {
     /// entirely -- makes a page of thumbnails read as a page of nothing,
     /// and running the alt text into the prose around it makes a caption
     /// look like a sentence.
-    fn push_image(&mut self, alt: Option<&str>) -> Result<(), Error> {
+    fn push_image(
+        &mut self,
+        src: Option<&str>,
+        alt: Option<&str>,
+        width: Option<&str>,
+        height: Option<&str>,
+    ) -> Result<(), Error> {
         let alt = alt.unwrap_or("").trim();
+        let separate_block = self.table.is_none();
+        if separate_block {
+            self.start_block(BlockKind::Paragraph)?;
+        } else {
+            self.close_run()?;
+        }
         // An image is a word: separated from what is around it, whether or
         // not the markup put whitespace there.
         self.pending_space = true;
         self.flush_pending_space()?;
+        let text_offset = self.document.text.len() as u32;
+        let image_index = if self.document.images.len() < MAX_IMAGES {
+            let source = src.and_then(|src| self.document.url.resolve(src).ok());
+            let owned_alt = memory::string_from(alt)?;
+            memory::push(
+                &mut self.document.images,
+                Image {
+                    source,
+                    alt: owned_alt,
+                    width: image_dimension(width, MAX_IMAGE_WIDTH),
+                    height: image_dimension(height, MAX_IMAGE_HEIGHT),
+                    intrinsic_width: None,
+                    intrinsic_height: None,
+                    text_offset,
+                    text_end: text_offset,
+                    link: self.link,
+                    button: None,
+                },
+            )?;
+            Some(self.document.images.len() - 1)
+        } else {
+            None
+        };
         self.push_character('[')?;
         if alt.is_empty() {
             self.push_text("image")?;
@@ -1124,6 +2135,13 @@ impl Builder {
             self.push_text(alt)?;
         }
         self.push_character(']')?;
+        self.close_run()?;
+        if let Some(index) = image_index {
+            self.document.images[index].text_end = self.document.text.len() as u32;
+        }
+        if separate_block {
+            self.close_block()?;
+        }
         self.pending_space = true;
         Ok(())
     }
@@ -1271,12 +2289,38 @@ fn inline_style(name: &str) -> Option<u8> {
     }
 }
 
+/// `rows` as HTML reads it: a positive integer, otherwise the default. Kept
+/// within `MAX_TEXTAREA_ROWS` so a page cannot make one box taller than the
+/// screen.
+fn textarea_rows(value: Option<&str>) -> u8 {
+    value
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|&rows| rows != 0)
+        .map_or(DEFAULT_TEXTAREA_ROWS, |rows| {
+            rows.min(u32::from(MAX_TEXTAREA_ROWS)) as u8
+        })
+}
+
 fn parse_span(value: Option<&str>) -> u8 {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value != 0)
         .unwrap_or(1)
         .min(crate::limits::MAX_TABLE_SPAN) as u8
+}
+
+fn image_dimension(value: Option<&str>, maximum: u32) -> Option<u16> {
+    let text = value?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = text.parse::<u32>().ok()?;
+    if value == 0 || value > maximum || value > u16::MAX as u32 {
+        None
+    } else {
+        Some(value as u16)
+    }
 }
 
 fn parse_border(value: Option<&str>) -> u8 {
@@ -1387,6 +2431,7 @@ mod tests {
                     },
                     BlockKind::Preformatted => "pre".to_string(),
                     BlockKind::Rule => "hr".to_string(),
+                    BlockKind::Control(index) => format!("control#{index}"),
                 };
                 let mut text = String::new();
                 for run in document.block_runs(block) {
@@ -1677,14 +2722,151 @@ mod tests {
     // --- images -----------------------------------------------------------
 
     #[test]
-    fn images_show_their_alt_text_in_brackets() {
+    fn images_keep_accessible_fallback_text_in_separate_blocks() {
         let document = parse(
             b"<p>a <img src=\"x.png\" alt=\"a red square\"> b \
               <img src=\"y.png\"> c <img src=\"z.png\" alt=\"\"> d</p>",
         );
         assert_eq!(
             outline(&document),
-            ["p|a [a red square] b [image] c [image] d"]
+            [
+                "p|a",
+                "p|[a red square]",
+                "p|b",
+                "p|[image]",
+                "p|c",
+                "p|[image]",
+                "p|d"
+            ]
+        );
+    }
+
+    #[test]
+    fn images_keep_resolved_sources_dimensions_and_link_identity() {
+        let document = parse(
+            b"<p><a href='/target'><img src='../pic.png' alt='a cat' width='320' height='0'></a>\
+              <img src='bad scheme:x' width='12px' height='40'></p>",
+        );
+        assert_eq!(document.images().len(), 2);
+        let first = &document.images()[0];
+        assert_eq!(
+            first.source.as_ref().unwrap().to_text().unwrap(),
+            "http://example.com/a/pic.png"
+        );
+        assert_eq!(first.alt, "a cat");
+        assert_eq!((first.width, first.height), (Some(320), None));
+        assert_eq!(first.link, Some(0));
+        let second = &document.images()[1];
+        assert!(second.source.is_none());
+        assert_eq!((second.width, second.height), (None, Some(40)));
+        assert_eq!(second.link, None);
+    }
+
+    #[test]
+    fn forms_keep_ordered_controls_defaults_and_disabled_state() {
+        let document = parse(
+            b"<form action='/find?old=1#x' method='GET'>\
+              <input name=q value='first'>\
+              <input type=hidden name=q value='second'>\
+              <input type=submit name=go value=Search disabled>\
+              <input type=date name=unsupported></form>",
+        );
+        assert_eq!(document.forms().len(), 1);
+        let form = &document.forms()[0];
+        assert_eq!(
+            form.action.to_text().unwrap(),
+            "http://example.com/find?old=1#x"
+        );
+        assert_eq!(form.method, FormMethod::Get);
+        assert_eq!(form.first_control, 0);
+        assert_eq!(form.control_count, 4);
+        assert_eq!(
+            document
+                .controls()
+                .iter()
+                .map(|control| (
+                    control.kind,
+                    control.name.as_str(),
+                    control.initial_value.as_str(),
+                    control.disabled
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (ControlKind::Text, "q", "first", false),
+                (ControlKind::Hidden, "q", "second", false),
+                (ControlKind::Submit, "go", "Search", true),
+                (ControlKind::Text, "unsupported", "", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn button_keeps_submission_value_separate_from_visible_text() {
+        let document = parse(
+            b"<p>before</p><form><button name=mode value=advanced> Apply <strong>changes</strong> now </button></form><p>after</p>",
+        );
+        let control = &document.controls()[0];
+        assert_eq!(control.kind, ControlKind::Submit);
+        assert_eq!(control.name, "mode");
+        assert_eq!(control.initial_value, "advanced");
+        assert_eq!(control.display_label, "Apply changes now");
+        assert_eq!(document.text(), "beforeafter");
+        assert_eq!(document.blocks()[1].first_control, 0);
+        assert_eq!(document.blocks()[1].control_count, 1);
+        assert_eq!(document.button_runs(control).len(), 3);
+        assert_eq!(document.button_runs(control)[1].style, STYLE_BOLD);
+    }
+
+    #[test]
+    fn inline_controls_keep_offsets_spaces_and_control_only_blocks() {
+        let document = parse(
+            b"<p>before<input name=a>after <input name=b> tail</p><p><input name=c></p><p><input type=hidden name=h></p><textarea name=t>two lines</textarea>",
+        );
+        assert_eq!(document.text(), "beforeafter  tail");
+        assert_eq!(document.controls()[0].text_offset, 6);
+        assert_eq!(document.controls()[1].text_offset, 12);
+        assert_eq!(document.blocks()[0].control_count, 2);
+        assert_eq!(document.blocks()[1].control_count, 1);
+        assert_eq!(document.blocks()[2].control_count, 1);
+        assert!(matches!(document.blocks()[3].kind, BlockKind::Control(4)));
+    }
+
+    #[test]
+    fn button_children_keep_styles_images_and_suppress_nested_controls() {
+        let document = parse(
+            b"<form><button name=go value=sent>plain <strong>bold <b>deep</b></strong><div><em> red</em></div><a href=/bad> link</a><img src=icon.png width=40 height=80 alt=icon><input name=bad><select name=bad2><option>leak</option></select> end</button></form>",
+        );
+        assert_eq!(document.controls().len(), 1);
+        let control = &document.controls()[0];
+        assert_eq!(control.initial_value, "sent");
+        assert_eq!(control.display_label, "plain bold deep red link end");
+        assert!(
+            document
+                .button_runs(control)
+                .iter()
+                .any(|run| run.style & STYLE_BOLD != 0)
+        );
+        assert!(
+            document
+                .button_runs(control)
+                .iter()
+                .any(|run| run.style & STYLE_ITALIC != 0)
+        );
+        assert!(document.links().is_empty());
+        assert_eq!(document.images().len(), 1);
+        assert_eq!(document.images()[0].button, Some(0));
+        assert_eq!(document.images()[0].text_offset, 24);
+    }
+
+    #[test]
+    fn explicit_label_resolves_a_control_declared_after_it() {
+        let document = parse(b"<label for=q>Search term</label><input id=q name=q>");
+        assert_eq!(document.labels().len(), 1);
+        assert_eq!(document.labels()[0].control, Some(0));
+        assert_eq!(
+            &document.text()
+                [document.labels()[0].text_start as usize..document.labels()[0].text_end as usize],
+            "Search term"
         );
     }
 
@@ -1916,6 +3098,22 @@ mod tests {
             (cells[2].row, cells[2].column, cells[2].colspan),
             (1, 1, 31)
         );
+    }
+
+    #[test]
+    fn nested_table_rows_stay_inside_the_outer_cell_as_compact_text() {
+        let document = parse(
+            b"<table><tr><td>before<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>after</td><td>right</td></tr></table>",
+        );
+        assert_eq!(document.tables().len(), 1);
+        assert_eq!(document.table_cells().len(), 2);
+        let block = &document.blocks()[document.table_cells()[0].block as usize];
+        let runs = document.block_runs(block);
+        let text = &document.text()
+            [runs.first().unwrap().start as usize..runs.last().unwrap().end as usize];
+        assert!(text.contains("a | b"), "{text:?}");
+        assert!(text.contains("c | d"), "{text:?}");
+        assert!(text.contains("after"), "{text:?}");
     }
 
     #[test]

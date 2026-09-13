@@ -15,3 +15,5 @@ publish = false
 [dependencies]
 tab5-font = { path = "../font" }
 tab5-ui-font = { path = "../ui-font" }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+zune-jpeg = { version = "0.5.15", default-features = false }

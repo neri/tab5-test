@@ -35,7 +35,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [APPS.md](docs/APPS.md) | ペイント／タッチ診断、座標チャート、BMI270軸テスト、バッテリー、デスクトップ |
 | [USB.md](docs/USB.md) | USB-Aホストの対応範囲、バス所有とスキャン、転送方式、Split Transaction |
 | [STORAGE.md](docs/STORAGE.md) | SDカードとUSBマスストレージのブロックI/O、共通ブロックデバイス層、MBR判定、シェルコマンド |
-| [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、読み書きの保証、RAMディスク |
+| [FILESYSTEM.md](docs/FILESYSTEM.md) | VFS、マウント規則、USBの自動マウント、FAT読み出し、パスの規則、カレントディレクトリ、`ls`の表示、空き容量（`df`）、読み書きの保証、RAMディスク |
 | [WIFI.md](docs/WIFI.md) | ESP32-C6経由のWi-Fi。SDIO接続、ESP-Hostedのフレーム層とRPC、シェルコマンド、microSDとの共存 |
 | [NETWORK.md](docs/NETWORK.md) | smoltcpによるIPv4。`phy::Device`実装、受信キューと背圧、SYSTIMERの1 kHzティック、DHCP／DNS／ping／TFTP／HTTP、TLS 1.3とSPKI pin |
 | [BROWSER.md](docs/BROWSER.md) | `browser`のハイパーテキストビューア。対応するHTML、操作、上限、エラー、未認証TLSとセキュリティ表示、診断コマンド |
@@ -79,6 +79,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 [BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)、
 [BROWSER_FRAGMENT_NAVIGATION_PLAN.md](docs/BROWSER_FRAGMENT_NAVIGATION_PLAN.md)、
 [BROWSER_TABLE_PLAN.md](docs/BROWSER_TABLE_PLAN.md)、
+[BROWSER_EXTENSION_PLAN.md](docs/BROWSER_EXTENSION_PLAN.md)、
+[BROWSER_INLINE_CONTROL_PLAN.md](docs/BROWSER_INLINE_CONTROL_PLAN.md)、
 [SCALABLE_PROPORTIONAL_FONT_PLAN.md](docs/SCALABLE_PROPORTIONAL_FONT_PLAN.md)。
 
 ## 制約
@@ -104,7 +106,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   読み出すVFSがあります。書き込めるのはFATで、PSRAM上のFAT16 RAMルート`/`
   （8 MiB、リセットで消える）に加えてSDカードとUSB Mass Storage上のFATが
   **既定で読み書き**です（`mount -r`で読み取り専用にできます）。exFATは形式として
-  読み取り専用です。電断に対する原子性や自動修復は保証しません——保証するのは
+  読み取り専用です。各ボリュームの空き容量は`df`で確認できます。電断に対する原子性や自動修復は保証しません——保証するのは
   エラーを返さず完了した通常操作が同じ内容で読み出せることまでです
   （[FILESYSTEM.md](docs/FILESYSTEM.md)）。SDのUHS-Iモードは未実装です。
   ブロック単位のUSB MSC WRITE(10)は実装・実機受入済みです。かつては間欠故障の
@@ -120,7 +122,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
   （[WIFI.md](docs/WIFI.md)）。
 - TCP/IPはsmoltcpによるIPv4です。DHCPでのアドレス取得、名前解決、ping、
-  TFTP読み出し、HTTP GET、TLS 1.3クライアントまでで、**IPv6とサーバ機能は
+  TFTP読み出し、HTTP GET／urlencoded POST、TLS 1.3クライアントまでで、**IPv6とサーバ機能は
   ありません**。`https://`はブラウザ・`hs`・`httpget`（明示スキーム時）・`tls`
   から取得できますが、接続先のidentityを保証しない**未認証TLS**です。受動的な
   盗聴は防ぎますが能動的な攻撃者は防ぎません。表示は必ず`TLS UNVERIFIED`とし、
@@ -132,8 +134,11 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   HTTPは同期の`httpget`と、1回のpollごとに戻る`net::http::Transaction`の
   2つの顔がありますが、実装は1つです。
 - `browser`はHTMLから文章とリンクを取り出して読む全画面ビューアです。
-  **Webブラウザではありません**。CSS、JavaScript、画像デコードはいずれも
-  ありません。`https://`は取得できますが未認証TLSなので、toolbarは
+  **Webブラウザではありません**。CSSとJavaScriptはありません。PNG/JPEG画像、table、
+  form（text・hidden・submit・button・checkbox・radio・textarea・select、GET／urlencoded POST）、
+  `/tmp`へ保存するHTTP cache（鮮度・`ETag`再検証）を限定的に扱います。
+  `https://`は取得できますが
+  未認証TLSなので、toolbarは
   `TLS UNVERIFIED`を平文と同じ赤で出します。`https`→`http`のredirectは
   `https-downgrade`で拒否します。
   日本語は16 pixelのNoto Sans CJK A4 strike（32 pixel時は整数2倍）、English Latinは比例幅で表示します

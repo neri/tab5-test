@@ -125,6 +125,7 @@ enum Cmd {
     Umount,
     Automount,
     Mounts,
+    Df,
     Fsverify,
     Cd,
     Pwd,
@@ -700,6 +701,19 @@ const HELP_ENTRIES: &[HelpEntry] = &[
             "list what is mounted where, with each mount's media generation",
             "and what its identity rests on. 'size only' means the medium",
             "offered nothing but its capacity, so a match proves little",
+        ],
+    },
+    HelpEntry {
+        name: "df",
+        aliases: &[],
+        group: Group::Product,
+        id: Cmd::Df,
+        usage: "df [-c]",
+        lines: &[
+            "size, used and free space of every mounted volume, in KiB, and",
+            "where the free count came from. FAT32 uses its FSInfo count when",
+            "it is valid; FAT12/16, or FAT32 with -c, read the whole FAT, which",
+            "takes a moment on a large card. exFAT counts its bitmap",
         ],
     },
     HelpEntry {
@@ -1662,6 +1676,19 @@ pub fn execute(
         Cmd::Devices => cmd_devices(console, framebuffer, usb_host, ram_disk),
         Cmd::Blkread => cmd_blkread(console, framebuffer, argument, usb_host, ram_disk),
         Cmd::Mounts => files::show_mounts(console, framebuffer, vfs),
+        Cmd::Df => {
+            let count = match trim(argument) {
+                b"" => Some(false),
+                b"-c" => Some(true),
+                _ => None,
+            };
+            match count {
+                Some(count) => with_devices(usb_host, ram_disk, |devices| {
+                    files::show_usage(console, framebuffer, devices, vfs, count)
+                }),
+                None => console.write_output_line(framebuffer, "usage: df [-c]"),
+            }
+        }
         Cmd::Fsverify => {
             with_devices(usb_host, ram_disk, |devices| {
                 files::verify(console, framebuffer, devices, vfs)
@@ -11766,22 +11793,38 @@ fn as_str(bytes: &[u8]) -> &str {
     core::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// Small stack-allocated line builder: this crate has no allocator and
-/// deliberately avoids `core::fmt`, so command output is assembled a few
-/// bytes at a time instead.
-/// Fixed-buffer ASCII line builder shared by every command's output
-/// formatting -- `pub(crate)` (rather than local to `shell.rs`) so
-/// `mbr.rs` can format its own output lines the same way, without either
-/// module owning the other's display concerns.
+/// Bytes one [`Line`] can hold.
+///
+/// It used to be 80, which silently cut any report line longer than that --
+/// `df` on a large volume, `mounts` with a long path -- although the console
+/// is `console::COLUMNS` cells wide and wraps whatever is longer. Several
+/// rows' worth now, so an ordinary report line is never cut; the commands
+/// that print unbounded text (`cat`) break at [`Line::is_full`] rather than
+/// losing it. A line lives on the stack, and 512 bytes is small beside the
+/// stack `memory.x` guarantees.
+pub(crate) const LINE_BYTES: usize = 512;
+
+const _: () = assert!(
+    LINE_BYTES >= crate::console::COLUMNS,
+    "a Line must hold at least one console row"
+);
+
+/// Small stack-allocated line builder, shared by every command's output
+/// formatting: this crate avoids `core::fmt`, so output is assembled a few
+/// pieces at a time instead. `pub(crate)` so that `mbr.rs` and the other
+/// app modules format their own lines the same way.
+///
+/// Text past [`LINE_BYTES`] is dropped a whole character at a time, so what
+/// is kept is always valid UTF-8 and never shown as an empty line.
 pub(crate) struct Line {
-    buffer: [u8; 80],
+    buffer: [u8; LINE_BYTES],
     len: usize,
 }
 
 impl Line {
     pub(crate) fn new() -> Self {
         Self {
-            buffer: [0; 80],
+            buffer: [0; LINE_BYTES],
             len: 0,
         }
     }
@@ -11793,12 +11836,23 @@ impl Line {
         self.len >= self.buffer.len()
     }
 
+    /// Appends one ASCII byte, or drops it when the line is full.
+    fn push_byte(&mut self, byte: u8) {
+        if self.len < self.buffer.len() {
+            self.buffer[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    /// Appends `text` up to the last whole character that fits.
     pub(crate) fn push_str(&mut self, text: &str) {
-        for byte in text.bytes() {
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = byte;
-                self.len += 1;
+        for character in text.chars() {
+            let width = character.len_utf8();
+            if self.len + width > self.buffer.len() {
+                break;
             }
+            character.encode_utf8(&mut self.buffer[self.len..self.len + width]);
+            self.len += width;
         }
     }
 
@@ -11816,10 +11870,7 @@ impl Line {
             count += 1;
         }
         for &digit in digits[..count].iter().rev() {
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = digit;
-                self.len += 1;
-            }
+            self.push_byte(digit);
         }
     }
 
@@ -11841,10 +11892,7 @@ impl Line {
             count += 1;
         }
         for &digit in digits[..count].iter().rev() {
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = digit;
-                self.len += 1;
-            }
+            self.push_byte(digit);
         }
     }
 
@@ -11859,10 +11907,7 @@ impl Line {
             } else {
                 b'.'
             };
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = ch;
-                self.len += 1;
-            }
+            self.push_byte(ch);
         }
     }
 
@@ -11870,10 +11915,7 @@ impl Line {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         for index in 0..digits {
             let nibble = (value >> (4 * (digits - 1 - index))) & 0xF;
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = HEX[nibble as usize];
-                self.len += 1;
-            }
+            self.push_byte(HEX[nibble as usize]);
         }
     }
 
@@ -11892,15 +11934,12 @@ impl Line {
             count += 1;
         }
         for &digit in digits[..count].iter().rev() {
-            if self.len < self.buffer.len() {
-                self.buffer[self.len] = digit;
-                self.len += 1;
-            }
+            self.push_byte(digit);
         }
     }
 
-    /// All bytes ever written come from ASCII literals or the digit/hex
-    /// tables above, so this is always valid UTF-8.
+    /// Always valid UTF-8: text is appended whole characters at a time and
+    /// every other push writes ASCII.
     pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buffer[..self.len]).unwrap_or("")
     }

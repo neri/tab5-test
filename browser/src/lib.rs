@@ -25,13 +25,18 @@
 
 extern crate alloc;
 
+pub mod cache;
 pub mod document;
 pub mod encoding;
 pub mod error;
+pub mod form;
 pub mod html;
+pub mod image;
 pub mod layout;
 pub mod limits;
 pub mod memory;
+pub mod request;
+pub mod text_input;
 pub mod url;
 
 pub use error::Error;

@@ -38,7 +38,9 @@ pub fn push_str(target: &mut String, text: &str) -> Result<(), OutOfMemory> {
 
 /// Appends one `char`, reserving its UTF-8 length first.
 pub fn push_char(target: &mut String, value: char) -> Result<(), OutOfMemory> {
-    target.try_reserve(value.len_utf8()).map_err(|_| OutOfMemory)?;
+    target
+        .try_reserve(value.len_utf8())
+        .map_err(|_| OutOfMemory)?;
     target.push(value);
     Ok(())
 }
@@ -50,7 +52,9 @@ pub fn push_char(target: &mut String, value: char) -> Result<(), OutOfMemory> {
 /// the browser's owned-memory budget for the whole life of the page.
 pub fn string_from(text: &str) -> Result<String, OutOfMemory> {
     let mut owned = String::new();
-    owned.try_reserve_exact(text.len()).map_err(|_| OutOfMemory)?;
+    owned
+        .try_reserve_exact(text.len())
+        .map_err(|_| OutOfMemory)?;
     owned.push_str(text);
     Ok(owned)
 }
@@ -93,10 +97,7 @@ pub fn push<T>(target: &mut Vec<T>, value: T) -> Result<(), OutOfMemory> {
 }
 
 /// Appends a slice to a `Vec`, reserving first.
-pub fn extend_from_slice<T: Clone>(
-    target: &mut Vec<T>,
-    values: &[T],
-) -> Result<(), OutOfMemory> {
+pub fn extend_from_slice<T: Clone>(target: &mut Vec<T>, values: &[T]) -> Result<(), OutOfMemory> {
     target.try_reserve(values.len()).map_err(|_| OutOfMemory)?;
     target.extend_from_slice(values);
     Ok(())

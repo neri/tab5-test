@@ -202,6 +202,7 @@ fn describe(document: &Document) -> String {
             },
             BlockKind::Preformatted => "pre".to_string(),
             BlockKind::Rule => "hr".to_string(),
+            BlockKind::Control(index) => format!("control#{index}"),
         };
         description.push_str(&kind);
         description.push('|');

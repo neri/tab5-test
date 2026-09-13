@@ -11,11 +11,12 @@
 外から観測できるプロトコル層にはその理由が当てはまりません。
 
 到達点はDHCPでアドレスを取得し、名前解決・ping・TFTP読み出し・最小の
-HTTP GETができるところまでです。受け取ったファイルはRAMルート上のカレント
+HTTP GETとurlencoded POSTができるところまでです。受け取ったファイルはRAMルート上のカレント
 ディレクトリへ保存できます
 （[`FILESYSTEM.md`](FILESYSTEM.md)）。**IPv6は入れていません**（smoltcpの
 `proto-ipv6`を有効にすれば足せますが、現状は無効）。名前解決はAレコードだけで、
-キャッシュ・サーチドメイン・逆引きはありません。サーバ機能とTLSもありません。
+キャッシュ・サーチドメイン・逆引きはありません。サーバ機能もありません。HTTPSはTLS 1.3の
+クライアントとして接続し、身元確認はSPKI pinを登録したhostだけです（下記「SPKI pin」）。
 
 ## 層構造
 
@@ -28,7 +29,7 @@ HTTP GETができるところまでです。受け取ったファイルはRAMル
 | `src/net/dns.rs` | 名前解決（Aレコード）。ソケットは`stack.rs`側 |
 | `src/net/ping.rs` | ICMP echoの送信と往復時間の測定 |
 | `src/net/tftp.rs` | TFTP読み出しクライアント（RFC 1350） |
-| `src/net/http.rs` | HTTP/1.0 GET。中断可能な`Transaction`と、その上の同期`get` |
+| `src/net/http.rs` | HTTP/1.0 GET／urlencoded POST。中断可能な`Transaction`と、その上の同期GET |
 | `src/net/tls.rs` | TLS 1.3クライアント。TCP socketを所有し、平文を出すtransport |
 | `spki/src/lib.rs` | leaf証明書のDERから`SubjectPublicKeyInfo`を取り出す（`tab5-spki`、host test付き） |
 | `src/entropy.rs` | SAR ADCノイズ源から種を取るCSPRNG。TLSの秘密値はここからだけ来る |
@@ -350,8 +351,8 @@ ping）のソケットはコマンドの実行中しか存在しませんが、`
 - **UDPソケットはDNSソケットより先に照合されます**（`iface`の受信経路）。
   TFTPのエフェメラルポートがDNSの送信元ポートと偶然一致すると応答を
   横取りされます。現状は解決が転送の前に終わるので重なりません
-- 名前は`Line`の80桁を超えると黙って切れます。判定にはアドレスの行を
-  見てください
+- 表示行は`Line`の512 byte（`LINE_BYTES`）までで、コンソール幅を超える分は折り返します。
+  それを超える分は文字単位で切れるので、判定にはアドレスの行を見てください
 
 `httpget`に名前を渡したときは、**`Host:`ヘッダにも名前が載ります**。
 解決後のアドレスを載せると、1つのアドレスを複数のサイトで共有している
@@ -376,8 +377,8 @@ RFC 1350のみで、オプション拡張（RFC 2347/2348）は入れていま�
   ACKの再送だけで、失われたACKからの回復は済みます
 - ERRORパケットは**コードだけがRFCの定めるもの**で（1 = File not found）、
   続く文字列はサーバが決めます。`server error <code>: <message>`と表示しますが、
-  1行80桁に収まらない分は黙って切れます（dnsmasqは絶対パスを入れるので必ず
-  切れます）。判定にはコードを見てください
+  長い文字列はコンソール幅で折り返し、1行512 byte（`LINE_BYTES`）を超える分だけ文字単位で
+  切れます。判定にはコードを見てください
 ### 受け取ったバイトはsinkへ渡す
 
 `tftp::get`はファイルを溜めません。ブロックが届くたびに
@@ -494,7 +495,18 @@ redirectや表示しないstatusを、本文を1 byteも読まずに判断でき
 ### 応答から読むもの
 
 status code、`Content-Type`と`charset`、`Content-Length`、
-`Transfer-Encoding: chunked`、`Location`、`Content-Encoding`。
+`Transfer-Encoding: chunked`、`Location`、`Content-Encoding`、`Cache-Control`の`no-store`・`no-cache`・`max-age`、`ETag`、`Vary`、`Date`、`Expires`、`Age`。
+
+`Cache-Control`は`no-store`と`no-cache`の有無、`max-age`の秒数を`Head`に持ちます。複数行ある場合は
+`no-store`・`no-cache`はどれか1つにあれば真、`max-age`は最小値で、読めない`max-age`は0です。`Age`は
+秒数、`Date`と`Expires`は64 byte以下の値をそのまま持ち、64 byteを超える`Expires`は空（期限切れ扱い）
+にします。鮮度の計算はブラウザ側です。`no-store`のPOST結果は履歴用に保持しません
+（[BROWSER.md](BROWSER.md)）。
+
+`ETag`は空でなく256 byte以下の印字可能ASCIIだけを`Head::etag`に持ちます。`Vary`は
+`Accept-Encoding`以外の名前（`*`を含む）があれば`Head::vary_blocks_cache`を真にします。要求側は
+GETに限り`If-None-Match`を1つ付けられます（`Transaction::start_request`の`if_none_match`）。
+値は`browser::request`で改行・制御文字を拒否し、POSTでは付けません。
 
 `charset`はここでは小文字化して持つだけです。使うのはブラウザ側で、
 本文の1 byte目より前に`Parser::declare_charset`へ渡します
