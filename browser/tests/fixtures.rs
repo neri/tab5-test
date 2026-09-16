@@ -8,7 +8,7 @@
 //! two ever disagree in count.
 //!
 //! Two things are checked for every fixture, and they are the Stage 3
-//! completion condition from `docs/WEB_BROWSER_PLAN.md`:
+//! completion condition from `docs/plans/archive/WEB_BROWSER_PLAN.md`:
 //!
 //! 1. it parses into the text, blocks and links it is supposed to
 //! 2. feeding it one byte at a time gives exactly the same document

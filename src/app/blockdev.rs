@@ -1,6 +1,6 @@
 //! Display for the block layer: the `devices` and `blkread` commands.
 //!
-//! `docs/FILESYSTEM_PLAN.md` Stage 1. These exist to make the layer visible
+//! `docs/plans/archive/FILESYSTEM_PLAN.md` Stage 1. These exist to make the layer visible
 //! from the shell before there is a VFS above it -- `devices` shows what each
 //! medium reports and what its LBA 0 turned out to be, and `blkread` reads
 //! one block through the same path a filesystem driver will, optionally

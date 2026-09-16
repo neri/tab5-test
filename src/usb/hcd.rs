@@ -13,8 +13,8 @@
 //! controller on GPIO24/25 that `uart.rs` already uses for
 //! flashing/logging.
 //!
-//! This is Stage 1 of `docs/USB_HOST_PLAN.md`: core bring-up and host-port
-//! connect/reset/speed detection. `docs/USB_INTERRUPT_REFACTOR_PLAN.md`
+//! This is Stage 1 of `docs/plans/archive/USB_HOST_PLAN.md`: core bring-up and host-port
+//! connect/reset/speed detection. `docs/plans/archive/USB_INTERRUPT_REFACTOR_PLAN.md`
 //! adds the first interrupt-driven completion layer while preserving the
 //! synchronous packet API during migration. Stage 6 added split transactions
 //! (`HCSPLT`, set up from
@@ -201,7 +201,7 @@ static DIRECT_BUFFER_NAK_COUNT: AtomicU32 = AtomicU32::new(0);
 static CHANNEL0_QTD_NEXT: AtomicU32 = AtomicU32::new(0);
 
 // ------------------------------------------------------------------------
-// Stage 0 observation contract (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`)
+// Stage 0 observation contract (`docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`)
 //
 // Nothing below changes what a transfer does. It exists so that the
 // proactive host cleanup this driver used to perform at every healthy
@@ -968,7 +968,7 @@ const HCFG_FRLISTEN_MASK: u32 = 0x3 << 24;
 const HCFG_FRLISTEN_32: u32 = 0x2 << 24;
 const HCFG_PERSCHEDENA: u32 = 1 << 26;
 
-/// Stage 4 of `docs/USB_HOST_PLAN.md`: when true, the host is restricted to
+/// Stage 4 of `docs/plans/archive/USB_HOST_PLAN.md`: when true, the host is restricted to
 /// Full/Low-Speed operation (`HCFG.FSLSSupp`), so it never drives the
 /// High-Speed chirp during a port reset and every attached device --
 /// including High-Speed-capable ones -- falls back to Full-Speed, which
@@ -1323,7 +1323,7 @@ const _: () = assert!(core::mem::size_of::<PacketStaging>() % DMA_ALIGN == 0);
 /// the hardware would have done.
 ///
 /// Fault injection for the Stage 1 contract of
-/// `docs/USB_BOT_HCD_REFACTOR_PLAN.md`: a refused synchronization has to
+/// `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`: a refused synchronization has to
 /// fail its transfer *before* the channel is armed, so that no packet
 /// succeeds and no IN buffer is published from a staging area DMA never
 /// wrote. There is no other way to reach that path on working hardware.
@@ -2123,7 +2123,7 @@ const FORCE_HOST_MODE_DELAY_MS: u32 = 30;
 /// Boot is the one caller that can afford to wait longer, because finding a
 /// USB mass-storage device there decides which filesystem the firmware comes
 /// up on; `input::InputManager::new` raises the limit for its one initial
-/// scan and puts it back. See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
+/// scan and puts it back. See `docs/plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md`.
 const DEFAULT_CONNECT_WAIT_MS: u32 = 500;
 /// Upper bound accepted by [`set_connect_wait_ms`], so the poll count it is
 /// converted into cannot overflow and no caller can block the foreground
@@ -2957,7 +2957,7 @@ pub enum FailureScope {
 ///
 /// The only channel-0 cleanup there is. It is reached from a timeout, a
 /// transaction error, or a channel that would not halt -- never from a
-/// healthy command. Until Stage 6 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md`
+/// healthy command. Until Stage 6 of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`
 /// this entry point was shared with a proactive cleanup that ran at every
 /// BOT command boundary, which made "how often did a transfer actually
 /// fail" impossible to read off the counters. Three real-hardware
@@ -5507,10 +5507,10 @@ fn cycle_count() -> u32 {
 /// The result is deliberately dropped here while `sdmmc.rs` treats it as a
 /// transfer failure. The buffers on this side are declared with an explicit
 /// alignment where DMA touches them, and this path has been through the
-/// acceptance testing in `docs/USB_WRITE_STABILITY_PLAN.md` as it stands;
+/// acceptance testing in `docs/plans/archive/USB_WRITE_STABILITY_PLAN.md` as it stands;
 /// turning refusals into failures here is a change to a verified transport
 /// that belongs with its own bus testing, not with an SD card fix. Stage 1
-/// of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` is that testing; until then this
+/// of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md` is that testing; until then this
 /// records what a refusal would have cost instead of acting on it.
 ///
 /// `site` and `direction` say which DMA-shared object this covers, and the

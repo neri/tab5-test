@@ -28,7 +28,7 @@
 //! [`unix_time_utc`]. Those check that the peer holds the key it presented,
 //! which is a question with no date in it, so a Tab5 whose RTC has never
 //! been set can still open an `https://` page. Only the public-CA profile
-//! (`docs/TLS_PLAN.md` Stage 9) makes the clock a precondition, and that is
+//! (`docs/plans/archive/TLS_PLAN.md` Stage 9) makes the clock a precondition, and that is
 //! the whole reason the two readings are separate calls.
 
 use tab5_time::{Calendar, TimeZone};

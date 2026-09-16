@@ -1,5 +1,5 @@
 //! ESP32-P4 SDHOST controller bring-up, SD card activation and DMA block I/O
-//! (stages 1-3 of `docs/SD_CARD_PLAN.md`).
+//! (stages 1-3 of `docs/plans/archive/SD_CARD_PLAN.md`).
 //!
 //! Targets the Tab5's microSD slot: SDIO1, IOMUX-routed (bypasses the GPIO
 //! matrix), 4-bit capable, GPIO39..44 = D0,D1,D2,D3,CLK,CMD (confirmed from
@@ -74,7 +74,7 @@ const PERI_CLK_CTRL02: usize = HP_SYS_CLKRST + 0x38;
 const HP_SDMMC_EMAC_RST_CTRL: usize = LP_CLKRST + 0x4C;
 
 /// Card (slot) numbers on the single SDHOST controller. Card 0 is the
-/// microSD socket, card 1 is the ESP32-C6's SDIO bus (`docs/WIFI_C6_PLAN.md`).
+/// microSD socket, card 1 is the ESP32-C6's SDIO bus (`docs/plans/archive/WIFI_C6_PLAN.md`).
 /// The controller multiplexes both through one CIU, so activating one card
 /// resets the state of the other.
 pub const CARD_SD: u32 = 0;
@@ -800,7 +800,7 @@ fn read_block_aligned(card: &SdCard, lba: u32, buffer: &mut [u8; BLOCK_BYTES]) -
 /// A single block goes to [`read_block`]'s CMD17 rather than to CMD18.
 /// CMD18 with hardware auto-stop is a multi-block command, and the only
 /// multi-block reads this driver has been accepted at on real hardware are
-/// four blocks and up (`docs/SD_CARD_PLAN.md` Stage 3, which verified
+/// four blocks and up (`docs/plans/archive/SD_CARD_PLAN.md` Stage 3, which verified
 /// `sdreadn 0 4`); one block through it was never exercised.
 pub fn read_blocks(card: &SdCard, lba: u32, buffer: &mut [u8]) -> bool {
     if !valid_block_length(buffer) {
@@ -1278,7 +1278,7 @@ fn cache_writeback_invalidate(address: usize, length: usize) -> bool {
 /// target card's bits are touched here. `host_div` however feeds the shared
 /// `sdhost_cclk_in` generator and therefore affects both cards; running the
 /// microSD and the C6 at the same time will need a common value (see
-/// `docs/WIFI_C6_PLAN.md` Stage 6).
+/// `docs/plans/archive/WIFI_C6_PLAN.md` Stage 6).
 fn set_card_clock(card: u32, host_div: u32, card_div: u32) -> bool {
     let enable_bits = (1 << card) | (1 << (16 + card));
     unsafe { modify(CLKENA, enable_bits, 0) };

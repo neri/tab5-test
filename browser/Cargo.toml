@@ -8,7 +8,7 @@ publish = false
 # data and the `advance` lookup, and it builds for the host exactly like this
 # one does. Line breaking has to measure text in the same pixels the renderer
 # draws it in, and the only way to guarantee that is for both to call the same
-# function -- see `docs/FONT_MIGRATION_PLAN.md`. URL parsing, HTML tokenizing
+# function -- see `docs/plans/archive/FONT_MIGRATION_PLAN.md`. URL parsing, HTML tokenizing
 # and the document model remain pure byte-in/value-out code, which is what
 # lets `cargo test` build this crate for the host while the firmware itself
 # only ever builds for RISC-V.

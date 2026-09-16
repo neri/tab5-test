@@ -1,8 +1,8 @@
 # 入力（キーボード・ポインタ・タッチ）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
-> [`INPUT_MANAGER_PLAN.md`](INPUT_MANAGER_PLAN.md)、
-> [`SOFT_I2C_REFACTOR_PLAN.md`](SOFT_I2C_REFACTOR_PLAN.md)
+> [`INPUT_MANAGER_PLAN.md`](plans/archive/INPUT_MANAGER_PLAN.md)、
+> [`SOFT_I2C_REFACTOR_PLAN.md`](plans/archive/SOFT_I2C_REFACTOR_PLAN.md)
 
 ## ソフトウェアI2C
 

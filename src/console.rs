@@ -32,7 +32,7 @@ const TOP: usize = 8;
 pub const COLUMNS: usize = (WIDTH - LEFT * 2) / CELL_WIDTH;
 const ROWS: usize = (HEIGHT - TOP) / CELL_HEIGHT;
 
-// The grid `docs/FONT_MIGRATION_PLAN.md` sizes everything else against. The
+// The grid `docs/plans/archive/FONT_MIGRATION_PLAN.md` sizes everything else against. The
 // arithmetic above is what defines it; this is here so that a change to the
 // margins or the cell size has to be a deliberate one rather than a quiet
 // reshaping of every screen that counts columns.
@@ -40,7 +40,7 @@ const _: () = assert!(COLUMNS == 156 && ROWS == 44);
 
 // The console is a half-width fixed terminal by design -- every cell is one
 // 8x16 glyph -- so the prompt is a half-width '>' rather than the full-width
-// '＞' a shell would show. See `docs/FONT_MIGRATION_PLAN.md`.
+// '＞' a shell would show. See `docs/plans/archive/FONT_MIGRATION_PLAN.md`.
 const PROMPT: [Id; 2] = [font::console::id('>'), font::console::id(' ')];
 
 /// Longest command line `submit` can capture: one row minus the prompt. This

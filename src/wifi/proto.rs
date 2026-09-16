@@ -1,5 +1,5 @@
 //! The slice of protobuf that ESP-Hosted's RPC needs (stage 3 of
-//! `docs/WIFI_C6_PLAN.md`).
+//! `docs/plans/archive/WIFI_C6_PLAN.md`).
 //!
 //! The slave decodes RPC messages with `protobuf-c` generated from
 //! `esp_hosted_rpc.proto`, so the wire format is fixed, but only a corner of

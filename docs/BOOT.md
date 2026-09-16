@@ -55,7 +55,7 @@ DROM終端とIROM開始は、読み取り専用データが増えるたびに64 
 16 px A4を追加した792,089 byteのcontainerと3,175 byteのASCIIを収めるため`0x40110000`です。DROMは領域を必ず埋め切る
 構成なので、余裕は末尾の0埋めの量として見えます。XIP窓の総終端`0x40400000`、セグメント数、物理／仮想
 ページ内offsetの一致は変えず、releaseごとに同じ検査で確認します。フォントを内部RAMや
-別パーティションへ置かない理由は[`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)に
+別パーティションへ置かない理由は[`FONT_MIGRATION_PLAN.md`](plans/archive/FONT_MIGRATION_PLAN.md)に
 あります。
 
 `font-drom-direct`を有効にした比較buildだけは平文A4 blobを収めるため、build scriptがlinker

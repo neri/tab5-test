@@ -92,7 +92,7 @@ interruptは許可したままですが、trap入口、ISR、参照定数、状�
 RAMディスクをヒープから動的に確保せず固定予約にしているのは、8 MiBという
 長寿命の確保がヒープを断片化し、起動後の順序次第で失敗し得るうえ、誤って解放
 されるとファイルシステムの裏付け領域が別の所有者へ渡ってしまうためです
-（[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)）。容量のruntime変更は実装しません。
+（[FILESYSTEM_PLAN.md](plans/archive/FILESYSTEM_PLAN.md)）。容量のruntime変更は実装しません。
 マッピングが3領域に足りない小ささで返った場合、`Psram::ram_disk`は`None`を返し、
 ヒープへ領域を戻すfallbackは行いません。アプリはこの領域を毎起動FAT16で作り直して
 `/`へ恒久マウントします。claim、format、初期ツリー作成、mountの失敗はpanicします。

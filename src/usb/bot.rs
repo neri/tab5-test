@@ -52,7 +52,7 @@ pub struct BotInterface {
 }
 
 /// Stage 0 baseline counters for one BOT session
-/// (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`).
+/// (`docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`).
 ///
 /// These are per attachment, not per boot: a session that has been rebuilt
 /// has genuinely started over, and carrying the old session's numbers into
@@ -203,7 +203,7 @@ pub struct BulkOnlyTransport {
     /// therefore unrelated HID devices) is broken.
     unusable: bool,
     packet_retries: u32,
-    /// Stage 0 observation counters (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`).
+    /// Stage 0 observation counters (`docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`).
     /// A single "retries" total cannot say whether the transport is losing
     /// packets or the device is simply slow, and the two led to opposite
     /// conclusions about removing the proactive cleanup.
@@ -434,7 +434,7 @@ impl BulkOnlyTransport {
     }
 
     /// The Stage 0 baseline counters for this session
-    /// (`docs/USB_BOT_HCD_REFACTOR_PLAN.md`).
+    /// (`docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`).
     pub fn observation(&self) -> TransportObservation {
         TransportObservation {
             packet_error_retries: self.packet_error_retries,
@@ -917,7 +917,7 @@ impl BulkOnlyTransport {
     ///
     /// Reported packet errors do not come here: see the retry arms above.
     ///
-    /// This is the case Stage 2 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md`
+    /// This is the case Stage 2 of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`
     /// exists to stop. Before it, a 64-byte OUT that reported
     /// `requested=64 actual=64` on a timeout was resubmitted four times,
     /// putting the same bytes on the bus again each time. The command now
@@ -1049,7 +1049,7 @@ impl BulkOnlyTransport {
 /// have an MPS of at most 512 bytes; Full-Speed devices use at most 64.
 ///
 /// This is **not** a DMA buffer and needs no cache-line alignment: since
-/// Stage 1 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` the HCD stages every
+/// Stage 1 of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md` the HCD stages every
 /// packet in a buffer it owns and aligns, and copies the received bytes out
 /// to whatever slice this layer passes. What this buffer is still for is
 /// the descriptor-DMA rule that an IN transfer size must be zero or a whole

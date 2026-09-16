@@ -1,5 +1,5 @@
 //! SDIO I/O-card activation for the ESP32-C6 on SDMMC card 1 (stage 1 of
-//! `docs/WIFI_C6_PLAN.md`).
+//! `docs/plans/archive/WIFI_C6_PLAN.md`).
 //!
 //! The Tab5's Wi-Fi radio lives in an ESP32-C6 that is wired to the P4 as an
 //! SDIO card, not as a memory card: GPIO11/10/9/8 = D0..D3, GPIO13 = CMD,

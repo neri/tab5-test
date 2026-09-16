@@ -175,7 +175,7 @@ Enterを押すと、プロンプトより後ろに入力された文字列（コ
 
 各コマンドの割り当てと、足場を生かしている作業への紐づけは
 [`CONSOLE_COMMAND_REVIEW.md`](CONSOLE_COMMAND_REVIEW.md)、削除計画は
-[`COMMAND_RETIREMENT_PLAN.md`](COMMAND_RETIREMENT_PLAN.md)にあります。
+[`COMMAND_RETIREMENT_PLAN.md`](plans/proposed/COMMAND_RETIREMENT_PLAN.md)にあります。
 
 ### 引数の区切りとダブルクォート
 
@@ -309,7 +309,7 @@ READ(10)を再送した回数です。`failures`は再送しても失敗した�
 ESP32-P4のESP-IDF balanced値は`fifo=512/256/128`です。
 
 USB BOT/HCDの受入試験は接続構成ごとに`usbcheck [reads] [lba]`を1回実行します
-（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。前後のcounterを自分で
+（[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)）。前後のcounterを自分で
 採り、read soakと、LBAを指定した場合は同じLBAへのwrite roundを10回実行し、最後に
 **差分**とGo条件ごとのPASS/FAILを出します。LBAを省略するとread専用で、mediaへは
 書き込みません。10回なのはStage 0のmatrixがその回数で、Full-Speedハブ経路の復元WRITEが
@@ -399,7 +399,7 @@ handshakeが何を証明したかを報告します。既定portは443、既定p
 報告するのはhandshake時間、総時間、poll回数、そして**1回のpollの最長時間**です。
 最後の値がブラウザのframe loopが実際に感じる停止時間で、署名検証はpollの内側の
 分割できない処理なので、ここが100 msを超えるかどうかが
-[TLS_PLAN.md](TLS_PLAN.md)の中止条件になります。
+[TLS_PLAN.md](plans/archive/TLS_PLAN.md)の中止条件になります。
 
 `entropy`はTLSがCSPRNGの種に使うSAR ADCノイズ源を検査します。引数なしで1回種を取り、
 32 byteと有効化／停止の累計回数を表示します。`entropy test [count]`は既定100回、
@@ -410,7 +410,7 @@ handshakeが何を証明したかを報告します。既定portは443、既定p
 
 `entropy fail on`はハードウェアに触れずに種の取得を失敗させるテストフックです。
 真性乱数が用意できないとき呼び出し側が1 packetも送らないことを確認するために使い、
-`entropy fail off`で戻します（[TLS_PLAN.md](TLS_PLAN.md) Stage 2）。
+`entropy fail off`で戻します（[TLS_PLAN.md](plans/archive/TLS_PLAN.md) Stage 2）。
 
 ## 再起動
 

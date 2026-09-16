@@ -1,9 +1,9 @@
 # ストレージ（SDカードとUSBマスストレージ）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
-> [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)、[`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)、
-> [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)、
-> [`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)
+> [`SD_CARD_PLAN.md`](plans/archive/SD_CARD_PLAN.md)、[`USB_MSC_PLAN.md`](plans/archive/USB_MSC_PLAN.md)、
+> [`USB_WRITE_STABILITY_PLAN.md`](plans/archive/USB_WRITE_STABILITY_PLAN.md)、
+> [`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)
 
 ブロック単位の読み書きと、その上の共通ブロックデバイス層・MBR判定までを
 実装しており、ファイルシステムは扱いません。SDカードとUSBメモリは
@@ -55,11 +55,11 @@ INQUIRY、TEST UNIT READY、READ CAPACITY(10)、READ(10)です。WRITE(10)は
 sessionが死ぬ間欠故障があり、予防的BOT再同期とMSC session隔離で緩和していました。
 その後HCD側の契約（DMA cache同期、descriptor完了の検査、実転送長の単一化、cleanup失敗の
 伝播）を整えた結果、**予防的BOT再同期は不要になり撤去しました**
-（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。High-Speed直結、
+（[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)）。High-Speed直結、
 FS-onlyハブ＋HID併用、High-Speedハブ＋Low-Speed HID併用の3構成でREAD／WRITE試験を
 完走しています。
 確定した事実・否定した仮説・入れた緩和策は
-[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)にまとめてあります。
+[`USB_WRITE_STABILITY_PLAN.md`](plans/archive/USB_WRITE_STABILITY_PLAN.md)にまとめてあります。
 Bulk転送は
 コントロール転送ではないため`protocol.rs`を通らず、`hcd.rs`のパケット
 プリミティブを直接使い、エンドポイントごとのデータトグルを自分で管理します。
@@ -124,7 +124,7 @@ FAILED応答またはstale tagとして処理します。
 対象以外が変化していれば`COLLATERAL DAMAGE`として表示し、保持した内容でそのブロックも
 書き戻します。**対象LBAに書いて対象LBAから読み戻すだけでは、デバイスが別の場所へ書いても
 必ず一致してしまう**ためです（実機で実際にデータ破損が起きました。
-[`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)の追補）。
+[`USB_MSC_PLAN.md`](plans/archive/USB_MSC_PLAN.md)の追補）。
 
 書き込みのたびにSYNCHRONIZE CACHE(10)（`msc::synchronize_cache`）でフラッシュを試み、
 照合の読み出しはFUA（Force Unit Access）付きREAD(10)（`read_blocks_from_medium`）で
@@ -221,16 +221,16 @@ sense key 2かつASC `0x3A`（MEDIUM NOT PRESENT）であれば**待たずに即
 （`USB BOOT:`、[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。将来ファイルシステム層が
 起動時にUSB MSCを最優先で選ぶために必要な待ち時間を実測で決めるための計測で、
 `usbmargin`はそれをVBUSの再投入で繰り返します。計測の目的と確定条件は
-[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)を参照してください。
+[`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)を参照してください。
 
 USBハブのポートに挿したUSBメモリも同じレジストリに乗ります
-（[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md) Stage F）。`usbmsc`／
+（[`USB_REFACTOR_PLAN.md`](plans/archive/USB_REFACTOR_PLAN.md) Stage F）。`usbmsc`／
 `usbread`／`usbmbr`はいずれもレジストリを引くので、直結とハブ経由を
 区別しません（[`USB.md`](USB.md)）。
 
 ## ブロックデバイス層（`src/fs/`）
 
-[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 1にあたる層です。SDカード、
+[FILESYSTEM_PLAN.md](plans/archive/FILESYSTEM_PLAN.md)のStage 1にあたる層です。SDカード、
 USB Mass Storage、PSRAM上のRAMディスクを、論理ブロック単位の共通interface
 `fs::block::BlockDevice`（`geometry`／`read_blocks`／`write_blocks`／`flush`）
 で扱えるようにします。ファイルシステムそのものはまだありません。
@@ -275,7 +275,7 @@ LBAと容量は`u64`、論理ブロック長は`BlockGeometry`が持ちます。
 **USBのWRITE(10)は最大8ブロック（4 KiB）です**（`MAX_WRITE_BLOCKS = 8`）。READ(10)も
 4 KiBまでまとめるため、filesystem adapterの転送上限は方向で同じになりました。かつては
 複数ブロックを1回のdata OUTフェーズに入れるとCSWが戻らず、1ブロックへ制限していました
-（[USB_WRITE_STABILITY_PLAN.md](USB_WRITE_STABILITY_PLAN.md)の「決定論的な再現手順」）。
+（[USB_WRITE_STABILITY_PLAN.md](plans/archive/USB_WRITE_STABILITY_PLAN.md)の「決定論的な再現手順」）。
 HCD／BOT契約とroot-port reset後のFIFO再適用を修正した後、Stage 7で2媒体×2 topologyの
 2／4／8 blockを各10回通したため上限を増やしました。8ブロックを超える呼び出しはadapterで
 4 KiBごとのWRITE(10)へ分割します。WRITE失敗を自動再送しない方針は変わりません。
@@ -388,6 +388,6 @@ UARTへログを出します（[`DIAGNOSTICS.md`](DIAGNOSTICS.md)）。
 
 ## 未実装
 
-- exFATの解析（[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 5）
+- exFATの解析（[FILESYSTEM_PLAN.md](plans/archive/FILESYSTEM_PLAN.md)のStage 5）
 - GPTの解析（MBRのみ。保護MBRは種別`0xEE`として表示されるだけ）
 - SDのUHS-Iモード（SDR50/SDR104等、100 MHz以上）

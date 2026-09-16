@@ -10,7 +10,7 @@
 
 SDHOST（SDMMCコントローラー）にも、ESP-IDFの実ドライバが一度も踏んでいないと
 思われる実機固有の制約が2つ見つかっています（詳細と切り分け過程は
-[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)のStage 2/3を参照）。
+[`SD_CARD_PLAN.md`](plans/archive/SD_CARD_PLAN.md)のStage 2/3を参照）。
 
 - `SDHOST_BUFFIFO_REG`へのCPU/APB直接読み出しはポップ動作をしない。
   `STATUS.FIFO_COUNT`はカードからの実データ到着どおりに増え続けるのに、
@@ -114,7 +114,7 @@ HID入力は正常に動きます。`usbwritetest`はpattern書き込みには�
 （`usbzero <LBA>`で消せます）。
 
 この時点では原因は未解明でした。実転送長の扱いとretry安全性は
-[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)のStage 2で確定させ、
+[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)のStage 2で確定させ、
 この失敗がそれらとは無関係であることまでは切り分けました。Stage 3でBOT phase、CSWの
 長さ／tag／status／residue、data INへのCSW先着を厳密に検証する実装と実機の正常系確認までは
 完了しました。同じ系統として、この経路では
@@ -224,7 +224,7 @@ channelをhaltしFIFOをflushするという、実装としても診断として
 実機A/Bは3構成（High-Speed直結、FS-onlyハブ＋HID＋MSC、High-Speedハブ＋Low-Speed HID
 ＋High-Speed MSC）で、READ側は`usbcheck 1000`が`proactive read+0`で完走、WRITE側は
 各構成100回と2メーカー媒体の`fswritetest`各10回が通りました。**予防cleanupは
-コードから撤去済みです**（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)の
+コードから撤去済みです**（[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)の
 Stage 5・6）。cleanupが残るのは失敗後だけで、そこでFIFO flushがtimeoutした場合は
 Reset Recoveryを実行せずsessionを引退させます。
 

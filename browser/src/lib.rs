@@ -13,7 +13,7 @@
 //! The firmware re-exports it as `crate::browser` (`src/browser.rs`), so
 //! module paths read the same on both sides.
 //!
-//! What this is *not* is a web browser. See `docs/WEB_BROWSER_PLAN.md`: no
+//! What this is *not* is a web browser. See `docs/plans/archive/WEB_BROWSER_PLAN.md`: no
 //! CSS, no JavaScript, no images, no TLS. HTML comes in, text and links come
 //! out, and anything else is skipped rather than guessed at.
 //!

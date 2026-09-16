@@ -6570,7 +6570,7 @@ iiiiiiii|WWWWWWWW|00000000|Tab5
     ///
     /// Not a demo. Line breaking, piece widths, underlines and hit testing
     /// all changed when characters stopped being one cell each
-    /// (`docs/FONT_MIGRATION_PLAN.md`), and this is the page that shows
+    /// (`docs/plans/archive/FONT_MIGRATION_PLAN.md`), and this is the page that shows
     /// whether they agree with each other -- with no network involved, so it
     /// can be looked at on a board that has never associated.
     pub const JAPANESE: &Page = &Page {

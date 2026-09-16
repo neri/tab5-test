@@ -16,7 +16,7 @@
 //! reference walk out of a directory the server thought it was confined to.
 //! Percent-encoding is only ever added (to non-ASCII bytes), never removed.
 //!
-//! Scope, from `docs/WEB_BROWSER_PLAN.md`: `http` connects, `https` parses
+//! Scope, from `docs/plans/archive/WEB_BROWSER_PLAN.md`: `http` connects, `https` parses
 //! but is reported as unsupported rather than silently downgraded, and every
 //! other scheme is refused. No userinfo, no IPv6 literals, no IDNA -- a
 //! Unicode host is an error, though its punycode spelling can be typed.
@@ -116,7 +116,7 @@ impl Scheme {
     ///
     /// True for `http`, and *also* true for `https` in this firmware:
     /// unauthenticated TLS stops passive eavesdropping and stops nothing
-    /// else (`docs/TLS_PLAN.md`). Which of the two a page actually got is
+    /// else (`docs/plans/archive/TLS_PLAN.md`). Which of the two a page actually got is
     /// not a property of the scheme, so nothing here can answer it -- the
     /// connection's own authentication state has to.
     pub fn is_cleartext(self) -> bool {

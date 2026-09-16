@@ -1,6 +1,6 @@
 //! One owner for the ESP-Hosted session and the IPv4 stack.
 //!
-//! Stage 3 of `docs/WIFI_REFACTOR_PLAN.md` puts the two optional resources
+//! Stage 3 of `docs/plans/archive/WIFI_REFACTOR_PLAN.md` puts the two optional resources
 //! beside the policy that explains why they exist. Stage 4 adds a bounded
 //! transition history and retry policy. Stage 5 retains menu credentials only
 //! in RAM while that connection is active, so a lost station or C6 link can be

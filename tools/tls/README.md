@@ -1,7 +1,7 @@
 # TLS fixture keys
 
 > 索引: [`../../DESIGN.md`](../../DESIGN.md) ／
-> [`../../docs/TLS_PLAN.md`](../../docs/TLS_PLAN.md)
+> [`../../docs/plans/archive/TLS_PLAN.md`](../../docs/plans/archive/TLS_PLAN.md)
 
 `browser_fixture_server.py --tls-port`が提示する証明書と鍵です。
 **秘密鍵がリポジトリに入っています。秘匿価値はありません。**

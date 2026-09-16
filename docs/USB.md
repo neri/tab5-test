@@ -1,11 +1,11 @@
 # USB-Aホスト
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
-> [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)、[`USB_REFACTOR_PLAN.md`](USB_REFACTOR_PLAN.md)、
-> [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md)、
-> [`USB_MSC_PLAN.md`](USB_MSC_PLAN.md)、[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)、
-> [`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)、
-> [`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)
+> [`USB_HOST_PLAN.md`](plans/archive/USB_HOST_PLAN.md)、[`USB_REFACTOR_PLAN.md`](plans/archive/USB_REFACTOR_PLAN.md)、
+> [`USB_INTERRUPT_REFACTOR_PLAN.md`](plans/archive/USB_INTERRUPT_REFACTOR_PLAN.md)、
+> [`USB_MSC_PLAN.md`](plans/archive/USB_MSC_PLAN.md)、[`USB_FLOPPY_PLAN.md`](plans/archive/USB_FLOPPY_PLAN.md)、
+> [`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)、
+> [`USB_WRITE_STABILITY_PLAN.md`](plans/archive/USB_WRITE_STABILITY_PLAN.md)
 
 Tab5のUSB-Aコネクタに繋がるHigh-Speed USB-DWCコントローラーをホストとして
 使用します。モジュールの層構成（`hcd`／`protocol`／`hid`／`hid_keyboard`／
@@ -28,8 +28,8 @@ USB Serial/JTAG（GPIO24/25）は対象外です。
   書き込み（WRITE(10)、`usbwritetest`）も実装・実機受入済みです。かつては間欠故障の
   緩和として各READ 16回ごと／各WRITE直前に予防的BOT再同期を必要としましたが、
   HCD側の契約を整えた結果それ無しで通るようになり、撤去しました
-  （[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)、
-  [`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)）。
+  （[`USB_WRITE_STABILITY_PLAN.md`](plans/archive/USB_WRITE_STABILITY_PLAN.md)、
+  [`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)）。
   通常のWRITE(10)は最大8 block（4 KiB）で、Stage 7では`1234:5645`と`054C:0243`を
   High-Speed直結／Full-Speed固定ハブ＋HIDの両方で2／4／8 block各10回確認しました。
 - High-Speedハブ配下にFull/Low-Speedデバイスを繋ぐ構成（Split Transaction）。
@@ -43,7 +43,7 @@ UFI/CBI USB Floppy用の試作クラスドライバは`src/usb/floppy.rs`に保�
 直結実機（VID:PID `054C:002C`、interface `08/04/00`、Bulk IN `0x81`、Bulk OUT
 `0x02`、status Interrupt IN `0x83`）でのCBI ADSC制御要求は、descriptor-DMAの
 SETUP PID修正後もSETUP段階の`XCS_XACT_ERR`で失敗した。詳細と再開条件は
-[`USB_FLOPPY_PLAN.md`](USB_FLOPPY_PLAN.md)を参照する。
+[`USB_FLOPPY_PLAN.md`](plans/archive/USB_FLOPPY_PLAN.md)を参照する。
 
 ## root portのconnect待ち
 
@@ -64,7 +64,7 @@ connect waitを1 msへ一時変更した通常の`rescan`を100 ms間隔で繰�
 このcampaign全体の所要時間は`UsbHost::finish_boot_scan_campaign`がboot診断へ記録します。
 Mass Storageのready待ちは初回scanから分離され、起動画面中の`AutoMount`が250 ms間隔、
 最大4,000 msの既存budgetで担当します。計測手順と従来の1,000 ms根拠は
-[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)にあります。
+[`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)にあります。
 `usbmargin`は計測中だけ5,000 msを使います。
 
 ## バスの所有とスキャン周期
@@ -373,7 +373,7 @@ FS-onlyの`ut 100`をretry 0で完走しています。給電したままの上�
   channel 0列挙controlと競合し、HID後挿し時だけ成功する状態になったためです。全port処理後に
   MSC併用ならchannel 0逐次化、HIDだけならperiodic開始を一度だけ選択します。
 - 転送はチャネル0を使った逐次・同期方式で、真の並列転送はしません。
-  [`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md) Stage 1として、
+  [`USB_INTERRUPT_REFACTOR_PLAN.md`](plans/archive/USB_INTERRUPT_REFACTOR_PLAN.md) Stage 1として、
   High-Speed DWCのsource 93をCLICへルーティングし、channel／root-port状態を短いISRで
   Atomicスナップショットへ保存します。通常のcontrol／bulkとsoftware SplitはAtomic／HCINTを
   再確認してから`WFI`し、USB完了割り込みで起床します。直結HIDのidle NAKはdescriptor DMAが
@@ -602,7 +602,7 @@ Espressifの資料はESP32-P4を非対応（`OTG_SINGLE_POINT=1`）としてい�
 実機のシリコンは`GHWCFG2.SingPnt=0`を報告し`HCSPLT`も実在するため、資料の側が
 誤りです。`usbhw`コマンドがこの検査（`hcd::probe_split_support`）を実行します。
 
-[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md) Stage 6でSplit Transactionを実装したため、
+[`USB_HOST_PLAN.md`](plans/archive/USB_HOST_PLAN.md) Stage 6でSplit Transactionを実装したため、
 Stage 4の回避策だったバス全体のFull-Speed固定（`FORCE_FS_LS_ONLY_HOST`）は
 既定で`false`です。診断時だけ`usbfs on`で同じ設定をruntimeに有効化して即時再列挙でき、
 `usbfs off`でHigh-Speedへ戻せます。High-SpeedハブをFull-Speedで列挙し、Splitのない
@@ -652,7 +652,7 @@ USB-A: High-Speed
 コンフィグレーション記述子のヘッダ、各interfaceとそのendpoint、HIDデバイスなら
 HID記述子です。文字列記述子（`iManufacturer`／`iProduct`／`iSerialNumber`／
 `iInterface`）はこのときだけ取得します。**列挙時には取りません**——起動時スキャンは
-ストレージ選択の判断時間に直結しており（[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)）、
+ストレージ選択の判断時間に直結しており（[`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)）、
 そこへ制御転送を増やさないためです。文字列を持たないデバイスは`(none)`、LANGIDを
 返さないデバイスは`strings: device reports none`と表示します。取得した文字列は
 表示先はコンソールの半角固定セルなのでASCIIへ畳み、非ASCIIは`?`にします。

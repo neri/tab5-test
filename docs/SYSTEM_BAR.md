@@ -1,6 +1,6 @@
 # 上部統合システムバー
 
-> 索引: [`../DESIGN.md`](../DESIGN.md) ／ 計画・実機受入項目: [`SYSTEM_BAR_PLAN.md`](SYSTEM_BAR_PLAN.md)
+> 索引: [`../DESIGN.md`](../DESIGN.md) ／ 計画・実機受入項目: [`SYSTEM_BAR_PLAN.md`](plans/active/SYSTEM_BAR_PLAN.md)
 
 通常buildは上部48 pixelをsystem操作とBrowser操作で共有する。実装済みだが、
 この統合経路の実機動作、押し分け、I2C／SDIOの最長停止時間、表示帯域は未確認。

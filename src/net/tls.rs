@@ -41,7 +41,7 @@
 //! matched and no validity date is read. An attacker able to answer in the
 //! server's place can present a certificate of their own and pass all of the
 //! above. That is [`Authentication::Unverified`], and it must never be shown
-//! as secure -- see `docs/TLS_PLAN.md` for what it is and is not for.
+//! as secure -- see `docs/plans/archive/TLS_PLAN.md` for what it is and is not for.
 //!
 //! [`Authentication::Pinned`] is the stronger case: the SHA-256 of the
 //! leaf's DER `SubjectPublicKeyInfo` matched one built into the firmware for
@@ -135,7 +135,7 @@ impl Authentication {
 
 /// Why a TLS connection did not deliver plaintext.
 ///
-/// One variant per failure name in `docs/TLS_PLAN.md`, because the browser
+/// One variant per failure name in `docs/plans/archive/TLS_PLAN.md`, because the browser
 /// fixtures match on those names: collapsing a certificate error into a
 /// timeout, or a pin mismatch into a generic certificate error, is what
 /// makes a failing fixture unable to say what broke.
@@ -648,7 +648,7 @@ fn alert_name(description: AlertDescription) -> &'static str {
 /// firmware does not implement that algorithm" and the other is "the server
 /// signed something else". Only the second is an attack.
 ///
-/// ECDSA P-256 and RSA-PSS are what `docs/TLS_PLAN.md` fixes. P-384 and
+/// ECDSA P-256 and RSA-PSS are what `docs/plans/archive/TLS_PLAN.md` fixes. P-384 and
 /// Ed25519 are left out for code size; the library advertises them in the
 /// ClientHello and this cannot stop it from doing so (the list is private),
 /// so a server holding only such a certificate fails here rather than being
@@ -917,7 +917,7 @@ impl Transaction {
     /// Fails before touching the socket when there is no hardware
     /// randomness. That order is the point: a handshake seeded from a
     /// guessable value is worse than no handshake, so not one packet goes
-    /// out (`docs/TLS_PLAN.md` Stage 2).
+    /// out (`docs/plans/archive/TLS_PLAN.md` Stage 2).
     pub fn start(
         stack: &mut Stack,
         address: Ipv4Address,

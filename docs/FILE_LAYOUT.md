@@ -179,7 +179,7 @@
 - `src/sdmmc.rs`: SDHOSTコントローラー初期化、SDカード活性化、DMA（IDMAC）
   経由のブロック読み書き。`gpio.rs`は使わずIO_MUXを直接操作する点は`psram.rs`と
   同じ構成。現状は[`STORAGE.md`](STORAGE.md)、実機で踏んだ罠は
-  [`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照。コントローラーは1つでカード
+  [`SD_CARD_PLAN.md`](plans/archive/SD_CARD_PLAN.md)を参照。コントローラーは1つでカード
   （スロット）が2つあり、カード0がmicroSD、カード1がESP32-C6。カード番号を取る
   低レベルAPI（`init_host`／`send_command_on`／`set_clock`／
   `set_host_bus_width_4bit`）を`sdio.rs`へ公開する
@@ -189,7 +189,7 @@
   （電源E2.P0、GPIO15リセット、CMD52／CMD5／CMD3／CMD7、CCCR設定、CIS読み出し）と、
   CMD52の1バイトアクセス・CMD53のブロック／バイトモード転送。ピンはGPIO Matrix
   経由なので`gpio.rs`の`configure_c6_sdio_pins`を使う。計画と実機での判断は
-  [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)を参照
+  [`WIFI_C6_PLAN.md`](plans/archive/WIFI_C6_PLAN.md)を参照
 - `src/wifi.rs`・`src/wifi/`: ESP32-C6経由のWi-Fi。`usb.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけを持つ
     - `src/wifi/hosted.rs`: ESP-Hostedのトランスポート層。12 byteペイロード
@@ -212,7 +212,7 @@
       握りつぶさずそのまま返す
 - `src/fs.rs`・`src/fs/`: ファイルシステム層。`usb.rs`と同じく親ファイルは
   サブモジュール宣言と再エクスポートだけ。現状はブロックデバイス層とMBR判定まで
-  （[FILESYSTEM_PLAN.md](FILESYSTEM_PLAN.md)のStage 1、現状は[STORAGE.md](STORAGE.md)）
+  （[FILESYSTEM_PLAN.md](plans/archive/FILESYSTEM_PLAN.md)のStage 1、現状は[STORAGE.md](STORAGE.md)）
     - `src/fs/block.rs`: 全媒体共通の同期`BlockDevice` trait、`BlockGeometry`、
       共通エラー`BlockError`、範囲検査。読み取り専用と読み書きでtraitを分けない
     - `src/fs/ramdisk.rs`: PSRAM固定領域上のRAMディスク。DMAが触らないので
@@ -320,7 +320,7 @@
       全デバイス（ハブ自身と未対応クラスを含む、記述子の生バイトつき）、`slots`が
       クラスドライバ。ポーリングと判断は`slots`、`lsusb`の表示は`records`を読む
   現状は[`USB.md`](USB.md)、段階分けと実装上の判断は
-  [`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)を参照
+  [`USB_HOST_PLAN.md`](plans/archive/USB_HOST_PLAN.md)を参照
 - `memory.x`: ESP32-P4用メモリとイメージ配置
 - `.cargo/config.toml`: ターゲット、リンカー、`partitions.csv`の`factory`アプリを
   選ぶ`espflash` runner
@@ -330,7 +330,7 @@
 - `tools/check_esp_image.py`: `espflash save-image`後のXIPセグメント数、appdesc、
   物理・仮想64 KiBページ内オフセットを検査
 - `tools/monitor.py`: USB Serial/JTAGの再列挙をまたいでログを追い続けるモニタ
-- [`FLASH_XIP_MIGRATION_PLAN.md`](FLASH_XIP_MIGRATION_PLAN.md): XIP移行のStage、判断、実測結果
+- [`FLASH_XIP_MIGRATION_PLAN.md`](plans/archive/FLASH_XIP_MIGRATION_PLAN.md): XIP移行のStage、判断、実測結果
 
 `esp-idf-reference/`には、レジスタ設定との比較に使用したESP-IDF v5.5.3版の
 参照実装があります。

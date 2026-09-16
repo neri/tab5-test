@@ -75,7 +75,7 @@ combining markの描画は必ず背景なしです。markの枠は左右の隣�
 
 従来1bpp文字描画の経路はこれだけです。以前あった5×7 ASCIIフォントと
 `draw_text_5x7`／`draw_ascii_char_5x7`は削除しました
-（[`FONT_MIGRATION_PLAN.md`](FONT_MIGRATION_PLAN.md)）。
+（[`FONT_MIGRATION_PLAN.md`](plans/archive/FONT_MIGRATION_PLAN.md)）。
 
 入口は1つですが、実際の描画は`WideGlyph::paint_opaque`と
 `WideGlyph::paint_sparse`に分かれています。避けるべき仕事が逆だからです。背景ありでは

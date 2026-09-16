@@ -12,7 +12,7 @@
 //! under `src/font/`.
 //!
 //! This replaced a 5x7 ASCII font that every screen used to draw through;
-//! `docs/FONT_MIGRATION_PLAN.md` records how and why.
+//! `docs/plans/archive/FONT_MIGRATION_PLAN.md` records how and why.
 
 // Deliberately narrow: each name arrives with the code that needs it, so the
 // list doubles as a record of how far the migration has got.

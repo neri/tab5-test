@@ -1,7 +1,7 @@
 # ファイルシステム（VFS、FAT、マウント）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機での判断:
-> [`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md) ／ 下層のブロックI/O:
+> [`FILESYSTEM_PLAN.md`](plans/archive/FILESYSTEM_PLAN.md) ／ 下層のブロックI/O:
 > [`STORAGE.md`](STORAGE.md)
 
 パス名でファイルを読み書きできるところまでを実装しています。読み出しは
@@ -121,7 +121,7 @@ activationまたはマウントが失敗した場合だけ500 ms間隔で合計3
 試行で終わります。
 
 かつては「ツリーに現れるボリュームは必ず誰かがマウントを要求した結果」と決めて
-いました（[`FILESYSTEM_PLAN.md`](FILESYSTEM_PLAN.md)）。あの方針の目的は、
+いました（[`FILESYSTEM_PLAN.md`](plans/archive/FILESYSTEM_PLAN.md)）。あの方針の目的は、
 起動媒体の探索順のような**判断**が「いつの間にかマウントされていた」に紛れ込むのを
 防ぐことでした。自動マウントはその判断をしません。挿さっているものを見えるように
 するだけなので、目的を損ないません。代わりに次を守ります。
@@ -175,7 +175,7 @@ FAT解析で数十msかかり得るので、`InputManager::service`（コンソ�
 ### 答えなかったものは聞き直す
 
 同じbudgetは**パーティションごとのマウント失敗**にも効きます。転送が1回失敗して
-recoveryで復帰するのはこのバスの既知の性質で（[`USB_WRITE_STABILITY_PLAN.md`](USB_WRITE_STABILITY_PLAN.md)）、
+recoveryで復帰するのはこのバスの既知の性質で（[`USB_WRITE_STABILITY_PLAN.md`](plans/archive/USB_WRITE_STABILITY_PLAN.md)）、
 それに対する既定の答えは「呼び出し側が後で再試行する」です（下記「rescanを
 跨いでもマウントは生き残る」）。1回タイムアウトしたREAD CAPACITYをそのentryの
 最終回答にすると、物理的に挿し直すまでそのパーティションはツリーに出てきません。
@@ -691,7 +691,7 @@ FATチェーンには古い末尾がつながったままになります。reade
 
 ## 書き込み経路の受入試験
 
-`fswritetest <dir> [rounds] [KiB]`が[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](FILESYSTEM_WRITE_REFACTOR_PLAN.md)の
+`fswritetest <dir> [rounds] [KiB]`が[`FILESYSTEM_WRITE_REFACTOR_PLAN.md`](plans/archive/FILESYSTEM_WRITE_REFACTOR_PLAN.md)の
 確認項目をまとめて実行し、**PASS／FAILで答えます**。手で1つずつ打つと間違えやすく、
 とくに「短く置き換えたファイルへの追記」は**バイトを比べないと目視では正しく見えます**
 ——長さは同じで、内容だけが古いチェーンの尾になるためです。

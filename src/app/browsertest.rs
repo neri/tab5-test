@@ -1,7 +1,7 @@
 //! `httpstream` -- the diagnostic that drives [`net::http::Transaction`]
 //! directly, without a browser screen in the way.
 //!
-//! Stage 2 of `docs/WEB_BROWSER_PLAN.md` needs a way to prove that the
+//! Stage 2 of `docs/plans/archive/WEB_BROWSER_PLAN.md` needs a way to prove that the
 //! interruptible transaction reaches the right end for each of the fixture
 //! server's responses, and to prove it a hundred times in a row without a
 //! socket or an allocation going missing. A full-screen viewer is the wrong

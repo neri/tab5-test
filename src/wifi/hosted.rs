@@ -1,5 +1,5 @@
 //! ESP-Hosted transport over the ESP32-C6's SDIO bus (stage 2 of
-//! `docs/WIFI_C6_PLAN.md`).
+//! `docs/plans/archive/WIFI_C6_PLAN.md`).
 //!
 //! ESP-Hosted multiplexes several logical interfaces over one SDIO link:
 //! station and softAP data frames, a serial channel that carries the RPC
@@ -616,7 +616,7 @@ impl Transport {
     ///
     /// ESP-Hosted's host reads these four bytes in one CMD53 byte-mode
     /// transfer, which cannot tear; on this hardware that transfer never
-    /// completed (see `docs/WIFI_C6_PLAN.md`). Byte-at-a-time reads work,
+    /// completed (see `docs/plans/archive/WIFI_C6_PLAN.md`). Byte-at-a-time reads work,
     /// but the packet-length register counts up as the slave produces data,
     /// so a value assembled from four commands can mix an old low half with
     /// a new high half -- and this host's read position is derived from it.

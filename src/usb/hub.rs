@@ -2,8 +2,8 @@
 //! control transfers -- the hub-side counterpart to `hid_keyboard.rs`, and
 //! the only module that knows what a downstream port is.
 //!
-//! This is Stage 4 of `docs/USB_HOST_PLAN.md`, generalized to every port by
-//! `docs/USB_REFACTOR_PLAN.md` Stage C: `usb::registry::UsbHost` walks every
+//! This is Stage 4 of `docs/plans/archive/USB_HOST_PLAN.md`, generalized to every port by
+//! `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage C: `usb::registry::UsbHost` walks every
 //! port with `debounce_connected_port`/`reset_port` rather than driving
 //! just one. Nothing in this file depends on the speed the hub or its
 //! devices came up at -- hub port management is identical at every speed,
@@ -538,7 +538,7 @@ impl Hub {
     /// Checks one port for a connected device and, if there is one, lets it
     /// settle before confirming it is still there -- the per-port building
     /// block `usb::registry::UsbHost` uses to attach every occupied port
-    /// instead of picking a single one (`docs/USB_REFACTOR_PLAN.md` Stage C).
+    /// instead of picking a single one (`docs/plans/archive/USB_REFACTOR_PLAN.md` Stage C).
     ///
     /// Returns `Some(true)` if a device is connected and stayed connected
     /// through debounce, `Some(false)` if the port is simply empty (no

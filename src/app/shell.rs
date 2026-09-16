@@ -1524,7 +1524,7 @@ pub enum Outcome {
 /// next.
 ///
 /// `usb_host` is the single registry the application's frame loop owns
-/// (`docs/USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
+/// (`docs/plans/archive/USB_REFACTOR_PLAN.md` Stage A) -- every USB command reads or drives
 /// devices already in it instead of probing the bus independently, which
 /// is what used to let a diagnostic command reset a live keyboard/Mass
 /// Storage session out from under itself.
@@ -3297,7 +3297,7 @@ const MARGIN_READY_BUDGET_MS: u32 = 15_000;
 /// discards every session, and times a full scan plus the SCSI sequence a
 /// filesystem probe would run. Nothing is written to the device.
 ///
-/// See `docs/USB_MSC_BOOT_MARGIN_PLAN.md`.
+/// See `docs/plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md`.
 fn cmd_usb_margin(
     console: &mut Console,
     framebuffer: &mut Framebuffer,
@@ -4643,7 +4643,7 @@ fn report_rtc_status(console: &mut Console, framebuffer: &mut Framebuffer, statu
 /// `VLF` is set still prints a UTC and a JST line above, because those are
 /// what the counters hold, and still fails here, because what the counters
 /// hold is not a time anyone set. Unauthenticated TLS and SPKI pinning do
-/// not consult this line at all (`docs/TLS_PLAN.md`).
+/// not consult this line at all (`docs/plans/archive/TLS_PLAN.md`).
 fn push_certificate_clock_line(console: &mut Console, framebuffer: &mut Framebuffer) {
     let mut line = Line::new();
     line.push_str("cert clock  ");
@@ -5741,7 +5741,7 @@ fn net_session<'a>(
 ///
 /// With no argument this only reports. `dhcp` starts the client and waits
 /// for a lease; an address in CIDR form sets one by hand, which is what
-/// Stage 3 of `docs/TCPIP_PLAN.md` used before DHCP existed and what still
+/// Stage 3 of `docs/plans/archive/TCPIP_PLAN.md` used before DHCP existed and what still
 /// works on a network without a server. `dns` replaces the resolvers
 /// without touching the address, which works on a lease as well as a
 /// static address -- the way to aim the stack at a resolver that is known
@@ -6372,7 +6372,7 @@ fn report_tftp_error(
 ///
 /// What it prints beyond the head is the state of the handshake and the
 /// shape of the polling, because those are the two things
-/// `docs/TLS_PLAN.md` says have to be measured on real hardware before the
+/// `docs/plans/archive/TLS_PLAN.md` says have to be measured on real hardware before the
 /// browser is allowed near HTTPS. The body is counted and dropped;
 /// `httpget` is where saving one belongs.
 fn cmd_tls(
@@ -6952,7 +6952,7 @@ fn write_response_head(console: &mut Console, framebuffer: &mut Framebuffer, bod
 
 /// `netdump` -- show the head of each 802.3 frame the C6 pushes at the host.
 ///
-/// This is the check Stage 0 of `docs/TCPIP_PLAN.md` calls for, kept as a
+/// This is the check Stage 0 of `docs/plans/archive/TCPIP_PLAN.md` calls for, kept as a
 /// command rather than thrown away: it is the one place that shows what is
 /// actually on the wire when the stack above it does not answer. Destination
 /// MAC, source MAC and ethertype are exactly the first fourteen bytes.
@@ -7674,7 +7674,7 @@ fn cmd_move(
 
 /// `fill <path> <KiB> [chunk] [repeat]`.
 ///
-/// The measurement `docs/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks for:
+/// The measurement `docs/plans/archive/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks for:
 /// the streaming write path against the repeated-open one it replaces, on
 /// the same volume with the same arguments.
 /// `fswritetest <dir> [rounds] [KiB]`.
@@ -8038,7 +8038,7 @@ fn with_devices<T>(
     body(&mut devices)
 }
 
-/// `docs/FILESYSTEM_PLAN.md` Stage 1: what the block layer sees, before
+/// `docs/plans/archive/FILESYSTEM_PLAN.md` Stage 1: what the block layer sees, before
 /// there is a VFS to mount any of it.
 fn cmd_devices(
     console: &mut Console,
@@ -8094,7 +8094,7 @@ fn cmd_blkread(
 
 /// Reads LBA 0 from the SD card and hands it to `mbr::show` -- the
 /// device-specific half of the SD/USB split described in
-/// `docs/USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
+/// `docs/plans/archive/USB_MSC_PLAN.md` Stage 6; the actual MBR parsing lives in `mbr.rs` and
 /// knows nothing about SD.
 fn cmd_sdmbr(console: &mut Console, framebuffer: &mut Framebuffer) {
     console.write_output_line(framebuffer, "activating SD card...");
@@ -8199,7 +8199,7 @@ fn cmd_sdreadpsram(console: &mut Console, framebuffer: &mut Framebuffer, argumen
 ///
 /// This -- together with every other USB command reading or driving
 /// devices already in `usb_host` instead of calling `usb::probe_port`/
-/// `usb::enumerate_device` on its own -- is `docs/USB_REFACTOR_PLAN.md` Stage
+/// `usb::enumerate_device` on its own -- is `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage
 /// A: only `UsbHost::rescan` (via `usbrescan`, or `lcd.rs`'s frame loop)
 /// ever resets the bus, so no USB command can invalidate another device's
 /// live session anymore.
@@ -8437,7 +8437,7 @@ fn device_kind_text(kind: &usb::DeviceKind) -> Line {
     line
 }
 
-/// `docs/USB_MSC_PLAN.md` Stage 1-4, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/plans/archive/USB_MSC_PLAN.md` Stage 1-4, extended by `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage F:
 /// runs SCSI INQUIRY/TEST UNIT READY/READ CAPACITY(10) against the Mass
 /// Storage device `UsbHost::rescan` already attached, wherever it is --
 /// USB-A directly or a hub port -- instead of enumerating one fresh. See
@@ -8513,7 +8513,7 @@ fn cmd_usbmsc(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &m
     console.write_output_line(framebuffer, line.as_str());
 }
 
-/// `docs/USB_MSC_PLAN.md` Stage 5, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/plans/archive/USB_MSC_PLAN.md` Stage 5, extended by `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage F:
 /// read one 512-byte block via SCSI READ(10) from whichever Mass Storage
 /// device `UsbHost::rescan` already attached, and dump it, mirroring
 /// `cmd_sdread`'s shape (and reusing `sdmmc::dump_block` for the UART hex
@@ -8911,7 +8911,7 @@ fn run_usb_write_test(
 ///
 /// Reading a run used to mean capturing two ten-line `usbhw` blocks and
 /// diffing them by eye, once per topology and per medium. That is the
-/// expensive part of the matrix in `docs/USB_BOT_HCD_REFACTOR_PLAN.md`, and
+/// expensive part of the matrix in `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`, and
 /// it is the part a person gets wrong.
 #[derive(Clone, Copy, Default)]
 struct UsbCheckCounters {
@@ -9517,7 +9517,7 @@ fn fill_usb_multiwrite_pattern(buffer: &mut [u8], first_lba: u32, blocks: usize,
 /// Runs one configuration's acceptance sequence and reports its own verdict.
 ///
 /// This is the whole per-topology, per-medium round of
-/// `docs/USB_BOT_HCD_REFACTOR_PLAN.md` in one command: counters before, the
+/// `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md` in one command: counters before, the
 /// read soak, the write rounds, counters after, the deltas, and a gate for
 /// each Go condition. [`cmd_usbrawcheck`] supplies the no-filesystem burst
 /// gate while raw WRITE remains unstable.
@@ -10029,7 +10029,7 @@ fn write_usbcheck_deltas(
 /// Proves that the four faults the HCD contract exists to catch are
 /// detected rather than absorbed.
 ///
-/// Stages 1, 2 and 4 of `docs/USB_BOT_HCD_REFACTOR_PLAN.md` add rules that
+/// Stages 1, 2 and 4 of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md` add rules that
 /// working hardware never exercises: a refused DMA cache synchronization
 /// must stop the packet before the channel is armed and publish nothing; a
 /// completion arriving under a generation the slot no longer holds must not
@@ -10585,7 +10585,7 @@ fn require_live_usb_msc(
     false
 }
 
-/// `docs/USB_MSC_PLAN.md` Stage 6, extended by `docs/USB_REFACTOR_PLAN.md` Stage F:
+/// `docs/plans/archive/USB_MSC_PLAN.md` Stage 6, extended by `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage F:
 /// reads LBA 0 from whichever Mass Storage device `UsbHost::rescan` already
 /// attached and hands it to the same `mbr::show` that `cmd_sdmbr` uses, so
 /// the two commands print partition tables in an identical format despite
@@ -10618,7 +10618,7 @@ fn cmd_usbmbr(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &m
     mbr::show(console, framebuffer, &sector);
 }
 
-/// `docs/USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `docs/USB_REFACTOR_PLAN.md`
+/// `docs/plans/archive/USB_HOST_PLAN.md` Stage 4-2/4-3, generalized by `docs/plans/archive/USB_REFACTOR_PLAN.md`
 /// Stage C: reports the hub `UsbHost::rescan` already opened, and every
 /// port's live status alongside which class driver (if any) is attached to
 /// it. `Hub::status`/`Hub::port_status` are plain `GET_STATUS` reads, safe
@@ -10884,7 +10884,7 @@ fn cmd_usbhw(console: &mut Console, framebuffer: &mut Framebuffer, usb_host: &us
     );
 }
 
-/// The Stage 0 baseline counters of `docs/USB_BOT_HCD_REFACTOR_PLAN.md`, in
+/// The Stage 0 baseline counters of `docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md`, in
 /// a fixed line format so two runs can be diffed rather than read.
 ///
 /// Every field is printed even when zero. A block that hides its zeroes

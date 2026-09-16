@@ -1,7 +1,7 @@
 # Wi-Fi（ESP32-C6経由）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機で踏んだ罠:
-> [`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)
+> [`WIFI_C6_PLAN.md`](plans/archive/WIFI_C6_PLAN.md)
 
 Tab5の無線はESP32-P4本体ではなく**ESP32-C6**が持ちます。C6には工場出荷時に
 Espressifの**ESP-Hosted（esp-hosted-mcu）のslaveファームウェア**が書かれており、

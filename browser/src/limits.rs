@@ -8,7 +8,7 @@
 //! limit set stops adding up.
 //!
 //! These are also the numbers `tools/browser_fixture_server.py` builds its
-//! over-limit fixtures against, and the ones `docs/WEB_BROWSER_PLAN.md`
+//! over-limit fixtures against, and the ones `docs/plans/archive/WEB_BROWSER_PLAN.md`
 //! records. All three have to agree, so the server reads them from its own
 //! copy of this table and the plan quotes them.
 //!

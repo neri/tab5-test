@@ -3,7 +3,7 @@
 
 The firmware never parses BDF: this runs on the host, and the checked-in
 `font/data/tab5font16.bin` is what `include_bytes!` picks up. See
-`docs/FONT_MIGRATION_PLAN.md` for why, and `README.md` next to this file for
+`docs/plans/archive/FONT_MIGRATION_PLAN.md` for why, and `README.md` next to this file for
 the format.
 """
 
@@ -343,7 +343,7 @@ def main() -> int:
             raise GenerationError(
                 f"{len(payload)} bytes exceeds the {SIZE_LIMIT} byte ceiling. "
                 "Widen the DROM budget or narrow the manifest, and record the "
-                "decision in docs/FONT_MIGRATION_PLAN.md."
+                "decision in docs/plans/archive/FONT_MIGRATION_PLAN.md."
             )
     except GenerationError as error:
         print(f"font generation failed: {error}", file=sys.stderr)

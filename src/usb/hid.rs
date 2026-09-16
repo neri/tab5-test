@@ -368,7 +368,7 @@ impl InterruptIn {
     /// port). What this catches instead is the owning handle's cached
     /// address/configuration going stale while the device is still
     /// physically present -- normally only `UsbHost::rescan` can cause
-    /// that now (`docs/USB_REFACTOR_PLAN.md` Stage A made it the sole owner
+    /// that now (`docs/plans/archive/USB_REFACTOR_PLAN.md` Stage A made it the sole owner
     /// of `hcd::probe_port`), so in practice this now means a genuine
     /// transaction error rather than another command resetting the bus out
     /// from under an active session. `InputManager` checks this and calls

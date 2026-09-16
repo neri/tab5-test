@@ -2,7 +2,7 @@
 
 > 索引: [`../../DESIGN.md`](../../DESIGN.md) ／
 > [`../../docs/NETWORK.md`](../../docs/NETWORK.md) ／
-> [`../../docs/TLS_PLAN.md`](../../docs/TLS_PLAN.md)
+> [`../../docs/plans/archive/TLS_PLAN.md`](../../docs/plans/archive/TLS_PLAN.md)
 
 `generate.py`が`pins.txt`と`fixture_pins.txt`を読み、firmwareがリンクする
 `src/net/pins/generated.rs`を書きます。firmwareはこのテキストを解析しません。

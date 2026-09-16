@@ -1,9 +1,9 @@
 //! Putting USB volumes into the tree as they are plugged in, and taking them
 //! out again as they are pulled.
 //!
-//! `docs/FILESYSTEM_WORKFLOW_PLAN.md` feature 2. Until this existed a volume
+//! `docs/plans/archive/FILESYSTEM_WORKFLOW_PLAN.md` feature 2. Until this existed a volume
 //! appeared in the tree only because somebody typed `mount`, which
-//! `docs/FILESYSTEM_PLAN.md` fixed on purpose: it kept decisions like "which
+//! `docs/plans/archive/FILESYSTEM_PLAN.md` fixed on purpose: it kept decisions like "which
 //! medium do we boot from" from hiding inside something that happened by
 //! itself. Automount does not make that kind of decision. It makes what is
 //! plugged in visible, and it says so every time, which is the half of the
@@ -301,7 +301,7 @@ struct Unsettled {
 /// Whether a failed mount is worth trying again.
 ///
 /// A transport that fails once and recovers is a known property of this bus
-/// (`docs/USB_WRITE_STABILITY_PLAN.md`), and the established answer to it is
+/// (`docs/plans/archive/USB_WRITE_STABILITY_PLAN.md`), and the established answer to it is
 /// that the caller retries rather than the mount being given up on
 /// (`docs/FILESYSTEM.md`, "rescan を跨いでもマウントは生き残る"). Treating
 /// one timed-out READ CAPACITY as this partition's final answer leaves it

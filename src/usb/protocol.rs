@@ -5,7 +5,7 @@
 //! this, the same way a real HID class driver would sit above a generic
 //! USB core.
 //!
-//! This is Stage 2 of `docs/USB_HOST_PLAN.md`.
+//! This is Stage 2 of `docs/plans/archive/USB_HOST_PLAN.md`.
 
 use super::hcd::{self, CompletionWait, Endpoint, HCCHAR_EPTYPE_CTRL, PacketOutcome, Route};
 use crate::delay::{delay_ms, delay_us};

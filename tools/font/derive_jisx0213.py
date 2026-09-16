@@ -10,7 +10,7 @@ reproduces it.
 
 Plane 1 of JIS X 0213 is levels 1 to 3.  Plane 2 (level 4) is deliberately not
 expanded: almost all of it lives outside the BMP, which the Unifont-JP source
-does not cover -- see `docs/FONT_MIGRATION_PLAN.md`.
+does not cover -- see `docs/plans/archive/FONT_MIGRATION_PLAN.md`.
 
 Characters that JIS X 0213 encodes as a base plus a combining mark decode to
 more than one scalar; every scalar involved is included.

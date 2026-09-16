@@ -35,7 +35,7 @@ cert clock  unix 1787799600
 上2行と3行目が食い違うことはあり得る。`VLF`が立った基板でもカウンタの値は表示できる
 一方、それは誰かが設定した時刻ではないためである。未認証TLSとSPKI pinningは
 `unix_time_utc`を参照しないので、時刻が分からない基板でも`https://`は開ける
-（[TLS_PLAN.md](TLS_PLAN.md)）。
+（[TLS_PLAN.md](plans/archive/TLS_PLAN.md)）。
 
 RX8130CEにはIDレジスタがない。したがってI2C ACKだけでは、そのアドレスに応答したのが
 本当にRX8130CEかを判定できない。`src/rtc.rs`はレジスタ内容自体を判定基準にする。

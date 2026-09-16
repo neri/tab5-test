@@ -212,7 +212,7 @@ def validate(elf: Path, readelf: str) -> None:
     # routine refuses a span that begins mid-line rather than rounding down,
     # and rounding down would drag another owner's dirty lines in. The frame
     # list and the QTD bank need the stronger 512 the hardware asks for.
-    # See docs/USB_BOT_HCD_REFACTOR_PLAN.md stage 1.
+    # See docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md stage 1.
     usb_dma: dict[str, int] = {}
     for suffix, alignment in (
         ("CHANNEL0_QTD_BANK", 512),

@@ -73,7 +73,7 @@ mean=...us underrun operations=.../100
 
 `completed`が指定値より小さい場合は、続けて`operation or display DMA failed`が出ます。
 CPU/PPA/cache同期の切り分けと実機試験条件は
-[`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](DISPLAY_UNDERRUN_REFACTOR_PLAN.md)を参照します。
+[`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](plans/archive/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)を参照します。
 
 同じ標準条件を一括実行する場合は`db`だけを入力します。`db 20`のように1 case当たりの
 回数も指定できます。結果は`mode phase burst mean underruns frames`の1行1 caseで、測定中の
@@ -115,7 +115,7 @@ SDカード関連は起動シーケンスに含まれず、シェルコマンド
 `sdreadn`/`sdwritetest`/`sdzero`）実行時にのみ`SDMMC: ...`という接頭辞で
 UARTへ出ます。正常時は`SDMMC: card activated`の後にCID/CSDの生値が続きます。
 対応範囲は[`STORAGE.md`](STORAGE.md)、失敗パターンの詳細は
-[`SD_CARD_PLAN.md`](SD_CARD_PLAN.md)を参照してください。
+[`SD_CARD_PLAN.md`](plans/archive/SD_CARD_PLAN.md)を参照してください。
 
 Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起動します。保存設定があれば
 `WIFI: saved profile auto-connect started`、なければ`WIFI: no saved profile`、設定取得までに
@@ -161,8 +161,8 @@ Wi-Fi（ESP32-C6）は保存profile確認のため対話ループ開始時に起
   画面へ出すのは、そこに攻撃者の書いた文字列が入り得るからです
 
 対応範囲は[`WIFI.md`](WIFI.md)と[`NETWORK.md`](NETWORK.md)、実機で踏んだ罠は
-[`WIFI_C6_PLAN.md`](WIFI_C6_PLAN.md)と[`TCPIP_PLAN.md`](TCPIP_PLAN.md)、
-TLSは[`TLS_PLAN.md`](TLS_PLAN.md)を参照してください。
+[`WIFI_C6_PLAN.md`](plans/archive/WIFI_C6_PLAN.md)と[`TCPIP_PLAN.md`](plans/archive/TCPIP_PLAN.md)、
+TLSは[`TLS_PLAN.md`](plans/archive/TLS_PLAN.md)を参照してください。
 
 IP層が答えない場合の切り分けはUARTログよりコマンドの出力を見ます。
 `netdump`が何も出さなければフレームがそもそも届いておらず（APへアソシエート
@@ -211,8 +211,8 @@ USB-AホストはLCDとCardKBの初期化後に起動し、最初の`UsbHost::re
 復帰時に`USB: ...`ログが出ます。`usbinfo`/`usbhub`/`usbmsc`等は共有レジストリを使い、
 `usbrescan`だけがユーザー操作でバスの再列挙を行います。`usbvbus`はI/O expanderの出力ビットを
 直接変更する診断用コマンドです。対応範囲は[`USB.md`](USB.md)、段階分けと未確定事項は
-[`USB_HOST_PLAN.md`](USB_HOST_PLAN.md)と
-[`USB_INTERRUPT_REFACTOR_PLAN.md`](USB_INTERRUPT_REFACTOR_PLAN.md)を参照してください。
+[`USB_HOST_PLAN.md`](plans/archive/USB_HOST_PLAN.md)と
+[`USB_INTERRUPT_REFACTOR_PLAN.md`](plans/archive/USB_INTERRUPT_REFACTOR_PLAN.md)を参照してください。
 Hub portのdevice descriptor取得に失敗した場合、通常の増分スキャンは同じ物理接続を保留して
 接続状態だけquietに監視します。約1秒ごとにport reset／列挙エラーを出し続けることはなく、抜き差し
 または明示的なfull rescanでだけ再試行します。第9版は起動時に`USB ENUM: bounded retry v9`を出します。
@@ -232,7 +232,7 @@ ESP-IDF既定のbalanced FIFO分割と周期SSPLITの位相合わせを組み合
 connect待ちの上限を使い切るので、その長さがUSBストレージを使わない起動のコストです）。
 これは起動時にUSB MSCを最優先のファイルシステムにするための待ち時間を実測で決めるためのもので、
 `usbmargin`が同じ計測をVBUSの再投入で繰り返します
-（[`USB_MSC_BOOT_MARGIN_PLAN.md`](USB_MSC_BOOT_MARGIN_PLAN.md)）。
+（[`USB_MSC_BOOT_MARGIN_PLAN.md`](plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md)）。
 
 転送失敗時のpacket errorログには、`USB:   HCINT=`／`HCCHAR=`／`HCTSIZ=`／転送済みbyte数と
 HPRT／HFNUMが続きます。QTD status 1はCRC・transaction timeout・stuffing・false EOP・
@@ -305,7 +305,7 @@ QTDへ分割し、各完了後にsoftwareが次のDATA PIDを決めます。成�
 WRITE(10)の直前にhost channel／FIFO cleanupを実行していました——実機で最短33 READ後に
 BulkとEP0が応答しなくなったため、EP0がまだ応答する半分の間隔でBOT境界を再確立する
 予防策です。HCD側の契約を整えたうえで3構成の実機A/Bを行い、READ 1000回・WRITE 100回とも
-cleanup無しで通ったため撤去しました（[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)の
+cleanup無しで通ったため撤去しました（[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)の
 Stage 5・6）。`proactive_resyncs=`と`USB MSC: proactive ...`のログはこの撤去で消えています。
 `ut`開始ログの`USB TEST: fault-rescan retry v42`は残ります。
 
@@ -333,7 +333,7 @@ Stage 7の2媒体×2 topology受入後は通常I/Oも最大8 blockを1 command�
 引き続き、guardとpacket／CSW traceを伴う回帰手段です。
 DMA cache同期の拒否経路は`usbcachefail`で確認します（下記）。
 
-`usbhw`は上記に続けて、[`USB_BOT_HCD_REFACTOR_PLAN.md`](USB_BOT_HCD_REFACTOR_PLAN.md)
+`usbhw`は上記に続けて、[`USB_BOT_HCD_REFACTOR_PLAN.md`](plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)
 Stage 0のbaseline counterを固定書式で表示します。0の項目も必ず表示します——「counterが
 無い」と「counterが0」を区別できない書式では比較になりません。行は当初`Line`の80 byteで
 打ち切られていたため、内訳は5桁の値でも収まる単位へ分割し、列見出しを短縮しています。現在の`Line`は

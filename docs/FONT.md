@@ -90,7 +90,7 @@ LZ4は最高の圧縮率よりdecoderの単純さと展開速度を優先して�
 省略します。ASCIIはどちらのbuildでもDROM直接です。既定buildはDROM/IROM境界`0x40110000`、
 比較buildは平文A4を収めるため`0x40150000`です。既定buildの新しい日本語A4構成は実機未確認です。
 以前の小さいA4 blobで行ったPSRAM対DROMのscroll比較結果は
-[`SCALABLE_PROPORTIONAL_FONT_PLAN.md`](SCALABLE_PROPORTIONAL_FONT_PLAN.md)に履歴として残します。
+[`SCALABLE_PROPORTIONAL_FONT_PLAN.md`](plans/active/SCALABLE_PROPORTIONAL_FONT_PLAN.md)に履歴として残します。
 
 ## モジュールと検査
 

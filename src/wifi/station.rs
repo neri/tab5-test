@@ -1,5 +1,5 @@
 //! Station-mode operations built on the RPC layer (stage 4 of
-//! `docs/WIFI_C6_PLAN.md`): bring the slave's Wi-Fi up, scan, and read the
+//! `docs/plans/archive/WIFI_C6_PLAN.md`): bring the slave's Wi-Fi up, scan, and read the
 //! results back.
 //!
 //! Each function here is one or a few `esp_wifi_*` calls executed on the C6.
@@ -291,7 +291,7 @@ fn simple_status(rpc: &mut Rpc, request_id: u32, body: &[u8]) -> Option<Status> 
 }
 
 // ---------------------------------------------------------------------------
-// Connecting (stage 5 of `docs/WIFI_C6_PLAN.md`)
+// Connecting (stage 5 of `docs/plans/archive/WIFI_C6_PLAN.md`)
 // ---------------------------------------------------------------------------
 
 const REQ_WIFI_CONNECT: u32 = 282;

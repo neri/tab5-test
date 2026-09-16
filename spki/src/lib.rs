@@ -24,7 +24,7 @@
 //! It does not validate a certificate. It reads no validity dates, no
 //! subject, no SAN, no basic constraints, no extensions at all, and it never
 //! looks at a second certificate in the chain. Those checks belong to the
-//! public-CA profile (`docs/TLS_PLAN.md` Stage 9) and are not what the
+//! public-CA profile (`docs/plans/archive/TLS_PLAN.md` Stage 9) and are not what the
 //! unauthenticated and pinned profiles rest on. Nothing here should be read
 //! as "the certificate is good"; the only claim it makes is "this is where
 //! the key is".

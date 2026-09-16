@@ -124,7 +124,7 @@ CPUの数字をそのままPPAの負荷見積もりへ使えない。
 ではないが、固定レイテンシ、refresh、read/write切替、AXI調停を含む実機に十分な余裕が
 あるとはいえない。正確な結論は、**80 MHz構成では大面積DMA更新中の瞬間帯域と最悪応答
 時間に余裕がない可能性が高い**、である。分離測定と対策は
-[`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](DISPLAY_UNDERRUN_REFACTOR_PLAN.md)で進める。
+[`DISPLAY_UNDERRUN_REFACTOR_PLAN.md`](plans/archive/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)で進める。
 
 なおL1ヒットの列は`membench`のSRAMバッファ（48 KiB）がL1データキャッシュ
 （64 KiB）に収まってしまったために得られた値で、**内蔵SRAM自体の値ではない**。
@@ -179,7 +179,7 @@ RAM枠（256 KiB）ではスタックと両立しない。
 アンダーランは減っても消えませんでした。CPU側でwrite-allocateを止める道も
 後述のPMAロックで塞がっています。残る手段は**CPUに書かせないこと**で、
 それを実装したのが`src/ppa.rs`と`src/dma2d.rs`です。段階ごとの検証手順は
-[`PPA_FILL_PLAN.md`](PPA_FILL_PLAN.md)にあります。
+[`PPA_FILL_PLAN.md`](plans/archive/PPA_FILL_PLAN.md)にあります。
 
 PPA（Pixel Processing Accelerator）のfillは2D-DMAが直接PSRAMへ書くので、
 write-allocateの読み込みが原理的に発生しません。2D-DMAのディスクリプタは
@@ -456,4 +456,4 @@ master port 1（CACHE）ではなくport 0（CPU集約ポート）に出てい�
 深追いしなかったのは、**仮に動いてもCPUを遅くすることで表示を守る仕組みだから**です。
 全画面塗りはすでに94 msかかっており、これをさらに遅くする方向の対策は
 求めているものではありません。塗りそのものを軽くする
-（[`PPA_FILL_PLAN.md`](PPA_FILL_PLAN.md)）ほうが筋が良いと判断しました。
+（[`PPA_FILL_PLAN.md`](plans/archive/PPA_FILL_PLAN.md)）ほうが筋が良いと判断しました。

@@ -1,7 +1,7 @@
 # ハイパーテキストビューア（browser）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機での判断記録:
-> [`WEB_BROWSER_PLAN.md`](WEB_BROWSER_PLAN.md)
+> [`WEB_BROWSER_PLAN.md`](plans/archive/WEB_BROWSER_PLAN.md)
 
 `browser`コマンドで開く全画面のビューアです。**Webブラウザではありません。**
 HTTPまたはHTTPSで取得したHTMLから文章、リンク、table、form、静止画像を取り出し、
@@ -37,7 +37,7 @@ HTTPまたはHTTPSで取得したHTMLから文章、リンク、table、form、�
 AEAD tagを検証します。しかしそれで分かるのは「相手が、提示した証明書の
 秘密鍵を持っている」ことだけで、その証明書がアドレス欄のhostのものかは
 **確認していません**。chainを辿らず、rootを見ず、名前を照合せず、有効期限も
-読みません（[NETWORK.md](NETWORK.md)、[TLS_PLAN.md](TLS_PLAN.md)）。
+読みません（[NETWORK.md](NETWORK.md)、[TLS_PLAN.md](plans/archive/TLS_PLAN.md)）。
 
 したがって受動的な盗聴は防ぎますが、能動的な攻撃者は自前の証明書で接続を
 終端でき、上の検証はすべて通ります。**これは通常のHTTPSと同じものではありません。**

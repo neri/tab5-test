@@ -16,8 +16,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 
 ## ドキュメント構成
 
-本文は`docs/`以下に分割してあります。各文書は実装の現状を説明するもので、
-`*_PLAN.md`は機能追加時の作業計画と実機での判断記録です。
+本文は`docs/`直下に分割してあります。各文書は実装の現状を説明するもので、
+作業計画は`docs/plans/`に分けてあります（下記）。
 
 | 文書 | 内容 |
 | --- | --- |
@@ -44,44 +44,10 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
 | [DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | 正常時のUARTログ通過点と主な失敗ログ |
 | [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | 実機で見つかった制約（DW-GDMA／SDHOST、USB、ファイルシステム） |
 
-作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）:
-[COMMAND_RETIREMENT_PLAN.md](docs/COMMAND_RETIREMENT_PLAN.md)、
-[DISPLAY_UNDERRUN_REFACTOR_PLAN.md](docs/DISPLAY_UNDERRUN_REFACTOR_PLAN.md)、
-[DEVICE_TREE_PLAN.md](docs/DEVICE_TREE_PLAN.md)、
-[FLASH_XIP_MIGRATION_PLAN.md](docs/FLASH_XIP_MIGRATION_PLAN.md)、
-[FONT_MIGRATION_PLAN.md](docs/FONT_MIGRATION_PLAN.md)、
-[ROOT_FILESYSTEM_PLAN.md](docs/ROOT_FILESYSTEM_PLAN.md)、
-[FILESYSTEM_PLAN.md](docs/FILESYSTEM_PLAN.md)、
-[FILESYSTEM_WRITE_REFACTOR_PLAN.md](docs/FILESYSTEM_WRITE_REFACTOR_PLAN.md)、
-[FILESYSTEM_WORKFLOW_PLAN.md](docs/FILESYSTEM_WORKFLOW_PLAN.md)、
-[INPUT_MANAGER_PLAN.md](docs/INPUT_MANAGER_PLAN.md)、
-[PPA_FILL_PLAN.md](docs/PPA_FILL_PLAN.md)、
-[SD_CARD_PLAN.md](docs/SD_CARD_PLAN.md)、
-[SOFT_I2C_REFACTOR_PLAN.md](docs/SOFT_I2C_REFACTOR_PLAN.md)、
-[STARTUP_SCREEN_REFACTOR_PLAN.md](docs/STARTUP_SCREEN_REFACTOR_PLAN.md)、
-[SYSTEM_BAR_PLAN.md](docs/SYSTEM_BAR_PLAN.md)、
-[USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
-[USB_FLOPPY_PLAN.md](docs/USB_FLOPPY_PLAN.md)、
-[USB_HOST_PLAN.md](docs/USB_HOST_PLAN.md)、
-[USB_HID_REPORT_PLAN.md](docs/USB_HID_REPORT_PLAN.md)、
-[USB_INTERRUPT_REFACTOR_PLAN.md](docs/USB_INTERRUPT_REFACTOR_PLAN.md)、
-[USB_MSC_PLAN.md](docs/USB_MSC_PLAN.md)、
-[USB_MSC_BOOT_MARGIN_PLAN.md](docs/USB_MSC_BOOT_MARGIN_PLAN.md)、
-[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
-[USB_REFACTOR_PLAN.md](docs/USB_REFACTOR_PLAN.md)、
-[WIFI_C6_PLAN.md](docs/WIFI_C6_PLAN.md)、
-[WIFI_REFACTOR_PLAN.md](docs/WIFI_REFACTOR_PLAN.md)、
-[TCPIP_PLAN.md](docs/TCPIP_PLAN.md)、
-[DNS_PLAN.md](docs/DNS_PLAN.md)、
-[TLS_PLAN.md](docs/TLS_PLAN.md)、
-[TLSF_ALLOCATOR_PLAN.md](docs/TLSF_ALLOCATOR_PLAN.md)、
-[WEB_BROWSER_PLAN.md](docs/WEB_BROWSER_PLAN.md)、
-[BROWSER_UI_PLAN.md](docs/BROWSER_UI_PLAN.md)、
-[BROWSER_FRAGMENT_NAVIGATION_PLAN.md](docs/BROWSER_FRAGMENT_NAVIGATION_PLAN.md)、
-[BROWSER_TABLE_PLAN.md](docs/BROWSER_TABLE_PLAN.md)、
-[BROWSER_EXTENSION_PLAN.md](docs/BROWSER_EXTENSION_PLAN.md)、
-[BROWSER_INLINE_CONTROL_PLAN.md](docs/BROWSER_INLINE_CONTROL_PLAN.md)、
-[SCALABLE_PROPORTIONAL_FONT_PLAN.md](docs/SCALABLE_PROPORTIONAL_FONT_PLAN.md)。
+作業計画（段階分け、実機での判断条件と実際に踏んだ罠を残すもの）は`docs/plans/`以下に、
+状態ごとに`active/`（着手済み・受入待ち）、`proposed/`（未着手）、`archive/`（完了・凍結・
+打ち切り）へ分けて置いてあります。一覧と各計画の状態は
+[docs/plans/INDEX.md](docs/plans/INDEX.md)を参照してください。
 
 ## 制約
 
@@ -115,8 +81,8 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   cleanup失敗の伝播）を整えた結果、3構成の実機A/Bで不要と確認して撤去しました。
   複数ブロックWRITEはStage 7で2媒体×2接続構成の2／4／8 blockを各10回実機確認し、
   1回のWRITE(10)上限を8ブロック（4 KiB）へ増やしました
-  （[USB_WRITE_STABILITY_PLAN.md](docs/USB_WRITE_STABILITY_PLAN.md)、
-  [USB_BOT_HCD_REFACTOR_PLAN.md](docs/USB_BOT_HCD_REFACTOR_PLAN.md)、
+  （[USB_WRITE_STABILITY_PLAN.md](docs/plans/archive/USB_WRITE_STABILITY_PLAN.md)、
+  [USB_BOT_HCD_REFACTOR_PLAN.md](docs/plans/archive/USB_BOT_HCD_REFACTOR_PLAN.md)、
   [STORAGE.md](docs/STORAGE.md)）。
 - Wi-FiはESP32-C6のESP-Hostedファームウェアを経由します。C6は2.4 GHz専用で
   5 GHzのAPは見えません。SoftAP、BLE、OpenThreadは未対応です
@@ -127,7 +93,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   から取得できますが、接続先のidentityを保証しない**未認証TLS**です。受動的な
   盗聴は防ぎますが能動的な攻撃者は防ぎません。表示は必ず`TLS UNVERIFIED`とし、
   `SECURE`とは表示しません。SPKI pinの仕組みはありますが登録先は空です
-  （[NETWORK.md](docs/NETWORK.md)、[TLS_PLAN.md](docs/TLS_PLAN.md)）。
+  （[NETWORK.md](docs/NETWORK.md)、[TLS_PLAN.md](docs/plans/archive/TLS_PLAN.md)）。
   名前解決はAレコードだけで、キャッシュ・逆引き・mDNSはありません。
   受信したファイルはRAMルート上のカレントディレクトリへ保存できます
   （[NETWORK.md](docs/NETWORK.md)、[FILESYSTEM.md](docs/FILESYSTEM.md)）。

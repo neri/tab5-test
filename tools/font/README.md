@@ -5,7 +5,7 @@
 `font/data/tab5font16.bin`を作るhost側のtoolです。firmwareはBDFを解析しません。
 元BDFはリポジトリへcommitせず、root `Makefile`が固定版をdownloadしてhashを検証します。
 3,175 byteの生成物はリポジトリへcommitし、通常のbuildは`include_bytes!`で読むだけです。移行計画は
-[`../../docs/FONT_MIGRATION_PLAN.md`](../../docs/FONT_MIGRATION_PLAN.md)にあります。
+[`../../docs/plans/archive/FONT_MIGRATION_PLAN.md`](../../docs/plans/archive/FONT_MIGRATION_PLAN.md)にあります。
 
 ## ファイル
 

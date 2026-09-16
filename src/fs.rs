@@ -1,6 +1,6 @@
 //! Filesystem support, from the block interface upward.
 //!
-//! Staged per `docs/FILESYSTEM_PLAN.md`. What is here is that plan's Stage 1:
+//! Staged per `docs/plans/archive/FILESYSTEM_PLAN.md`. What is here is that plan's Stage 1:
 //! the block layer, MBR handling, and the PSRAM RAM disk. The VFS, the mount
 //! table and the FAT drivers are not here yet, so nothing above this module
 //! opens a file -- the shell reaches the layer directly.

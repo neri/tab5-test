@@ -79,7 +79,7 @@ const ASC_MEDIUM_NOT_PRESENT: u8 = 0x3A;
 /// can be mounted from: it may still be spinning up, reporting a unit
 /// attention from the power-on it just went through, or waiting for media.
 /// The boot-time storage selection has to budget for that separately from
-/// enumeration, which is what `docs/USB_MSC_BOOT_MARGIN_PLAN.md` sizes.
+/// enumeration, which is what `docs/plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md` sizes.
 /// Why [`UsbMassStorage::measure_ready_and_first_read`] stopped.
 ///
 /// A boot-time storage probe needs more than a yes/no: `NoMedium` is a

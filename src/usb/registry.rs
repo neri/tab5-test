@@ -1,7 +1,7 @@
 //! Single owner of the USB-A bus, and the device registry that replaces
 //! the old "one keyboard, driven from the top of `usb.rs`" model.
 //!
-//! `docs/USB_HOST_PLAN.md`/`docs/USB_MSC_PLAN.md` staged this project one device at a
+//! `docs/plans/archive/USB_HOST_PLAN.md`/`docs/plans/archive/USB_MSC_PLAN.md` staged this project one device at a
 //! time, which left two gaps once real hardware had more than one device
 //! plugged in: `hub::Hub` only ever drove a single chosen port
 //! (`hub.rs`'s old `find_connected_port`), so which device got noticed
@@ -9,11 +9,11 @@
 //! shell command (`usbinfo`, `usbhub`, `usbmsc`, ...) called
 //! `hcd::probe_port`/`protocol::enumerate_device` independently, which does
 //! a full bus reset and silently invalidated whatever `UsbKeyboard` the
-//! frame loop had going (`docs/USB_HOST_PLAN.md`'s "Stage 3, trap #2").
+//! frame loop had going (`docs/plans/archive/USB_HOST_PLAN.md`'s "Stage 3, trap #2").
 //!
 //! `UsbHost` fixes both by being the *only* thing that ever calls
 //! `hcd::probe_port`/`hub::Hub::open`, and by attaching every occupied
-//! port instead of one. See `docs/USB_REFACTOR_PLAN.md` Stages A-D and F.
+//! port instead of one. See `docs/plans/archive/USB_REFACTOR_PLAN.md` Stages A-D and F.
 //!
 //! What is on the bus and what this project can drive are two different
 //! questions, so they are two arrays: `records` holds every device that
@@ -208,7 +208,7 @@ impl DeviceSummary {
 /// Kept for the boot-time storage decision rather than for its own sake: the
 /// firmware wants USB mass storage to win over the SD card when one is
 /// plugged in, and that only works if boot waits long enough for a device
-/// that is powering up right then. `docs/USB_MSC_BOOT_MARGIN_PLAN.md` turns
+/// that is powering up right then. `docs/plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md` turns
 /// these numbers into that budget.
 #[derive(Clone, Copy, Default)]
 pub struct ScanTiming {
@@ -365,7 +365,7 @@ impl DeviceRecord {
     /// Reads one of this device's string descriptors as ASCII. Costs one
     /// control transfer per call, which is why enumeration does not do it
     /// for every device up front: the boot-time scan is on the critical
-    /// path of the storage decision (`docs/USB_MSC_BOOT_MARGIN_PLAN.md`),
+    /// path of the storage decision (`docs/plans/archive/USB_MSC_BOOT_MARGIN_PLAN.md`),
     /// and nothing but a display has ever needed these.
     pub fn read_string(&self, index: u8, language: u16, out: &mut [u8]) -> Option<usize> {
         protocol::read_string_ascii(&self.control_pipe(), index, language, out)
@@ -443,7 +443,7 @@ pub struct BusDevice<'a> {
 /// in `shell.rs` takes a `&UsbHost`/`&mut UsbHost` and reads or drives
 /// devices already in the registry instead of touching `hcd`/`hub`/
 /// `protocol` directly -- so nothing can reset the bus out from under a
-/// live session anymore (`docs/USB_REFACTOR_PLAN.md` Stage A).
+/// live session anymore (`docs/plans/archive/USB_REFACTOR_PLAN.md` Stage A).
 pub struct UsbHost {
     last_probe: Option<HostPort>,
     hub: Option<Hub>,
@@ -636,7 +636,7 @@ impl UsbHost {
     /// The first attached Mass Storage device, if any -- `usbmsc`/
     /// `usbread`/`usbmbr` no longer enumerate their own device fresh on
     /// every call; they share whatever `rescan` already attached, wherever
-    /// it is (USB-A directly or a hub port). `docs/USB_REFACTOR_PLAN.md` Stage F.
+    /// it is (USB-A directly or a hub port). `docs/plans/archive/USB_REFACTOR_PLAN.md` Stage F.
     ///
     /// The single-device diagnostics keep using this. The filesystem layer
     /// does not: it addresses storage by number through
@@ -1329,7 +1329,7 @@ impl UsbHost {
     /// Opens the hub plugged into USB-A, powers its ports, and attaches
     /// whatever is connected on each one in turn -- up to `MAX_HUB_PORTS`
     /// of them, unlike the old `hub::Hub::find_connected_port`'s "first
-    /// port only" (`docs/USB_REFACTOR_PLAN.md` Stage C).
+    /// port only" (`docs/plans/archive/USB_REFACTOR_PLAN.md` Stage C).
     ///
     /// Ports are enumerated one at a time, never interleaved, per
     /// `protocol::enumerate_device`'s "only one device may be in the

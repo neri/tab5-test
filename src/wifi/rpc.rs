@@ -1,5 +1,5 @@
 //! ESP-Hosted's RPC layer: remote `esp_wifi_*` calls over the serial
-//! interface (stage 3 of `docs/WIFI_C6_PLAN.md`).
+//! interface (stage 3 of `docs/plans/archive/WIFI_C6_PLAN.md`).
 //!
 //! A call is a protobuf `Rpc` message -- message type, message id, a uid to
 //! match the answer with, and one nested payload field whose *field number

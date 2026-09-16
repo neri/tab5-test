@@ -1,7 +1,7 @@
 # TCP/IP（smoltcp）
 
 > 索引: [`../DESIGN.md`](../DESIGN.md) ／ 段階分けと実機での判断記録:
-> [`TCPIP_PLAN.md`](TCPIP_PLAN.md)
+> [`TCPIP_PLAN.md`](plans/archive/TCPIP_PLAN.md)
 
 [`WIFI.md`](WIFI.md)のリンク層（ESP32-C6のESP-Hosted）の上に、IPv4を載せた
 層です。ARP・IPv4・ICMP・UDP・DHCP・TCPは**自前実装せず
@@ -576,7 +576,7 @@ GETに限り`If-None-Match`を1つ付けられます（`Transaction::start_reque
 ### 1 frameで戻るための構造
 
 TLSエンジンは[embedded-tls](https://docs.rs/embedded-tls/) 0.19である。採用理由と
-検討したほかの候補は[TLS_PLAN.md](TLS_PLAN.md)にある。
+検討したほかの候補は[TLS_PLAN.md](plans/archive/TLS_PLAN.md)にある。
 
 このライブラリのblocking APIは`open()`がhandshake全体を回してから返るため、
 「1回のpollで決まった量だけ進んで返る」という契約と両立しない。そこでasync APIを
@@ -730,7 +730,7 @@ alertの中身（`handshake_failure`、`protocol_version`、`unrecognized_name`�
 
 **1回のpollの最長は約70 ms**である。これはhandshake中の1 pollで、鍵交換と署名検証が
 ライブラリ内部の分割できない処理としてまとまっているためで、こちらから分割できない。
-[TLS_PLAN.md](TLS_PLAN.md)の中止条件（1 stepが100 msを超える）には当たらないが、
+[TLS_PLAN.md](plans/archive/TLS_PLAN.md)の中止条件（1 stepが100 msを超える）には当たらないが、
 57.3 Hzのframe loopでは約4 frame分の停止に相当する。ブラウザへ統合する際は、
 handshake中は「読み込み中」の表示のまま止まって見える時間がこの長さになる。
 
@@ -739,7 +739,7 @@ handshake中は「読み込み中」の表示のまま止まって見える時�
 HTTP層とは`net::transport`経由で繋がっており、`tls`コマンド
 （[CONSOLE_SHELL.md](CONSOLE_SHELL.md)）が`net::http::Transaction`を
 TLS transportの上で回す。まだ無いのは`https://` URLのfetch、ブラウザ表示、
-redirect規則、pin tableの生成で、段階分けは[TLS_PLAN.md](TLS_PLAN.md)にある。
+redirect規則、pin tableの生成で、段階分けは[TLS_PLAN.md](plans/archive/TLS_PLAN.md)にある。
 `httpget`とブラウザは引き続き平文専用である。
 
 ## 制約

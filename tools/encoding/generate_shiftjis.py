@@ -3,7 +3,7 @@
 
 The firmware has no codec library and no room for a general one: this runs
 on the host, and the checked-in `browser/data/shiftjis.bin` is what
-`include_bytes!` picks up. See `docs/BROWSER_UI_PLAN.md` for why the table
+`include_bytes!` picks up. See `docs/plans/archive/BROWSER_UI_PLAN.md` for why the table
 looks like this, and `browser/src/encoding.rs` for how it is read.
 
 The source is CPython's `cp932`, not `shift_jis`. What calls itself

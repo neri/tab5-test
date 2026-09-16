@@ -18,7 +18,7 @@ use crate::usb::{
 
 /// Bytes per READ(10). READ(10) itself allows 65,535 blocks, but 4 KiB is the
 /// transfer size the acceptance testing in
-/// `docs/USB_WRITE_STABILITY_PLAN.md` actually covers, and the bulk layer
+/// `docs/plans/archive/USB_WRITE_STABILITY_PLAN.md` actually covers, and the bulk layer
 /// splits everything into single MPS packets underneath regardless. Larger
 /// requests are split here.
 const MAX_READ_BYTES: usize = 4096;

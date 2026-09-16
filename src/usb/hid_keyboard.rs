@@ -7,7 +7,7 @@
 //! keyboard boot interface, diffing successive reports to find newly
 //! pressed keys, and translating HID usage IDs into `input::Key`.
 //!
-//! This is Stage 3 of `docs/USB_HOST_PLAN.md`, the actual milestone: `UsbKeyboard`
+//! This is Stage 3 of `docs/plans/archive/USB_HOST_PLAN.md`, the actual milestone: `UsbKeyboard`
 //! feeds decoded keystrokes into the same `Console::push` path `cardkb.rs`
 //! uses, polled by `input::InputManager` alongside `CardKb`.
 

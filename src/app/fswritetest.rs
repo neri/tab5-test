@@ -1,6 +1,6 @@
 //! `fswritetest`: the write-path acceptance run, as one command.
 //!
-//! `docs/FILESYSTEM_WRITE_REFACTOR_PLAN.md` asks for a list of things to try
+//! `docs/plans/archive/FILESYSTEM_WRITE_REFACTOR_PLAN.md` asks for a list of things to try
 //! by hand on a sacrificial volume. Typed one at a time they are easy to get
 //! wrong -- and the check that matters most, appending to a file that was
 //! just replaced with a shorter one, looks *correct* by eye unless the exact

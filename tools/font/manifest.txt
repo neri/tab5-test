@@ -12,7 +12,7 @@
 # reported and dropped, and the count of dropped code points is printed, so
 # characters are never silently lost -- see `README.md`.
 #
-# The size ceiling is 512 KiB (`docs/FONT_MIGRATION_PLAN.md`). Generation fails
+# The size ceiling is 512 KiB (`docs/plans/archive/FONT_MIGRATION_PLAN.md`). Generation fails
 # above it rather than dropping characters to fit.
 
 # ---------------------------------------------------------------- Japanese

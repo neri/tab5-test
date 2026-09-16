@@ -1,7 +1,7 @@
 //! Display for the VFS: `mounts`, `ls`, `cat`, and the commands that change
 //! something -- `write`, `mkdir` and the current directory `cd` moves.
 //!
-//! `docs/FILESYSTEM_PLAN.md` Stage 2. These are the read-only shell the plan
+//! `docs/plans/archive/FILESYSTEM_PLAN.md` Stage 2. These are the read-only shell the plan
 //! asks for, and they are also how the reader gets tested: `ls /tmp` has to
 //! show the long name rather than its `~1` alias, and `cat /tmp/CHAIN.TXT`
 //! has to keep printing the right cluster number past the end of the first
@@ -841,7 +841,7 @@ const FILL_MAX_CHUNK: usize = 4096;
 /// `fill <path> <KiB> [chunk]`: writes a known pattern and reports how long
 /// it took.
 ///
-/// This is the measurement `docs/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks
+/// This is the measurement `docs/plans/archive/FILESYSTEM_WORKFLOW_PLAN.md` Stage 3-2 asks
 /// for, kept independent of the network so that "is the write path linear?"
 /// and "does the transfer work?" are two questions with two answers.
 /// `repeated` takes the old path -- one `Vfs::write` per chunk, each of
