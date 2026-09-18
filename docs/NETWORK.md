@@ -49,6 +49,10 @@ backoffで再試行し、成功後にDHCPを自動開始します。接続後の
 再取得を続けます。ブラウザの進行中socketは旧stackとともに無効になり、画面は操作可能なまま
 新しい接続を待ちます。associationとDHCPが完了したら、ブラウザは保持していた元のURLの
 GETを先頭から自動再開します。旧応答の途中と新応答を連結しません。
+GUIでは再association後のSTA MAC取得もフレーム単位の非同期RPCなので、一時的にstackの無い
+`Associated`状態になります。この状態は`MenuManaged`かつ`Dhcp`なら回復処理中として公開し、
+その間に始まったブラウザの最初のアクセスもIPv4取得まで待たせます。CLIの`Associated`は
+IP設定待ちの終端なので、この扱いにはしません。
 
 C6 NVSに保存profileがある起動も同じ`MenuManaged`／`Dhcp`方針へ入り、画面操作なしで
 associationとDHCPを開始します。メニューの`Connect once`とCLIはC6 RAM設定を使うため、

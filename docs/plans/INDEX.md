@@ -35,6 +35,7 @@
 
 | 計画 | 内容 | 状態 |
 | --- | --- | --- |
+| [BROWSER_IMAGE_CACHE_WEBP_PLAN.md](archive/BROWSER_IMAGE_CACHE_WEBP_PLAN.md) | Browser画像LRU・上限緩和・静止WebP | 完了（8 MiB候補棄却、実Wi-Fi切断回帰は見送り） |
 | [BROWSER_EXTENSION_PLAN.md](archive/BROWSER_EXTENSION_PLAN.md) | Browser画像・フォーム・キャッシュ | 完了（Stage 0〜8） |
 | [BROWSER_FRAGMENT_NAVIGATION_PLAN.md](archive/BROWSER_FRAGMENT_NAVIGATION_PLAN.md) | ブラウザfragment navigation | 完了 |
 | [BROWSER_INLINE_CONTROL_PLAN.md](archive/BROWSER_INLINE_CONTROL_PLAN.md) | Browser inline control・装飾button | 完了（Stage 0〜6） |

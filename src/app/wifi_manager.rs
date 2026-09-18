@@ -314,6 +314,26 @@ impl Manager {
         self.stack.as_ref()
     }
 
+    /// Whether the connection policy is still able to produce an addressed
+    /// stack without another user action.
+    ///
+    /// `Associated` is normally terminal for a CLI connection, but it is a
+    /// short-lived intermediate state for a GUI-managed connection while the
+    /// incremental MAC-address RPC runs before DHCP starts.  Keeping that
+    /// distinction here prevents network users from mistaking the gap for a
+    /// final no-network state.
+    pub fn network_recovery_active(&self) -> bool {
+        matches!(
+            self.state,
+            State::Associating { .. }
+                | State::RetryWaiting { .. }
+                | State::RequestingDhcp { .. }
+                | State::AssociatedNoLease(_)
+        ) || (matches!(self.state, State::Associated(_))
+            && self.source == Some(ConnectionSource::MenuManaged)
+            && self.ip_policy == IpPolicy::Dhcp)
+    }
+
     pub fn profile_save_state(&self) -> ProfileSaveState {
         self.profile_save_state
     }

@@ -800,7 +800,7 @@ impl Fetch {
             }
             if !matches!(
                 head.media_type.as_deref(),
-                Some(b"image/png" | b"image/jpeg")
+                Some(b"image/png" | b"image/jpeg" | b"image/webp")
             ) {
                 return Outcome::Failed(NOT_IMAGE.with_status(status));
             }
@@ -1077,7 +1077,7 @@ pub const NOT_HTML: Failure = Failure::new(
 pub const NOT_IMAGE: Failure = Failure::new(
     "not-image",
     "Not a supported image",
-    "The response did not declare image/png or image/jpeg.",
+    "The response did not declare image/png, image/jpeg, or image/webp.",
 );
 pub const EMPTY: Failure = Failure::new("empty", "Empty response", "The server sent no page.");
 pub const OUT_OF_MEMORY: Failure = Failure::new(

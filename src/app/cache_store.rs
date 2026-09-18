@@ -235,7 +235,7 @@ impl CacheRead {
             .filter(|size| *size <= MAX_HTTP_CACHE_ENTRY_BYTES)?;
         let media = hit.record.media_type.as_str();
         let target = if image {
-            if !matches!(media, "image/png" | "image/jpeg") {
+            if !matches!(media, "image/png" | "image/jpeg" | "image/webp") {
                 return None;
             }
             let mut bytes = Vec::new();

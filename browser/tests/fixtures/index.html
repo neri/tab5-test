@@ -26,6 +26,9 @@ is itself part of what is being tested.</p>
   <li><a href="encoding/shift-jis-meta">encoding/shift-jis-meta</a> - declared by meta</li>
   <li><a href="encoding/shift-jis-lying-meta">encoding/shift-jis-lying-meta</a> - header over meta</li>
   <li><a href="encoding/shift-jis-broken">encoding/shift-jis-broken</a> - one dangling lead byte</li>
+  <li><a href="encoding/euc-jp">encoding/euc-jp</a> - declared by the header</li>
+  <li><a href="encoding/euc-jp-meta">encoding/euc-jp-meta</a> - declared by meta</li>
+  <li><a href="encoding/euc-jp-broken">encoding/euc-jp-broken</a> - one dangling lead byte</li>
   <li><a href="encoding/utf8-bom.html">encoding/utf8-bom.html</a> - a byte order mark</li>
 </ul>
 <h2>Media types</h2>
@@ -40,6 +43,22 @@ is itself part of what is being tested.</p>
   <li><a href="broken/deep-nest.html">broken/deep-nest.html</a></li>
   <li><a href="broken/huge-attribute.html">broken/huge-attribute.html</a></li>
   <li><a href="broken/bad-utf8.html">broken/bad-utf8.html</a></li>
+</ul>
+<h2>Forms</h2>
+<ul>
+  <li><a href="forms/post.html">forms/post.html</a> - direct POST</li>
+  <li><a href="forms/inline-controls.html">forms/inline-controls.html</a> - inline controls and decorated/image buttons</li>
+  <li><a href="forms/post-redirects.html">forms/post-redirects.html</a> - POST redirect rules</li>
+  <li><a href="cache/index.html">cache/index.html</a> - HTTP cache revalidation</li>
+  <li><a href="images/png-formats.html">images/png-formats.html</a> - every PNG colour type and bit depth up to 8 bits, and rejected variants</li>
+  <li><a href="images/webp.html">images/webp.html</a> - static lossless/lossy-alpha WebP and rejected animation/damage</li>
+  <li><a href="images/webp-lru.html">images/webp-lru.html</a> - cached WebP eviction and re-decode after large no-store images</li>
+  <li><a href="images/lru.html">images/lru.html</a> - sixteen distinct large images that cross the decoded-image soft limit</li>
+  <li><a href="images/limit-expanded.html">images/limit-expanded.html</a> - image between the old 512 KiB and new 1 MiB compressed limits</li>
+  <li><a href="images/limit-dimensions.html">images/limit-dimensions.html</a> - width between the old 1280 and new 2048 pixel limits</li>
+  <li><a href="images/limit-pixels.html">images/limit-pixels.html</a> - 1920x1080 inside and 2048x1025 just outside the new pixel limit</li>
+  <li><a href="images/limit-work.html">images/limit-work.html</a> - RGBA expansion inside and just outside the 4 MiB decoder-work limit</li>
+  <li><a href="images/pinned.html">images/pinned.html</a> - images from a TLS PINNED page (over the TLS listener)</li>
 </ul>
 <h2>Transfers</h2>
 <ul>

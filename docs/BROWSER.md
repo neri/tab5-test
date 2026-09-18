@@ -6,7 +6,7 @@
 `browser`コマンドで開く全画面のビューアです。**Webブラウザではありません。**
 HTTPまたはHTTPSで取得したHTMLから文章、リンク、table、form、静止画像を取り出し、
 画面幅へ折り返して読むものだけを実装してあります。CSSとJavaScriptはありません。
-`img`はPNGとbaseline JPEGを取得・decodeしてRGB565で拡縮描画します。TLSは
+`img`はPNG、baseline JPEG、静止WebPを取得・decodeしてRGB565で拡縮描画します。TLSは
 ありますが、接続先の身元は確認しません（下記「未認証TLS」）。
 
 対象を狭く固定してあるのは能力不足の言い訳ではなく設計です。対象外の内容を
@@ -23,7 +23,7 @@ HTTPまたはHTTPSで取得したHTMLから文章、リンク、table、form、�
 | HTMLの文章・見出し・リスト・リンク | CSS（`style`属性・`<style>`・外部stylesheet） |
 | 相対リンクの解決、履歴8ページ、戻る・進む | JavaScript、DOM API |
 | 再読込、リダイレクト5回まで | animated／progressive画像、SVG、video、audio |
-| UTF-8とShift_JIS（下記「文字符号化」） | それ以外の符号化（EUC-JP、ISO-2022-JPなど） |
+| UTF-8、Shift_JIS、EUC-JP（下記「文字符号化」） | それ以外の符号化（ISO-2022-JPなど） |
 | chunked転送、form送信、ファイルcache | cookie、HTTP認証、client証明書 |
 | キーボード・タッチ・USBマウス | 日本語入力 |
 | 読み込み中のキャンセル | IPv6、HTTP/2、HTTP/3、WebSocket |
@@ -230,6 +230,11 @@ associationとDHCPが完了したら**同じGETを先頭から自動的にやり
 `reconnecting Wi-Fi; this page will retry automatically`と表示し、Escape／中止ボタンで
 取り消せます。HTTPの途中位置から継続しないのは、切断前と再接続後の応答が同じ内容とは
 限らず、途中同士を連結すると1つの壊れたページを成功として表示してしまうためです。
+再association直後、GUIの非同期RPCがSTA MACを取得してDHCPを開始するまでの
+`Associated`状態も管理対象接続なら再接続待ちに含めます。この短い区間で新しいURLを開いても
+`no-network`にはせず、IPv4取得後に最初のGETを自動開始します。
+2026-09-19にTab5実機で、自動切断後の再接続中に最初のWebアクセスを行い、
+`no-network`にならず再接続後に取得を開始することを受入済みです。
 
 この自動再試行は接続管理器自身が再接続中の場合だけです。CLIの`wifi connect`は資格情報を
 保持せず、自動再associationも自動DHCPも行わないため、従来どおり`no-network`になり、
@@ -308,7 +313,7 @@ bucketディレクトリへ置きます。`<hash>.body`が転送符号を外し�
 期限を数えられます。
 
 保存するのは、redirectを経ない`200`で、`Cache-Control: no-store`がなく、`Vary`が`Accept-Encoding`
-以外を含まず、identity符号で、1 entry 512 KiB（`MAX_HTTP_CACHE_ENTRY_BYTES`）以内の応答だけです。
+以外を含まず、identity符号で、1 entry 1 MiB（`MAX_HTTP_CACHE_ENTRY_BYTES`）以内の応答だけです。
 鮮度は`Cache-Control: max-age`、なければ`Expires`から応答自身の`Date`を引いた時間、どちらも
 なければ既定の1時間（`DEFAULT_CACHE_FRESHNESS_SECS`）で、`Age`を差し引きます。受信時点で期限が
 切れている応答（`max-age=0`、`Date`より前の`Expires`、日付として読めない`Expires`）は保存しません。
@@ -479,7 +484,7 @@ BOMだけで、先頭1 KiBを溜める必要もありません。
 | `a href` | リンク。青＋下線、選択中は反転 |
 | `ul`、`ol`、`li` | markerと字下げ。深さは`MAX_NESTING_DEPTH`で頭打ち |
 | `hr` | 水平線 |
-| `img` | `src`、`alt`、正の`width`／`height`を画像IDへ保持し、PNG／baseline JPEGを取得・decodeする。通常本文では回り込みなしの予約領域、`button`内では内容line高へ縮小したinline画像になる |
+| `img` | `src`、`alt`、正の`width`／`height`を画像IDへ保持し、PNG／baseline JPEG／静止WebPを取得・decodeする。通常本文では回り込みなしの予約領域、`button`内では内容line高へ縮小したinline画像になる |
 | `table`、`caption`、`thead`、`tbody`、`tfoot`、`tr`、`th`、`td` | 本文幅内の表。cell内折返し、見出し背景、罫線、正整数の`rowspan`／`colspan`に対応 |
 | `form`、`input`、`select`、`option`、`textarea`、`button`、`label` | GET／urlencoded POST、編集・選択・送信。`textarea`以外のvisible controlは本文とtable cellのinline flowへ参加する |
 | `strong`、`b` | 二度打ちで太く見せる |
@@ -516,7 +521,22 @@ tableに余裕があれば指定300×120 pixelを維持します。全列が収�
 余裕があるのにalt文字幅まで縮んだ問題の修正を含め、2026-09-12に実機受入済みです。
 
 `file:`文書から相対参照したPNGは
-文書表示後に1件ずつ最大512 KiBまで読み、白背景へalpha合成して予約領域へ描画します。
+文書表示後に1件ずつ最大1 MiBまで読み、白背景へalpha合成して予約領域へ描画します。
+圧縮入力とHTTP cache entryは2026-09-18に512 KiBから1 MiBへ拡張しました。LAN fixtureの
+`/images/limit-expanded.html`は旧上限を超えて新上限内の有効PNGと、新上限を1 byte超える応答を並べます。
+前者の表示・cache保存と、後者だけが`image too large`として局所失敗することは2026-09-18に
+Tab5実機で受入済みです。幅・高さ上限は同日に1280から2048 pixelへ拡張しました。LAN fixtureの
+`/images/limit-dimensions.html`で、1600×400の1-bit PNG表示と幅2049の局所失敗を確認でき、
+2026-09-18に実機受入済みです。その後、総画素数上限を1,048,576から2,097,152へ拡張しました。LAN fixtureの
+`/images/limit-pixels.html`で1920×1080の表示と2048×1025の総画素数超過を確認できます。この画素数上限は
+2026-09-18にTab5実機で受入済みです。decoder作業領域は次に1 MiBから4 MiBへ拡張し、約3 MiBの
+1024×768 RGBA PNG表示と4 MiBを1,024 byte超えるRGBA PNGの局所失敗を同日に実機受入しました。
+4 MiBを採用上限とします。8 MiB候補も評価しましたが、1920×1080 RGBA PNGのdecodeでTab5がPANICした
+ため不採用とし、4 MiBへ戻しました。PNG decoderは展開bufferとRGB565出力を同時保持するため、作業領域を
+8 MiBへ上げるだけでは安全なpeakになりません。より大きいRGBA／WebPは走査線decodeまたはbuffer再利用を
+別途実装するまで`image too large`として局所拒否します。`/images/limit-work.html`も成功済みの
+1024×768 RGBAと4 MiBを1,024 byte超える1024×1024 RGBAへ戻しています。4 MiB版を書き込み直した後、
+同じ成功・局所失敗と`PANIC`しないことを同日に再確認済みです。
 `tools/make_browser_image_fixture.py <mounted-directory>`で隣接する`stage3.html`と
 `stage3.png`を作れます。このlocal取得・decode・scroll・clipは2026-09-12に実機受入済みです。
 HTTP(S)文書の`image/png`も文書表示後に同じ上限とdecoderで1件ずつ取得します。同一URLは
@@ -536,12 +556,51 @@ bit深度で表せる数を超える`PLTE`、パレット外のindex、`PLTE`よ
 PNG chunkのCRC-32不一致、非対応variant、破損、上限超過、OOM、取得失敗は画像枠内へ
 理由を表示し、文書と他画像は表示を続けます。CRC不一致の局所失敗表示は
 2026-09-12に実機受入済みです。
+
+静止WebPは`image/webp`とRIFF/WebP signatureを受理し、VP8 lossy、VP8L lossless、VP8Xのalphaを
+白背景へ合成してRGB565へ変換します。ICC、Exif、XMPは読みません。VP8Xのanimation flag、`ANIM`、
+`ANMF`は先頭frameだけを表示せず、decode前に画像単位の非対応として拒否します。decoderは
+`webpkit 0.1.0`を`no_std + alloc`で使用し、metadata読込みを無効化しています。圧縮入力は最大1 MiBで、
+WebPの一時RGBA8は4 MiB作業上限に合わせるため最大1,048,576 pixelです。
+lossless、lossy＋alpha、animation拒否、作業上限、切断入力のhost testとRISC-V release buildは通過して
+います。LAN fixtureは`/images/webp.html`で、静止2形式とanimation／切断の局所失敗を1ページで
+確認できます。静止lossless／lossy＋alphaの表示、animated／brokenだけが画像枠内で失敗して本文と
+他画像が残ることは、2026-09-18にTab5実機で受入済みです。大画像の性能とheap peakは未確認です。
+`/images/webp-lru.html`はcache可能なWebPの後へ16枚の大きな`no-store` PNGを並べ、WebPをLRUから
+evictionした後、上端へ戻ってHTTP cacheから再decodeできることを確認します。2026-09-18の実機試験では、
+上端`img 1500/1500K e0`、末尾`6000/6000K e5`、上端へ戻って`6000/6000K e9`となり、戻り時に
+cache hitが`h0`から`h1`へ増えました。WebPの同じboxへの再表示を含め、この経路は実機受入済みです。
+
+画像取得は文書先頭から全件を読むのではなく、viewport内、上下各1 viewportの先読み範囲、focus中の
+link画像の順で必要な1件だけを選びます。それ以外の遠方画像はscrollで近づくまで取得しません。
+画像をnetwork、HTTP cache、local fileから読んでいる間もtoolbarの再読込buttonは停止buttonになり、
+Escapeまたは停止buttonでその1件を閉じます。中止した画像枠は`stopped`となり、同じviewportにあるため
+直ちに再取得することはありません。pageの再読込では失敗状態を捨て、通常どおり取得し直します。
+この経路は`/images/stage3.html`の遅延PNGを使い、本文と既存PNG／JPEGを維持した局所停止と再読込後の
+取得成功を2026-09-19にTab5実機で受入済みです。
+decode済みRGB565は同一page内の同じ解決済みURLで共有し、実容量をpage合計で数えます。6 MiBの
+soft limitを超えると、viewportと交差しない最終利用の古い画像をURL共有単位で全体evictionし、8 MiBの
+hard limitを超える新規画像は局所失敗にします。eviction前に確定したintrinsic寸法は残るのでlayoutは
+変わらず、再び近づいた画像はlocal file、HTTP cache、networkの既存経路で再取得します。decode開始前にも
+完成後RGB565分の空きを作り、decode後だけの判定で一時peakを増やしません。`i`診断の`img current/peak K eN`で
+現在量、peak、eviction累計を確認できます。このschedulerとLRUはrelease buildとTab5実機の上下1往復を
+通過しています。
+LRU確認用のLAN fixtureは`/images/lru.html`です。640×400 RGBA source（RGB565で1枚512,000 bytes）を
+異なる`no-store` URLで16枚並べ、上端から下端へscrollすると6 MiB soft limitを超える構成です。末尾と
+上端へ戻った時点の`i`を比較し、`e`の増加、`img`がhard limit以内であること、box高と操作応答が変わらない
+ことを確認します。再表示時は`no-store`のためnetworkから再取得されます。2026-09-18の実機試験では、
+上端`img 500/500K e0`、末尾`6000/6000K e4`、上端へ戻って`6000/6000K e9`となり、heap使用量は
+1,641 KiBから7,011 KiBへ増えた後に一定、socketは取得完了後2へ戻りました。全画像単位LRUと再取得は
+この1往復で受入済みです。
 画像のdecode後は未指定寸法をintrinsic寸法・縦横比で置き換えて再layoutします。その際は
 viewport先頭の論理的な文章位置と選択中linkを維持します。5秒のHTTP idle timeoutを避けて
 2秒ごとに届く遅延画像を使い、2026-09-12に実機受入済みです。
 親文書がPinned TLSなら画像もpin登録済みHTTPSだけを許可し、未認証接続へのidentity downgradeを
 画像取得開始前に拒否します。上限近くの640×400 RGBA fixtureも用意しています。
 640×400画像のdecode・clip、遷移中止、Wi-Fi／system bar復帰は2026-09-12に実機受入済みです。
+画像cache・viewport scheduler変更後も、`/images/stage3.html`の遅延PNG取得中にLauncherへ移動して
+Browserへ戻り、同じpageとscroll位置、既存PNG／JPEG／本文を維持して取得を再開することを
+2026-09-18に再確認済みです。画像取得中そのものに実Wi-Fi切断を起こす経路は未確認です。
 Pinned TLSから未認証画像への拒否は2026-09-13に実機受入済みです。この確認用にLAN fixtureの`/images/pinned.html`を
 用意しています（`no-store`で、常に実際にTLSで取得されます）。確認手順は次のとおりです。
 
@@ -587,7 +646,8 @@ damageを上書きせず蓄積します。それを超える場合だけviewport
 またはtouchで共通
 `TextInput`の単一行編集を開始し、Escapeで現在値を保持して編集を終了、Tabで保持して次の
 focusへ進みます。q/r/[ / ]を含む印字可能ASCIIは編集中はBrowser shortcutではなく文字として
-扱います。caret移動は旧新caret、
+扱います。URL欄、text input、textareaの選択範囲は共通テーマの青いアクセント面と白文字で表示します。
+caret移動は旧新caret、
 選択変更は旧新選択、挿入・削除は変更位置以右だけをhorizontal clipして再描画します。横scrollが
 変わるときだけcontrolのtext内側全幅を更新します。Tabから直接編集へ入る操作に加え、その他の
 編集キーと編集時の局所再描画も2026-09-13に実機受入済みです。単一行text編集中の
@@ -776,10 +836,10 @@ HTMLは壊れているのが通常だという前提です。未終了タグ・�
 
 ## 文字符号化
 
-UTF-8とShift_JISの2つです。それ以外はUTF-8として読みます。
+UTF-8、Shift_JIS、EUC-JPの3つです。それ以外はUTF-8として読みます。
 
-Shift_JISが要るのは、日本語の小さいserverや古いページが今も使っているためです。
-Shift_JISのページをUTF-8として読むと「何文字か化ける」のではなく、**漢字が
+Shift_JISとEUC-JPが要るのは、日本語の小さいserverや古いページが今も使っているためです。
+これらのページをUTF-8として読むと「何文字か化ける」のではなく、**漢字が
 すべて不正なUTF-8になるのでページ全体が置換文字になり、読むものが何も残りません**。
 
 復号は`browser/src/encoding.rs`にあり、`Parser`の**内側**です。
@@ -821,6 +881,7 @@ Shift_JISのページをUTF-8として読むと「何文字か化ける」ので
 | ラベル | 符号化 |
 | --- | --- |
 | `shift_jis`、`shift-jis`、`sjis`、`s-jis`、`x-sjis`、`shiftjis`、`ms_kanji`、`windows-31j`、`cp932`、`csshiftjis` | Shift_JIS |
+| `euc-jp`、`euc_jp`、`eucjp`、`x-euc-jp`、`cseucpkdfmtjapanese` | EUC-JP |
 | `utf-8`、`utf8`、`us-ascii`、`ascii` | UTF-8 |
 | その他すべて | UTF-8として読む |
 
@@ -829,7 +890,8 @@ Shift_JISのページをUTF-8として読むと「何文字か化ける」ので
 
 ### 変換表
 
-`browser/data/shiftjis.bin`（22,576 byte、DROM）を
+Shift_JISとEUC-JPは同じJIS区点表を共有します。`browser/data/shiftjis.bin`
+（22,576 byte、DROM）を
 `tools/encoding/generate_shiftjis.py`がCPythonの`cp932`から生成します。生成物を
 リポジトリに入れ、生成器も入れ、ホスト側のテストが代表点を照合する形は
 フォント（[FONT.md](FONT.md)）と同じです。
@@ -859,7 +921,22 @@ Shift_JISのページをUTF-8として読むと「何文字か化ける」ので
 揃っています**（[FONT.md](FONT.md)）。足りなかったのはバイト列から符号位置への
 対応だけでした。
 
-EUC-JPは同じ表を別の算術で引くだけですが、今は対応していません。
+EUC-JPは次のように読みます。完全な規格検証より、古いページの本文を表示し、壊れた1文字で
+後続HTMLまで同期を失わないことを優先します。
+
+| バイト | 扱い |
+| --- | --- |
+| `0x00..=0x7F` | そのままASCII |
+| `0xA1..=0xFE`＋`0xA1..=0xFE` | JIS X 0208。`row = lead - 0xA1`、`cell = trail - 0xA1`で共有表を引く |
+| `0x8E`＋`0xA1..=0xDF` | 半角カナ |
+| `0x8F`＋2 byte | JIS X 0212は表を持たず、3 byte全体をU+FFFD 1文字にする |
+| その他、未対応の区点、途中で終わる文字 | U+FFFD |
+
+多byte文字はchunkをまたいでも保持します。不正なtrailがASCIIならU+FFFDを出してASCIIを
+読み直すため、壊れた文字の直後にある`<`や`>`をmarkupとして残します。
+2026-09-19にTab5実機で、fixture serverの`/encoding/euc-jp`、
+`/encoding/euc-jp-meta`、`/encoding/euc-jp-broken`を使い、ヘッダ宣言とmeta宣言の
+日本語・半角カナ表示、および破損箇所だけを置換して後続本文とlinkを残すことを受入済みです。
 
 ## 上限
 
@@ -885,7 +962,7 @@ EUC-JPは同じ表を別の算術で引くだけですが、今は対応して�
 2 MiBでも、markupばかりなら入力上限に、テキストばかりなら1 MiBのテキスト
 上限に先に当たります。
 
-**Shift_JISのページでは、この2 MiBが2箇所で別のものを数えます。**転送側
+**Shift_JIS／EUC-JPのページでは、この2 MiBが2箇所で別のものを数えます。**転送側
 （`net::http::Transaction`）が数えるのは回線から受け取ったbyte数、tokenizerが
 数えるのは復号後のbyte数です。全角文字は2 byteから3 byteへ増えるので、
 回線上で約1.33 MiBのページがtokenizer側の2 MiBに先に当たります
@@ -1045,7 +1122,7 @@ mise run test    # cargo test -p tab5-browser --target x86_64-unknown-linux-gnu
 | モジュール | 責務 |
 | --- | --- |
 | `browser/src/url.rs` | URL解析・検証・相対参照解決・request target生成 |
-| `browser/src/encoding.rs` | Shift_JIS復号、`charset`ラベル判定、`<meta>`のsniff |
+| `browser/src/encoding.rs` | Shift_JIS／EUC-JP復号、`charset`ラベル判定、`<meta>`のsniff |
 | `browser/src/html.rs`のplain mode | markupでない文書のtokenizer（全byteがテキスト） |
 | `browser/src/html.rs` | 増分HTML tokenizer。chunk境界に依存しない |
 | `browser/src/document.rs` | 文書モデル（flat arena）とビルダ |
@@ -1081,7 +1158,8 @@ mise run test    # cargo test -p tab5-browser --target x86_64-unknown-linux-gnu
 ヘッダが終わらない応答・`Content-Length`と食い違う本文・16進でないchunk
 size・途中で切れる接続など、まともなサーバなら送らない応答を返します。
 `/encoding/`以下はShift_JISの4通り——ヘッダで宣言、`<meta>`だけで宣言、
-ヘッダが`<meta>`と食い違う、先頭バイトが1つ宙に浮いている——とBOM付きUTF-8です。
+ヘッダが`<meta>`と食い違う、先頭バイトが1つ宙に浮いている——、EUC-JPの3通り——
+ヘッダで宣言、`<meta>`だけで宣言、先頭バイトが1つ宙に浮いている——とBOM付きUTF-8です。
 上限値はPython側とRust側の両方にあり、起動時に突き合わせて食い違えば
 起動しません。
 

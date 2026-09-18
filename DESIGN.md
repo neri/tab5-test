@@ -100,7 +100,7 @@ PSRAM、MIPI-DSI、GDMAを初期化します。
   HTTPは同期の`httpget`と、1回のpollごとに戻る`net::http::Transaction`の
   2つの顔がありますが、実装は1つです。
 - `browser`はHTMLから文章とリンクを取り出して読む全画面ビューアです。
-  **Webブラウザではありません**。CSSとJavaScriptはありません。PNG/JPEG画像、table、
+  **Webブラウザではありません**。CSSとJavaScriptはありません。PNG/JPEG/WebP静止画像、table、
   form（text・hidden・submit・button・checkbox・radio・textarea・select、GET／urlencoded POST）、
   `/tmp`へ保存するHTTP cache（鮮度・`ETag`再検証）を限定的に扱います。
   `https://`は取得できますが

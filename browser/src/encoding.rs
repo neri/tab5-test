@@ -1,11 +1,10 @@
 //! Turning a page's bytes into the UTF-8 the tokenizer reads.
 //!
-//! Two encodings and no more: UTF-8, which is what almost everything is,
-//! and Shift_JIS, which is what a great deal of Japanese text on small and
-//! old servers still is. A page in Shift_JIS decoded as UTF-8 is not a page
-//! with a few wrong characters -- every kanji in it is invalid UTF-8, so
-//! the whole body becomes replacement characters and there is nothing to
-//! read at all.
+//! Three encodings: UTF-8, which is what almost everything is, and the two
+//! legacy Japanese encodings Shift_JIS and EUC-JP. A page in either legacy
+//! encoding decoded as UTF-8 is not a page with a few wrong characters --
+//! every kanji in it is invalid UTF-8, so the whole body becomes replacement
+//! characters and there is nothing to read at all.
 //!
 //! This sits inside [`crate::document::Parser`] rather than in front of it,
 //! so the firmware's fetch, the `hs` and `bt` diagnostics and this crate's
@@ -21,11 +20,12 @@
 //! buffer, no allocation. The work below happens only for the pages that
 //! need it.
 //!
-//! The table is generated: `tools/encoding/generate_shiftjis.py` writes
+//! The shared JIS-row table is generated: `tools/encoding/generate_shiftjis.py` writes
 //! `browser/data/shiftjis.bin` from CPython's `cp932`, which is checked in
 //! and linked into DROM. Windows-31J and not the narrower JIS X 0208,
 //! because what the web labels `Shift_JIS` is Windows-31J in practice --
-//! the same choice WHATWG's encoding standard makes.
+//! the same choice WHATWG's encoding standard makes. EUC-JP uses the first
+//! 94 rows of the same table with different byte arithmetic.
 
 use alloc::vec::Vec;
 
@@ -69,6 +69,8 @@ pub enum Encoding {
     Utf8,
     /// Windows-31J, which is what `Shift_JIS` labels in the wild.
     ShiftJis,
+    /// JIS X 0208 plus the EUC-JP halfwidth-katakana shift sequence.
+    EucJp,
 }
 
 /// The encoding a `charset` label names, or `None` for one this does not
@@ -98,6 +100,17 @@ pub fn from_label(label: &[u8]) -> Option<Encoding> {
             return Some(Encoding::ShiftJis);
         }
     }
+    for name in [
+        b"euc-jp".as_slice(),
+        b"euc_jp",
+        b"eucjp",
+        b"x-euc-jp",
+        b"cseucpkdfmtjapanese",
+    ] {
+        if label.eq_ignore_ascii_case(name) {
+            return Some(Encoding::EucJp);
+        }
+    }
     for name in [b"utf-8".as_slice(), b"utf8", b"us-ascii", b"ascii"] {
         if label.eq_ignore_ascii_case(name) {
             return Some(Encoding::Utf8);
@@ -108,12 +121,10 @@ pub fn from_label(label: &[u8]) -> Option<Encoding> {
 
 /// A page's bytes on the way to the tokenizer.
 ///
-/// Holds three things at most: which encoding was settled on, the bytes
-/// held while that was still undecided, and a Shift_JIS lead byte whose
-/// trail byte has not arrived yet. The last one is why this is a type and
-/// not a function -- a two-byte character split across a chunk boundary is
-/// the ordinary case, not an edge one, and it is the failure that shows up
-/// as "one character in a page is occasionally wrong".
+/// Holds the settled encoding, bytes held while it was undecided, and the
+/// partial legacy-encoding character at a chunk boundary. The last one is
+/// why this is a type and not a function -- a multibyte character split
+/// across calls is the ordinary case, not an edge one.
 pub struct Decoder {
     encoding: Option<Encoding>,
     /// Whether the document is markup, and so might declare its own
@@ -127,6 +138,10 @@ pub struct Decoder {
     markup: bool,
     held: Vec<u8>,
     lead: Option<u8>,
+    /// An EUC-JP `0x8F` sequence has consumed its second byte and is waiting
+    /// for the third. JIS X 0212 is not in the display table, so the complete
+    /// sequence becomes one replacement character rather than three.
+    euc_plane2: bool,
 }
 
 impl Default for Decoder {
@@ -142,6 +157,7 @@ impl Decoder {
             markup: true,
             held: Vec::new(),
             lead: None,
+            euc_plane2: false,
         }
     }
 
@@ -201,6 +217,7 @@ impl Decoder {
         match self.encoding {
             Some(Encoding::Utf8) => sink(bytes),
             Some(Encoding::ShiftJis) => self.decode_shift_jis(bytes, sink),
+            Some(Encoding::EucJp) => self.decode_euc_jp(bytes, sink),
             None => self.sniff(bytes, sink),
         }
     }
@@ -220,6 +237,7 @@ impl Decoder {
             self.settle(sink)?;
         }
         if self.lead.take().is_some() {
+            self.euc_plane2 = false;
             sink(replacement_bytes())?;
         }
         Ok(())
@@ -282,10 +300,71 @@ impl Decoder {
                             }
                         }
                     },
-                    None => match single(byte) {
+                    None => match single_shift_jis(byte) {
                         Some(character) => push(&mut out, &mut used, character, sink)?,
                         // A lead byte, whose trail may be in the next chunk.
                         None => self.lead = Some(byte),
+                    },
+                }
+            }
+        }
+        if used > 0 {
+            sink(&out[..used])?;
+        }
+        Ok(())
+    }
+
+    fn decode_euc_jp(&mut self, bytes: &[u8], sink: &mut Sink<'_>) -> Result<(), Error> {
+        let mut out = [0u8; OUT_BYTES];
+        let mut used = 0usize;
+        for &byte in bytes {
+            let mut pending = Some(byte);
+            while let Some(byte) = pending {
+                pending = None;
+                if self.euc_plane2 {
+                    self.euc_plane2 = false;
+                    self.lead = None;
+                    push(&mut out, &mut used, REPLACEMENT, sink)?;
+                    if byte.is_ascii() {
+                        pending = Some(byte);
+                    }
+                    continue;
+                }
+                match self.lead.take() {
+                    Some(0x8E) => {
+                        if let Some(character) = euc_halfwidth(byte) {
+                            push(&mut out, &mut used, character, sink)?;
+                        } else {
+                            push(&mut out, &mut used, REPLACEMENT, sink)?;
+                            if byte.is_ascii() {
+                                pending = Some(byte);
+                            }
+                        }
+                    }
+                    Some(0x8F) => {
+                        if (0xA1..=0xFE).contains(&byte) {
+                            self.lead = Some(byte);
+                            self.euc_plane2 = true;
+                        } else {
+                            push(&mut out, &mut used, REPLACEMENT, sink)?;
+                            if byte.is_ascii() {
+                                pending = Some(byte);
+                            }
+                        }
+                    }
+                    Some(lead) => match paired_euc_jp(lead, byte) {
+                        Some(character) => push(&mut out, &mut used, character, sink)?,
+                        None => {
+                            push(&mut out, &mut used, REPLACEMENT, sink)?;
+                            if byte.is_ascii() {
+                                pending = Some(byte);
+                            }
+                        }
+                    },
+                    None => match byte {
+                        0x00..=0x7F => push(&mut out, &mut used, byte as char, sink)?,
+                        0x8E | 0x8F | 0xA1..=0xFE => self.lead = Some(byte),
+                        _ => push(&mut out, &mut used, REPLACEMENT, sink)?,
                     },
                 }
             }
@@ -483,7 +562,7 @@ fn paired(lead: u8, trail: u8) -> Option<char> {
 
 /// The character a byte stands for on its own, or `None` if it is a lead
 /// byte and the next one is needed.
-fn single(byte: u8) -> Option<char> {
+fn single_shift_jis(byte: u8) -> Option<char> {
     match byte {
         // ASCII as itself, including 0x5C. Shift_JIS inherits JIS X 0201's
         // yen sign there, and pages are written as though it were a
@@ -495,6 +574,29 @@ fn single(byte: u8) -> Option<char> {
         0x81..=0x9F | 0xE0..=0xFC => None,
         // 0x80, 0xA0, 0xFD..=0xFF: not characters and not leads.
         _ => Some(REPLACEMENT),
+    }
+}
+
+/// The JIS X 0208 character selected by an EUC-JP pair. Plane 1 is exactly
+/// the first 94 rows of the table used by Shift_JIS.
+fn paired_euc_jp(lead: u8, trail: u8) -> Option<char> {
+    let row = lead.checked_sub(0xA1)? as usize;
+    let cell = trail.checked_sub(0xA1)? as usize;
+    if row >= 94 || cell >= CELLS {
+        return None;
+    }
+    let offset = HEADER_BYTES + (row * CELLS + cell) * 2;
+    match u16::from_le_bytes([DATA[offset], DATA[offset + 1]]) {
+        0 => None,
+        scalar => char::from_u32(scalar as u32),
+    }
+}
+
+fn euc_halfwidth(byte: u8) -> Option<char> {
+    if (0xA1..=0xDF).contains(&byte) {
+        char::from_u32(0xFF61 + (byte as u32 - 0xA1))
+    } else {
+        None
     }
 }
 
@@ -608,6 +710,32 @@ mod tests {
     }
 
     #[test]
+    fn euc_jp_decodes_jis_rows_and_halfwidth_katakana() {
+        let bytes = b"<p>\xc6\xfc\xcb\xdc\xb8\xec \xa4\xa2\xa4\xa4 \x8e\xb1\x8e\xb2</p>";
+        let whole = declared(b"euc-jp", bytes, bytes.len());
+        assert_eq!(
+            whole,
+            "<p>\u{65E5}\u{672C}\u{8A9E} \u{3042}\u{3044} \u{FF71}\u{FF72}</p>"
+        );
+        for chunk in 1..=bytes.len() {
+            assert_eq!(declared(b"euc-jp", bytes, chunk), whole, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn unsupported_euc_jp_plane_two_costs_one_character() {
+        assert_eq!(declared(b"euc-jp", b"a\x8f\xa1\xa1b", 1), "a\u{FFFD}b");
+        assert_eq!(declared(b"euc-jp", b"a\x8f\xa1", 1), "a\u{FFFD}");
+    }
+
+    #[test]
+    fn damaged_euc_jp_preserves_following_ascii() {
+        assert_eq!(declared(b"euc-jp", b"a\xa4 b", 1), "a\u{FFFD} b");
+        assert_eq!(declared(b"euc-jp", b"ab\xa4", 1), "ab\u{FFFD}");
+        assert_eq!(declared(b"euc-jp", b"a\x8e b", 1), "a\u{FFFD} b");
+    }
+
+    #[test]
     fn a_bad_trail_byte_costs_one_character() {
         // 0x93 is a lead; 0x20 is not a trail. The space survives, because
         // a byte that was not a trail is reconsidered on its own.
@@ -635,8 +763,18 @@ mod tests {
         }
         assert_eq!(from_label(b"utf-8"), Some(Encoding::Utf8));
         assert_eq!(from_label(b"UTF8"), Some(Encoding::Utf8));
+        for label in [
+            &b"euc-jp"[..],
+            b"EUC_JP",
+            b"eucjp",
+            b"x-euc-jp",
+            b"cseucpkdfmtjapanese",
+            b"  euc-jp  ",
+        ] {
+            assert_eq!(from_label(label), Some(Encoding::EucJp), "{label:?}");
+        }
         // Not known, and not an error: the caller falls back to UTF-8.
-        assert_eq!(from_label(b"euc-jp"), None);
+        assert_eq!(from_label(b"iso-2022-jp"), None);
         assert_eq!(from_label(b""), None);
     }
 
@@ -666,6 +804,7 @@ mod tests {
         assert!(decode(equiv, 5).ends_with('\u{65E5}'));
         // Unquoted, which is legal and does occur.
         assert!(decode(b"<meta charset=shift_jis>\x93\xfa", 3).ends_with('\u{65E5}'));
+        assert!(decode(b"<meta charset=euc-jp>\xc6\xfc", 3).ends_with('\u{65E5}'));
     }
 
     #[test]

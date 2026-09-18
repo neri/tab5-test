@@ -67,22 +67,26 @@ MAX_TABLE_COLUMNS = 32
 MAX_TABLE_SPAN = 32
 MAX_TABLE_BORDER = 4
 MAX_IMAGES = 64
-MAX_IMAGE_COMPRESSED_BYTES = 512 * 1024
-MAX_IMAGE_PIXELS = 1024 * 1024
-MAX_IMAGE_DECODE_WORK_BYTES = 1024 * 1024
+MAX_IMAGE_COMPRESSED_BYTES = 1024 * 1024
+MAX_IMAGE_WIDTH = 2048
+MAX_IMAGE_HEIGHT = 2048
+MAX_IMAGE_PIXELS = 2 * 1024 * 1024
+MAX_IMAGE_DECODE_WORK_BYTES = 4 * 1024 * 1024
+MAX_DECODED_IMAGE_SOFT_BYTES = 6 * 1024 * 1024
+MAX_DECODED_IMAGE_HARD_BYTES = 8 * 1024 * 1024
 MAX_FORMS = 32
 MAX_FORM_CONTROLS = 256
 MAX_INPUT_VALUE_BYTES = 4096
 MAX_FORM_VALUE_BYTES = 32 * 1024
 MAX_ENCODED_REQUEST_BYTES = 48 * 1024
 MAX_SELECT_OPTIONS = 4096
-MAX_HTTP_CACHE_ENTRY_BYTES = 512 * 1024
+MAX_HTTP_CACHE_ENTRY_BYTES = 1024 * 1024
 DEFAULT_CACHE_FRESHNESS_SECS = 3600
 MAX_CACHE_META_BYTES = 4096
 MAX_RETAINED_POST_RESULTS = 2
 MAX_RETAINED_POST_RESULT_BYTES = 320 * 1024
 MAX_RETAINED_POST_REQUEST_BYTES = 2 * 48 * 1024
-MAX_EXTENSION_OWNED_BYTES = 6 * 1024 * 1024
+MAX_EXTENSION_OWNED_BYTES = 16 * 1024 * 1024
 
 LIMITS = {
     "MAX_HEADER_BYTES": MAX_HEADER_BYTES,
@@ -104,8 +108,12 @@ LIMITS = {
     "MAX_TABLE_BORDER": MAX_TABLE_BORDER,
     "MAX_IMAGES": MAX_IMAGES,
     "MAX_IMAGE_COMPRESSED_BYTES": MAX_IMAGE_COMPRESSED_BYTES,
+    "MAX_IMAGE_WIDTH": MAX_IMAGE_WIDTH,
+    "MAX_IMAGE_HEIGHT": MAX_IMAGE_HEIGHT,
     "MAX_IMAGE_PIXELS": MAX_IMAGE_PIXELS,
     "MAX_IMAGE_DECODE_WORK_BYTES": MAX_IMAGE_DECODE_WORK_BYTES,
+    "MAX_DECODED_IMAGE_SOFT_BYTES": MAX_DECODED_IMAGE_SOFT_BYTES,
+    "MAX_DECODED_IMAGE_HARD_BYTES": MAX_DECODED_IMAGE_HARD_BYTES,
     "MAX_FORMS": MAX_FORMS,
     "MAX_FORM_CONTROLS": MAX_FORM_CONTROLS,
     "MAX_INPUT_VALUE_BYTES": MAX_INPUT_VALUE_BYTES,
@@ -134,7 +142,7 @@ def read_rust_limits() -> dict[str, int]:
     """
     if not LIMITS_RS.exists():
         raise SystemExit(f"cannot find {LIMITS_RS}")
-    pattern = re.compile(r"pub const (\w+): usize = ([0-9_ *]+);")
+    pattern = re.compile(r"pub const (\w+): (?:usize|u32) = ([0-9_ *]+);")
     found: dict[str, int] = {}
     for name, expression in pattern.findall(LIMITS_RS.read_text(encoding="utf-8")):
         terms = [int(term.replace("_", "")) for term in expression.split("*")]
@@ -204,6 +212,9 @@ is itself part of what is being tested.</p>
   <li><a href="encoding/shift-jis-meta">encoding/shift-jis-meta</a> - declared by meta</li>
   <li><a href="encoding/shift-jis-lying-meta">encoding/shift-jis-lying-meta</a> - header over meta</li>
   <li><a href="encoding/shift-jis-broken">encoding/shift-jis-broken</a> - one dangling lead byte</li>
+  <li><a href="encoding/euc-jp">encoding/euc-jp</a> - declared by the header</li>
+  <li><a href="encoding/euc-jp-meta">encoding/euc-jp-meta</a> - declared by meta</li>
+  <li><a href="encoding/euc-jp-broken">encoding/euc-jp-broken</a> - one dangling lead byte</li>
   <li><a href="encoding/utf8-bom.html">encoding/utf8-bom.html</a> - a byte order mark</li>
 </ul>
 <h2>Media types</h2>
@@ -226,6 +237,13 @@ is itself part of what is being tested.</p>
   <li><a href="forms/post-redirects.html">forms/post-redirects.html</a> - POST redirect rules</li>
   <li><a href="cache/index.html">cache/index.html</a> - HTTP cache revalidation</li>
   <li><a href="images/png-formats.html">images/png-formats.html</a> - every PNG colour type and bit depth up to 8 bits, and rejected variants</li>
+  <li><a href="images/webp.html">images/webp.html</a> - static lossless/lossy-alpha WebP and rejected animation/damage</li>
+  <li><a href="images/webp-lru.html">images/webp-lru.html</a> - cached WebP eviction and re-decode after large no-store images</li>
+  <li><a href="images/lru.html">images/lru.html</a> - sixteen distinct large images that cross the decoded-image soft limit</li>
+  <li><a href="images/limit-expanded.html">images/limit-expanded.html</a> - image between the old 512 KiB and new 1 MiB compressed limits</li>
+  <li><a href="images/limit-dimensions.html">images/limit-dimensions.html</a> - width between the old 1280 and new 2048 pixel limits</li>
+  <li><a href="images/limit-pixels.html">images/limit-pixels.html</a> - 1920x1080 inside and 2048x1025 just outside the new pixel limit</li>
+  <li><a href="images/limit-work.html">images/limit-work.html</a> - RGBA expansion inside and just outside the 4 MiB decoder-work limit</li>
   <li><a href="images/pinned.html">images/pinned.html</a> - images from a TLS PINNED page (over the TLS listener)</li>
 </ul>
 <h2>Transfers</h2>
@@ -423,6 +441,36 @@ SHIFT_JIS_HEADER = (
 _BROKEN_AT = SHIFT_JIS_HEADER.index("表".encode(SJIS_CODEC))
 SHIFT_JIS_BROKEN = (
     SHIFT_JIS_HEADER[:_BROKEN_AT] + b"\x93." + SHIFT_JIS_HEADER[_BROKEN_AT + 2 :]
+)
+
+# --- EUC-JP ---------------------------------------------------------------
+
+EUC_JP_CODEC = "euc_jp"
+EUC_JP_TEXT = """<h1>日本語の表示</h1>
+<p>このページはEUC-JPで送られています。
+半角カナ（ｶﾞｷﾞｸﾞﾀﾞ）も半角のまま出るはずです。</p>
+<p>ひらがな：あいうえお。漢字：日本語。</p>
+<p><a href="/simple.html">simple.html</a></p>"""
+
+EUC_JP_META = (
+    '<!DOCTYPE html>\n<html><head><meta charset="EUC-JP">'
+    "<title>日本語</title></head>\n<body>\n"
+    + EUC_JP_TEXT
+    + "\n</body></html>\n"
+).encode(EUC_JP_CODEC)
+
+EUC_JP_HEADER = (
+    "<!DOCTYPE html>\n<html><head><title>日本語</title></head>\n<body>\n"
+    + EUC_JP_TEXT
+    + "\n</body></html>\n"
+).encode(EUC_JP_CODEC)
+
+_EUC_BROKEN_AT = EUC_JP_HEADER.index("表".encode(EUC_JP_CODEC))
+EUC_JP_BROKEN = (
+    EUC_JP_HEADER[:_EUC_BROKEN_AT]
+    + EUC_JP_HEADER[_EUC_BROKEN_AT : _EUC_BROKEN_AT + 1]
+    + b"."
+    + EUC_JP_HEADER[_EUC_BROKEN_AT + 2 :]
 )
 
 # Text that is not markup. What has to survive is its own spacing and line
@@ -1063,6 +1111,135 @@ IMAGE_PAGE = page(
 )
 static("/images/stage3.html", "ok", IMAGE_PAGE)
 
+LRU_IMAGE_COUNT = 16
+LRU_PAGE = page(
+    "decoded image LRU",
+    "<h1>Decoded image LRU</h1>"
+    "<p>Each image is a distinct no-store URL with a 640x400 RGBA source "
+    "(512,000 decoded RGB565 bytes). Scroll to the end and back. The viewer "
+    "must stay responsive, preserve every box, and report evictions.</p>"
+    + "".join(
+        f"<h2>Image {index + 1} of {LRU_IMAGE_COUNT}</h2>"
+        f"<img src='/images/lru.png?id={index}' width='384' height='240' "
+        f"alt='LRU image {index + 1} failed'>"
+        for index in range(LRU_IMAGE_COUNT)
+    )
+    + "<p>End of LRU fixture. Press i, then return to the top and press i again.</p>",
+)
+static("/images/lru.html", "ok", LRU_PAGE)
+
+EXPANDED_LIMIT_PAGE = page(
+    "expanded image input limit",
+    "<h1>Expanded image input limit</h1>"
+    "<p>The first valid RGB PNG is larger than the old 512 KiB compressed limit "
+    "and no larger than the new 1 MiB limit. It must display and be cacheable.</p>"
+    "<img src='/images/expanded-limit.png' width='384' height='240' alt='new limit failed'>"
+    "<p>The second response is exactly one byte over the new limit. Only its image "
+    "box must fail with image too large.</p>"
+    "<img src='/images/over-expanded-limit.png' width='384' height='120' alt='over limit'>"
+    "<p>The page and first image must remain after the local failure.</p>",
+)
+static("/images/limit-expanded.html", "ok", EXPANDED_LIMIT_PAGE)
+
+DIMENSION_LIMIT_PAGE = page(
+    "expanded image dimensions",
+    "<h1>Expanded image dimensions</h1>"
+    "<p>The first 1600x400 one-bit PNG exceeds the old 1280-pixel side limit "
+    "while staying below the unchanged pixel and decoder-work limits.</p>"
+    "<img src='/images/wide-limit.png' width='768' height='192' alt='wide image failed'>"
+    "<p>The second image is 2049x1, one pixel over the new side limit. Only its "
+    "box must fail with image too large.</p>"
+    "<img src='/images/over-wide-limit.png' width='384' height='64' alt='over width'>"
+    "<p>The page and first image must remain after the local failure.</p>",
+)
+static("/images/limit-dimensions.html", "ok", DIMENSION_LIMIT_PAGE)
+
+PIXEL_LIMIT_PAGE = page(
+    "expanded image pixel count",
+    "<h1>Expanded image pixel count</h1>"
+    "<p>The first 1920x1080 one-bit PNG is inside the 2,097,152-pixel limit. "
+    "Its decoded RGB565 allocation is 4,147,200 bytes.</p>"
+    "<img src='/images/full-hd-limit.png' width='768' height='432' alt='full HD failed'>"
+    "<p>The second image is 2048x1025: both sides are legal, but its 2,099,200 "
+    "pixels exceed the total by 2,048. Only its box must fail with image too large.</p>"
+    "<img src='/images/over-pixel-limit.png' width='384' height='192' alt='over pixels'>"
+    "<p>The page and first image must remain after the local failure.</p>",
+)
+static("/images/limit-pixels.html", "ok", PIXEL_LIMIT_PAGE)
+
+WORK_LIMIT_PAGE = page(
+    "expanded decoder work limit",
+    "<h1>Expanded decoder work limit</h1>"
+    "<p>The first 1024x768 RGBA PNG expands to about 3 MiB before RGB565 "
+    "conversion and must display.</p>"
+    "<img src='/images/rgba-work-limit.png' width='512' height='384' alt='RGBA work failed'>"
+    "<p>The second 1024x1024 RGBA PNG needs 4,195,328 bytes including one PNG "
+    "filter byte per row: 1,024 bytes over the 4 MiB work limit. Only its box "
+    "must fail with image too large.</p>"
+    "<img src='/images/over-work-limit.png' width='384' height='384' alt='over work'>"
+    "<p>The page and first image must remain after the local failure.</p>",
+)
+static("/images/limit-work.html", "ok", WORK_LIMIT_PAGE)
+
+
+def one_bit_grey_png(width: int, height: int) -> bytes:
+    row_bytes = (width + 7) // 8
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        rows.extend((0xAA if (byte + y // 16) % 2 == 0 else 0x55) for byte in range(row_bytes))
+    ihdr = struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(rows, 6))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def rgba_work_png(width: int, height: int) -> bytes:
+    row = bytearray()
+    for x in range(width):
+        row.extend((x & 0xFF, (x * 3) & 0xFF, 160, (x * 5) & 0xFF))
+    rows = (b"\x00" + bytes(row)) * height
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(rows, 6))
+        + png_chunk(b"IEND", b"")
+    )
+
+_EXPANDED_LIMIT_PNG: bytes | None = None
+
+
+def expanded_limit_png() -> bytes:
+    """A deterministic 640x400 RGB PNG whose compressed body is 512 KiB..1 MiB."""
+    global _EXPANDED_LIMIT_PNG
+    if _EXPANDED_LIMIT_PNG is not None:
+        return _EXPANDED_LIMIT_PNG
+    width, height = 640, 400
+    state = 0x5A17_2026
+    rows = bytearray()
+    for _y in range(height):
+        rows.append(0)
+        for _x in range(width * 3):
+            state ^= state << 13
+            state ^= state >> 17
+            state ^= state << 5
+            state &= 0xFFFF_FFFF
+            rows.append(state & 0xFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    body = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(rows, 6))
+        + png_chunk(b"IEND", b"")
+    )
+    assert 512 * 1024 < len(body) <= MAX_IMAGE_COMPRESSED_BYTES
+    _EXPANDED_LIMIT_PNG = body
+    return body
+
 INLINE_CONTROL_PAGE = page(
     "inline controls and buttons",
     "<h1>Inline controls and buttons</h1>"
@@ -1090,6 +1267,93 @@ static("/forms/inline-controls.html", "ok", INLINE_CONTROL_PAGE)
 BASELINE_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAMABADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDyvRfCP3f3f6V32ieEPu/u/wBK7XRNMtvl+Su+0XTLX5fkpYbEs5+GeJa2h//Z"
 )
+
+# Generated with Pillow 10.2.0 from a 16x16 RGBA gradient. Keeping the encoded
+# bytes here makes the fixture server independent of Pillow and libwebp.
+WEBP_LOSSLESS = base64.b64decode(
+    "UklGRjAAAABXRUJQVlA4TCQAAAAvD8ADEJmM6H9sIgre/wCRtk0tzL/gw9OJGMBFmABwHbuu9R4="
+)
+WEBP_LOSSY_ALPHA = base64.b64decode(
+    "UklGRoYAAABXRUJQVlA4WAoAAAAQAAAADwAADwAAQUxQSBAAAAAFDzAIERHi/v8R/Q////9/"
+    "VlA4IFAAAABwAgCdASoQABAAAUAmJbACdHMBMAH6AAXeScYAAP79pt/9JYkuNU1fVraR/qJ3g"
+    "iHrmN7KAv/4jw1/u6VVwBEXsA//86CwD//z8a/ZK7AAAA=="
+)
+# Two opaque 16x16 frames, red then blue. Animation must be rejected rather
+# than silently showing its first frame.
+WEBP_ANIMATED = base64.b64decode(
+    "UklGRsQAAABXRUJQVlA4WAoAAAACAAAADwAADwAAQU5JTQYAAAAAAAAAAABBTk1GSgAAAAAAAAAA"
+    "AA8AAA8AAGQAAAJWUDggMgAAADABAJ0BKhAAEAABQCYloAADcAD+8ut///mwP/bz/wR6Af//0u"
+    "D//pcH//S4P/SkAAAAQU5NRkYAAAAAAAAAAAAPAAAPAABkAAAAVlA4IC4AAAA0AQCdASoQABAAAA"
+    "AmJaAAA3AA/vtV4///S4P/+lwf/9Lg/9Lg//rV5Vesq6AA"
+)
+
+WEBP_PAGE = page(
+    "static WebP",
+    "<h1>Static WebP</h1>"
+    "<p>Lossless RGBA gradient: expected image.</p>"
+    "<img src='/images/webp-lossless.webp' width='256' height='256' alt='lossless failed'>"
+    "<p>Lossy VP8 plus ALPH: expected image with white alpha compositing.</p>"
+    "<img src='/images/webp-lossy-alpha.webp' width='256' height='256' alt='lossy alpha failed'>"
+    "<p>Animated: expected unsupported image in this box only.</p>"
+    "<img src='/images/webp-animated.webp' width='256' height='128' alt='animation'>"
+    "<p>Truncated: expected malformed image in this box only.</p>"
+    "<img src='/images/webp-broken.webp' width='256' height='128' alt='broken'>"
+    "<p>The page and both static images must remain usable after the two failures.</p>",
+)
+static("/images/webp.html", "ok", WEBP_PAGE)
+
+WEBP_LRU_PAGE = page(
+    "WebP eviction and re-decode",
+    "<h1>WebP eviction and re-decode</h1>"
+    "<p>The cached lossless WebP below must display. Record the i diagnostic, "
+    "then scroll through every large no-store PNG to force the old WebP out of "
+    "the decoded-image LRU. Return here: the WebP must reappear from the HTTP "
+    "cache without changing this box.</p>"
+    "<img src='/images/webp-lossless.webp' width='256' height='256' alt='WebP re-decode failed'>"
+    + "".join(
+        f"<h2>Pressure image {index + 1} of {LRU_IMAGE_COUNT}</h2>"
+        f"<img src='/images/lru.png?webp={index}' width='384' height='240' "
+        f"alt='pressure image {index + 1} failed'>"
+        for index in range(LRU_IMAGE_COUNT)
+    )
+    + "<p>End. Record i, return to the top, wait for the WebP, and record i again.</p>",
+)
+static("/images/webp-lru.html", "ok", WEBP_LRU_PAGE)
+
+
+def send_webp(self: "FixtureHandler", body: bytes) -> None:
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/webp"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "max-age=3600"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/webp-lossless.webp", "download:webp-lossless")
+def webp_lossless(self: "FixtureHandler", request: Request) -> None:
+    send_webp(self, WEBP_LOSSLESS)
+
+
+@route("/images/webp-lossy-alpha.webp", "download:webp-lossy-alpha")
+def webp_lossy_alpha(self: "FixtureHandler", request: Request) -> None:
+    send_webp(self, WEBP_LOSSY_ALPHA)
+
+
+@route("/images/webp-animated.webp", "download:webp-animated")
+def webp_animated(self: "FixtureHandler", request: Request) -> None:
+    send_webp(self, WEBP_ANIMATED)
+
+
+@route("/images/webp-broken.webp", "download:webp-broken")
+def webp_broken(self: "FixtureHandler", request: Request) -> None:
+    send_webp(self, WEBP_LOSSLESS[:-8])
 
 
 @route("/images/pinned.html", "ok")
@@ -1210,6 +1474,160 @@ def network_large_png(self: "FixtureHandler", request: Request) -> None:
             [
                 ("Content-Type", "image/png"),
                 ("Content-Length", str(len(body))),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/lru.png", "download:png-lru-no-store")
+def network_lru_png(self: "FixtureHandler", request: Request) -> None:
+    body = large_png()
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/expanded-limit.png", "download:png-expanded-limit")
+def network_expanded_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = expanded_limit_png()
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "max-age=3600"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/over-expanded-limit.png", "download:png-over-expanded-limit")
+def network_over_expanded_limit_png(self: "FixtureHandler", request: Request) -> None:
+    valid = expanded_limit_png()
+    body = valid + bytes(MAX_IMAGE_COMPRESSED_BYTES + 1 - len(valid))
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/wide-limit.png", "download:png-wide-limit")
+def network_wide_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = one_bit_grey_png(1600, 400)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/over-wide-limit.png", "download:png-over-wide-limit")
+def network_over_wide_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = one_bit_grey_png(2049, 1)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/full-hd-limit.png", "download:png-full-hd-limit")
+def network_full_hd_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = one_bit_grey_png(1920, 1080)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/over-pixel-limit.png", "download:png-over-pixel-limit")
+def network_over_pixel_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = one_bit_grey_png(2048, 1025)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/rgba-work-limit.png", "download:png-rgba-work-limit")
+def network_rgba_work_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = rgba_work_png(1024, 768)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+                ("Connection", "close"),
+            ],
+        )
+        + body
+    )
+
+
+@route("/images/over-work-limit.png", "download:png-over-work-limit")
+def network_over_work_limit_png(self: "FixtureHandler", request: Request) -> None:
+    body = rgba_work_png(1024, 1024)
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "image/png"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
                 ("Connection", "close"),
             ],
         )
@@ -1527,6 +1945,54 @@ def shift_jis_broken(self: "FixtureHandler", request: Request) -> None:
             ],
         )
         + SHIFT_JIS_BROKEN
+    )
+
+
+@route("/encoding/euc-jp", "ok")
+def euc_jp_header(self: "FixtureHandler", request: Request) -> None:
+    """EUC-JP declared in the header and nowhere else."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html; charset=EUC-JP"),
+                ("Content-Length", str(len(EUC_JP_HEADER))),
+                ("Connection", "close"),
+            ],
+        )
+        + EUC_JP_HEADER
+    )
+
+
+@route("/encoding/euc-jp-meta", "ok")
+def euc_jp_meta(self: "FixtureHandler", request: Request) -> None:
+    """EUC-JP declared only by `<meta>`."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html"),
+                ("Content-Length", str(len(EUC_JP_META))),
+                ("Connection", "close"),
+            ],
+        )
+        + EUC_JP_META
+    )
+
+
+@route("/encoding/euc-jp-broken", "ok")
+def euc_jp_broken(self: "FixtureHandler", request: Request) -> None:
+    """EUC-JP with one lead byte whose trail byte is missing."""
+    self.send_all(
+        head(
+            200,
+            [
+                ("Content-Type", "text/html; charset=euc-jp"),
+                ("Content-Length", str(len(EUC_JP_BROKEN))),
+                ("Connection", "close"),
+            ],
+        )
+        + EUC_JP_BROKEN
     )
 
 

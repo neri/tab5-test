@@ -124,11 +124,17 @@ pub const MAX_LAYOUT_LINES: usize = 32768;
 // deliberately separate: a tiny, adversarial PNG can describe a very large
 // output and must be refused before its dimensions are multiplied.
 pub const MAX_IMAGES: usize = 64;
-pub const MAX_IMAGE_COMPRESSED_BYTES: usize = 512 * 1024;
-pub const MAX_IMAGE_WIDTH: u32 = 1280;
-pub const MAX_IMAGE_HEIGHT: u32 = 1280;
-pub const MAX_IMAGE_PIXELS: usize = 1024 * 1024;
-pub const MAX_IMAGE_DECODE_WORK_BYTES: usize = 1024 * 1024;
+pub const MAX_IMAGE_COMPRESSED_BYTES: usize = 1024 * 1024;
+pub const MAX_IMAGE_WIDTH: u32 = 2048;
+pub const MAX_IMAGE_HEIGHT: u32 = 2048;
+pub const MAX_IMAGE_PIXELS: usize = 2 * 1024 * 1024;
+pub const MAX_IMAGE_DECODE_WORK_BYTES: usize = 4 * 1024 * 1024;
+/// Preferred and absolute bounds for decoded RGB565 pixels retained by the
+/// current page. Crossing the soft bound evicts off-screen least-recently
+/// used images. Visible images may take the cache past the soft bound, but
+/// no new decoded image is installed past the hard bound.
+pub const MAX_DECODED_IMAGE_SOFT_BYTES: usize = 6 * 1024 * 1024;
+pub const MAX_DECODED_IMAGE_HARD_BYTES: usize = 8 * 1024 * 1024;
 pub const PLACEHOLDER_IMAGE_WIDTH: u16 = 160;
 pub const PLACEHOLDER_IMAGE_HEIGHT: u16 = 90;
 
@@ -145,7 +151,7 @@ pub const MAX_SELECT_OPTIONS: usize = 4096;
 /// disk and has no total bound of its own: a write that finds the volume
 /// full purges entries and retries. Only this body -- captured while it
 /// arrives, then written out -- is ever held in memory.
-pub const MAX_HTTP_CACHE_ENTRY_BYTES: usize = 512 * 1024;
+pub const MAX_HTTP_CACHE_ENTRY_BYTES: usize = 1024 * 1024;
 /// How long a response with no `max-age` and no usable `Expires` stays
 /// fresh.
 pub const DEFAULT_CACHE_FRESHNESS_SECS: usize = 3600;
@@ -167,7 +173,7 @@ pub const MAX_RETAINED_POST_REQUEST_BYTES: usize = 2 * 48 * 1024;
 /// Aggregate extension-owned memory outside the existing Document/Layout
 /// accounting.  Every cache/image/form allocation must reserve against this
 /// budget before growing its own buffer.
-pub const MAX_EXTENSION_OWNED_BYTES: usize = 6 * 1024 * 1024;
+pub const MAX_EXTENSION_OWNED_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -186,15 +192,19 @@ mod tests {
 
     #[test]
     fn extension_limits_fit_the_aggregate_budget() {
-        // One active compressed image, its decoder workspace and decoded
-        // RGB565 pixels may coexist with one cache body in memory and all
-        // form values.
-        let active_image = MAX_IMAGE_COMPRESSED_BYTES
-            + MAX_IMAGE_DECODE_WORK_BYTES
-            + MAX_IMAGE_PIXELS * core::mem::size_of::<u16>();
+        // The decoded hard limit may coexist with one active compressed
+        // image, its decoder workspace, one cache body and form/history
+        // state. The incoming RGB565 allocation is already included in the
+        // decoded hard limit, so counting MAX_IMAGE_PIXELS again would count
+        // the same allocation twice.
+        let image_transient = MAX_IMAGE_COMPRESSED_BYTES + MAX_IMAGE_DECODE_WORK_BYTES;
         let history = MAX_RETAINED_POST_RESULT_BYTES + MAX_RETAINED_POST_REQUEST_BYTES;
         assert!(
-            active_image + MAX_HTTP_CACHE_ENTRY_BYTES + MAX_FORM_VALUE_BYTES + history
+            MAX_DECODED_IMAGE_HARD_BYTES
+                + image_transient
+                + MAX_HTTP_CACHE_ENTRY_BYTES
+                + MAX_FORM_VALUE_BYTES
+                + history
                 <= MAX_EXTENSION_OWNED_BYTES
         );
         assert!(MAX_ENCODED_REQUEST_BYTES <= MAX_RETAINED_POST_REQUEST_BYTES);
@@ -209,5 +219,12 @@ mod tests {
             .checked_mul(MAX_IMAGE_HEIGHT as usize)
             .expect("dimension product");
         assert!(MAX_IMAGE_PIXELS <= largest_declared);
+    }
+
+    #[test]
+    fn one_largest_image_fits_the_decoded_cache() {
+        let largest = MAX_IMAGE_PIXELS * core::mem::size_of::<u16>();
+        assert!(largest <= MAX_DECODED_IMAGE_SOFT_BYTES);
+        assert!(MAX_DECODED_IMAGE_SOFT_BYTES <= MAX_DECODED_IMAGE_HARD_BYTES);
     }
 }

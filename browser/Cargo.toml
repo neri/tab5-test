@@ -17,3 +17,8 @@ tab5-font = { path = "../font" }
 tab5-ui-font = { path = "../ui-font" }
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 zune-jpeg = { version = "0.5.15", default-features = false }
+# Pure-Rust static WebP decoder. `std` is not required; metadata extraction
+# is disabled at the call site and animated containers are rejected before
+# decode. The candidate evaluation and memory gates are recorded in
+# `docs/plans/archive/BROWSER_IMAGE_CACHE_WEBP_PLAN.md`.
+webpkit = { version = "0.1.0", default-features = false, features = ["alloc"] }

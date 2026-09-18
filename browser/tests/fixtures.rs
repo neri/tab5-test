@@ -431,6 +431,35 @@ fn shift_jis_decodes_to_the_text_it_was_written_as() {
     }
 }
 
+#[test]
+fn euc_jp_header_and_meta_reach_the_document_as_utf8() {
+    let header_body = b"<h1>\xc6\xfc\xcb\xdc\xb8\xec</h1><p>\xa4\xa2\xa4\xa4 \x8e\xb1\x8e\xb2</p>";
+    for chunk in 1..=header_body.len() {
+        let text = text_of(&parse_in_chunks(header_body, Some(b"EUC-JP"), chunk));
+        assert!(
+            text.contains("\u{65E5}\u{672C}\u{8A9E}"),
+            "chunk {chunk}: {text}"
+        );
+        assert!(
+            text.contains("\u{3042}\u{3044} \u{FF71}\u{FF72}"),
+            "chunk {chunk}: {text}"
+        );
+        assert!(!text.contains('\u{FFFD}'), "chunk {chunk}: {text}");
+    }
+
+    let meta_body = b"<meta charset=euc-jp><p>\xc6\xfc\xcb\xdc\xb8\xec</p>";
+    let text = text_of(&parse_in_chunks(meta_body, None, 3));
+    assert!(text.contains("\u{65E5}\u{672C}\u{8A9E}"), "{text}");
+}
+
+#[test]
+fn a_damaged_euc_jp_byte_costs_one_character() {
+    let body = b"<p>\xc6.\xcb\xdc\xb8\xec</p>";
+    let text = text_of(&parse_in_chunks(body, Some(b"euc-jp"), 1));
+    assert_eq!(text.matches('\u{FFFD}').count(), 1, "{text}");
+    assert!(text.contains(".\u{672C}\u{8A9E}"), "{text}");
+}
+
 /// One dangling lead byte costs one character and nothing else.
 ///
 /// The failure this guards against is the one that matters in practice: a

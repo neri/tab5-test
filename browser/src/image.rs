@@ -18,6 +18,7 @@ use crate::limits::{
 pub enum Format {
     Png,
     Jpeg,
+    WebP,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +70,70 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         decode_png(bytes)
     } else if bytes.starts_with(b"\xff\xd8") {
         decode_jpeg(bytes)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        decode_webp(bytes)
     } else {
         Err(DecodeError::Unsupported)
+    }
+}
+
+/// Decodes a still WebP image. Animated WebP is deliberately rejected before
+/// entering the one-shot decoder (whose normal API returns its first frame).
+/// The existing decode-work budget limits the temporary RGBA8 buffer.
+pub fn decode_webp(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    if bytes.len() > MAX_IMAGE_COMPRESSED_BYTES {
+        return Err(DecodeError::TooLarge);
+    }
+    if !bytes.starts_with(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return Err(DecodeError::Unsupported);
+    }
+    match webpkit::is_animated(bytes) {
+        Ok(true) => return Err(DecodeError::Unsupported),
+        Ok(false) => {}
+        Err(error) => return Err(map_webp_error(error)),
+    }
+    let max_pixels = (MAX_IMAGE_PIXELS.min(MAX_IMAGE_DECODE_WORK_BYTES / 4)) as u64;
+    let options = webpkit::DecodeOptions::new()
+        .max_pixels(max_pixels)
+        .read_metadata(false);
+    let rgba = webpkit::decode_with(bytes, &options).map_err(map_webp_error)?;
+    let width = rgba.width();
+    let height = rgba.height();
+    match dimensions(Format::WebP, width, height) {
+        Inspection::Dimensions(_) => {}
+        Inspection::TooLarge => return Err(DecodeError::TooLarge),
+        _ => return Err(DecodeError::Malformed),
+    }
+    let pixel_count = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(DecodeError::TooLarge)?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(pixel_count)
+        .map_err(|_| DecodeError::OutOfMemory)?;
+    for pixel in rgba.as_bytes().chunks_exact(4) {
+        pixels.push(rgb565_over_white(pixel[0], pixel[1], pixel[2], pixel[3]));
+    }
+    if pixels.len() != pixel_count {
+        return Err(DecodeError::Malformed);
+    }
+    Ok(DecodedImage {
+        width: width as u16,
+        height: height as u16,
+        pixels,
+    })
+}
+
+fn map_webp_error(error: webpkit::Error) -> DecodeError {
+    match error {
+        webpkit::Error::LimitExceeded { .. } => DecodeError::TooLarge,
+        webpkit::Error::UnsupportedFeature => DecodeError::Unsupported,
+        _ => DecodeError::Malformed,
     }
 }
 
@@ -517,6 +580,12 @@ pub fn inspect(bytes: &[u8]) -> Inspection {
             u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
         );
     }
+    if bytes.len() < 4 && b"RIFF".starts_with(bytes) {
+        return Inspection::NeedMore;
+    }
+    if bytes.starts_with(b"RIFF") {
+        return inspect_webp(bytes);
+    }
     if bytes.len() < 2 {
         return Inspection::NeedMore;
     }
@@ -524,6 +593,81 @@ pub fn inspect(bytes: &[u8]) -> Inspection {
         return Inspection::Unsupported;
     }
     inspect_jpeg(bytes)
+}
+
+fn inspect_webp(bytes: &[u8]) -> Inspection {
+    if bytes.len() < 12 {
+        return Inspection::NeedMore;
+    }
+    if &bytes[8..12] != b"WEBP" {
+        return Inspection::Unsupported;
+    }
+    let declared = match usize::try_from(u32::from_le_bytes(bytes[4..8].try_into().unwrap()))
+        .ok()
+        .and_then(|size| size.checked_add(8))
+    {
+        Some(size) if size >= 12 => size,
+        _ => return Inspection::Malformed,
+    };
+    let mut offset = 12usize;
+    while offset < declared {
+        if offset + 8 > bytes.len() {
+            return if bytes.len() >= declared {
+                Inspection::Malformed
+            } else {
+                Inspection::NeedMore
+            };
+        }
+        let kind = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let data_start = offset + 8;
+        let data_end = match data_start.checked_add(length) {
+            Some(end) if end <= declared => end,
+            _ => return Inspection::Malformed,
+        };
+        if data_end > bytes.len() {
+            return Inspection::NeedMore;
+        }
+        let data = &bytes[data_start..data_end];
+        match kind {
+            b"VP8X" if data.len() >= 10 => {
+                if data[0] & 0x02 != 0 {
+                    return Inspection::Unsupported;
+                }
+                let width = 1 + u32::from_le_bytes([data[4], data[5], data[6], 0]);
+                let height = 1 + u32::from_le_bytes([data[7], data[8], data[9], 0]);
+                return dimensions(Format::WebP, width, height);
+            }
+            b"VP8 " if data.len() >= 10 => {
+                if data[3..6] != [0x9d, 0x01, 0x2a] {
+                    return Inspection::Malformed;
+                }
+                let width = u16::from_le_bytes([data[6], data[7]]) & 0x3fff;
+                let height = u16::from_le_bytes([data[8], data[9]]) & 0x3fff;
+                return dimensions(Format::WebP, u32::from(width), u32::from(height));
+            }
+            b"VP8L" if data.len() >= 5 => {
+                if data[0] != 0x2f {
+                    return Inspection::Malformed;
+                }
+                let bits = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                let width = (bits & 0x3fff) + 1;
+                let height = ((bits >> 14) & 0x3fff) + 1;
+                return dimensions(Format::WebP, width, height);
+            }
+            b"ANIM" | b"ANMF" => return Inspection::Unsupported,
+            _ => {}
+        }
+        offset = match data_end.checked_add(length & 1) {
+            Some(next) if next <= declared => next,
+            _ => return Inspection::Malformed,
+        };
+    }
+    if bytes.len() < declared {
+        Inspection::NeedMore
+    } else {
+        Inspection::Malformed
+    }
 }
 
 fn inspect_jpeg(bytes: &[u8]) -> Inspection {
@@ -686,6 +830,22 @@ mod tests {
         rgb565_over_white(level, level, level, 255)
     }
 
+    fn webp_riff(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        for (kind, data) in chunks {
+            body.extend_from_slice(*kind);
+            body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            body.extend_from_slice(data);
+            if data.len() & 1 != 0 {
+                body.push(0);
+            }
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
     #[test]
     fn png_dimensions_wait_for_the_whole_ihdr_prefix() {
         let bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x20\0\0\0\x10";
@@ -718,8 +878,82 @@ mod tests {
 
     #[test]
     fn dimensions_are_bounded_before_decode() {
-        let bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x05\x01\0\0\x05\x01";
-        assert_eq!(inspect(bytes), Inspection::TooLarge);
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&(MAX_IMAGE_WIDTH + 1).to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        assert_eq!(inspect(&bytes), Inspection::TooLarge);
+    }
+
+    #[test]
+    fn inspects_and_decodes_static_lossless_webp() {
+        let rgba = [255, 0, 0, 255, 0, 0, 255, 128];
+        let bytes = webpkit::encode_lossless_rgba(2, 1, &rgba).unwrap();
+        assert_eq!(
+            inspect(&bytes),
+            Inspection::Dimensions(Dimensions {
+                format: Format::WebP,
+                width: 2,
+                height: 1,
+            })
+        );
+        let image = decode(&bytes).unwrap();
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.pixels, [0xf800, rgb565_over_white(0, 0, 255, 128)]);
+    }
+
+    #[test]
+    fn decodes_lossy_webp_with_alpha_container() {
+        let mut rgba = Vec::new();
+        for y in 0..16u8 {
+            for x in 0..16u8 {
+                rgba.extend_from_slice(&[
+                    x.saturating_mul(16),
+                    y.saturating_mul(16),
+                    128,
+                    x.saturating_add(y).saturating_mul(8),
+                ]);
+            }
+        }
+        let bytes = webpkit::encode_lossy_rgba(16, 16, &rgba, 80).unwrap();
+        assert_eq!(
+            inspect(&bytes),
+            Inspection::Dimensions(Dimensions {
+                format: Format::WebP,
+                width: 16,
+                height: 16,
+            })
+        );
+        let image = decode(&bytes).unwrap();
+        assert_eq!(
+            (image.width, image.height, image.pixels.len()),
+            (16, 16, 256)
+        );
+    }
+
+    #[test]
+    fn animated_webp_is_rejected_before_decode() {
+        let vp8x = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bytes = webp_riff(&[(b"VP8X", &vp8x), (b"ANIM", &[0; 6])]);
+        assert_eq!(inspect(&bytes), Inspection::Unsupported);
+        assert!(matches!(decode(&bytes), Err(DecodeError::Unsupported)));
+    }
+
+    #[test]
+    fn webp_work_limit_and_truncation_are_local_errors() {
+        // Inside the generic 2-Mpixel image limit but above WebP's
+        // 4-MiB RGBA8 work limit.
+        let bits = (1100u32 - 1) | ((1000u32 - 1) << 14);
+        let mut vp8l = vec![0x2f];
+        vp8l.extend_from_slice(&bits.to_le_bytes());
+        let too_large = webp_riff(&[(b"VP8L", &vp8l)]);
+        assert!(matches!(decode(&too_large), Err(DecodeError::TooLarge)));
+
+        let complete = webpkit::encode_lossless_rgba(1, 1, &[0, 0, 0, 255]).unwrap();
+        assert_eq!(inspect(&complete[..12]), Inspection::NeedMore);
+        assert!(matches!(
+            decode(&complete[..12]),
+            Err(DecodeError::Malformed)
+        ));
     }
 
     #[test]

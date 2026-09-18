@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the Shift_JIS to Unicode table the browser links into DROM.
+"""Write the shared JIS-row to Unicode table the browser links into DROM.
 
 The firmware has no codec library and no room for a general one: this runs
 on the host, and the checked-in `browser/data/shiftjis.bin` is what
@@ -13,8 +13,14 @@ Roman numerals, and the kanji variants that turn up in names. WHATWG's
 encoding standard makes the same choice, mapping the `shift_jis` label onto
 the Windows index.
 
+EUC-JP plane 1 addresses the first 94 rows of the same table directly. This
+project accepts the small CP932/JIS mapping differences because its legacy
+decoders prioritize readable old pages over standards-perfect conversion.
+
 The table is indexed by JIS row and cell (ku and ten), 1-based, which is
 what the two-byte form decodes to:
+
+Shift_JIS converts its bytes to a row and cell as follows:
 
     lead 0x81..=0x9F -> c1 = lead - 0x81
     lead 0xE0..=0xFC -> c1 = lead - 0xC1

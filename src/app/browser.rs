@@ -64,11 +64,14 @@ use crate::browser::document::{
 };
 use crate::browser::error::{self, Error};
 use crate::browser::form;
-use crate::browser::image::{DecodeError, DecodedImage, decode, png_chunk_crc};
+use crate::browser::image::{
+    DecodeError, DecodedImage, Inspection, decode, inspect as inspect_image, png_chunk_crc,
+};
 use crate::browser::layout::{Layout, Line, Metrics};
 use crate::browser::limits::{
-    MAX_HISTORY, MAX_INPUT_VALUE_BYTES, MAX_RETAINED_POST_REQUEST_BYTES,
-    MAX_RETAINED_POST_RESULT_BYTES, MAX_RETAINED_POST_RESULTS, MAX_URL_BYTES,
+    MAX_DECODED_IMAGE_HARD_BYTES, MAX_DECODED_IMAGE_SOFT_BYTES, MAX_HISTORY,
+    MAX_INPUT_VALUE_BYTES, MAX_RETAINED_POST_REQUEST_BYTES, MAX_RETAINED_POST_RESULT_BYTES,
+    MAX_RETAINED_POST_RESULTS, MAX_URL_BYTES,
 };
 use crate::browser::memory;
 use crate::browser::request::{Method as RequestMethod, Request as HttpRequest};
@@ -245,7 +248,8 @@ const DISABLED_COLOR: u16 = theme::BORDER;
 /// The address field while it is being edited.
 const EDIT_BACKGROUND: u16 = WHITE;
 const EDIT_CARET: u16 = theme::ACCENT;
-const EDIT_SELECTION: u16 = theme::SUBTLE;
+const EDIT_SELECTION: u16 = theme::ACCENT;
+const EDIT_SELECTION_TEXT: u16 = theme::ON_ACCENT;
 
 /// The two buttons a POST resend question puts at the right of the status
 /// line. Keys answer it as well (`y`/Enter, `n`/Escape).
@@ -279,7 +283,6 @@ pub struct Browser {
     pending: Option<Pending>,
     local_image: Option<LocalImagePending>,
     network_image: Option<NetworkImagePending>,
-    next_image: usize,
     /// The file-backed HTTP cache's work in progress and counters.
     cache: CacheState,
     cache_image: Option<CacheImagePending>,
@@ -338,6 +341,17 @@ fn decode_failure(error: DecodeError) -> &'static str {
     }
 }
 
+fn image_fetch_failure(failure: fetch::Failure) -> &'static str {
+    match failure.name {
+        // The HTTP transaction enforces the compressed-image ceiling before
+        // the decoder sees a byte. Its page-oriented headline is misleading
+        // inside an image box, so keep the same local label as decoder limits.
+        "body-limit" => "image too large",
+        "out-of-memory" => "image out of memory",
+        _ => failure.headline,
+    }
+}
+
 fn shared_decoded_image(page: &Page, image: usize, url: &Url) -> Option<Rc<DecodedImage>> {
     (0..image).find_map(|candidate| {
         let same = page.document.images()[candidate]
@@ -348,6 +362,33 @@ fn shared_decoded_image(page: &Page, image: usize, url: &Url) -> Option<Rc<Decod
             .flatten()
     })
 }
+
+fn decoded_image_bytes(image: &DecodedImage) -> usize {
+    image
+        .pixels
+        .capacity()
+        .saturating_mul(core::mem::size_of::<u16>())
+}
+
+fn install_image(viewer: &mut Viewer, image: usize, decoded: Rc<DecodedImage>) {
+    match viewer.install_decoded_image(image, decoded) {
+        Ok(true) => {}
+        Ok(false) => viewer.page.image_failures[image] = Some("image memory limit"),
+        Err(_) => viewer.page.image_failures[image] = Some("image layout failed"),
+    }
+}
+
+fn decode_image(viewer: &mut Viewer, image: usize, bytes: &[u8]) {
+    if !viewer.prepare_image_decode(bytes) {
+        viewer.page.image_failures[image] = Some("image memory limit");
+        return;
+    }
+    match decode(bytes) {
+        Ok(decoded) => install_image(viewer, image, Rc::new(decoded)),
+        Err(error) => viewer.page.image_failures[image] = Some(decode_failure(error)),
+    }
+}
+
 impl Browser {
     pub fn new(start: Option<Url>, wifi: &mut WifiManager) -> Option<Self> {
         let mut viewer = Viewer::new().ok()?;
@@ -362,14 +403,17 @@ impl Browser {
             pending: None,
             local_image: None,
             network_image: None,
-            next_image: 0,
             cache: CacheState::new(),
             cache_image: None,
             images_bypass_cache: false,
         })
     }
     pub fn key(&mut self, key: Key, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
-        let action = self.viewer.handle_key(key, self.pending.is_some());
+        let loading = self.pending.is_some()
+            || self.local_image.is_some()
+            || self.cache_image.is_some()
+            || self.network_image.is_some();
+        let action = self.viewer.handle_key(key, loading);
         self.answer(action, wifi, vfs)
     }
     pub fn click(&mut self, x: usize, y: usize, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
@@ -379,13 +423,43 @@ impl Browser {
     fn answer(&mut self, action: Action, wifi: &mut WifiManager, vfs: &mut Vfs) -> bool {
         match action {
             Action::Continue => {}
-            Action::Cancel => stop_pending(&mut self.viewer, &mut self.pending, wifi, vfs),
+            Action::Cancel if self.pending.is_some() => {
+                stop_pending(&mut self.viewer, &mut self.pending, wifi, vfs)
+            }
+            Action::Cancel => self.stop_image(wifi, vfs),
             Action::Report => {
                 report_state(&mut self.viewer, &self.pending, wifi, &self.cache.stats)
             }
             Action::Leave => return true,
         }
         false
+    }
+
+    /// Stops the one image source being read and makes that reader choice a
+    /// stable local result. Without the failure label the viewport scheduler
+    /// would immediately queue the same still-visible image again.
+    fn stop_image(&mut self, wifi: &mut WifiManager, vfs: &mut Vfs) {
+        let mut stopped = None;
+        if let Some(active) = self.local_image.take() {
+            stopped = Some(active.image);
+            active.read.close(vfs);
+        }
+        if let Some(active) = self.cache_image.take() {
+            stopped = Some(active.image);
+            active.read.close(vfs);
+        }
+        if let Some(active) = self.network_image.take() {
+            stopped = Some(active.image);
+            if let Some(mut link) = raw_network(wifi) {
+                active.fetch.close(&mut link);
+            }
+        }
+        self.viewer.set_image_loading(false);
+        if let Some(image) = stopped {
+            self.viewer.page.image_failures[image] = Some("stopped");
+            self.viewer.dirty.viewport = true;
+            self.viewer.say("stopped");
+        }
     }
     pub fn wheel(&mut self, amount: i32) {
         self.viewer.close_select();
@@ -422,10 +496,10 @@ impl Browser {
             }
         }
         if let Some(active) = self.network_image.take() {
-            self.next_image = self.next_image.min(active.image);
             if let Some(mut link) = raw_network(wifi) {
                 active.fetch.close(&mut link);
             }
+            self.viewer.set_image_loading(false);
         }
     }
     pub fn close(&mut self, wifi: &mut WifiManager, vfs: &mut Vfs) {
@@ -446,6 +520,7 @@ impl Browser {
         if let Some(write) = self.cache.write.take() {
             write.abandon(vfs);
         }
+        self.viewer.set_image_loading(false);
     }
     pub fn draw(&mut self, fb: &mut Framebuffer, wifi: &mut WifiManager, full: bool) -> bool {
         if full {
@@ -472,10 +547,10 @@ impl Browser {
     ) {
         if self.network_image.is_some() && !network_is_addressed(wifi) {
             if let Some(active) = self.network_image.take() {
-                self.next_image = self.next_image.min(active.image);
                 if let Some(mut link) = raw_network(wifi) {
                     active.fetch.close(&mut link);
                 }
+                self.viewer.set_image_loading(false);
             }
         }
         // A managed connection can disappear between two page-fetch steps.
@@ -513,19 +588,21 @@ impl Browser {
             }
             if let Some(active) = self.local_image.take() {
                 active.read.close(vfs);
+                self.viewer.set_image_loading(false);
             }
             if let Some(active) = self.network_image.take() {
                 if let Some(mut link) = raw_network(wifi) {
                     active.fetch.close(&mut link);
                 }
+                self.viewer.set_image_loading(false);
             }
             if let Some(active) = self.cache_image.take() {
                 active.read.close(vfs);
+                self.viewer.set_image_loading(false);
             }
             // A body still being written is finished before the next page
             // can capture another, so at most one is ever held in memory.
             self.finish_cache_write(vfs, ram_disk.as_deref_mut(), input);
-            self.next_image = 0;
             self.pending = match requested {
                 Requested::Navigation(navigation) => begin(
                     &mut self.viewer,
@@ -671,7 +748,6 @@ impl Browser {
                         Some(false) => self.viewer.say("shown from the cache; no request was sent"),
                         None => {}
                     }
-                    self.next_image = 0;
                 }
             }
             Some(FetchOutcome::NotModified) => {
@@ -879,18 +955,10 @@ impl Browser {
             return false;
         };
         active.read.close(vfs);
+        self.viewer.set_image_loading(false);
         match outcome {
             FetchOutcome::Image(bytes) => {
-                match decode(&bytes) {
-                    Ok(decoded) => {
-                        let _ = self
-                            .viewer
-                            .install_decoded_image(active.image, Rc::new(decoded));
-                    }
-                    Err(error) => {
-                        self.viewer.page.image_failures[active.image] = Some(decode_failure(error));
-                    }
-                }
+                decode_image(&mut self.viewer, active.image, &bytes);
                 self.viewer.dirty.viewport = true;
             }
             _ => {
@@ -906,7 +974,6 @@ impl Browser {
                     cache_store::remove(vfs, devices, &url);
                     self.cache.stats.purged += 1;
                 }
-                self.next_image = self.next_image.min(active.image);
             }
         }
         false
@@ -925,19 +992,14 @@ impl Browser {
             usb: input.usb_host_mut(),
         };
         if self.local_image.is_none() {
-            while self.next_image < self.viewer.page.document.images().len() {
-                let image = self.next_image;
-                self.next_image += 1;
-                let Some(url) = self.viewer.page.document.images()[image].source.clone() else {
-                    continue;
-                };
+            while let Some(image) = self.viewer.needed_image(true) {
+                let url = self.viewer.page.document.images()[image]
+                    .source
+                    .clone()
+                    .expect("scheduled image has no URL");
                 if let Some(shared) = shared_decoded_image(&self.viewer.page, image, &url) {
-                    let _ = self.viewer.install_decoded_image(image, shared);
+                    install_image(&mut self.viewer, image, shared);
                     continue;
-                }
-                if url.scheme() != crate::browser::url::Scheme::File {
-                    self.next_image -= 1;
-                    break;
                 }
                 if self.viewer.page.visit_url.scheme() != crate::browser::url::Scheme::File {
                     self.viewer.page.image_failures[image] = Some("local image refused");
@@ -948,6 +1010,7 @@ impl Browser {
                 match ImageRead::start(&url, vfs, &mut devices) {
                     Ok(read) => {
                         self.local_image = Some(LocalImagePending { image, read });
+                        self.viewer.set_image_loading(true);
                         break;
                     }
                     Err(_) => {
@@ -967,17 +1030,8 @@ impl Browser {
             Some(ImageOutcome::Complete(bytes)) => {
                 if let Some(active) = self.local_image.take() {
                     active.read.close(vfs);
-                    match decode(&bytes) {
-                        Ok(decoded) => {
-                            let _ = self
-                                .viewer
-                                .install_decoded_image(active.image, Rc::new(decoded));
-                        }
-                        Err(error) => {
-                            self.viewer.page.image_failures[active.image] =
-                                Some(decode_failure(error));
-                        }
-                    }
+                    self.viewer.set_image_loading(false);
+                    decode_image(&mut self.viewer, active.image, &bytes);
                     self.viewer.dirty.viewport = true;
                 }
             }
@@ -986,6 +1040,7 @@ impl Browser {
                     self.viewer.page.image_failures[active.image] = Some(failure.headline);
                     self.viewer.dirty.viewport = true;
                     active.read.close(vfs);
+                    self.viewer.set_image_loading(false);
                 }
                 self.viewer.say(failure.detail);
             }
@@ -1017,19 +1072,14 @@ impl Browser {
             return;
         }
         if self.network_image.is_none() {
-            while self.next_image < self.viewer.page.document.images().len() {
-                let image = self.next_image;
-                let Some(url) = self.viewer.page.document.images()[image].source.clone() else {
-                    self.next_image += 1;
-                    continue;
-                };
+            while let Some(image) = self.viewer.needed_image(false) {
+                let url = self.viewer.page.document.images()[image]
+                    .source
+                    .clone()
+                    .expect("scheduled image has no URL");
                 if let Some(shared) = shared_decoded_image(&self.viewer.page, image, &url) {
-                    let _ = self.viewer.install_decoded_image(image, shared);
-                    self.next_image += 1;
+                    install_image(&mut self.viewer, image, shared);
                     continue;
-                }
-                if !url.scheme().is_network() {
-                    return;
                 }
                 if self.viewer.page.visit_url.scheme() == crate::browser::url::Scheme::Https
                     && url.scheme() == crate::browser::url::Scheme::Http
@@ -1037,7 +1087,6 @@ impl Browser {
                     self.viewer.page.image_failures[image] = Some("HTTPS downgrade refused");
                     self.viewer.dirty.viewport = true;
                     self.viewer.say("refused an HTTPS image downgrade");
-                    self.next_image += 1;
                     continue;
                 }
                 if self.viewer.page.security
@@ -1047,7 +1096,6 @@ impl Browser {
                 {
                     self.viewer.page.image_failures[image] = Some("TLS identity downgrade refused");
                     self.viewer.dirty.viewport = true;
-                    self.next_image += 1;
                     continue;
                 }
                 let now = tick::now_ms();
@@ -1065,8 +1113,8 @@ impl Browser {
                             hit.record.used_ms = now;
                             let _ = cache_store::update_record(vfs, &mut devices, &hit);
                             self.cache.stats.hits += 1;
-                            self.next_image += 1;
                             self.cache_image = Some(CacheImagePending { image, read });
+                            self.viewer.set_image_loading(true);
                             break;
                         }
                         cache_store::remove_hit(vfs, &mut devices, &hit);
@@ -1078,10 +1126,10 @@ impl Browser {
                 let Some(mut network) = addressed_network(wifi) else {
                     return;
                 };
-                self.next_image += 1;
                 match Fetch::start_image_cached(url, &mut network, validator) {
                     Ok(fetch) => {
                         self.network_image = Some(NetworkImagePending { image, fetch });
+                        self.viewer.set_image_loading(true);
                         break;
                     }
                     Err(failure) => {
@@ -1109,17 +1157,8 @@ impl Browser {
                     if let Some(mut network) = raw_network(wifi) {
                         active.fetch.close(&mut network);
                     }
-                    match decode(&bytes) {
-                        Ok(decoded) => {
-                            let _ = self
-                                .viewer
-                                .install_decoded_image(active.image, Rc::new(decoded));
-                        }
-                        Err(error) => {
-                            self.viewer.page.image_failures[active.image] =
-                                Some(decode_failure(error));
-                        }
-                    }
+                    self.viewer.set_image_loading(false);
+                    decode_image(&mut self.viewer, active.image, &bytes);
                     self.viewer.dirty.viewport = true;
                 }
             }
@@ -1130,6 +1169,7 @@ impl Browser {
                     if let Some(mut network) = raw_network(wifi) {
                         active.fetch.close(&mut network);
                     }
+                    self.viewer.set_image_loading(false);
                     let now = tick::now_ms();
                     match cache_store::find(vfs, &mut devices, &url) {
                         Some(mut hit) => {
@@ -1142,24 +1182,25 @@ impl Browser {
                                         image: active.image,
                                         read,
                                     });
+                                    self.viewer.set_image_loading(true);
                                 }
                                 None => {
                                     cache_store::remove_hit(vfs, &mut devices, &hit);
-                                    self.next_image = self.next_image.min(active.image);
                                 }
                             }
                         }
-                        None => self.next_image = self.next_image.min(active.image),
+                        None => {}
                     }
                 }
             }
             FetchOutcome::Failed(failure) => {
                 if let Some(active) = self.network_image.take() {
-                    self.viewer.page.image_failures[active.image] = Some(failure.headline);
+                    self.viewer.page.image_failures[active.image] = Some(image_fetch_failure(failure));
                     self.viewer.dirty.viewport = true;
                     if let Some(mut network) = raw_network(wifi) {
                         active.fetch.close(&mut network);
                     }
+                    self.viewer.set_image_loading(false);
                 }
                 self.viewer.say(failure.detail);
             }
@@ -1299,6 +1340,12 @@ fn report_state(
     line.push_usize(cache.purged);
     line.push(" x");
     line.push_usize(cache.invalidated);
+    line.push(" img ");
+    line.push_usize(viewer.decoded_resident_bytes() / 1024);
+    line.push("/");
+    line.push_usize(viewer.page.decoded_image_peak / 1024);
+    line.push("K e");
+    line.push_usize(viewer.page.decoded_image_evictions);
     line.push(" page ");
     line.push_usize(viewer.page_owned_bytes() / 1024);
     line.push("K peak ");
@@ -1461,19 +1508,10 @@ fn network_is_addressed(wifi: &WifiManager) -> bool {
 }
 
 /// Whether the manager is already doing work that can produce a fresh stack.
-///
-/// `Associated` is deliberately absent: that is also the terminal state of a
-/// CLI connection whose address must be configured manually. The other four
-/// states are transient states of managed reassociation or DHCP recovery.
+/// The manager owns the distinction between a terminal CLI `Associated` state
+/// and the GUI-managed association-to-DHCP gap.
 fn network_is_recovering(wifi: &WifiManager) -> bool {
-    use super::wifi_manager::State;
-    matches!(
-        wifi.state(),
-        State::Associating { .. }
-            | State::RetryWaiting { .. }
-            | State::RequestingDhcp { .. }
-            | State::AssociatedNoLease(_)
-    )
+    wifi.network_recovery_active()
 }
 
 /// Starts a navigation, or answers it without leaving the board when it
@@ -2098,6 +2136,12 @@ struct Page {
     /// introduced with the fetch job; this stable index keeps drawing and
     /// layout independent of how bytes arrived.
     decoded_images: Vec<Option<Rc<DecodedImage>>>,
+    /// LRU generations by Document image ID. Slots that share one decoded
+    /// allocation use the newest generation among their aliases.
+    image_access: Vec<u64>,
+    image_access_generation: u64,
+    decoded_image_peak: usize,
+    decoded_image_evictions: usize,
     /// Stable, image-local failure labels. A failed image keeps its layout
     /// box and never turns the whole document into an error page.
     image_failures: Vec<Option<&'static str>>,
@@ -2224,6 +2268,10 @@ struct Viewer {
     confirm: Option<Confirmation>,
     select_popup: Option<SelectPopup>,
     loading: Option<Loading>,
+    /// An image source is being read after the document itself was shown.
+    /// Kept separate so the address field continues to name the page while
+    /// the toolbar still exposes Stop for the image transfer.
+    image_loading: bool,
     /// A sentence for the status line. Takes priority over the focused
     /// link's target, because it is only ever set as the answer to
     /// something the reader just did.
@@ -2308,6 +2356,7 @@ impl Viewer {
             confirm: None,
             select_popup: None,
             loading: None,
+            image_loading: false,
             message: None,
             request: None,
             painted_bottom: VIEWPORT_BOTTOM,
@@ -2707,6 +2756,15 @@ impl Viewer {
             self.dirty.toolbar = true;
             self.dirty.status = true;
         }
+    }
+
+    fn set_image_loading(&mut self, loading: bool) {
+        if self.image_loading == loading {
+            return;
+        }
+        self.image_loading = loading;
+        self.dirty.toolbar = true;
+        self.dirty.status = true;
     }
 
     /// Puts a finished document on screen.
@@ -4019,7 +4077,9 @@ impl Viewer {
             // The same button, and the same code Escape reaches: while
             // something is arriving it stops it, and otherwise it fetches
             // the address again.
-            Button::Reload if self.loading.is_some() => return Action::Cancel,
+            Button::Reload if self.loading.is_some() || self.image_loading => {
+                return Action::Cancel;
+            }
             Button::Reload => self.reload(false),
         }
         Action::Continue
@@ -4129,11 +4189,173 @@ impl Viewer {
         }
     }
 
+    fn image_intersects(&self, image: usize, margin: u32) -> bool {
+        let top = self.page.scroll_y.saturating_sub(margin);
+        let bottom = self
+            .page
+            .scroll_y
+            .saturating_add(VIEWPORT_HEIGHT as u32)
+            .saturating_add(margin);
+        self.page.layout.images().iter().any(|box_| {
+            box_.image as usize == image
+                && box_.y < bottom
+                && box_.y.saturating_add(box_.height as u32) > top
+        })
+    }
+
+    fn touch_image(&mut self, image: usize) {
+        let Some(decoded) = self.page.decoded_images.get(image).and_then(Option::clone) else {
+            return;
+        };
+        self.page.image_access_generation = self.page.image_access_generation.wrapping_add(1);
+        if self.page.image_access_generation == 0 {
+            self.page.image_access.fill(0);
+            self.page.image_access_generation = 1;
+        }
+        let generation = self.page.image_access_generation;
+        for (slot, access) in self
+            .page
+            .decoded_images
+            .iter()
+            .zip(&mut self.page.image_access)
+        {
+            if slot
+                .as_ref()
+                .is_some_and(|candidate| Rc::ptr_eq(candidate, &decoded))
+            {
+                *access = generation;
+            }
+        }
+    }
+
+    fn decoded_resident_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for (index, decoded) in self.page.decoded_images.iter().enumerate() {
+            let Some(decoded) = decoded else { continue };
+            let already_counted = self.page.decoded_images[..index]
+                .iter()
+                .flatten()
+                .any(|candidate| Rc::ptr_eq(candidate, decoded));
+            if !already_counted {
+                total = total.saturating_add(decoded_image_bytes(decoded));
+            }
+        }
+        total
+    }
+
+    /// Makes room for one newly decoded allocation. Visible allocations are
+    /// pinned; off-screen allocations are removed as whole URL-shared groups
+    /// in least-recently-used order.
+    fn make_decoded_room(&mut self, incoming: &Rc<DecodedImage>) -> bool {
+        let shared = self
+            .page
+            .decoded_images
+            .iter()
+            .flatten()
+            .any(|candidate| Rc::ptr_eq(candidate, incoming));
+        let incoming_bytes = if shared {
+            0
+        } else {
+            decoded_image_bytes(incoming)
+        };
+        self.make_decoded_room_for_bytes(incoming_bytes, Some(incoming))
+    }
+
+    /// Evicts before the decoder allocates its output. The compressed body and
+    /// decoder workspace are separately bounded; this reserves the persistent
+    /// RGB565 part early so a successful decode will not briefly retain stale
+    /// off-screen images as well.
+    fn prepare_image_decode(&mut self, bytes: &[u8]) -> bool {
+        let Inspection::Dimensions(dimensions) = inspect_image(bytes) else {
+            return true;
+        };
+        let incoming_bytes = usize::try_from(dimensions.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(dimensions.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(core::mem::size_of::<u16>()));
+        incoming_bytes.is_some_and(|bytes| self.make_decoded_room_for_bytes(bytes, None))
+    }
+
+    fn make_decoded_room_for_bytes(
+        &mut self,
+        incoming_bytes: usize,
+        protected: Option<&Rc<DecodedImage>>,
+    ) -> bool {
+        if incoming_bytes > MAX_DECODED_IMAGE_HARD_BYTES {
+            return false;
+        }
+        while self
+            .decoded_resident_bytes()
+            .saturating_add(incoming_bytes)
+            > MAX_DECODED_IMAGE_SOFT_BYTES
+        {
+            let mut victim: Option<(usize, u64)> = None;
+            for index in 0..self.page.decoded_images.len() {
+                let Some(decoded) = self.page.decoded_images[index].as_ref() else {
+                    continue;
+                };
+                if protected.is_some_and(|incoming| Rc::ptr_eq(decoded, incoming))
+                    || self.page.decoded_images[..index]
+                        .iter()
+                        .flatten()
+                        .any(|candidate| Rc::ptr_eq(candidate, decoded))
+                {
+                    continue;
+                }
+                let mut visible = false;
+                let mut age = 0u64;
+                for alias in 0..self.page.decoded_images.len() {
+                    if self.page.decoded_images[alias]
+                        .as_ref()
+                        .is_some_and(|candidate| Rc::ptr_eq(candidate, decoded))
+                    {
+                        visible |= self.image_intersects(alias, 0);
+                        age = age.max(self.page.image_access[alias]);
+                    }
+                }
+                if !visible && victim.is_none_or(|(_, oldest)| age < oldest) {
+                    victim = Some((index, age));
+                }
+            }
+            let Some((victim, _)) = victim else { break };
+            let decoded = self.page.decoded_images[victim]
+                .as_ref()
+                .expect("LRU victim disappeared")
+                .clone();
+            for (slot, access) in self
+                .page
+                .decoded_images
+                .iter_mut()
+                .zip(&mut self.page.image_access)
+            {
+                if slot
+                    .as_ref()
+                    .is_some_and(|candidate| Rc::ptr_eq(candidate, &decoded))
+                {
+                    *slot = None;
+                    *access = 0;
+                }
+            }
+            self.page.decoded_image_evictions += 1;
+            self.dirty.viewport = true;
+        }
+        self.decoded_resident_bytes()
+            .saturating_add(incoming_bytes)
+            <= MAX_DECODED_IMAGE_HARD_BYTES
+    }
+
     fn install_decoded_image(
         &mut self,
         image: usize,
         decoded: Rc<DecodedImage>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
+        if !self.make_decoded_room(&decoded) {
+            return Ok(false);
+        }
         let reading = self.page.layout.reading_position(self.page.scroll_y);
         // A new layout can move the select box the open list belongs to.
         self.select_popup = None;
@@ -4178,8 +4400,13 @@ impl Viewer {
         self.page.focus =
             focused.and_then(|target| self.page.order.iter().position(|item| *item == target));
         self.page.decoded_images[image] = Some(decoded);
+        self.touch_image(image);
+        self.page.decoded_image_peak = self
+            .page
+            .decoded_image_peak
+            .max(self.decoded_resident_bytes());
         self.dirty.viewport = true;
-        Ok(())
+        Ok(true)
     }
 
     fn max_scroll_y(&self) -> u32 {
@@ -4187,6 +4414,57 @@ impl Viewer {
             .layout
             .height()
             .saturating_sub(VIEWPORT_HEIGHT as u32)
+    }
+
+    /// Chooses one image near what the reader can currently see. Far-away
+    /// images remain unrequested, so they cannot evict useful decoded data
+    /// before the reader scrolls to them.
+    fn needed_image(&self, local: bool) -> Option<usize> {
+        let top = self.page.scroll_y;
+        let viewport_bottom = top.saturating_add(VIEWPORT_HEIGHT as u32);
+        let near_top = top.saturating_sub(VIEWPORT_HEIGHT as u32);
+        let near_bottom = viewport_bottom.saturating_add(VIEWPORT_HEIGHT as u32);
+        let focused = self.focused_link();
+        let mut best: Option<(u8, u32, usize)> = None;
+        for (image, item) in self.page.document.images().iter().enumerate() {
+            if self.page.decoded_images[image].is_some()
+                || self.page.image_failures[image].is_some()
+            {
+                continue;
+            }
+            let Some(url) = item.source.as_ref() else {
+                continue;
+            };
+            if (url.scheme() == crate::browser::url::Scheme::File) != local {
+                continue;
+            }
+            if !local && !url.scheme().is_network() {
+                continue;
+            }
+            for box_ in self
+                .page
+                .layout
+                .images()
+                .iter()
+                .filter(|box_| box_.image as usize == image)
+            {
+                let bottom = box_.y.saturating_add(box_.height as u32);
+                let priority = if box_.y < viewport_bottom && bottom > top {
+                    0
+                } else if box_.y < near_bottom && bottom > near_top {
+                    1
+                } else if box_.link.is_some() && box_.link == focused {
+                    2
+                } else {
+                    continue;
+                };
+                let candidate = (priority, box_.y, image);
+                if best.is_none_or(|current| candidate < current) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best.map(|(_, _, image)| image)
     }
 
     fn scroll_focus_into_view(&mut self) {
@@ -4555,7 +4833,7 @@ impl Viewer {
         let glyphs = [
             BACK_GLYPH,
             FORWARD_GLYPH,
-            if self.loading.is_some() {
+            if self.loading.is_some() || self.image_loading {
                 STOP_GLYPH
             } else {
                 RELOAD_GLYPH
@@ -4647,6 +4925,7 @@ impl Viewer {
         let first = editing.visible_start(text_budget.saturating_sub(2), |text| {
             crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
         });
+        let mut selected_pixels = None;
         if let Some(selection) = editing.selection() {
             let visible_start = selection.start.max(first);
             let visible_end = selection.end.max(first);
@@ -4668,6 +4947,7 @@ impl Viewer {
                     CELL_HEIGHT * CHROME_SCALE,
                     EDIT_SELECTION,
                 );
+                selected_pixels = Some((selection_x, selection_width));
             }
         }
         draw_clipped(
@@ -4678,6 +4958,17 @@ impl Viewer {
             text_budget,
             BLACK,
         );
+        if let Some((selection_x, selection_width)) = selected_pixels {
+            draw_selection_foreground(
+                framebuffer,
+                ADDRESS_LEFT,
+                CHROME_TEXT_Y,
+                &editing.text()[first..],
+                text_budget,
+                ADDRESS_LEFT + selection_x,
+                selection_width,
+            );
+        }
         let caret_x = crate::font::ui_text_width(
             &editing.text()[first..editing.caret()],
             crate::font::UiTextStyle::BODY,
@@ -4737,6 +5028,17 @@ impl Viewer {
                 MARGIN,
                 STATUS_TEXT_Y,
                 text.as_str(),
+                CHROME_SCALE,
+                CHROME_TEXT,
+            );
+            return;
+        }
+        if self.image_loading && self.message.is_none() {
+            draw_ascii(
+                framebuffer,
+                MARGIN,
+                STATUS_TEXT_Y,
+                "loading image; Escape or the stop button stops",
                 CHROME_SCALE,
                 CHROME_TEXT,
             );
@@ -5268,6 +5570,7 @@ impl Viewer {
                     .visible_start(text_budget.saturating_sub(2), |text| {
                         crate::font::ui_text_width(text, crate::font::UiTextStyle::BODY)
                     });
+                let mut selected_pixels = None;
                 if let Some(selection) = editing.input.selection() {
                     let visible_start = selection.start.max(first);
                     let visible_end = selection.end.max(first);
@@ -5289,6 +5592,7 @@ impl Viewer {
                             CELL_HEIGHT,
                             EDIT_SELECTION,
                         );
+                        selected_pixels = Some((selection_x, selection_width));
                     }
                 }
                 draw_clipped(
@@ -5299,6 +5603,17 @@ impl Viewer {
                     text_budget,
                     TEXT_COLOR,
                 );
+                if let Some((selection_x, selection_width)) = selected_pixels {
+                    draw_selection_foreground(
+                        framebuffer,
+                        text_left,
+                        text_y,
+                        &editing.input.text()[first..],
+                        text_budget,
+                        text_left + selection_x,
+                        selection_width,
+                    );
+                }
                 let caret_x = crate::font::ui_text_width(
                     &editing.input.text()[first..editing.input.caret()],
                     crate::font::UiTextStyle::BODY,
@@ -5436,7 +5751,8 @@ impl Viewer {
             }
         }
         let focused = self.focused_link();
-        for image_box in self.page.layout.images() {
+        for image_box_index in 0..self.page.layout.images().len() {
+            let image_box = self.page.layout.images()[image_box_index];
             let bottom = image_box.y.saturating_add(image_box.height as u32);
             let viewport_bottom = top.saturating_add(VIEWPORT_HEIGHT as u32);
             if bottom <= top || image_box.y >= viewport_bottom {
@@ -5471,6 +5787,7 @@ impl Viewer {
                     background,
                 );
             }
+            self.touch_image(image_box.image as usize);
             let decoded = self
                 .page
                 .decoded_images
@@ -5930,6 +6247,35 @@ fn draw_clipped(
     }
 }
 
+/// Repaints the selected part of an already drawn text run with the theme's
+/// on-accent ink. Intersecting the temporary selection clip with the caller's
+/// damage clip keeps a caret-only repair from touching neighboring pixels.
+fn draw_selection_foreground(
+    framebuffer: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    text: &str,
+    budget: usize,
+    selection_left: usize,
+    selection_width: usize,
+) {
+    let selection_right = selection_left.saturating_add(selection_width);
+    let old_clip = framebuffer.set_horizontal_clip(selection_left, selection_right);
+    framebuffer.set_horizontal_clip(
+        old_clip.0.max(selection_left),
+        old_clip.1.min(selection_right),
+    );
+    draw_clipped(
+        framebuffer,
+        x,
+        y,
+        text,
+        budget,
+        EDIT_SELECTION_TEXT,
+    );
+    framebuffer.set_horizontal_clip(old_clip.0, old_clip.1);
+}
+
 /// A textarea's text: wrapped rows from the edit's scroll position, with the
 /// selection and caret when it is being edited.
 #[allow(clippy::too_many_arguments)]
@@ -5956,6 +6302,7 @@ fn draw_textarea(
     let selection = editing.and_then(|editing| editing.input.selection());
     for (index, row) in rows.iter().enumerate().skip(first).take(visible) {
         let y = top + (index - first) * row_height;
+        let mut selected_pixels = None;
         if let Some(selection) = &selection {
             let start = selection.start.clamp(row.start, row.end);
             let end = selection.end.clamp(row.start, row.end);
@@ -5963,9 +6310,21 @@ fn draw_textarea(
                 let x = measure(&text[row.start..start]).min(budget);
                 let width = measure(&text[start..end]).min(budget - x);
                 framebuffer.fill_rect(left + x, y, width, CELL_HEIGHT, EDIT_SELECTION);
+                selected_pixels = Some((x, width));
             }
         }
         draw_clipped(framebuffer, left, y, &text[row.clone()], budget, ink);
+        if let Some((selection_x, selection_width)) = selected_pixels {
+            draw_selection_foreground(
+                framebuffer,
+                left,
+                y,
+                &text[row.clone()],
+                budget,
+                left + selection_x,
+                selection_width,
+            );
+        }
         if let (Some(caret), Some(caret_row)) = (caret, caret_row)
             && caret_row == index
         {
@@ -6045,6 +6404,7 @@ fn build_page(document: Document) -> Result<Page, Error> {
     let decoded_images = core::iter::repeat_with(|| None)
         .take(document.images().len())
         .collect();
+    let image_access = core::iter::repeat_n(0, document.images().len()).collect();
     let image_failures = core::iter::repeat_n(None, document.images().len()).collect();
     let mut control_values = Vec::new();
     for control in document.controls() {
@@ -6075,6 +6435,10 @@ fn build_page(document: Document) -> Result<Page, Error> {
         focus: None,
         order,
         decoded_images,
+        image_access,
+        image_access_generation: 0,
+        decoded_image_peak: 0,
+        decoded_image_evictions: 0,
         image_failures,
         control_values,
         control_checked,
