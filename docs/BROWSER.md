@@ -1188,7 +1188,7 @@ redirectして`https-downgrade`になります。降格の拒否は「TLSを話�
 （pinを持たないbuildでは失うidentityが無いので、単に名前が引けず`dns`）。
 
 **既定はpinを持たないbuildです。**`tls-fixture-pins`はdefault featureでは
-ないので、`cargo build --release`——CLAUDE.mdが書いているbuild——にpinは1つも
+ないので、`cargo build --release`——AGENTS.mdが書いているbuild——にpinは1つも
 入りません。pin入りbuildで巡回するときだけ`--pinned-board`を付けてください。
 
 この既定は逆でした。既定をpin入りにしていたため、普通にbuildした基板で普通に

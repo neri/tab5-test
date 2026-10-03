@@ -3063,7 +3063,7 @@ PORTS: dict[str, int] = {}
 #
 # False by default, because that is what an ordinary board is.
 # `tls-fixture-pins` is not a default feature, so `cargo build --release` --
-# the build `CLAUDE.md` documents and the one anybody runs -- carries no
+# the build `AGENTS.md` documents and the one anybody runs -- carries no
 # pins at all. Defaulting to True meant the ordinary walk reported two
 # failures on the Ed25519 and RSA listeners, and the person running it had
 # to know to describe their normal build with a flag.

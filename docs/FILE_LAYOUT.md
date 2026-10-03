@@ -350,7 +350,7 @@ MMIOプリミティブ）は`unsafe fn`として定義します。呼び出し�
 関数単位でまとめるのが方針です）。
 
 `README.md`は人間がメンテします。AIは指示された場合を除き編集しないでください。
-このルールと設計資料への入口は[`AGENTS.md`](../AGENTS.md)に、同じREADME管理ルールは
-[`CLAUDE.md`](../CLAUDE.md)にも書いてあります（DESIGN.mdは自動では読み込まれないため）。
+このルールと設計資料への入口は[`AGENTS.md`](../AGENTS.md)に書いてあります
+（DESIGN.mdは自動では読み込まれないため）。
 `.claude/settings.json`の`permissions.ask`でも、README.mdへの
 `Edit`/`Write`に確認を挟むようにしてあります。
